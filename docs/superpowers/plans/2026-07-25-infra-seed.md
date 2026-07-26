@@ -1955,6 +1955,7 @@ import { seedGeneration } from "../../src/cli.js";
 
 const GEN6_COUNTS = {
   pokemon: 834, moves: 618, items: 283, abilities: 191, typeChart: 324,
+  learnsets: 62157,
 };
 
 describe("seedGeneration", () => {
@@ -2062,6 +2063,8 @@ Esperado: FAIL, no existe `src/cli.js`.
 
 `packages/seed/src/cli.ts`:
 ```ts
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { GENERATION_LABELS, loadGen, packageVersion } from "./extract/dex.js";
 import { extractSpecies } from "./extract/species.js";
@@ -2121,8 +2124,13 @@ async function main(): Promise<void> {
   await seedGeneration(Number(values.gen));
 }
 
-// Solo corre como CLI, no cuando lo importa un test.
-if (process.argv[1] && import.meta.url.endsWith(process.argv[1].split("/").pop()!)) {
+/**
+ * Solo corre como CLI, no cuando lo importa un test. Se comparan las rutas
+ * resueltas: comparar solo el nombre de archivo daria falsos positivos con
+ * cualquier otro cli.ts del monorepo.
+ */
+const invokedPath = process.argv[1] ? realpathSync(process.argv[1]) : null;
+if (invokedPath === fileURLToPath(import.meta.url)) {
   main().catch((err) => {
     console.error(err);
     process.exit(1);
@@ -2159,7 +2167,7 @@ git commit -m "feat(seed): CLI y pipeline completo multi-generacion"
 
 **Files:**
 - Create: `packages/seed/test/extract/golden.test.ts`
-- Create: `packages/seed/test/__snapshots__/golden.test.ts.snap` (lo genera vitest)
+- Create: `packages/seed/test/extract/__snapshots__/golden.test.ts.snap` (lo genera vitest, junto al test)
 - Modify: `docs/DECISIONS.md`, `db/schema.sql`
 
 **Interfaces:**
@@ -2233,7 +2241,7 @@ describe("golden files gen 6", () => {
 pnpm --filter @ludex/seed test golden
 ```
 
-Abrir `packages/seed/test/__snapshots__/golden.test.ts.snap` y **leerlo entero** antes de commitear. Un snapshot generado sin mirar convierte un bug en la referencia oficial. Confirmar en particular que el snapshot de `dragondance` muestra `sourceSpecies: "charmander"` y ningún método con `gen > 6`.
+Abrir `packages/seed/test/extract/__snapshots__/golden.test.ts.snap` y **leerlo entero** antes de commitear. Un snapshot generado sin mirar convierte un bug en la referencia oficial. Confirmar en particular que el snapshot de `dragondance` muestra `sourceSpecies: "charmander"` y ningún método con `gen > 6`.
 
 - [ ] **Step 3: Verificar que el snapshot detecta cambios**
 
