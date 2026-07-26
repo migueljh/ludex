@@ -4,6 +4,10 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  pg@8.13.1: 0052bd6628995b3314b300d675c50db28c2361c57b44f8472cf100afb0567952
+  pokemon-showdown@0.11.10: a423e66c033e9c405f7d469e6a18a64d105c0ca375f7e905a251546a5d456065
+
 importers:
 
   .: {}
@@ -12,10 +16,10 @@ importers:
     dependencies:
       pg:
         specifier: 8.13.1
-        version: 8.13.1
+        version: 8.13.1(patch_hash=0052bd6628995b3314b300d675c50db28c2361c57b44f8472cf100afb0567952)
       pokemon-showdown:
         specifier: 0.11.10
-        version: 0.11.10(@types/node@22.10.2)
+        version: 0.11.10(patch_hash=a423e66c033e9c405f7d469e6a18a64d105c0ca375f7e905a251546a5d456065)(@types/node@22.10.2)
     devDependencies:
       '@types/node':
         specifier: 22.10.2
@@ -2402,9 +2406,9 @@ snapshots:
 
   pg-numeric@1.0.2: {}
 
-  pg-pool@3.14.0(pg@8.13.1):
+  pg-pool@3.14.0(pg@8.13.1(patch_hash=0052bd6628995b3314b300d675c50db28c2361c57b44f8472cf100afb0567952)):
     dependencies:
-      pg: 8.13.1
+      pg: 8.13.1(patch_hash=0052bd6628995b3314b300d675c50db28c2361c57b44f8472cf100afb0567952)
 
   pg-protocol@1.15.0: {}
 
@@ -2426,10 +2430,10 @@ snapshots:
       postgres-interval: 3.0.0
       postgres-range: 1.1.4
 
-  pg@8.13.1:
+  pg@8.13.1(patch_hash=0052bd6628995b3314b300d675c50db28c2361c57b44f8472cf100afb0567952):
     dependencies:
       pg-connection-string: 2.14.0
-      pg-pool: 3.14.0(pg@8.13.1)
+      pg-pool: 3.14.0(pg@8.13.1(patch_hash=0052bd6628995b3314b300d675c50db28c2361c57b44f8472cf100afb0567952))
       pg-protocol: 1.15.0
       pg-types: 2.2.0
       pgpass: 1.0.6
@@ -2446,7 +2450,7 @@ snapshots:
   pirates@4.0.7:
     optional: true
 
-  pokemon-showdown@0.11.10(@types/node@22.10.2):
+  pokemon-showdown@0.11.10(patch_hash=a423e66c033e9c405f7d469e6a18a64d105c0ca375f7e905a251546a5d456065)(@types/node@22.10.2):
     dependencies:
       esbuild: 0.16.17
       mysql2: 3.23.1(@types/node@22.10.2)
@@ -2463,7 +2467,7 @@ snapshots:
       node-static: 0.7.11
       nodemailer: 6.10.1
       permessage-deflate: 0.1.7
-      pg: 8.13.1
+      pg: 8.13.1(patch_hash=0052bd6628995b3314b300d675c50db28c2361c57b44f8472cf100afb0567952)
       sql-template-strings: 2.2.2
       sqlite: 3.0.6
       sucrase: 3.35.1

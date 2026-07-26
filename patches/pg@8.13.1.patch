@@ -1,0 +1,28 @@
+diff --git a/lib/index.js b/lib/index.js
+index 1742d168acb6e95e640bf27ced16ae010b094cbe..0f70ce9fac76fba8446003a6a97d6936500b9ab2 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -56,3 +56,23 @@ if (typeof process.env.NODE_PG_FORCE_NATIVE !== 'undefined') {
+     },
+   })
+ }
++
++// --- PATCH (ludex): `module.exports = new PG(...)` sets properties
++// dynamically inside the PG constructor (this.Pool = ..., this.Client = ...),
++// so Node's static cjs-module-lexer (which backs `import { Pool } from "pg"`
++// under a real ESM loader, e.g. tsx in a "type": "module" package) can't see
++// them and only detects "native" (the one literal `Object.defineProperty`
++// call above). Verified directly with cjs-module-lexer: it reports only
++// ["native"] for the unpatched file. These self-assignments are pure
++// lexer-visible markers -- the values already exist on module.exports by
++// this point, so this is a no-op at runtime, but it gives the lexer the
++// literal `module.exports.NAME = ...` pattern it needs to expose the name.
++module.exports.Pool = module.exports.Pool
++module.exports.Client = module.exports.Client
++module.exports.Query = module.exports.Query
++module.exports.types = module.exports.types
++module.exports.defaults = module.exports.defaults
++module.exports.Connection = module.exports.Connection
++module.exports.DatabaseError = module.exports.DatabaseError
++module.exports.escapeIdentifier = module.exports.escapeIdentifier
++module.exports.escapeLiteral = module.exports.escapeLiteral
