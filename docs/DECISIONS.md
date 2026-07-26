@@ -77,3 +77,21 @@ un seed de gen 6.
 
 El filtro de D6 excluye todo lo nonstandard, así que la columna sería siempre
 `NULL`.
+
+## D8 — Puertos del host remapeados para convivir con `jets`
+
+El puerto 5432 del host ya está ocupado por un contenedor de otro proyecto del
+usuario (`jets-api-db-1`), que se queda prendido. En vez de detener un
+contenedor ajeno, Ludex remapea únicamente el mapeo al host:
+
+- Postgres: `5433:5432` en `docker-compose.yml`. Adentro de la red de compose
+  el servicio sigue siendo `postgres:5432`; `migrate` no cambia.
+- Showdown: `SHOWDOWN_LOCAL_PORT=8100` en `.env.example` (antes 8000), para el
+  mismo tipo de eventual colisión en la fase 2.
+- `DATABASE_URL` en `.env.example` pasa a
+  `postgres://ludex:ludex@localhost:5433/ludex?sslmode=disable`.
+
+Motivo: nunca se toca infraestructura de otro proyecto para hacer lugar a
+Ludex. Solo cambia el mapeo host-contenedor; todo lo que corre dentro de la
+red de docker-compose (el servicio `migrate`, y eventualmente `showdown`
+resolviendo contra `postgres`) sigue usando los puertos internos estándar.
