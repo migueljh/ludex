@@ -506,7 +506,11 @@ Esperado: `showdown OK`.
 - [ ] **Step 5: Apagarlo y commitear**
 
 ```bash
-docker compose --profile local down
+# Solo el servicio showdown. NO uses `docker compose --profile local down`:
+# baja TODO el proyecto, incluido postgres con su estado ya verificado.
+docker compose stop showdown
+docker compose rm -f showdown
+
 git add docker/
 git commit -m "feat(infra): server local de Showdown bajo profile local"
 ```
