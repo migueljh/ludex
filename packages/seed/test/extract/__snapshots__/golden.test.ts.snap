@@ -1,0 +1,350 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`golden files gen 6 > especie base con evolucion 1`] = `
+{
+  "abilities": {
+    "0": "Blaze",
+    "H": "Solar Power",
+  },
+  "baseSpecies": "Charizard",
+  "baseStats": {
+    "atk": 84,
+    "def": 78,
+    "hp": 78,
+    "spa": 109,
+    "spd": 85,
+    "spe": 100,
+  },
+  "dexNum": 6,
+  "evolvesFrom": "charmeleon",
+  "forme": null,
+  "isDefault": true,
+  "name": "Charizard",
+  "showdownId": "charizard",
+  "tier": "NU",
+  "types": [
+    "Fire",
+    "Flying",
+  ],
+  "weightKg": 90.5,
+}
+`;
+
+exports[`golden files gen 6 > fila de tabla de tipos con inmunidad 1`] = `
+[
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Bug",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Dark",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Dragon",
+    "multiplier": 2,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Electric",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Fairy",
+    "multiplier": 0,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Fighting",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Fire",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Flying",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Ghost",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Grass",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Ground",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Ice",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Normal",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Poison",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Psychic",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Rock",
+    "multiplier": 1,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Steel",
+    "multiplier": 0.5,
+  },
+  {
+    "attackingType": "Dragon",
+    "defendingType": "Water",
+    "multiplier": 1,
+  },
+]
+`;
+
+exports[`golden files gen 6 > forma alternativa que comparte dex_num 1`] = `
+{
+  "abilities": {
+    "0": "Tough Claws",
+  },
+  "baseSpecies": "Charizard",
+  "baseStats": {
+    "atk": 130,
+    "def": 111,
+    "hp": 78,
+    "spa": 130,
+    "spd": 85,
+    "spe": 100,
+  },
+  "dexNum": 6,
+  "evolvesFrom": null,
+  "forme": "Mega-X",
+  "isDefault": false,
+  "name": "Charizard-Mega-X",
+  "showdownId": "charizardmegax",
+  "tier": "OU",
+  "types": [
+    "Fire",
+    "Dragon",
+  ],
+  "weightKg": 110.5,
+}
+`;
+
+exports[`golden files gen 6 > learnsets > movimiento heredado de la preevolucion 1`] = `
+{
+  "methods": [
+    {
+      "gen": 3,
+      "method": "egg",
+      "sourceSpecies": "charmander",
+    },
+    {
+      "gen": 4,
+      "method": "egg",
+      "sourceSpecies": "charmander",
+    },
+    {
+      "gen": 5,
+      "method": "egg",
+      "sourceSpecies": "charmander",
+    },
+    {
+      "gen": 6,
+      "method": "egg",
+      "sourceSpecies": "charmander",
+    },
+  ],
+  "moveId": "dragondance",
+  "speciesId": "charizard",
+}
+`;
+
+exports[`golden files gen 6 > learnsets > movimiento propio con metodos de varias generaciones 1`] = `
+{
+  "methods": [
+    {
+      "gen": 3,
+      "level": 31,
+      "method": "level",
+      "sourceSpecies": "charmander",
+    },
+    {
+      "gen": 3,
+      "level": 34,
+      "method": "level",
+      "sourceSpecies": "charizard",
+    },
+    {
+      "gen": 3,
+      "level": 34,
+      "method": "level",
+      "sourceSpecies": "charmeleon",
+    },
+    {
+      "gen": 3,
+      "method": "machine",
+      "sourceSpecies": "charizard",
+    },
+    {
+      "gen": 3,
+      "method": "machine",
+      "sourceSpecies": "charmander",
+    },
+    {
+      "gen": 3,
+      "method": "machine",
+      "sourceSpecies": "charmeleon",
+    },
+    {
+      "gen": 4,
+      "level": 34,
+      "method": "level",
+      "sourceSpecies": "charmander",
+    },
+    {
+      "gen": 4,
+      "level": 39,
+      "method": "level",
+      "sourceSpecies": "charmeleon",
+    },
+    {
+      "gen": 4,
+      "level": 42,
+      "method": "level",
+      "sourceSpecies": "charizard",
+    },
+    {
+      "gen": 4,
+      "method": "machine",
+      "sourceSpecies": "charizard",
+    },
+    {
+      "gen": 4,
+      "method": "machine",
+      "sourceSpecies": "charmander",
+    },
+    {
+      "gen": 4,
+      "method": "machine",
+      "sourceSpecies": "charmeleon",
+    },
+    {
+      "gen": 5,
+      "level": 37,
+      "method": "level",
+      "sourceSpecies": "charmander",
+    },
+    {
+      "gen": 5,
+      "level": 43,
+      "method": "level",
+      "sourceSpecies": "charmeleon",
+    },
+    {
+      "gen": 5,
+      "level": 47,
+      "method": "level",
+      "sourceSpecies": "charizard",
+    },
+    {
+      "gen": 5,
+      "method": "machine",
+      "sourceSpecies": "charizard",
+    },
+    {
+      "gen": 5,
+      "method": "machine",
+      "sourceSpecies": "charmander",
+    },
+    {
+      "gen": 5,
+      "method": "machine",
+      "sourceSpecies": "charmeleon",
+    },
+    {
+      "gen": 6,
+      "method": "event",
+      "sourceSpecies": "charizard",
+    },
+    {
+      "gen": 6,
+      "level": 37,
+      "method": "level",
+      "sourceSpecies": "charmander",
+    },
+    {
+      "gen": 6,
+      "level": 43,
+      "method": "level",
+      "sourceSpecies": "charmeleon",
+    },
+    {
+      "gen": 6,
+      "level": 47,
+      "method": "level",
+      "sourceSpecies": "charizard",
+    },
+    {
+      "gen": 6,
+      "method": "machine",
+      "sourceSpecies": "charizard",
+    },
+    {
+      "gen": 6,
+      "method": "machine",
+      "sourceSpecies": "charmander",
+    },
+    {
+      "gen": 6,
+      "method": "machine",
+      "sourceSpecies": "charmeleon",
+    },
+  ],
+  "moveId": "flamethrower",
+  "speciesId": "charizard",
+}
+`;
+
+exports[`golden files gen 6 > movimiento con flags y precision 1`] = `
+{
+  "accuracy": 100,
+  "category": "Special",
+  "description": "Has a 10% chance to burn the target.",
+  "flags": {
+    "metronome": 1,
+    "mirror": 1,
+    "protect": 1,
+  },
+  "name": "Flamethrower",
+  "power": 90,
+  "pp": 15,
+  "priority": 0,
+  "showdownId": "flamethrower",
+  "target": "normal",
+  "type": "Fire",
+}
+`;
