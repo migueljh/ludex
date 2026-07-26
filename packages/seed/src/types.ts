@@ -27,11 +27,26 @@ export interface MoveRow {
   description: string | null;
 }
 
+/**
+ * El tipo Item del paquete NO expone `flags`. Estas son las propiedades reales
+ * que sirven al agente y al filtro de disponibilidad por ronda.
+ */
+export interface ItemProperties {
+  isBerry: boolean;
+  isGem: boolean;
+  isChoice: boolean;
+  isPokeball: boolean;
+  megaStone: string | null;    // especie mega que produce, ej. 'Charizard-Mega-X'
+  megaEvolves: string | null;  // especie base que evoluciona, ej. 'Charizard'
+  naturalGift: unknown | null;
+  fling: unknown | null;
+}
+
 export interface ItemRow {
   showdownId: string;
   name: string;
   description: string | null;
-  flags: Record<string, unknown>;
+  properties: ItemProperties;
 }
 
 export interface AbilityRow {

@@ -9,7 +9,16 @@ export function extractItems(dex: ModdedDex): ItemRow[] {
       showdownId: i.id,
       name: i.name,
       description: i.desc || i.shortDesc || null,
-      flags: { ...(i.flags ?? {}) } as Record<string, unknown>,
+      properties: {
+        isBerry: Boolean(i.isBerry),
+        isGem: Boolean(i.isGem),
+        isChoice: Boolean(i.isChoice),
+        isPokeball: Boolean(i.isPokeball),
+        megaStone: i.megaStone ?? null,
+        megaEvolves: i.megaEvolves ?? null,
+        naturalGift: i.naturalGift ?? null,
+        fling: i.fling ?? null,
+      },
     }));
 }
 

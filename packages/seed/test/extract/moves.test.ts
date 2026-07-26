@@ -7,19 +7,22 @@ const gen9 = extractMoves(loadGen(9));
 const byId = (id: string) => gen6.find((m) => m.showdownId === id)!;
 
 describe("extractMoves", () => {
-  it("devuelve los conteos conocidos", () => {
-    // El mod lista 634 entradas, pero las 16 variantes de tipo de Hidden Power
-    // repiten el id "hiddenpower": la clave natural (gen, id) conserva una.
+  it("devuelve los conteos conocidos, ya deduplicados", () => {
     expect(gen6).toHaveLength(618);
     expect(gen9).toHaveLength(685);
   });
 
-  it("deduplica las variantes de Hidden Power conservando la entrada base", () => {
+  it("colapsa los 17 Hidden Power de gen 6 en la entrada base", () => {
+    // Los 17 (base + 16 tipos) comparten id 'hiddenpower'. La columna
+    // moves.showdown_id es UNIQUE por generacion, asi que si extract no
+    // deduplica, load colapsa a 618 igual y seed_runs.row_counts miente.
     const hp = gen6.filter((m) => m.showdownId === "hiddenpower");
     expect(hp).toHaveLength(1);
     expect(hp[0].name).toBe("Hidden Power");
     expect(hp[0].type).toBe("Normal");
     expect(hp[0].power).toBe(60);
+    // En gen 9 el movimiento ya no existe.
+    expect(gen9.some((m) => m.showdownId === "hiddenpower")).toBe(false);
   });
 
   it("mapea basePower al campo power", () => {

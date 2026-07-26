@@ -23,6 +23,21 @@ describe("extractItems", () => {
     expect(lefties.name).toBe("Leftovers");
     expect(lefties.description).toContain("1/16");
   });
+
+  it("extrae las propiedades reales del paquete, no un `flags` inexistente", () => {
+    const stone = items6.find((i) => i.showdownId === "charizarditex")!;
+    expect(stone.properties.megaStone).toBe("Charizard-Mega-X");
+    expect(stone.properties.megaEvolves).toBe("Charizard");
+    expect(stone.properties.isBerry).toBe(false);
+
+    const berry = items6.find((i) => i.showdownId === "sitrusberry")!;
+    expect(berry.properties.isBerry).toBe(true);
+    expect(berry.properties.naturalGift).not.toBeNull();
+
+    const band = items6.find((i) => i.showdownId === "choiceband")!;
+    expect(band.properties.isChoice).toBe(true);
+    expect(band.properties.megaStone).toBeNull();
+  });
 });
 
 describe("extractAbilities", () => {
