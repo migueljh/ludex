@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(node -e ' *)"
+      "Bash(node -e ' *)",
+      "Bash(docker compose *)",
+      "Bash(echo \"exit code: $?\")",
+      "Bash(git add *)"
     ]
   }
 }
