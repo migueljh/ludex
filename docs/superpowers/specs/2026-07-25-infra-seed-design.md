@@ -97,7 +97,7 @@ La imagen del server local de Showdown también se pinea a un tag concreto.
 
 ### D5 — El seed corre en el host
 
-Postgres expone 5432 al host y `pnpm seed` corre fuera de Docker contra
+Postgres expone 5433 al host (5432 adentro del contenedor; ver D8: 5432 lo ocupa otro proyecto del usuario) y `pnpm seed` corre fuera de Docker contra
 `localhost`. Menos fricción para iterar y debuggear el volcado.
 
 ## 4. Estructura del repositorio
@@ -139,7 +139,7 @@ codifica los learnsets. Al ser funciones puras se testea sin levantar nada.
 
 | servicio | imagen | notas |
 |---|---|---|
-| `postgres` | `pgvector/pgvector:pg16` | puerto 5432 al host, volumen nombrado, healthcheck `pg_isready` |
+| `postgres` | `pgvector/pgvector:0.8.5-pg16` | puerto 5433 al host, volumen nombrado, healthcheck `pg_isready` |
 | `migrate` | `ghcr.io/amacneil/dbmate` (tag fijo) | one-shot, `docker compose run --rm migrate up` |
 | `showdown` | build desde `docker/showdown/Dockerfile` | profile `local`, `--no-security`, puerto 8000 |
 
@@ -160,8 +160,8 @@ línea. Sin placeholders de fases futuras.
 POSTGRES_USER=ludex
 POSTGRES_PASSWORD=ludex
 POSTGRES_DB=ludex
-DATABASE_URL=postgres://ludex:ludex@localhost:5432/ludex?sslmode=disable
-SHOWDOWN_LOCAL_PORT=8000
+DATABASE_URL=postgres://ludex:ludex@localhost:5433/ludex?sslmode=disable
+SHOWDOWN_LOCAL_PORT=8100
 ```
 
 `DATABASE_URL` es la única que consumen tanto dbmate como el seed.

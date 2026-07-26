@@ -183,7 +183,7 @@ SHOWDOWN_LOCAL_PORT=8100
 ```yaml
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:0.8.5-pg16
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
