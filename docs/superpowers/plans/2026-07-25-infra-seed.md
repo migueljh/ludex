@@ -130,7 +130,7 @@ Corte que importa: `extract/` es puro y no importa nada de `pg`; `load/` no impo
 
 **Interfaces:**
 - Consumes: nada.
-- Produces: `DATABASE_URL` apuntando a `postgres://ludex:ludex@localhost:5432/ludex?sslmode=disable`; el comando `pnpm db:migrate`; una base con la extensión `vector` instalada.
+- Produces: `DATABASE_URL` apuntando a `postgres://ludex:ludex@localhost:5433/ludex?sslmode=disable`; el comando `pnpm db:migrate`; una base con la extensión `vector` instalada.
 
 - [ ] **Step 1: Crear los archivos raíz del workspace**
 
@@ -170,10 +170,10 @@ POSTGRES_PASSWORD=ludex
 POSTGRES_DB=ludex
 
 # Unica fuente de conexion. La consumen dbmate y el seed.
-DATABASE_URL=postgres://ludex:ludex@localhost:5432/ludex?sslmode=disable
+DATABASE_URL=postgres://ludex:ludex@localhost:5433/ludex?sslmode=disable
 
 # Puerto del server local de Showdown (profile "local", se usa desde la fase 2)
-SHOWDOWN_LOCAL_PORT=8000
+SHOWDOWN_LOCAL_PORT=8100
 ```
 
 - [ ] **Step 2: Escribir `docker-compose.yml`**
@@ -189,7 +189,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      - "5432:5432"
+      # 5433 en el host: 5432 lo ocupa otro proyecto del usuario. Adentro del
+      # contenedor sigue siendo 5432, asi que el servicio migrate no cambia.
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -496,7 +498,7 @@ Si el `git clone` del tag falla porque el repo del server no publica ese tag, li
 - [ ] **Step 4: Verificar que responde**
 
 ```bash
-curl -sf http://localhost:8000/ -o /dev/null && echo "showdown OK"
+curl -sf http://localhost:8100/ -o /dev/null && echo "showdown OK"
 ```
 
 Esperado: `showdown OK`.
@@ -2176,7 +2178,7 @@ docker compose down -v
 docker compose up -d postgres
 docker compose run --rm migrate up
 docker compose --profile local up -d --build showdown
-curl -sf http://localhost:8000/ -o /dev/null && echo "showdown OK"
+curl -sf http://localhost:8100/ -o /dev/null && echo "showdown OK"
 pnpm seed --gen 6
 pnpm seed --gen 9
 pnpm -r run test
