@@ -130,3 +130,12 @@ o menor a 49321 para gen 6, algo rompió la resolución de `baseSpecies` o de
 `prevo` (por ejemplo, las 48 megaevoluciones de gen 6 quedando sin aportar
 movimientos propios de su forma base). Sirve de canario barato sin tener que
 inspeccionar fila por fila.
+
+**Este canario está enforced**, no solo documentado: el test "resuelve mas
+filas de las que hay directas" en `packages/seed/test/extract/learnsets.test.ts`
+afirma `rows.length` tanto `toBeGreaterThan(49321)` (la relación conceptual,
+sobrevive a cambios de versión del paquete) como `toHaveLength(62157)` (el
+valor exacto pineado, detecta cualquier deriva). Se verificó rompiendo a
+propósito la resolución de `baseSpecies` en `inheritanceChain`: el conteo cae
+a 52482 filas y el test falla, mientras que sin esta aserción exacta el chequeo
+`toBeGreaterThan(49321)` solo hubiera pasado en falso (52482 > 49321 igual).
