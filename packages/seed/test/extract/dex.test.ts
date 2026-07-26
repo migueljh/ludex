@@ -38,6 +38,19 @@ describe("isAvailable", () => {
     expect(dex.species.all().length).toBe(1425);
     expect(kept.length).toBe(834);
   });
+
+  it("aisla la clausula de generacion, no solo la marca nonstandard", () => {
+    // Entradas sinteticas a proposito. En la data real de Showdown TODO lo de
+    // generaciones futuras ya viene marcado isNonstandard:'Future' (verificado:
+    // cero entradas con gen > dex.gen y sin marca, en gen 6 y en gen 9). Sin
+    // este test, un `return !entry.isNonstandard` pasaria las otras siete
+    // aserciones y la comparacion de generacion quedaria sin cobertura, en el
+    // predicado del que depende todo el pipeline.
+    expect(isAvailable(dex, { gen: 5, isNonstandard: null })).toBe(true);
+    expect(isAvailable(dex, { gen: 6, isNonstandard: null })).toBe(true);
+    expect(isAvailable(dex, { gen: 7, isNonstandard: null })).toBe(false);
+    expect(isAvailable(dex, { gen: 9, isNonstandard: null })).toBe(false);
+  });
 });
 
 describe("metadatos", () => {
