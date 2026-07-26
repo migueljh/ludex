@@ -63,7 +63,8 @@ La imagen del server local de Showdown también se pinea a un tag concreto.
 
 ## D5 — El seed corre en el host
 
-Postgres expone 5432 al host y `pnpm seed` corre fuera de Docker contra
+Postgres expone 5433 al host (5432 adentro del contenedor; ver D8: 5432 lo
+ocupa otro proyecto del usuario) y `pnpm seed` corre fuera de Docker contra
 `localhost`. Menos fricción para iterar y debuggear el volcado.
 
 ## D6 — Los mods de Showdown no filtran por generación
@@ -95,3 +96,21 @@ Motivo: nunca se toca infraestructura de otro proyecto para hacer lugar a
 Ludex. Solo cambia el mapeo host-contenedor; todo lo que corre dentro de la
 red de docker-compose (el servicio `migrate`, y eventualmente `showdown`
 resolviendo contra `postgres`) sigue usando los puertos internos estándar.
+
+## D9 — Imagen de Postgres pineada a `pgvector/pgvector:0.8.5-pg16`
+
+`docker-compose.yml` usaba `pgvector/pgvector:pg16`, un tag flotante que se
+mueve entre versiones de pgvector y patches de Postgres. Se pinea a
+`pgvector/pgvector:0.8.5-pg16`.
+
+Motivo: fija la versión de pgvector, que es la que afecta el comportamiento de
+los índices vectoriales y del retrieval por similitud que usa la fase 6, y a
+la vez deja que los patches de Postgres sigan fluyendo dentro de 16.x para no
+quedarse sin parches de seguridad. Se eligió el tag de versión y no el digest
+`sha256` para no congelar también los patches de Postgres: el digest fijaría
+la imagen entera, incluida la versión exacta de Postgres 16.x, lo cual va más
+allá de lo que esta decisión busca pinear.
+
+Coherente con D1 (dbmate pineado a `2.21`) y D4 (versiones exactas de
+`pokemon-showdown` y de la imagen de Showdown): todo componente cuya versión
+afecta el comportamiento observable del sistema se pinea a un tag concreto.
