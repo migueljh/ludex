@@ -37,7 +37,7 @@ Conteos resultantes:
 | especies | 834 | 874 |
 | especies base (`name === baseSpecies`) | 721 | 733 |
 | megaevoluciones | 48 | 0 |
-| movimientos | 634 | 685 |
+| movimientos (tras deduplicar por id) | 618 | 685 |
 | objetos | 283 | 248 |
 | habilidades | 191 | 310 |
 | tipos | 18 | 19 |
@@ -947,9 +947,22 @@ const gen9 = extractMoves(loadGen(9));
 const byId = (id: string) => gen6.find((m) => m.showdownId === id)!;
 
 describe("extractMoves", () => {
-  it("devuelve los conteos conocidos", () => {
-    expect(gen6).toHaveLength(634);
+  it("devuelve los conteos conocidos, ya deduplicados", () => {
+    expect(gen6).toHaveLength(618);
     expect(gen9).toHaveLength(685);
+  });
+
+  it("colapsa los 17 Hidden Power de gen 6 en la entrada base", () => {
+    // Los 17 (base + 16 tipos) comparten id 'hiddenpower'. La columna
+    // moves.showdown_id es UNIQUE por generacion, asi que si extract no
+    // deduplica, load colapsa a 618 igual y seed_runs.row_counts miente.
+    const hp = gen6.filter((m) => m.showdownId === "hiddenpower");
+    expect(hp).toHaveLength(1);
+    expect(hp[0].name).toBe("Hidden Power");
+    expect(hp[0].type).toBe("Normal");
+    expect(hp[0].power).toBe(60);
+    // En gen 9 el movimiento ya no existe.
+    expect(gen9.some((m) => m.showdownId === "hiddenpower")).toBe(false);
   });
 
   it("mapea basePower al campo power", () => {
@@ -1040,10 +1053,26 @@ Esperado: FAIL, módulos inexistentes.
 import { isAvailable, type ModdedDex } from "./dex.js";
 import type { MoveRow } from "../types.js";
 
+/**
+ * En gen 6 los 17 Hidden Power (base + 16 tipos) comparten id 'hiddenpower'.
+ * Se conserva la entrada cuyo nombre normaliza a su propio id, que es la base
+ * ("Hidden Power", Normal, 60) — deterministico, sin depender del orden de
+ * iteracion. Las variantes tipadas son alias de presentacion: el tipo real lo
+ * determinan los IVs del pokemon, no la entrada del movimiento, y el protocolo
+ * de batalla siempre reporta 'Hidden Power'.
+ */
+function dedupeById(dex: ModdedDex, moves: readonly { id: string; name: string }[]) {
+  const byId = new Map<string, { id: string; name: string }>();
+  for (const m of moves) {
+    const existing = byId.get(m.id);
+    if (!existing || dex.toID(m.name) === m.id) byId.set(m.id, m);
+  }
+  return [...byId.values()];
+}
+
 export function extractMoves(dex: ModdedDex): MoveRow[] {
-  return dex.moves
-    .all()
-    .filter((m) => isAvailable(dex, m))
+  const available = dex.moves.all().filter((m) => isAvailable(dex, m));
+  return (dedupeById(dex, available) as typeof available)
     .map((m) => ({
       showdownId: m.id,
       name: m.name,
@@ -1849,7 +1878,7 @@ import { createPool } from "../../src/load/client.js";
 import { seedGeneration } from "../../src/cli.js";
 
 const GEN6_COUNTS = {
-  pokemon: 834, moves: 634, items: 283, abilities: 191, typeChart: 324,
+  pokemon: 834, moves: 618, items: 283, abilities: 191, typeChart: 324,
 };
 
 describe("seedGeneration", () => {

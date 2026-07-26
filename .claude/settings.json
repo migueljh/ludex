@@ -4,7 +4,12 @@
       "Bash(node -e ' *)",
       "Bash(docker compose *)",
       "Bash(echo \"exit code: $?\")",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(pnpm --filter @ludex/seed test)",
+      "Bash(pnpm approve-builds *)",
+      "Bash(pnpm install *)",
+      "Bash(node -e \"console.log\\(require\\('./node_modules/pokemon-showdown/package.json'\\).version\\)\")",
+      "Bash(echo \"grep-exit:$?\")"
     ]
   }
 }
