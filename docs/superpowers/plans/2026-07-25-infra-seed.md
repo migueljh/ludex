@@ -1463,8 +1463,15 @@ describe("extractLearnsets gen 6", () => {
     expect(new Set(keys).size).toBe(keys.length);
   });
 
-  it("nunca deja methods vacio", () => {
-    expect(rows.every((r) => r.methods.length > 0)).toBe(true);
+  it("resuelve mas filas de las que hay directas: el canario de la herencia", () => {
+    // 49321 son los pares (especie, movimiento) con gen <= 6 que existen
+    // DIRECTAMENTE en getLearnsetData, sin resolver herencia. La herencia solo
+    // puede sumar filas, nunca restar, asi que 62157 > 49321 es la senal de que
+    // la cadena corrio. Si esto baja a ~49321, se rompio la resolucion por
+    // baseSpecies (las 48 megas de gen 6 quedandose sin movimientos) o la de
+    // prevo. Sin esta asercion la regresion pasa con los tests en verde.
+    expect(rows.length).toBeGreaterThan(49321);
+    expect(rows).toHaveLength(62157);
   });
 });
 ```
