@@ -1,0 +1,12 @@
+{
+  "name": "ludex",
+  "private": true,
+  "packageManager": "pnpm@11.1.2",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "db:migrate": "docker compose run --rm migrate up",
+    "db:dump": "docker compose run --rm migrate dump",
+    "seed": "pnpm --filter @ludex/seed run seed",
+    "test": "pnpm -r run test"
+  }
+}
