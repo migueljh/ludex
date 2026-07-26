@@ -130,7 +130,7 @@ Corte que importa: `extract/` es puro y no importa nada de `pg`; `load/` no impo
 
 **Interfaces:**
 - Consumes: nada.
-- Produces: `DATABASE_URL` apuntando a `postgres://ludex:ludex@localhost:5433/ludex?sslmode=disable`; el comando `pnpm db:migrate`; una base con la extensión `vector` instalada.
+- Produces: `DATABASE_URL` apuntando a `postgres://ludex:ludex@localhost:15432/ludex?sslmode=disable`; el comando `pnpm db:migrate`; una base con la extensión `vector` instalada.
 
 - [ ] **Step 1: Crear los archivos raíz del workspace**
 
@@ -170,7 +170,7 @@ POSTGRES_PASSWORD=ludex
 POSTGRES_DB=ludex
 
 # Unica fuente de conexion. La consumen dbmate y el seed.
-DATABASE_URL=postgres://ludex:ludex@localhost:5433/ludex?sslmode=disable
+DATABASE_URL=postgres://ludex:ludex@localhost:15432/ludex?sslmode=disable
 
 # Puerto del server local de Showdown (profile "local", se usa desde la fase 2)
 SHOWDOWN_LOCAL_PORT=8100
@@ -189,9 +189,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      # 5433 en el host: 5432 lo ocupa otro proyecto del usuario. Adentro del
+      # 15432 en el host: 5432 lo ocupa otro proyecto del usuario. Adentro del
       # contenedor sigue siendo 5432, asi que el servicio migrate no cambia.
-      - "5433:5432"
+      - "15432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -583,7 +583,16 @@ git commit -m "feat(infra): server local de Showdown bajo profile local"
 
 `packages/seed/vitest.config.ts`:
 ```ts
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
+
+// Los tests de la capa load/ necesitan DATABASE_URL. vitest no lee .env solo, y
+// sin esto `pnpm test` desde una shell limpia falla mientras que desde la shell
+// del que lo escribio pasa — el peor modo de falla posible. process.loadEnvFile
+// es nativo de Node 22, asi que no hace falta dotenv.
+const envPath = fileURLToPath(new URL("../../.env", import.meta.url));
+if (existsSync(envPath)) process.loadEnvFile(envPath);
 
 export default defineConfig({
   test: {

@@ -139,3 +139,24 @@ valor exacto pineado, detecta cualquier deriva). Se verificó rompiendo a
 propósito la resolución de `baseSpecies` en `inheritanceChain`: el conteo cae
 a 52482 filas y el test falla, mientras que sin esta aserción exacta el chequeo
 `toBeGreaterThan(49321)` solo hubiera pasado en falso (52482 > 49321 igual).
+
+## D11 — Puerto del host movido a 15432
+
+El Postgres de Ludex expone `15432` en el host (sigue siendo 5432 adentro del
+contenedor). Reemplaza al 5433 que fijaba D8.
+
+Motivo: esta máquina tiene un `postgresql@14` nativo, instalado por Homebrew y
+levantado como servicio, que bindea `127.0.0.1:5433` y `[::1]:5433`. Docker
+bindea `*:5433`. Como el bind específico gana sobre el wildcard, una conexión a
+`localhost:5433` llegaba al Postgres nativo y no al del proyecto: `psql -h
+localhost -p 5433 -U ludex` devolvía `FATAL: role "ludex" does not exist`.
+
+Esto es peor que un puerto ocupado, porque no falla al levantar: el contenedor
+arranca sano, las migraciones corren bien (el servicio `migrate` habla con
+`postgres:5432` por la red interna de compose, sin pasar por el host), y recién
+el seed —que sí corre en el host— habría escrito en la base equivocada.
+
+Se eligió 15432 y no 5434 para salir del rango donde se instalan bases por
+defecto, y no se paró el servicio de Homebrew porque es de otro proyecto del
+usuario y Homebrew lo relevanta al reiniciar, con lo que el conflicto volvería
+sin aviso.

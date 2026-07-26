@@ -160,7 +160,7 @@ línea. Sin placeholders de fases futuras.
 POSTGRES_USER=ludex
 POSTGRES_PASSWORD=ludex
 POSTGRES_DB=ludex
-DATABASE_URL=postgres://ludex:ludex@localhost:5433/ludex?sslmode=disable
+DATABASE_URL=postgres://ludex:ludex@localhost:15432/ludex?sslmode=disable
 SHOWDOWN_LOCAL_PORT=8100
 ```
 
