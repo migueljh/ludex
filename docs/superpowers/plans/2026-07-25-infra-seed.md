@@ -347,13 +347,17 @@ CREATE TABLE learnsets (
 );
 CREATE INDEX learnsets_move_id_idx ON learnsets (move_id);
 
+-- Ojo: el tipo Item de pokemon-showdown NO tiene `flags` (cero de 537 objetos
+-- la exponen). La columna guarda propiedades reales del paquete, incluidas
+-- megaStone y megaEvolves, que son las que filtra round_availability en un
+-- torneo de gen 6.
 CREATE TABLE items (
   id          serial PRIMARY KEY,
   gen_id      int  NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
   showdown_id text NOT NULL,
   name        text NOT NULL,
   description text,
-  flags       jsonb NOT NULL,
+  properties  jsonb NOT NULL,
   UNIQUE (gen_id, showdown_id)
 );
 
@@ -628,11 +632,26 @@ export interface MoveRow {
   description: string | null;
 }
 
+/**
+ * El tipo Item del paquete NO expone `flags`. Estas son las propiedades reales
+ * que sirven al agente y al filtro de disponibilidad por ronda.
+ */
+export interface ItemProperties {
+  isBerry: boolean;
+  isGem: boolean;
+  isChoice: boolean;
+  isPokeball: boolean;
+  megaStone: string | null;    // especie mega que produce, ej. 'Charizard-Mega-X'
+  megaEvolves: string | null;  // especie base que evoluciona, ej. 'Charizard'
+  naturalGift: unknown | null;
+  fling: unknown | null;
+}
+
 export interface ItemRow {
   showdownId: string;
   name: string;
   description: string | null;
-  flags: Record<string, unknown>;
+  properties: ItemProperties;
 }
 
 export interface AbilityRow {
@@ -1040,6 +1059,21 @@ describe("extractItems", () => {
     expect(lefties.name).toBe("Leftovers");
     expect(lefties.description).toContain("1/16");
   });
+
+  it("extrae las propiedades reales del paquete, no un `flags` inexistente", () => {
+    const stone = items6.find((i) => i.showdownId === "charizarditex")!;
+    expect(stone.properties.megaStone).toBe("Charizard-Mega-X");
+    expect(stone.properties.megaEvolves).toBe("Charizard");
+    expect(stone.properties.isBerry).toBe(false);
+
+    const berry = items6.find((i) => i.showdownId === "sitrusberry")!;
+    expect(berry.properties.isBerry).toBe(true);
+    expect(berry.properties.naturalGift).not.toBeNull();
+
+    const band = items6.find((i) => i.showdownId === "choiceband")!;
+    expect(band.properties.isChoice).toBe(true);
+    expect(band.properties.megaStone).toBeNull();
+  });
 });
 
 describe("extractAbilities", () => {
@@ -1122,7 +1156,16 @@ export function extractItems(dex: ModdedDex): ItemRow[] {
       showdownId: i.id,
       name: i.name,
       description: i.desc || i.shortDesc || null,
-      flags: { ...(i.flags ?? {}) } as Record<string, unknown>,
+      properties: {
+        isBerry: Boolean(i.isBerry),
+        isGem: Boolean(i.isGem),
+        isChoice: Boolean(i.isChoice),
+        isPokeball: Boolean(i.isPokeball),
+        megaStone: i.megaStone ?? null,
+        megaEvolves: i.megaEvolves ?? null,
+        naturalGift: i.naturalGift ?? null,
+        fling: i.fling ?? null,
+      },
     }));
 }
 
@@ -1780,9 +1823,9 @@ export const loadMoves = (pool: Pool, genId: number, rows: MoveRow[]) =>
 export const loadItems = (pool: Pool, genId: number, rows: ItemRow[]) =>
   upsertBatch(pool, {
     table: "items",
-    columns: ["gen_id", "showdown_id", "name", "description", "flags"],
+    columns: ["gen_id", "showdown_id", "name", "description", "properties"],
     conflict: ["gen_id", "showdown_id"],
-    rows: rows.map((i) => [genId, i.showdownId, i.name, i.description, JSON.stringify(i.flags)]),
+    rows: rows.map((i) => [genId, i.showdownId, i.name, i.description, JSON.stringify(i.properties)]),
   });
 
 export const loadAbilities = (pool: Pool, genId: number, rows: AbilityRow[]) =>

@@ -225,7 +225,7 @@ learnsets(
 )
 
 items(
-  id, gen_id, showdown_id, name, description, flags jsonb,
+  id, gen_id, showdown_id, name, description, properties jsonb,
   UNIQUE(gen_id, showdown_id)
 )
 
