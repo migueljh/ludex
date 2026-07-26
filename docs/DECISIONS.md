@@ -114,3 +114,19 @@ allá de lo que esta decisión busca pinear.
 Coherente con D1 (dbmate pineado a `2.21`) y D4 (versiones exactas de
 `pokemon-showdown` y de la imagen de Showdown): todo componente cuya versión
 afecta el comportamiento observable del sistema se pinea a un tag concreto.
+
+## D10 — Volumen de referencia de `extractLearnsets` para gen 6
+
+Con `pokemon-showdown@0.11.10`, contando pares `(especie, código)` con
+`gen <= 6` directamente desde `getLearnsetData` sin resolver herencia, hay
+**49321** pares. Después de que `extractLearnsets` (ver D3, `packages/seed/src/extract/learnsets.ts`)
+resuelve la herencia por `baseSpecies` y por cadena `prevo`, el número de filas
+`(pokemon, move)` resueltas para gen 6 es **62157**.
+
+Motivo: la herencia solo puede sumar filas (una especie nunca pierde un
+movimiento que ya tenía directo), así que 62157 > 49321 es la primera señal de
+que la cadena de herencia corrió. Si un reseed futuro devuelve un número igual
+o menor a 49321 para gen 6, algo rompió la resolución de `baseSpecies` o de
+`prevo` (por ejemplo, las 48 megaevoluciones de gen 6 quedando sin aportar
+movimientos propios de su forma base). Sirve de canario barato sin tener que
+inspeccionar fila por fila.
