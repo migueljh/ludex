@@ -80,7 +80,14 @@
       "Bash(git checkout *)",
       "Bash(PGPASSWORD=ludex psql -h localhost -p 15432 -U ludex -d ludex -X -tAc \"TRUNCATE learnsets;\")",
       "Bash(python3 -c \"import json;json.load\\(open\\('.claude/settings.json'\\)\\);print\\('JSON válido'\\)\")",
-      "Bash(git merge *)"
+      "Bash(git merge *)",
+      "Bash(git branch *)",
+      "Bash(gh auth *)",
+      "Bash(grep -c \"^\\\\.env$\")",
+      "Bash(xargs -I{} test {} -eq 0)",
+      "Bash(git rm *)",
+      "Bash(git commit -q -m 'chore: sacar .claude/settings.json del control de versiones *)",
+      "Bash(xargs -I{} sh -c 'test {} -eq 0 && echo \"OK, fuera\" || echo \"sigue adentro\"')"
     ]
   }
 }
