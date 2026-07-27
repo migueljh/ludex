@@ -1,0 +1,21 @@
+{
+  "name": "@ludex/teams",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "audit": "tsx src/audit.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "pg": "8.13.1",
+    "pokemon-showdown": "0.11.10"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "@types/pg": "8.11.10",
+    "tsx": "4.19.2",
+    "typescript": "5.7.2",
+    "vitest": "2.1.8"
+  }
+}
