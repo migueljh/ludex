@@ -772,7 +772,10 @@ def serialize_battle(battle: Any) -> dict:
         "gen": battle.gen,
         "field": {
             "weather": _conditions(battle.weather),
-            "terrain": _conditions(battle.fields),
+            # `battle.fields` no son solo terrenos: incluye Trick Room, Gravity
+            # y Wonder Room. La clave se llama field_effects para no mentirle a
+            # quien consuma el dataset en la fase de entrenamiento.
+            "field_effects": _conditions(battle.fields),
             "my_side": _conditions(battle.side_conditions),
             "opponent_side": _conditions(battle.opponent_side_conditions),
         },
