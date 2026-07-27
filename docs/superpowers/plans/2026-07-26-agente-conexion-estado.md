@@ -286,6 +286,11 @@ packages = ["src/ludex_agent"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Verificado empiricamente: sin esto, pytest-asyncio adopta "function" como
+# default y la fixture de scope module de la Tarea 8 falla con ScopeMismatch,
+# no con un warning. "module" alcanza para esa fixture y evita un loop de
+# sesion sosteniendo engines de base entre modulos.
+asyncio_default_fixture_loop_scope = "module"
 testpaths = ["tests"]
 ```
 
