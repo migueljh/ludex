@@ -4,6 +4,27 @@ Este archivo es para cualquier agente que toque el repo. Las decisiones de
 arquitectura están en `docs/DECISIONS.md` y el plan general en `docs/PLAN.md`,
 sección 11. Acá van solo las reglas operativas.
 
+## Skills del proyecto — leelas antes de empezar
+
+En `.claude/` hay tres guías escritas para este repo. Cada una vive en un
+`SKILL.md` y **condensa trampas que ya nos costaron trabajo tirado**:
+
+- **`.claude/migrations/SKILL.md`** — convenciones de esquema y migraciones con
+  dbmate y Postgres. Al crear o tocar migraciones, agregar tablas o columnas,
+  elegir tipos o claves, o escribir queries contra el esquema.
+- **`.claude/showdown-data/SKILL.md`** — trampas conocidas del paquete npm
+  `pokemon-showdown` y de `@smogon/calc`. Al tocar `packages/seed`,
+  `packages/calc`, cualquier extractor de data de juego, o las tablas
+  `pokemon`, `moves`, `learnsets`, `items`, `abilities`, `type_chart`. También
+  al agregar una generación nueva.
+- **`.claude/verification/SKILL.md`** — cómo se verifica el trabajo antes de
+  darlo por terminado. Al escribir tests, fijar conteos esperados, cerrar una
+  rebanada, revisar código de otro agente, o cuando un test pasa y hay que
+  decidir si eso significa algo.
+
+Claude Code las carga solo por descripción. **Los demás agentes tienen que
+abrirlas y leerlas como documentación**: son archivos de texto común.
+
 ## Commits
 
 - **Los mensajes de commit se escriben en inglés.** El resto del proyecto
