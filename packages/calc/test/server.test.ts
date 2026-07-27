@@ -91,4 +91,37 @@ describe("POST /calc", () => {
     expect((await fetch(`${base}/calc`)).status).toBe(405);
     expect((await fetch(`${base}/nope`)).status).toBe(404);
   });
+
+  it("body demasiado grande: 400 con JSON, no connection reset", async () => {
+    // Antes: req.destroy() mataba el socket entero y el cliente recibia
+    // 'Empty reply from server'. El servicio tiene que responder el 400.
+    const big = JSON.stringify({
+      gen: 6,
+      attacker: { species: "Garchomp" },
+      defender: { species: "Snorlax" },
+      move: { name: "Earthquake" },
+      pad: "x".repeat(70 * 1024),
+    });
+    const res = await post(big);
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe("invalid_request");
+    expect(body.error.message).toMatch(/grande/);
+  });
+
+  it("gen 9 via HTTP: Snow aceptado con boost, Hail rechazado con mensaje", async () => {
+    const base9 = {
+      gen: 9,
+      attacker: { species: "Garchomp" },
+      defender: { species: "Weavile" },
+      move: { name: "Earthquake" },
+    };
+    const snow = await post({ ...base9, field: { weather: "Snow" } });
+    expect(snow.status).toBe(200);
+    expect((await snow.json()).min_damage).toBe(127);
+
+    const hail = await post({ ...base9, field: { weather: "Hail" } });
+    expect(hail.status).toBe(400);
+    expect((await hail.json()).error.message).toMatch(/Snow/);
+  });
 });

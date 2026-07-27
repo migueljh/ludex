@@ -249,6 +249,105 @@ describe("runCalc: nombres e ids", () => {
   });
 });
 
+describe("runCalc: clima y terreno gateados por generacion", () => {
+  // Medido contra @smogon/calc@0.11.0 (ver kimi-calc.md §review): el paquete
+  // ignora en silencio los climas primordiales y los terrenos en gens 1-4,
+  // ignora 'Hail' en gen 9 (renombrado a 'Snow'), e ignora 'Snow' en gens 3-6
+  // (en 7-8 lo calcula, pero el nombre del clima no existia aun). Regla: el
+  // contrato nunca acepta un string que el paquete va a ignorar en esa gen.
+  const eqVsWeavile = (gen: number, weather?: string) => ({
+    gen,
+    attacker: { species: "Garchomp" },
+    defender: { species: "Weavile" },
+    move: { name: "Earthquake" },
+    ...(weather ? { field: { weather } } : {}),
+  });
+
+  it("gen 9: Snow se acepta y aplica el +50% de Defensa de los tipos Hielo", () => {
+    const sin = runCalc(eqVsWeavile(9));
+    expect(sin.damage_rolls).toEqual([[
+      192, 193, 196, 198, 201, 202, 205, 207,
+      210, 211, 214, 216, 219, 220, 223, 226,
+    ]]);
+    const con = runCalc(eqVsWeavile(9, "Snow"));
+    expect(con.damage_rolls).toEqual([[
+      127, 129, 130, 132, 133, 135, 136, 138,
+      139, 141, 142, 144, 145, 147, 148, 151,
+    ]]);
+    expect(con.min_percent).toBe(45.1);
+    expect(con.max_percent).toBe(53.7);
+    expect(con.description).toContain("in Snow");
+  });
+
+  it("gen 9: Hail se rechaza apuntando a Snow (el paquete lo ignora: seria un calculo sin clima disfrazado)", () => {
+    try {
+      runCalc(eqVsWeavile(9, "Hail"));
+      expect.unreachable("debio lanzar");
+    } catch (e) {
+      expect(e).toBeInstanceOf(CalcError);
+      expect((e as CalcError).message).toMatch(/Hail/);
+      expect((e as CalcError).message).toMatch(/Snow/);
+    }
+  });
+
+  it("gen 6: Snow se rechaza apuntando a Hail (Snow existe desde gen 9)", () => {
+    try {
+      runCalc(eqVsWeavile(6, "Snow"));
+      expect.unreachable("debio lanzar");
+    } catch (e) {
+      expect(e).toBeInstanceOf(CalcError);
+      expect((e as CalcError).message).toMatch(/Snow/);
+      expect((e as CalcError).message).toMatch(/Hail/);
+    }
+  });
+
+  it("gen 8: Hail se acepta (no modifica el daño, correcto para esa gen)", () => {
+    const r = runCalc(eqVsWeavile(8, "Hail"));
+    expect([r.min_damage, r.max_damage]).toEqual([192, 226]);
+  });
+
+  it("climas primordiales: calculados en gen 5+, rechazados en gen <= 4 donde el paquete los ignora", () => {
+    const attacker = { species: "Charizard", nature: "Modest", evs: { spa: 252 } };
+    const con = runCalc({
+      gen: 5, attacker, defender: { species: "Snorlax" },
+      move: { name: "Flamethrower" }, field: { weather: "Harsh Sunshine" },
+    });
+    expect([con.min_damage, con.max_damage]).toEqual([210, 247]);
+    try {
+      runCalc({
+        gen: 4, attacker, defender: { species: "Snorlax" },
+        move: { name: "Flamethrower" }, field: { weather: "Harsh Sunshine" },
+      });
+      expect.unreachable("debio lanzar");
+    } catch (e) {
+      expect((e as CalcError).message).toMatch(/ignora/);
+    }
+  });
+
+  it("terrenos: calculados en gen 5+, rechazados en gen <= 4 donde el paquete los ignora", () => {
+    const con = runCalc({
+      gen: 5,
+      attacker: { species: "Pikachu", nature: "Modest", evs: { spa: 252 } },
+      defender: { species: "Snorlax" },
+      move: { name: "Thunderbolt" },
+      field: { terrain: "Electric" },
+    });
+    expect([con.min_damage, con.max_damage]).toEqual([130, 154]);
+    try {
+      runCalc({
+        gen: 4,
+        attacker: { species: "Pikachu", nature: "Modest", evs: { spa: 252 } },
+        defender: { species: "Snorlax" },
+        move: { name: "Thunderbolt" },
+        field: { terrain: "Electric" },
+      });
+      expect.unreachable("debio lanzar");
+    } catch (e) {
+      expect((e as CalcError).message).toMatch(/ignora/);
+    }
+  });
+});
+
 describe("runCalc: validacion de entrada", () => {
   const valid = {
     gen: 6,
@@ -290,6 +389,35 @@ describe("runCalc: validacion de entrada", () => {
     expectError({ ...valid, attacker: { species: "Garchomp", ability: "NotAnAbility" } }, "unknown_ability", /NotAnAbility/);
     expectError({ ...valid, attacker: { species: "Garchomp", nature: "NotANature" } }, "unknown_nature", /NotANature/);
     expectError({ ...valid, attacker: { species: "Garchomp", status: "notastatus" } }, "invalid_request", /status/);
+  });
+
+  it("boosts fuera de -6..6: 400 util, no 500 (el paquete indexa una tabla de 7 sin clampear y revienta)", () => {
+    expectError({ ...valid, attacker: { species: "Garchomp", boosts: { atk: 99 } } }, "invalid_request", /boosts\.atk.*-6 y 6/);
+    expectError({ ...valid, attacker: { species: "Garchomp", boosts: { atk: -7 } } }, "invalid_request", /-6 y 6/);
+    expectError({ ...valid, defender: { species: "Snorlax", boosts: { def: 2.5 } } }, "invalid_request", /entero/);
+    const ok = runCalc({ ...valid, attacker: { species: "Garchomp", boosts: { atk: 6 } } });
+    expect(ok.max_damage).toBeGreaterThan(0);
+  });
+
+  it("evs e ivs fuera de rango: 400 util, no numeros absurdos en silencio", () => {
+    // evs {atk: 999999} devolvia max_percent 8839.9 sin error (medido en review).
+    expectError({ ...valid, attacker: { species: "Garchomp", evs: { atk: 999999 } } }, "invalid_request", /evs\.atk.*0 y 252/);
+    expectError({ ...valid, attacker: { species: "Garchomp", evs: { atk: -1 } } }, "invalid_request", /0 y 252/);
+    expectError({ ...valid, defender: { species: "Snorlax", ivs: { def: 32 } } }, "invalid_request", /ivs\.def.*0 y 31/);
+    // Los limites validos pasan: 252 EVs y 31 IVs.
+    const ok = runCalc({ ...valid, attacker: { species: "Garchomp", evs: { atk: 252 }, ivs: { atk: 31 } } });
+    expect(ok.max_damage).toBeGreaterThan(0);
+  });
+
+  it("gen 1-2 con spa != spd: 400 con el mensaje del paquete, no 500", () => {
+    // El paquete lanza Error('Special Attack and Special Defense must match
+    // before Gen 3') al construir el Pokemon: es error del cliente, no un bug.
+    expectError({
+      gen: 2,
+      attacker: { species: "Charizard", evs: { spa: 252 } },
+      defender: { species: "Snorlax" },
+      move: { name: "Flamethrower" },
+    }, "invalid_request", /Special Attack and Special Defense must match/);
   });
 
   it("campos requeridos y forma del body", () => {

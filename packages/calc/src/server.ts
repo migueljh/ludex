@@ -11,16 +11,23 @@ function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let tooBig = false;
     req.on("data", (chunk: Buffer) => {
+      if (tooBig) return; // se sigue drenando el stream sin destruir el socket
       size += chunk.length;
       if (size > MAX_BODY_BYTES) {
+        tooBig = true;
+        // NUNCA req.destroy() aca: req y res comparten el socket, y destruirlo
+        // mata la conexion antes de poder escribir el 400 (el cliente recibia
+        // 'Empty reply from server', indistinguible de un servicio caido).
         reject(new CalcError("invalid_request", `body demasiado grande (max ${MAX_BODY_BYTES} bytes)`));
-        req.destroy();
         return;
       }
       chunks.push(chunk);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("end", () => {
+      if (!tooBig) resolve(Buffer.concat(chunks).toString("utf8"));
+    });
     req.on("error", reject);
   });
 }

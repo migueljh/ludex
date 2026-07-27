@@ -1,5 +1,5 @@
 import { Generations, Pokemon, Move, Field, calculate, toID } from "@smogon/calc";
-import type { GenerationNum } from "@smogon/calc";
+import type { GenerationNum, State } from "@smogon/calc";
 
 /**
  * Capa pura del servicio: recibe un descriptor JSON-able, valida contra los
@@ -37,7 +37,42 @@ export type StatusCondition = (typeof STATUSES)[number];
 // Field lo ignora en silencio y el clima no se aplica (medido: Flamethrower
 // 132-156 sin boost contra 198-234 con boost). Es la clase de error que este
 // servicio existe para evitar, asi que el contrato solo admite el string exacto.
-const WEATHERS = ["Rain", "Sun", "Sand", "Hail", "Harsh Sunshine", "Heavy Rain", "Strong Winds"] as const;
+//
+// Y el allowlist esta GATEADO POR GENERACION (medido contra @smogon/calc@0.11.0,
+// ver kimi-calc.md): el paquete ignora en silencio valores que no existen en
+// la mecanica de esa gen, y aceptar esos strings seria devolver "sin clima"
+// disfrazado de "con clima". Regla: nunca aceptar un string que el paquete
+// ignora en esa gen.
+const ALL_GENS = [1, 2, 3, 4, 5, 6, 7, 8, 9] as const;
+const WEATHER_GENS: Record<string, { gens: readonly number[]; rejectedHint?: string }> = {
+  // Rain/Sun/Sand: el paquete los calcula (o son correctamente neutros) en
+  // todas las gens y nunca cambiaron de nombre.
+  "Rain": { gens: ALL_GENS },
+  "Sun": { gens: ALL_GENS },
+  "Sand": { gens: ALL_GENS },
+  // Hail: no modifica el daño en gens 1-8 (correcto). En gen 9 el granizo se
+  // renombro a Snow y el paquete IGNORA 'Hail' (medido: EQ 192-226 igual que
+  // sin clima).
+  "Hail": {
+    gens: [1, 2, 3, 4, 5, 6, 7, 8],
+    rejectedHint: "en gen 9 el granizo se llama 'Snow' (y da +50% de Defensa al tipo Hielo)",
+  },
+  // Snow: el clima con boost de Defensa existe solo en gen 9. El paquete lo
+  // ignora en gens 3-6 y en 7-8 aplica un boost que en esos juegos no existia
+  // bajo ese nombre; el contrato lo admite unicamente donde es real.
+  "Snow": {
+    gens: [9],
+    rejectedHint: "existe a partir de gen 9; en esta generacion el granizo es 'Hail' (sin boost de Defensa)",
+  },
+  // Climas primordiales (ORAS): el paquete los ignora en gens 1-4 y los
+  // calcula honestamente en gens 5-9 (medido). Se aceptan donde los calcula.
+  "Harsh Sunshine": { gens: [5, 6, 7, 8, 9] },
+  "Heavy Rain": { gens: [5, 6, 7, 8, 9] },
+  "Strong Winds": { gens: [5, 6, 7, 8, 9] },
+};
+const WEATHERS = Object.keys(WEATHER_GENS) as (keyof typeof WEATHER_GENS)[];
+// Terrenos: el paquete los ignora en gens 1-4 y los calcula en gens 5-9 (medido).
+const TERRAIN_GENS: readonly number[] = [5, 6, 7, 8, 9];
 const TERRAINS = ["Electric", "Grassy", "Psychic", "Misty"] as const;
 const GAME_TYPES = ["Singles", "Doubles"] as const;
 
@@ -111,13 +146,33 @@ function checkKeys(obj: Record<string, unknown>, allowed: readonly string[], pat
   }
 }
 
-function checkStatTable(v: unknown, path: string): Partial<Record<StatName, number>> | undefined {
+const STAT_RANGES = {
+  // El paquete indexa una tabla fija de 7 stages con el boost, sin clampear:
+  // fuera de -6..6 revienta con TypeError (que el server mapearia a un 500
+  // opaco). Un boost fuera de rango es un bug plausible del agente (Danza
+  // Espada + Intimidacion mal acumuladas), asi que el error tiene que ser claro.
+  boosts: { min: -6, max: 6 },
+  // Fuera de rango no revienta: MIENTE (evs {atk: 999999} daba max_percent
+  // 8839.9 sin error). Rangos del juego.
+  evs: { min: 0, max: 252 },
+  ivs: { min: 0, max: 31 },
+} as const;
+
+function checkStatTable(
+  v: unknown,
+  path: string,
+  kind: keyof typeof STAT_RANGES,
+): Partial<Record<StatName, number>> | undefined {
   if (v === undefined) return undefined;
   if (!isObj(v)) fail("invalid_request", `${path} debe ser un objeto {hp?, atk?, ...}`);
   checkKeys(v, STATS, path);
+  const { min, max } = STAT_RANGES[kind];
   for (const [k, n] of Object.entries(v)) {
     if (typeof n !== "number" || !Number.isFinite(n)) {
       fail("invalid_request", `${path}.${k} debe ser un numero, recibido: ${JSON.stringify(n)}`);
+    }
+    if (!Number.isInteger(n) || n < min || n > max) {
+      fail("invalid_request", `${path}.${k} debe ser un entero entre ${min} y ${max}; recibido ${n}`);
     }
   }
   return v as Partial<Record<StatName, number>>;
@@ -196,9 +251,9 @@ function buildPokemon(
   return new Pokemon(gen, species.name, {
     level,
     nature: nature?.name,
-    evs: checkStatTable(raw.evs, `${side}.evs`),
-    ivs: checkStatTable(raw.ivs, `${side}.ivs`),
-    boosts: checkStatTable(raw.boosts, `${side}.boosts`),
+    evs: checkStatTable(raw.evs, `${side}.evs`, "evs"),
+    ivs: checkStatTable(raw.ivs, `${side}.ivs`, "ivs"),
+    boosts: checkStatTable(raw.boosts, `${side}.boosts`, "boosts"),
     ability: ability?.name,
     item: item?.name,
     status: status as PokemonDescriptor["status"],
@@ -236,7 +291,7 @@ function buildSide(raw: unknown, path: string): SideDescriptor | undefined {
   return raw as SideDescriptor;
 }
 
-function buildField(raw: unknown): Field | undefined {
+function buildField(raw: unknown, genNum: number): Field | undefined {
   if (raw === undefined) return undefined;
   if (!isObj(raw)) fail("invalid_request", "field debe ser un objeto");
   checkKeys(raw, ["gameType", "weather", "terrain", "isGravity", "attackerSide", "defenderSide"], "field");
@@ -246,22 +301,38 @@ function buildField(raw: unknown): Field | undefined {
     fail("invalid_request", `field.gameType debe ser uno de ${GAME_TYPES.join(", ")}; recibido '${gameType}'`);
   }
   const weather = optString(raw.weather, "field.weather");
-  if (weather !== undefined && !(WEATHERS as readonly string[]).includes(weather)) {
-    fail("invalid_request", `field.weather debe ser uno de ${WEATHERS.join(", ")}; recibido '${weather}'`);
+  if (weather !== undefined) {
+    const entry = WEATHER_GENS[weather];
+    if (!entry) {
+      fail("invalid_request", `field.weather debe ser uno de ${WEATHERS.join(", ")}; recibido '${weather}'`);
+    }
+    if (!entry.gens.includes(genNum)) {
+      fail("invalid_request",
+        `field.weather '${weather}' no aplica en gen ${genNum}: ${entry.rejectedHint ?? "el paquete lo ignora en esta generacion (medido: no tiene ningun efecto)"}`);
+    }
   }
   const terrain = optString(raw.terrain, "field.terrain");
-  if (terrain !== undefined && !(TERRAINS as readonly string[]).includes(terrain)) {
-    fail("invalid_request", `field.terrain debe ser uno de ${TERRAINS.join(", ")}; recibido '${terrain}'`);
+  if (terrain !== undefined) {
+    if (!(TERRAINS as readonly string[]).includes(terrain)) {
+      fail("invalid_request", `field.terrain debe ser uno de ${TERRAINS.join(", ")}; recibido '${terrain}'`);
+    }
+    if (!TERRAIN_GENS.includes(genNum)) {
+      fail("invalid_request",
+        `field.terrain '${terrain}' no aplica en gen ${genNum}: el paquete ignora los terrenos antes de gen 5 (medido: no tienen ningun efecto)`);
+    }
   }
 
-  return new Field({
-    gameType: gameType as FieldDescriptor["gameType"],
-    weather: weather as FieldDescriptor["weather"],
-    terrain: terrain as FieldDescriptor["terrain"],
+  // Partial<State.Field> es el tipo exacto del constructor del paquete; los
+  // strings ya pasaron la validacion contra su dominio.
+  const options: Partial<State.Field> = {
+    gameType: gameType as State.Field["gameType"],
+    weather: weather as State.Field["weather"],
+    terrain: terrain as State.Field["terrain"],
     isGravity: optBool(raw.isGravity, "field.isGravity"),
-    attackerSide: buildSide(raw.attackerSide, "field.attackerSide"),
-    defenderSide: buildSide(raw.defenderSide, "field.defenderSide"),
-  });
+    attackerSide: buildSide(raw.attackerSide, "field.attackerSide") as State.Side,
+    defenderSide: buildSide(raw.defenderSide, "field.defenderSide") as State.Side,
+  };
+  return new Field(options);
 }
 
 /** El paquete TRUNCA a 1 decimal (301/461 = 65.29 -> 65.2); medido, no deducido. */
@@ -279,14 +350,29 @@ export function runCalc(request: unknown): CalcResponse {
   }
   const gen = Generations.get(genNum as GenerationNum);
 
-  const attacker = buildPokemon(gen, genNum, request.attacker, "attacker");
-  const defender = buildPokemon(gen, genNum, request.defender, "defender");
-  const move = buildMove(gen, genNum, request.move);
-  const field = buildField(request.field);
+  // La validacion de arriba cubre la entrada; lo que el paquete rechace con un
+  // Error propio (p. ej. 'Special Attack and Special Defense must match before
+  // Gen 3' si spa != spd en gens 1-2) es un error del CLIENTE y se devuelve
+  // como 400 con el mensaje del paquete. Los TypeError son bugs (del paquete o
+  // nuestros) y siguen yendo al 500 del server, logueados.
+  let result: ReturnType<typeof calculate>;
+  let defender: Pokemon;
+  try {
+    const attacker = buildPokemon(gen, genNum, request.attacker, "attacker");
+    defender = buildPokemon(gen, genNum, request.defender, "defender");
+    const move = buildMove(gen, genNum, request.move);
+    const field = buildField(request.field, genNum);
 
-  const result = field
-    ? calculate(gen, attacker, defender, move, field)
-    : calculate(gen, attacker, defender, move);
+    result = field
+      ? calculate(gen, attacker, defender, move, field)
+      : calculate(gen, attacker, defender, move);
+  } catch (e) {
+    if (e instanceof CalcError || e instanceof TypeError) throw e;
+    if (e instanceof Error) {
+      throw new CalcError("invalid_request", `combinacion rechazada por el paquete: ${e.message}`);
+    }
+    throw e;
+  }
 
   // damage puede ser: escalar (0 o daño fijo), number[] (16 rolls de un golpe)
   // o number[][] (un array por golpe en multi-golpe). Se normaliza a number[][].
