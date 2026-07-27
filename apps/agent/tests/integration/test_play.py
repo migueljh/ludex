@@ -6,6 +6,7 @@ from sqlalchemy import text
 
 from ludex_agent.config import load_settings
 from ludex_agent.cli import play
+from ludex_agent.db.repository import BattleRepository
 from ludex_agent.db.session import make_engine, session_factory
 from ludex_agent.state.schema import STATE_SCHEMA_VERSION
 
@@ -89,19 +90,33 @@ async def test_no_hay_fuga_de_informacion_del_rival(jugadas):
             """), {"tags": list(jugadas)})).all()
             assert filas, "no hay pasos que verificar"
 
+            revisados = 0
             for turno, estado, side, battle_id in filas:
-                acumulado = (await s.execute(text("""
-                    SELECT string_agg(array_to_string(protocol_lines, ' '), ' ')
-                    FROM battle_turns
+                # Se comparan LINEAS sueltas, no el protocolo concatenado. Pegar
+                # todo y sacarle los separadores crea un blob donde una especie
+                # puede "aparecer" a caballo entre dos tokens sin relacion, y una
+                # fuga real pasaria como revelada.
+                lineas = (await s.execute(text("""
+                    SELECT unnest(protocol_lines) FROM battle_turns
                     WHERE battle_id = :b AND player_side = :ps AND turn_number <= :t
-                """), {"b": battle_id, "ps": side, "t": turno})).scalar_one() or ""
+                """), {"b": battle_id, "ps": side, "t": turno})).scalars().all()
+                normalizadas = [_normalizar(l) for l in lineas]
+
                 for mon in estado["opponent"]["pokemon"]:
+                    revisados += 1
                     especie = _normalizar(mon["species"])
-                    visto = especie in _normalizar(acumulado)
+                    visto = any(especie in linea for linea in normalizadas)
                     assert visto, (
                         f"FUGA: {mon['species']} aparece en el estado del turno "
                         f"{turno} pero el protocolo no lo revelo hasta ahi"
                     )
+
+            # Canario: sin esto, un serializador que dejara `opponent.pokemon`
+            # siempre vacio haria que el loop no itere nunca y el test pasara en
+            # verde sin haber verificado una sola especie.
+            assert revisados > 0, (
+                "ningun paso tenia pokemon del rival: el test no verifico nada"
+            )
     finally:
         await engine.dispose()
 
@@ -121,15 +136,68 @@ async def test_la_version_de_esquema_esta_en_todas_las_filas(jugadas):
         await engine.dispose()
 
 
-async def test_reejecutar_no_duplica(jugadas):
-    """El runner es idempotente por battle_tag."""
+async def test_repersistir_la_misma_batalla_no_duplica(jugadas):
+    """Idempotencia REAL: se vuelve a guardar una batalla ya guardada.
+
+    La version anterior de este test solo contaba filas de una unica corrida,
+    donde cada battle_tag es unico por construccion del loop: pasaba en verde
+    aunque el ON CONFLICT estuviera roto o ausente. Para ejercer la garantia
+    hay que reescribir la MISMA batalla y verificar que no aparece una fila
+    nueva y que devuelve el mismo id.
+    """
+    engine = make_engine(load_settings().database_url)
+    try:
+        factory = session_factory(engine)
+        repo = BattleRepository(factory)
+        tag = jugadas[0]
+        async with factory() as s:
+            antes = (await s.execute(
+                text("SELECT count(*) FROM battles"))).scalar_one()
+            fila = (await s.execute(text(
+                "SELECT id, format, p1, p2 FROM battles WHERE battle_tag = :t"),
+                {"t": tag})).one()
+
+        de_nuevo = await repo.save_battle(
+            battle_tag=tag, fmt=fila[1], p1=fila[2], p2=fila[3],
+            winner=None, source="local", played_by="bot",
+        )
+
+        async with factory() as s:
+            despues = (await s.execute(
+                text("SELECT count(*) FROM battles"))).scalar_one()
+
+        assert de_nuevo == fila[0], "el mismo battle_tag debe devolver el mismo id"
+        assert despues == antes, "re-persistir no debe crear una fila nueva"
+    finally:
+        await engine.dispose()
+
+
+async def test_cada_paso_de_estado_tiene_su_protocolo(jugadas):
+    """La propiedad que hace REVERSIBLE al serializador.
+
+    Si manana se descubre que el serializador tenia un defecto, el historico se
+    re-deriva desde el protocolo crudo en vez de descartarse. Eso solo vale si
+    CADA paso de estado tiene su protocolo, del mismo jugador y del mismo turno.
+    Contar filas de cada lado por separado no alcanza: hay que verificar la
+    correspondencia turno a turno.
+    """
     engine = make_engine(load_settings().database_url)
     try:
         async with session_factory(engine)() as s:
-            for tag in jugadas:
-                n = (await s.execute(text(
-                    "SELECT count(*) FROM battles WHERE battle_tag=:t"),
-                    {"t": tag})).scalar_one()
-                assert n == 1
+            huerfanos = (await s.execute(text("""
+                SELECT count(*) FROM trajectory_steps ts
+                JOIN trajectories t ON t.id = ts.trajectory_id
+                JOIN battles b ON b.id = t.battle_id
+                WHERE b.battle_tag = ANY(:tags)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM battle_turns bt
+                      WHERE bt.battle_id = t.battle_id
+                        AND bt.player_side = t.player_side
+                        AND bt.turn_number = ts.turn_number)
+            """), {"tags": list(jugadas)})).scalar_one()
+        assert huerfanos == 0, (
+            f"{huerfanos} pasos de estado sin su protocolo crudo: el historico "
+            "de esas batallas no se podria re-derivar"
+        )
     finally:
         await engine.dispose()

@@ -16,6 +16,11 @@ from .state.schema import STATE_SCHEMA_VERSION
 
 app = typer.Typer()
 
+# Una batalla de gen6randombattle ronda los 60-120 turnos y tarda segundos.
+# Este techo es holgado a proposito: solo existe para que un server colgado
+# no deje el proceso esperando indefinidamente.
+BATTLE_TIMEOUT_SECONDS = 180
+
 
 async def play(n: int, fmt: str) -> list[str]:
     settings = load_settings()
@@ -30,7 +35,10 @@ async def play(n: int, fmt: str) -> list[str]:
         account_configuration=AccountConfiguration(f"Rival{suffix}", None),
         server_configuration=server, battle_format=fmt, log_level=40,
     )
-    await agent.battle_against(rival, n_battles=n)
+    # Sin timeout, una batalla que no termina —server colgado, conexion
+    # cortada— deja el proceso esperando para siempre y no persiste nada.
+    async with asyncio.timeout(BATTLE_TIMEOUT_SECONDS * n):
+        await agent.battle_against(rival, n_battles=n)
 
     engine = make_engine(settings.database_url)
     repo = BattleRepository(session_factory(engine))
