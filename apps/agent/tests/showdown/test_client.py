@@ -358,6 +358,30 @@ def test_find_action_line_no_pasa_el_techo_de_turno():
     assert encontrado[0] == 4, "el techo tiene que impedir el salto al turno 50"
 
 
+def test_find_action_line_no_sigue_de_largo_tras_encontrar_respaldo():
+    """Defecto 1 (fix-cursor), segunda causa real: si esta decision ya se
+    resolvio por `|cant|` DENTRO de su propio turno, un `|move|` del MISMO
+    nombre en un turno POSTERIOR no puede ser evidencia de ESTA decision —
+    tiene que ser el de la decision SIGUIENTE, que repite el movimiento
+    (reproduccion minima de battle-gen6randombattle-408: Volbeat congelado
+    elige Encore, se resuelve como `|cant|...|frz` en su propio turno; dos
+    turnos despues el SIGUIENTE intento de Encore falla y narra
+    `|move|...Encore||[still]`). Sin este corte, la primera decision se
+    apropiaba de la linea de la segunda."""
+    recorder = _recorder_con([
+        ["|turn|4", "|cant|p1a: X|frz"],
+        ["|turn|6", "|move|p1a: X|Encore||[still]"],
+    ])
+    encontrado = _find_action_line(
+        recorder, "p1", {"kind": "move", "id": "encore"}, 0, max_turn=7,
+        actor_species="x",
+    )
+    assert encontrado == (4, 2), (
+        "tiene que quedarse en el cant de SU propio turno, no robarle "
+        "la linea de Encore a la decision siguiente"
+    )
+
+
 def test_correct_step_turns_corrige_en_orden_con_un_cursor_que_avanza():
     """Prueba de integracion chica: dos decisiones "outrage" seguidas,
     ambas con `turn` crudo (sin corregir) apuntando al mismo numero, deben
@@ -409,6 +433,189 @@ def test_correct_step_turns_sin_side_conocido_no_revienta():
         {"turn": 1, "state": {}, "action_taken": {"kind": "move", "id": "x"}}
     ]
     player._correct_step_turns("tag-sin-side")  # no debe lanzar
+
+
+# --- Defecto 1 (fix-cursor): el autogolpe por confusion no deja `|move|` ni
+# `|cant|`, solo `|-activate|{side}a: Name|confusion`. Sin reconocerlo, la
+# busqueda se pasa de largo y el respaldo content-blind puede aceptar el
+# `|faint|`/`|cant|` de OTRO pokemon, en un turno posterior, robandole la
+# linea a la decision siguiente (ver docs/DECISIONS.md D22, batalla real
+# battle-gen6randombattle-398, decision 45). ---
+
+
+def test_find_action_line_ancla_en_autogolpe_por_confusion():
+    """Showdown SI deja rastro de un autogolpe por confusion: `-activate`
+    seguido de `confusion`. Antes de este fix, `_find_action_line` no lo
+    miraba y la busqueda se pasaba de largo hasta encontrar (o no) otra
+    cosa mas adelante."""
+    recorder = _recorder_con([
+        ["|turn|4", "|-activate|p1a: Muk|confusion", "|-damage|p1a: Muk|132/328"],
+    ])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "move", "id": "brickbreak"}, 0, max_turn=4,
+        actor_species="muk",
+    ) == (4, 2)
+
+
+def test_find_action_line_respaldo_no_roba_faint_de_otro_pokemon():
+    """El respaldo (`|faint|`) NO puede resolver la decision de un pokemon
+    con el nombre de OTRO: sin este chequeo, un debilitamiento no
+    relacionado (de un pokemon distinto, en un turno posterior) se acepta
+    como si fuera la resolucion de la decision actual — y eso es
+    exactamente lo que le robaba la linea a la decision siguiente en la
+    batalla 398."""
+    recorder = _recorder_con([
+        ["|turn|4"],
+        ["|turn|5", "|faint|p1a: Swellow"],
+    ])
+    accion = {"kind": "move", "id": "brickbreak"}
+    # Con el actor correcto (Muk) declarado, el faint de Swellow no cuenta:
+    # no hay evidencia real de Muk en la ventana, resultado None.
+    assert _find_action_line(
+        recorder, "p1", accion, 0, max_turn=7, actor_species="muk"
+    ) is None
+
+
+def test_find_action_line_respaldo_de_faint_del_mismo_pokemon_si_cuenta():
+    """El chequeo de actor no rompe el caso que SI esta cubierto desde
+    2651081: mi propio pokemon (el mismo que iba a actuar) se debilito
+    antes de poder ejecutar la accion elegida."""
+    recorder = _recorder_con([["|turn|4", "|faint|p1a: Muk"]])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "move", "id": "brickbreak"}, 0, max_turn=4,
+        actor_species="muk",
+    ) == (4, 2)
+
+
+def test_find_action_line_sin_actor_species_mantiene_compat():
+    """Sin pasar `actor_species` (firma vieja / llamador que no lo conoce),
+    el chequeo queda deshabilitado: no rompe a nadie que no lo use."""
+    recorder = _recorder_con([
+        ["|turn|4"],
+        ["|turn|5", "|faint|p1a: Swellow"],
+    ])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "move", "id": "brickbreak"}, 0, max_turn=7
+    ) == (5, 3)
+
+
+def test_correct_step_turns_autogolpe_por_confusion_no_le_roba_la_linea_a_la_siguiente():
+    """Reproduccion minima de la batalla real (battle-gen6randombattle-398,
+    decisiones 45/46): Muk elige Brick Break, se autogolpea por confusion en
+    el turno 4 (sin `|move|` ni `|cant|`), y en el turno 5 el jugador cambia
+    a Ludicolo. Antes del fix, la decision de Muk se quedaba sin encontrar
+    nada dentro del margen viejo O (con margen mas largo) terminaba
+    aceptando un `|faint|` de otro pokemon mas adelante, adelantando el
+    cursor y dejando el cambio a Ludicolo sin encontrar SU linea."""
+    player = _player()
+    tag = "battle-x-1"
+    player.recorders[tag] = _recorder_con([
+        [
+            "|turn|4",
+            "|-activate|p1a: Muk|confusion",
+            "|-damage|p1a: Muk|132/328",
+        ],
+        ["|turn|5", "|switch|p1a: Ludicolo|Ludicolo, L88, M|57/284"],
+    ])
+    player._sides[tag] = "p1"
+    player.steps[tag] = [
+        {"turn": 4, "decision_turn": 4, "state": {}, "actor_species": "muk",
+         "action_taken": {"kind": "move", "id": "brickbreak"}},
+        {"turn": 4, "decision_turn": 4, "state": {}, "actor_species": None,
+         "action_taken": {"kind": "switch", "species": "ludicolo"}},
+    ]
+
+    player._correct_step_turns(tag)
+
+    assert player.steps[tag][0]["turn"] == 4, "Muk se resolvio en el turno del autogolpe"
+    assert player.steps[tag][1]["turn"] == 5, (
+        "el cambio a Ludicolo tiene que encontrar SU propia linea, no "
+        "quedar bloqueado por el autogolpe de la decision anterior"
+    )
+
+
+def test_choose_move_captura_actor_species():
+    """El pokemon activo al momento de decidir se captura sincronicamente,
+    igual que `legal_actions`/`action_taken`: es lo que permite que el
+    respaldo de `_find_action_line` verifique que un `|cant|`/`|faint|`/
+    autogolpe por confusion pertenece al MISMO pokemon que esta decision,
+    no a otro del mismo lado (ver D22)."""
+    player = _player()
+    tag = "battle-x-1"
+
+    class FakeMove:
+        id = "brickbreak"
+
+    class FakeActive:
+        species = "Muk"
+        base_species = "Muk"
+
+    battle = SimpleNamespace(
+        turn=3, battle_tag=tag, player_role="p1",
+        available_moves=[FakeMove()], available_switches=[], can_mega_evolve=False,
+        active_pokemon=FakeActive(),
+    )
+
+    with patch.object(
+        client_module.RandomPlayer, "choose_move",
+        lambda self, b: FakeOrder(mid="brickbreak"),
+    ):
+        player.choose_move(battle)
+
+    assert player.steps[tag][0]["actor_species"] == "muk"
+
+
+def test_choose_move_captura_base_species_no_la_forma():
+    """Regresion (fix-cursor): Showdown identifica al actor en `|move|`/
+    `|switch|`/`|cant|`/`|faint|` SIEMPRE con el nombre BASE, nunca con la
+    forma (verificado sobre datos reales: `p1a: Arceus`, nunca
+    `p1a: Arceus-Poison`, para las 6 formas de plato; lo mismo con Rotom,
+    Giratina-Origin, Wormadam, Keldeo-Resolute, Landorus-Therian,
+    Thundurus-Therian, Shaymin-Sky). `mon.species` para esos pokemon SI
+    incluye la forma (`arceuspoison`). Capturar `species` en vez de
+    `base_species` rompia el chequeo de actor para CUALQUIER decision de un
+    pokemon con forma: un `|faint|p1a: Arceus` real se rechazaba porque
+    "arceuspoison" != "arceus", y la decision se quedaba sin corregir."""
+    player = _player()
+    tag = "battle-x-1"
+
+    class FakeMove:
+        id = "earthpower"
+
+    class FakeActive:
+        species = "arceuspoison"  # lo que devuelve poke-env para Arceus-Poison
+        base_species = "arceus"   # lo que Showdown usa como identificador
+
+    battle = SimpleNamespace(
+        turn=37, battle_tag=tag, player_role="p1",
+        available_moves=[FakeMove()], available_switches=[], can_mega_evolve=False,
+        active_pokemon=FakeActive(),
+    )
+
+    with patch.object(
+        client_module.RandomPlayer, "choose_move",
+        lambda self, b: FakeOrder(mid="earthpower"),
+    ):
+        player.choose_move(battle)
+
+    assert player.steps[tag][0]["actor_species"] == "arceus", (
+        "tiene que capturar la forma BASE (lo que Showdown narra como "
+        "actor), no la especie completa con forma"
+    )
+
+
+def test_find_action_line_respaldo_con_pokemon_de_forma_no_se_pierde():
+    """Integracion chica de la regresion real: Arceus (base_species=arceus)
+    elige Earth Power, un Porygon-Z mas rapido lo debilita antes de que le
+    toque actuar. El `|faint|p1a: Arceus` (sin forma) tiene que contar como
+    resolucion de ESA decision cuando `actor_species="arceus"`."""
+    recorder = _recorder_con([
+        ["|turn|38", "|move|p2a: Porygon-Z|Tri Attack|p1a: Arceus", "|faint|p1a: Arceus"],
+    ])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "move", "id": "earthpower"}, 0, max_turn=40,
+        actor_species="arceus",
+    ) == (38, 3)
 
 
 def test_normalize_saca_toda_la_puntuacion():

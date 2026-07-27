@@ -60,12 +60,39 @@ def _normalize(text: str) -> str:
 ACTION_SEARCH_MARGIN_TURNS = 3
 
 
+def _actor_matches(parts: list[str], actor_species: str | None) -> bool:
+    """El respaldo (`|cant|`/`|faint|`/autogolpe por confusion) solo puede
+    resolver la decision del pokemon que REALMENTE estaba en la cancha
+    cuando se pidio la accion.
+
+    Defecto 1 (fix-cursor, docs/DECISIONS.md D22): sin este chequeo, un
+    `|faint|` (o un `|cant|`) de OTRO pokemon del mismo lado — en un turno
+    posterior, dentro de una cadena de cambios sin ninguna relacion con la
+    decision que se esta resolviendo — se acepta igual, porque el respaldo
+    viejo solo miraba el lado (`p1a`/`p2a`), nunca el nombre. Eso adelanta
+    el cursor global mas alla de la evidencia real de la decision SIGUIENTE,
+    que entonces ya no puede encontrarla (verificado sobre datos reales:
+    battle-gen6randombattle-398, decision 45 le robaba la linea a la 46).
+
+    `actor_species is None` deja el chequeo deshabilitado (compatibilidad
+    con llamadores/tests que no lo conocen): no reduce ninguna cobertura
+    existente, solo AGREGA una condicion cuando el dato esta disponible.
+    """
+    if actor_species is None:
+        return True
+    if len(parts) < 3:
+        return False
+    ident = parts[2].split(": ", 1)[-1]
+    return _normalize(ident) == actor_species
+
+
 def _find_action_line(
     recorder: ProtocolRecorder,
     side: str,
     action_taken: dict | None,
     from_index: int,
     max_turn: int,
+    actor_species: str | None = None,
 ) -> tuple[int, int] | None:
     """Busca, desde una posicion GLOBAL en el protocolo (no solo un turno),
     la primera linea `|move|` o `|switch|` propia que menciona la accion
@@ -91,22 +118,43 @@ def _find_action_line(
 
     Si la accion no se ejecuto, Showdown SI deja rastro, y la primera version
     de esta funcion no lo miraba: `|cant|` cuando el juego impidio la accion
-    (sueño, paralisis, congelamiento) y `|faint|` propio cuando al pokemon lo
-    debilitaron antes de poder actuar. Ese rastro aparece en el bloque donde
-    la decision se RESOLVIO, que es un turno mas adelante que `decision_turn`.
-    Sin mirarlo, esas filas quedaban etiquetadas un turno antes: era el 100%
-    del residual que sobrevivio a la primera vuelta de C1.
+    (sueño, paralisis, congelamiento), `|faint|` propio cuando al pokemon lo
+    debilitaron antes de poder actuar, y `|-activate|{side}a: Name|confusion`
+    cuando el pokemon se autogolpeo por confusion en vez de ejecutar la
+    accion elegida (defecto 1, fix-cursor: este tercer caso faltaba y NO es
+    teorico, ver mas abajo). Ese rastro aparece en el bloque donde la
+    decision se RESOLVIO, que puede ser el mismo turno que `decision_turn` o
+    uno mas adelante. Sin mirarlo, esas filas quedaban etiquetadas un turno
+    antes: era el 100% del residual que sobrevivio a la primera vuelta de C1.
 
     De ahi la definicion que gobierna `turn_number` en el dataset:
 
         Una fila pertenece al turno en que su decision se RESOLVIO, sin
-        importar como se resolvio — se ejecuto, el juego la impidio, o al
-        pokemon lo debilitaron antes.
+        importar como se resolvio — se ejecuto, el juego la impidio, al
+        pokemon lo debilitaron antes, o se autogolpeo por confusion.
 
     La linea de resolucion se usa solo como RESPALDO, nunca antes de agotar
     la busqueda del `|move|`/`|switch|` real: un `|faint|` propio puede ser
     posterior a una accion que si se ejecuto, y en ese caso la evidencia
     buena es el `|move|`, no el debilitamiento.
+
+    **`actor_species`** (defecto 1, fix-cursor, D22): el respaldo (`|cant|`/
+    `|faint|`/autogolpe) solo puede resolver la decision del pokemon que
+    REALMENTE estaba en la cancha al pedirse la accion — ver `_actor_matches`.
+    Sin este chequeo, cuando la accion elegida no deja NINGUNA de las tres
+    evidencias dentro de su propio bloque (el caso real: un autogolpe por
+    confusion, que esta funcion no reconocia), la busqueda seguia de largo y
+    el respaldo viejo aceptaba el `|faint|`/`|cant|` de OTRO pokemon del
+    mismo lado en un turno posterior — adelantando el cursor global mas alla
+    de la evidencia real de la decision SIGUIENTE, que entonces ya no podia
+    encontrarla. Verificado sobre datos reales
+    (`battle-gen6randombattle-398`): la decision 45 (autogolpe de Muk, sin
+    rastro reconocido) le robaba asi la linea a la decision 46 (un cambio a
+    Ludicolo que si tenia su propia linea, dos turnos antes de donde el
+    robo la dejo inalcanzable). Reconocer el autogolpe por confusion YA
+    arregla ese caso puntual; el chequeo de `actor_species` cierra la clase
+    entera (cualquier `|cant|`/`|faint|` de un pokemon que no es el que
+    actua, sea cual sea la razon por la que su propia evidencia no aparecio).
     """
     if action_taken is None:
         return None
@@ -125,10 +173,29 @@ def _find_action_line(
     prefix_switch = f"|switch|{side}a:"
     prefix_cant = f"|cant|{side}a:"
     prefix_faint = f"|faint|{side}a:"
+    prefix_confusion = f"|-activate|{side}a:"
     respaldo: tuple[int, int] | None = None
+    respaldo_turn: int | None = None
     se_movio_en: set[int] = set()
     for offset, (turn, line) in enumerate(recorder.entries_from(from_index)):
         if turn > max_turn:
+            break
+        if respaldo is not None and turn != respaldo_turn:
+            # Defecto 1 (fix-cursor, D22): ya encontramos, DENTRO del bloque
+            # de esta decision, evidencia de que se resolvio SIN ejecutar el
+            # movimiento/cambio elegido (cant/faint/confusion). Una decision
+            # se resuelve una sola vez: un match "real" del mismo nombre en
+            # un turno POSTERIOR no puede ser el de ESTA decision, tiene que
+            # ser el de la SIGUIENTE, que repite el mismo movimiento (p.ej.
+            # varios Encore seguidos porque el rival no tiene un movimiento
+            # repetible que encorear). Sin este corte, la busqueda segui­a de
+            # largo y esa repeticion posterior se aceptaba como si fuera la
+            # resolucion de ESTA decision, robandole la linea a la que
+            # realmente le pertenecia (verificado sobre datos reales,
+            # battle-gen6randombattle-408: la decision "Encore" que se
+            # resolvia con `|cant|...|frz` en su propio turno terminaba
+            # apropiandose del `|move|...|Encore||[still]` de la decision
+            # SIGUIENTE, dos turnos mas adelante).
             break
         if line.startswith(prefix_move) or line.startswith(prefix_switch):
             if clave in _normalize(line):
@@ -136,13 +203,36 @@ def _find_action_line(
             if line.startswith(prefix_move):
                 se_movio_en.add(turn)
         elif respaldo is None:
-            if line.startswith(prefix_cant):
+            parts = line.split("|")
+            if line.startswith(prefix_cant) and _actor_matches(parts, actor_species):
                 respaldo = (turn, from_index + offset + 1)
-            elif line.startswith(prefix_faint) and turn not in se_movio_en:
+                respaldo_turn = turn
+            elif (
+                line.startswith(prefix_faint)
+                and turn not in se_movio_en
+                and _actor_matches(parts, actor_species)
+            ):
                 # Un debilitamiento propio DESPUES de haberse movido en el
                 # mismo bloque no resuelve esta decision: resuelve la de
-                # alguien que ya actuo.
+                # alguien que ya actuo. El chequeo de actor descarta ademas
+                # el debilitamiento de OTRO pokemon del mismo lado.
                 respaldo = (turn, from_index + offset + 1)
+                respaldo_turn = turn
+            elif (
+                line.startswith(prefix_confusion)
+                and len(parts) >= 4
+                and parts[3] == "confusion"
+                and turn not in se_movio_en
+                and _actor_matches(parts, actor_species)
+            ):
+                # Autogolpe por confusion: el pokemon eligio un movimiento
+                # pero se golpeo a si mismo en su lugar. Showdown narra esto
+                # como `|-activate|{side}a: Name|confusion`, nunca como
+                # `|move|` ni `|cant|` — sin reconocerlo aca, la decision
+                # queda sin ninguna evidencia dentro de su propio bloque y la
+                # busqueda sigue de largo (ver docstring, defecto 1).
+                respaldo = (turn, from_index + offset + 1)
+                respaldo_turn = turn
     return respaldo
 
 
@@ -299,11 +389,38 @@ class LudexPlayer(RandomPlayer):
         # choose_move DESPUES de eso), asi que estan tan al dia como pueden
         # estarlo. `action_taken in legal_actions` queda garantizado por
         # construccion porque las dos vienen de esta MISMA linea de codigo.
+        # Defecto 1 (fix-cursor, D22): el pokemon activo AHORA es el que va a
+        # intentar ejecutar `action_taken`. Se guarda normalizado para que
+        # `_find_action_line` pueda verificar que un `|cant|`/`|faint|`/
+        # autogolpe por confusion de respaldo pertenece a ESTE pokemon, no a
+        # otro del mismo lado (ver `_actor_matches`). `getattr` con default
+        # `None`: en el `forceSwitch` que sigue a un debilitamiento no hay
+        # pokemon activo propio (ya fainted), y ahi el respaldo no aplica de
+        # todos modos porque un cambio siempre deja su propia linea `|switch|`.
+        #
+        # `base_species`, NO `species`: Showdown identifica al actor en
+        # `|move|`/`|switch|`/`|cant|`/`|faint|` SIEMPRE con el nombre base,
+        # nunca con la forma (verificado contra la base real: `p1a: Arceus`
+        # para las 6 formas de plato, `p1a: Rotom` para las 6 de electrodomes-
+        # tico, `p1a: Giratina` para Origin, igual con Wormadam/Keldeo/
+        # Landorus/Thundurus/Shaymin). `mon.species` para esos SI incluye la
+        # forma (`arceuspoison`, `rotommow`): comparar contra eso rompia el
+        # chequeo para cualquier pokemon con forma, descartando por error un
+        # `|faint|`/`|cant|` que si le pertenecia (medido: Arceus-Poison,
+        # decision "Earth Power" nunca ejecutada porque a Arceus lo debilito
+        # un Porygon-Z mas rapido — el `|faint|p1a: Arceus` real quedaba
+        # rechazado porque "arceus" != "arceuspoison").
+        actor = getattr(battle, "active_pokemon", None)
+        actor_species = (
+            _normalize(getattr(actor, "base_species", "") or actor.species)
+            if actor is not None else None
+        )
         step = {
             "turn": battle.turn,
             "decision_turn": battle.turn,
             "action_taken": action_taken,
             "legal_actions": legal_actions(battle),
+            "actor_species": actor_species,
             "state": None,  # se completa en _finalize_pending_steps
         }
         index = len(self.steps[tag])
@@ -388,7 +505,10 @@ class LudexPlayer(RandomPlayer):
             if step is None:
                 continue
             max_turn = step["decision_turn"] + ACTION_SEARCH_MARGIN_TURNS
-            found = _find_action_line(recorder, side, step["action_taken"], cursor, max_turn)
+            found = _find_action_line(
+                recorder, side, step["action_taken"], cursor, max_turn,
+                actor_species=step.get("actor_species"),
+            )
             if found is not None:
                 step["turn"], cursor = found
                 # El `turn` DENTRO del estado serializado tiene que quedar

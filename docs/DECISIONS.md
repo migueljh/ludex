@@ -520,3 +520,116 @@ decisiones pueden compartir turno y eso ahora es representable.
 Sin backfill (migración `20260727000006`): las 57 batallas grabadas hasta la
 review final eran de prueba, random contra random, y no sirven para entrenar.
 Se truncan y se regraban con `agent play`.
+
+## D22 — C-1 vuelve a ser síncrona; el cursor de `_correct_step_turns` reconoce
+tres formas de "la acción no se ejecutó" y deja de robarle líneas a la
+decisión siguiente
+
+Dos correcciones de la última puerta antes del merge de
+`feat/agent-conexion-estado` (review-merge.md), sobre el mismo mecanismo:
+
+**Primera parte — por qué C-1 (D20) volvió a ser síncrona (commit
+`dd62bc8`).** D20 documentó la materialización diferida (`3ea7caf`) como el
+arreglo que funciona. La review de merge encontró que **no** lo era: la task
+de fondo lee `battle`, un objeto mutable, y para cuando corre, el
+planificador de asyncio puede haber despachado ya la decisión N+1 —
+`serialize_battle(battle)` fotografía entonces el punto de decisión
+SIGUIENTE, no el de la decisión N que originó la task. Medido sobre datos
+reales: 7 de 6625 filas (~0.11%) con `action_taken` fuera de su propia
+`legal_actions`, un piso (carrera contra el planificador) y no un techo. La
+corrección: nada que tenga que ser consistente con la decisión (`legal_actions`,
+`action_taken`, `decision_turn`) se vuelve a leer de `battle` después de que
+la decisión pasó — se captura sincrónicamente en `choose_move`, como antes de
+`3ea7caf`, y `action_taken ∈ legal_actions` vuelve a valer por construcción.
+Lo que SÍ seguía haciendo falta esperar (el lado del rival) se resuelve
+dentro de la MISMA llamada síncrona a `_handle_battle_message`, nunca en una
+task planificada aparte (ver el docstring de `LudexPlayer` en `client.py`
+para el detalle completo). Verificado: 12 batallas nuevas, 774 filas, cero
+fuera de máscara.
+
+**Segunda parte — el cursor de `_correct_step_turns` pierde líneas (fix
+posterior al merge, "fix-cursor").** Con C-1 cerrado, la corrección de
+`turn_number` (D20, `_find_action_line`) seguía teniendo un defecto
+independiente: el cursor global, que existe para que dos decisiones no
+compartan línea, podía en cambio **perder** la línea real de una decisión
+posterior. Instrumentado y verificado sobre datos reales (no se dio por
+buena la hipótesis original antes de medir), con dos mecanismos distintos,
+ambos con el mismo síntoma:
+
+1. **Una forma de "no se ejecutó" que el código no reconocía.**
+   `battle-gen6randombattle-398`, decisión 45 (Muk elige Brick Break): el
+   pokémon se autogolpea por confusión (`|-activate|p1a: Muk|confusion`,
+   sin `|move|` ni `|cant|`) — un tercer rastro que Showdown sí deja y que
+   `_find_action_line` no miraba. Sin nada que matchear en su propio
+   bloque, la búsqueda seguía de largo y el respaldo (que solo miraba el
+   LADO, `p1a`/`p2a`, nunca el pokémon) aceptaba el `|faint|p1a: Swellow`
+   de un pokémon **no relacionado**, dos turnos más adelante, en una cadena
+   de cambios sin ninguna conexión con la decisión de Muk. Eso adelantaba
+   el cursor más allá de la línea real de la decisión SIGUIENTE (cambio a
+   Ludicolo, turno 44), que quedaba entonces inalcanzable.
+2. **Un match "real" posterior ganándole a un respaldo válido anterior.**
+   `battle-gen6randombattle-408`: Volbeat congelado resuelve su decisión de
+   "Encore" con `|cant|...|frz` en su propio turno — evidencia válida y
+   completa —, pero la búsqueda seguía escaneando y encontraba, dos turnos
+   después, el `|move|...|Encore||[still]` de la decisión **siguiente**
+   (un segundo intento de Encore, que también falla). Una decisión se
+   resuelve una sola vez: un match del mismo nombre después de un respaldo
+   ya encontrado en su propio bloque no puede ser evidencia de ESA
+   decisión.
+
+**El arreglo, en `_find_action_line`/`client.py`:**
+
+- Se reconoce el autogolpe por confusión (`|-activate|{side}a: Name|confusion`,
+  sin `|move|` en el mismo bloque) como una tercera forma válida de
+  respaldo, al mismo nivel que `|cant|` y `|faint|` propio.
+- El respaldo (`|cant|`/`|faint|`/confusión) ahora exige que el pokémon
+  nombrado en esa línea sea el mismo que iba a actuar (`actor_species`,
+  capturado sincrónicamente en `choose_move` junto con `legal_actions`).
+  Se compara por `base_species`, no por `species`: Showdown identifica al
+  actor en `|move|`/`|switch|`/`|cant|`/`|faint|` siempre con el nombre
+  BASE (`p1a: Arceus`, nunca `p1a: Arceus-Poison`; lo mismo con Rotom,
+  Giratina-Origin, Wormadam, Keldeo-Resolute, Landorus-Therian,
+  Thundurus-Therian, Shaymin-Sky), mientras que `mon.species` de poke-env sí
+  incluye la forma (`arceuspoison`) — comparar contra `species` directamente
+  rompía el chequeo para cualquier pokémon con forma alternativa.
+- Una vez que la búsqueda encuentra un respaldo válido dentro de su propio
+  turno, deja de escanear turnos posteriores buscando un match "real": si
+  el turno avanza más allá del turno del respaldo sin que apareciera un
+  match real ANTES, se corta ahí. Un match real posterior pertenece, por
+  definición, a la decisión siguiente que repite el mismo nombre.
+
+Verificación tras el arreglo: instrumentación decisión-por-decisión sobre
+`battle-gen6randombattle-398` (las cinco decisiones de cambio a Ludicolo
+pasan de 14/22/31/**43**/**48** a 14/22/31/**44**/48, la real) y sobre
+`battle-gen6randombattle-408` (la cadena Encore/Thunder Wave deja de
+robarse líneas entre sí); 12 batallas frescas (`gen6randombattle`, 809
+filas con acción): 785 con match directo, 24 excusadas por
+`cant`/`faint`/confusión propio, **0 residuales**; suite completa (87
+tests) verde en 3 corridas consecutivas, cada una jugando batallas nuevas
+contra el server local.
+
+**No cambia lo que el cursor ya protegía:** dos decisiones que mencionan el
+mismo movimiento o la misma especie (dos Outrage seguidos, dos cambios al
+mismo pokémon) siguen sin poder compartir línea — los tests que cubrían eso
+(`test_find_action_line_no_reusa_una_linea_ya_consumida`,
+`test_correct_step_turns_corrige_en_orden_con_un_cursor_que_avanza`) pasan
+sin modificación.
+
+**Defecto 2, siete filas envenenadas de builds intermedios.** El invariante
+`action_taken ∈ legal_actions` (D-1 de esta entrada) seguía fallando por 7
+filas de 5 batallas de prueba (`battle-gen6randombattle-246/277/290/295/362`,
+grabadas el mismo día con builds intermedios de esta rama, antes de
+`dd62bc8`, random contra random). Se decidió borrarlas —no re-derivarlas—
+por `battle_tag` exacto, con cascada: mantener una fila que se sabe
+contradictoria es peor que perder datos sintéticos sin valor de
+entrenamiento, y hay backup del día. `battles`: 150→145; `trajectories`:
+149→144; `trajectory_steps`: 8939→8672. Verificado tras el borrado: 0 filas
+fuera de máscara en toda la base.
+
+**Pendiente, no resuelto por este mecanismo:** el límite documentado en D20
+(acción elegida que nunca se ejecuta porque el propio pokémon muere sin
+`cant`/`faint` reconocible DENTRO del margen de búsqueda) sigue sin trato —
+ninguno de los dos mecanismos de esta entrada lo toca. Datos de dataset real
+(`source='local'`) anteriores a este arreglo conservan 9 filas con
+`turn_number` retrocedido en 7 trayectorias (Minor 9 de review-merge.md, ya
+señalado como deuda de higiene, no tocado en esta tarea).
