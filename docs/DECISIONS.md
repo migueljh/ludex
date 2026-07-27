@@ -160,3 +160,27 @@ Se eligió 15432 y no 5434 para salir del rango donde se instalan bases por
 defecto, y no se paró el servicio de Homebrew porque es de otro proyecto del
 usuario y Homebrew lo relevanta al reiniciar, con lo que el conflicto volvería
 sin aviso.
+
+## D12 — Conteos de referencia de `pokemon-showdown@0.11.10`
+
+Valores verificados corriendo el seed contra una base vacía (ver criterios de
+aceptación §9), para poder comparar tras un bump de versión del paquete:
+
+| tabla       | gen 6 | gen 9 |
+|-------------|------:|------:|
+| pokemon     |   834 |   874 |
+| moves       |   618 |   685 |
+| items       |   283 |   248 |
+| abilities   |   191 |   310 |
+| type_chart  |   324 |   361 |
+| learnsets   | 62157 | 64921 |
+
+Motivo: son los mismos conteos que `seedGeneration` imprime y que
+`seed_runs` (D4) persiste por corrida. Tenerlos también acá, fijos al lado de
+la versión pineada del paquete, da un punto de comparación estático sin tener
+que ir a buscar una corrida vieja en la base cuando se evalúe un bump de
+`pokemon-showdown`.
+
+El server local de Showdown (D5, `docker/showdown/Dockerfile`) pinea
+`SHOWDOWN_REF=v0.11.10`, la misma versión exacta que `pokemon-showdown` en
+`packages/seed/package.json` (D4).
