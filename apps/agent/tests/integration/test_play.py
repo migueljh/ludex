@@ -153,14 +153,29 @@ async def test_repersistir_la_misma_batalla_no_duplica(jugadas):
         async with factory() as s:
             antes = (await s.execute(
                 text("SELECT count(*) FROM battles"))).scalar_one()
+            # `winner` TIENE que venir en el SELECT y volver tal cual: el
+            # ON CONFLICT hace `SET winner = EXCLUDED.winner`, asi que mandar
+            # None aca borraria el ganador real de una batalla ya jugada. Este
+            # test verifica idempotencia; no debe destruir el dato que verifica.
             fila = (await s.execute(text(
-                "SELECT id, format, p1, p2 FROM battles WHERE battle_tag = :t"),
+                "SELECT id, format, p1, p2, winner FROM battles WHERE battle_tag = :t"),
                 {"t": tag})).one()
+
+        # Canario: sin esto la asercion de abajo se cumple sola cuando el
+        # ganador ya viene en NULL, que es justo el estado que este test
+        # provocaba antes. Una batalla de `jugadas` termino: tiene ganador.
+        assert fila[4] is not None, "la batalla recien jugada debe tener ganador"
 
         de_nuevo = await repo.save_battle(
             battle_tag=tag, fmt=fila[1], p1=fila[2], p2=fila[3],
-            winner=None, source="local", played_by="bot",
+            winner=fila[4], source="local", played_by="bot",
         )
+
+        async with factory() as s:
+            ganador = (await s.execute(text(
+                "SELECT winner FROM battles WHERE battle_tag = :t"),
+                {"t": tag})).scalar_one()
+        assert ganador == fila[4], "re-persistir no debe alterar el ganador"
 
         async with factory() as s:
             despues = (await s.execute(
