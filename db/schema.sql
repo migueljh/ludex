@@ -23,6 +23,50 @@ CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
 COMMENT ON EXTENSION vector IS 'vector data type and ivfflat and hnsw access methods';
 
 
+--
+-- Name: action_source; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.action_source AS ENUM (
+    'agent',
+    'human',
+    'opponent'
+);
+
+
+--
+-- Name: battle_result; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.battle_result AS ENUM (
+    'win',
+    'loss',
+    'tie'
+);
+
+
+--
+-- Name: battle_source; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.battle_source AS ENUM (
+    'challenge',
+    'ladder',
+    'local',
+    'import'
+);
+
+
+--
+-- Name: played_by_kind; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.played_by_kind AS ENUM (
+    'bot',
+    'human'
+);
+
+
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
@@ -58,6 +102,59 @@ CREATE SEQUENCE public.abilities_id_seq
 --
 
 ALTER SEQUENCE public.abilities_id_seq OWNED BY public.abilities.id;
+
+
+--
+-- Name: battle_turns; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.battle_turns (
+    battle_id integer NOT NULL,
+    player_side text NOT NULL,
+    turn_number integer NOT NULL,
+    protocol_lines text[] NOT NULL,
+    agent_reasoning jsonb
+);
+
+
+--
+-- Name: battles; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.battles (
+    id integer NOT NULL,
+    battle_tag text NOT NULL,
+    tournament_id integer,
+    round_id integer,
+    format text NOT NULL,
+    p1 text NOT NULL,
+    p2 text NOT NULL,
+    winner text,
+    played_by public.played_by_kind NOT NULL,
+    source public.battle_source NOT NULL,
+    replay_url text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: battles_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.battles_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: battles_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.battles_id_seq OWNED BY public.battles.id;
 
 
 --
@@ -273,6 +370,58 @@ ALTER SEQUENCE public.seed_runs_id_seq OWNED BY public.seed_runs.id;
 
 
 --
+-- Name: trajectories; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.trajectories (
+    id integer NOT NULL,
+    battle_id integer NOT NULL,
+    gen_id integer NOT NULL,
+    format text NOT NULL,
+    player_side text NOT NULL,
+    final_result public.battle_result,
+    elo_bucket text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: trajectories_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.trajectories_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: trajectories_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.trajectories_id_seq OWNED BY public.trajectories.id;
+
+
+--
+-- Name: trajectory_steps; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.trajectory_steps (
+    trajectory_id integer NOT NULL,
+    turn_number integer NOT NULL,
+    state jsonb NOT NULL,
+    state_schema_version integer NOT NULL,
+    legal_actions jsonb NOT NULL,
+    action_taken jsonb,
+    action_source public.action_source NOT NULL,
+    reward numeric
+);
+
+
+--
 -- Name: type_chart; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -326,6 +475,13 @@ ALTER TABLE ONLY public.abilities ALTER COLUMN id SET DEFAULT nextval('public.ab
 
 
 --
+-- Name: battles id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.battles ALTER COLUMN id SET DEFAULT nextval('public.battles_id_seq'::regclass);
+
+
+--
 -- Name: generations id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -361,6 +517,13 @@ ALTER TABLE ONLY public.seed_runs ALTER COLUMN id SET DEFAULT nextval('public.se
 
 
 --
+-- Name: trajectories id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trajectories ALTER COLUMN id SET DEFAULT nextval('public.trajectories_id_seq'::regclass);
+
+
+--
 -- Name: usage_stats id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -381,6 +544,30 @@ ALTER TABLE ONLY public.abilities
 
 ALTER TABLE ONLY public.abilities
     ADD CONSTRAINT abilities_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: battle_turns battle_turns_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.battle_turns
+    ADD CONSTRAINT battle_turns_pkey PRIMARY KEY (battle_id, player_side, turn_number);
+
+
+--
+-- Name: battles battles_battle_tag_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.battles
+    ADD CONSTRAINT battles_battle_tag_key UNIQUE (battle_tag);
+
+
+--
+-- Name: battles battles_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.battles
+    ADD CONSTRAINT battles_pkey PRIMARY KEY (id);
 
 
 --
@@ -472,6 +659,30 @@ ALTER TABLE ONLY public.seed_runs
 
 
 --
+-- Name: trajectories trajectories_battle_id_player_side_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trajectories
+    ADD CONSTRAINT trajectories_battle_id_player_side_key UNIQUE (battle_id, player_side);
+
+
+--
+-- Name: trajectories trajectories_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trajectories
+    ADD CONSTRAINT trajectories_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: trajectory_steps trajectory_steps_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trajectory_steps
+    ADD CONSTRAINT trajectory_steps_pkey PRIMARY KEY (trajectory_id, turn_number);
+
+
+--
 -- Name: type_chart type_chart_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -493,6 +704,13 @@ ALTER TABLE ONLY public.usage_stats
 
 ALTER TABLE ONLY public.usage_stats
     ADD CONSTRAINT usage_stats_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: battles_created_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX battles_created_at_idx ON public.battles USING btree (created_at DESC);
 
 
 --
@@ -524,11 +742,26 @@ CREATE INDEX pokemon_gen_dex_num_idx ON public.pokemon USING btree (gen_id, dex_
 
 
 --
+-- Name: trajectory_steps_version_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX trajectory_steps_version_idx ON public.trajectory_steps USING btree (state_schema_version);
+
+
+--
 -- Name: abilities abilities_gen_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.abilities
     ADD CONSTRAINT abilities_gen_id_fkey FOREIGN KEY (gen_id) REFERENCES public.generations(id) ON DELETE CASCADE;
+
+
+--
+-- Name: battle_turns battle_turns_battle_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.battle_turns
+    ADD CONSTRAINT battle_turns_battle_id_fkey FOREIGN KEY (battle_id) REFERENCES public.battles(id) ON DELETE CASCADE;
 
 
 --
@@ -580,6 +813,30 @@ ALTER TABLE ONLY public.seed_runs
 
 
 --
+-- Name: trajectories trajectories_battle_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trajectories
+    ADD CONSTRAINT trajectories_battle_id_fkey FOREIGN KEY (battle_id) REFERENCES public.battles(id) ON DELETE CASCADE;
+
+
+--
+-- Name: trajectories trajectories_gen_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trajectories
+    ADD CONSTRAINT trajectories_gen_id_fkey FOREIGN KEY (gen_id) REFERENCES public.generations(id);
+
+
+--
+-- Name: trajectory_steps trajectory_steps_trajectory_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trajectory_steps
+    ADD CONSTRAINT trajectory_steps_trajectory_id_fkey FOREIGN KEY (trajectory_id) REFERENCES public.trajectories(id) ON DELETE CASCADE;
+
+
+--
 -- Name: type_chart type_chart_gen_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -616,4 +873,5 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20260725000001'),
     ('20260725000002'),
     ('20260725000003'),
-    ('20260726000001');
+    ('20260726000001'),
+    ('20260727000005');
