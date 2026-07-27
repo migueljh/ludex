@@ -968,6 +968,7 @@ que juegue bien, es que grabe bien.
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import Any
 
@@ -977,6 +978,22 @@ from poke_env.player import RandomPlayer
 from ..state.actions import action_from_order
 from ..state.serializer import serialize_battle
 from .protocol import ProtocolRecorder
+
+
+logger = logging.getLogger(__name__)
+
+
+def battle_tag_from(split_messages: list[list[str]]) -> str | None:
+    """El battle_tag llega como una linea `>battle-...`.
+
+    Funcion pura y separada a proposito: es la unica logica de este modulo que
+    se puede testear sin levantar un WebSocket, y de ella depende que un lote
+    de protocolo se guarde o se pierda.
+    """
+    for parts in split_messages:
+        if parts and parts[0].startswith(">"):
+            return parts[0][1:].strip()
+    return None
 
 
 def local_server_configuration(ws_url: str) -> ServerConfiguration:
@@ -999,16 +1016,20 @@ class LudexPlayer(RandomPlayer):
         self.steps: dict[str, list[dict]] = defaultdict(list)
 
     def _handle_battle_message(self, split_messages: list[list[str]]) -> Any:
-        # El battle_tag llega como primera linea con formato `>battle-...`.
-        tag = None
-        for parts in split_messages:
-            if parts and parts[0].startswith(">"):
-                tag = parts[0][1:].strip()
-                break
+        tag = battle_tag_from(split_messages)
         if tag is None and len(self.recorders) == 1:
+            # Rama de respaldo: hoy inalcanzable, porque poke-env garantiza el
+            # tag en la primera linea. Se conserva por si esa garantia cambia.
             tag = next(iter(self.recorders))
         if tag:
             self.recorders[tag].record(split_messages)
+        else:
+            # Nunca descartar en silencio: el protocolo es la fuente de verdad
+            # y perder un lote rompe la re-derivacion del estado.
+            logger.warning(
+                "lote de protocolo sin battle_tag, %d lineas descartadas",
+                len(split_messages),
+            )
         return super()._handle_battle_message(split_messages)
 
     def choose_move(self, battle: Any) -> Any:
@@ -1023,7 +1044,55 @@ class LudexPlayer(RandomPlayer):
         return order
 ```
 
-- [ ] **Step 2: Verificar que importa y que el corte se sostiene**
+- [ ] **Step 2: Escribir los tests de la parte testeable sin red**
+
+`apps/agent/tests/showdown/test_client.py`:
+```python
+import logging
+
+from ludex_agent.showdown.client import battle_tag_from, local_server_configuration
+
+
+def _split(raw: str) -> list[str]:
+    return raw.split("|")
+
+
+def test_extrae_el_tag_de_la_primera_linea():
+    lote = [[">battle-gen6randombattle-1"], _split("|init|battle")]
+    assert battle_tag_from(lote) == "battle-gen6randombattle-1"
+
+
+def test_encuentra_el_tag_aunque_no_sea_la_primera_linea():
+    lote = [_split("|init|battle"), [">battle-gen9ou-42"]]
+    assert battle_tag_from(lote) == "battle-gen9ou-42"
+
+
+def test_sin_linea_de_tag_devuelve_none():
+    assert battle_tag_from([_split("|init|battle"), _split("|turn|1")]) is None
+
+
+def test_lote_vacio_y_lineas_vacias_no_revientan():
+    assert battle_tag_from([]) is None
+    assert battle_tag_from([[], [""]]) is None
+
+
+def test_descarta_espacios_alrededor_del_tag():
+    assert battle_tag_from([[">battle-x-1  "]]) == "battle-x-1"
+
+
+def test_la_config_local_conserva_la_url_del_websocket():
+    cfg = local_server_configuration("ws://localhost:8100/showdown/websocket")
+    assert cfg.websocket_url == "ws://localhost:8100/showdown/websocket"
+```
+
+- [ ] **Step 3: Correr los tests**
+
+```bash
+cd apps/agent && uv run pytest tests/showdown/test_client.py -v
+```
+Esperado: PASS, 6 tests.
+
+- [ ] **Step 4: Verificar que importa y que el corte se sostiene**
 
 ```bash
 cd apps/agent && uv run python -c "from ludex_agent.showdown.client import LudexPlayer, local_server_configuration; print('import OK')"
@@ -1031,7 +1100,7 @@ grep -rn "sqlalchemy\|asyncpg" src/ludex_agent/showdown/ && echo "FALLA: showdow
 ```
 Esperado: `import OK` y la línea `OK`.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git commit -m "feat(agent): cliente de showdown que graba mientras juega" -- apps/agent/
