@@ -1,6 +1,13 @@
 import { createRequire } from "node:module";
-import { Dex } from "pokemon-showdown";
+// `import { Dex }` falla bajo el loader ESM nativo de Node: esbuild compila
+// pokemon-showdown de forma que sus exports quedan como getters no
+// configurables, que cjs-module-lexer no detecta (reporta cero exports
+// nombrados). Vitest no lo muestra porque usa su propio interop. El import por
+// defecto mas desestructuracion funciona con cualquier modulo CJS y evita tener
+// que parchear el paquete.
+import showdown from "pokemon-showdown";
 
+const { Dex } = showdown;
 const require = createRequire(import.meta.url);
 
 export type ModdedDex = ReturnType<typeof Dex.mod>;

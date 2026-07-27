@@ -6,6 +6,3 @@ allowBuilds:
   esbuild: false
   pokemon-showdown: false
   sqlite3: false
-patchedDependencies:
-  pg@8.13.1: patches/pg@8.13.1.patch
-  pokemon-showdown@0.11.10: patches/pokemon-showdown@0.11.10.patch

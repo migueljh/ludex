@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { GENERATION_LABELS, loadGen, packageVersion } from "./extract/dex.js";
@@ -13,6 +13,12 @@ import {
   loadTypeChart, upsertGeneration,
 } from "./load/tables.js";
 import { finishRun, startRun } from "./load/runs.js";
+
+// El CLI corre en el host y necesita DATABASE_URL. Sin esto, `pnpm seed --gen 6`
+// falla desde cualquier shell que no la tenga exportada a mano, que es el modo
+// de falla que ya se corrigio para los tests en vitest.config.ts.
+const envPath = fileURLToPath(new URL("../../../.env", import.meta.url));
+if (existsSync(envPath)) process.loadEnvFile(envPath);
 
 export async function seedGeneration(genNumber: number): Promise<Record<string, number>> {
   const dex = loadGen(genNumber);

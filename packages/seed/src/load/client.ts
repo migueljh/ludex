@@ -1,4 +1,9 @@
-import { Pool } from "pg";
+// Mismo problema de interop que en extract/dex.ts: pg asigna sus propiedades
+// dinamicamente en el constructor, asi que `import { Pool }` no resuelve bajo
+// el loader ESM nativo. El import de TIPO si puede ser nombrado, porque se
+// borra en compilacion y nunca llega al runtime.
+import pg from "pg";
+import type { Pool } from "pg";
 
 /** Postgres admite 65535 parametros por sentencia; se deja margen. */
 const MAX_PARAMS = 30_000;
@@ -8,7 +13,7 @@ export function createPool(): Pool {
   if (!connectionString) {
     throw new Error("Falta DATABASE_URL. Copiar .env.example a .env.");
   }
-  return new Pool({ connectionString });
+  return new pg.Pool({ connectionString });
 }
 
 export async function withPool<T>(fn: (pool: Pool) => Promise<T>): Promise<T> {
