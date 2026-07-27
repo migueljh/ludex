@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { loadGen } from "../../src/extract/dex.js";
+import { isAvailable, loadGen } from "../../src/extract/dex.js";
 import { extractLearnsets, parseLearnCode } from "../../src/extract/learnsets.js";
 import type { LearnsetRow } from "../../src/types.js";
 
@@ -79,8 +79,9 @@ describe("extractLearnsets gen 6", () => {
   });
 
   it("no genera filas para movimientos fuera de la generacion", () => {
+    const dex = loadGen(6);
     const gen6MoveIds = new Set(
-      loadGen(6).moves.all().filter((m) => m.gen <= 6 && !m.isNonstandard).map((m) => m.id),
+      dex.moves.all().filter((m) => isAvailable(dex, m)).map((m) => m.id),
     );
     expect(rows.every((r) => gen6MoveIds.has(r.moveId))).toBe(true);
   });

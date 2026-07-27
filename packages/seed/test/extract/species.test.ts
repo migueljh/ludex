@@ -45,6 +45,11 @@ describe("extractSpecies", () => {
     expect(base.tier).toBe("NU");
   });
 
+  it("mapea habilidades normales y ocultas", () => {
+    expect(byId(gen6, "charizard").abilities).toEqual({ "0": "Blaze", H: "Solar Power" });
+    expect(byId(gen6, "charizardmegax").abilities).toEqual({ "0": "Tough Claws" });
+  });
+
   it("normaliza la ausencia de preevolucion a null", () => {
     expect(byId(gen6, "charmander").evolvesFrom).toBeNull();
     expect(byId(gen6, "charizardmegax").evolvesFrom).toBeNull();
