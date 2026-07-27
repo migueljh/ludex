@@ -286,6 +286,11 @@ packages = ["src/ludex_agent"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Verificado empiricamente: sin esto, pytest-asyncio adopta "function" como
+# default y la fixture de scope module de la Tarea 8 falla con ScopeMismatch,
+# no con un warning. "module" alcanza para esa fixture y evita un loop de
+# sesion sosteniendo engines de base entre modulos.
+asyncio_default_fixture_loop_scope = "module"
 testpaths = ["tests"]
 ```
 
@@ -454,6 +459,31 @@ def test_traduce_una_orden_de_cambio():
 
 def test_orden_vacia_es_none():
     assert action_from_order(None) is None
+
+
+def test_orden_sin_contenido_es_none():
+    assert action_from_order(SimpleNamespace(order=None)) is None
+
+
+def test_orden_con_contenido_inesperado_es_none():
+    # Ni .id ni .species: no revienta, devuelve None.
+    assert action_from_order(SimpleNamespace(order=SimpleNamespace(raro=1))) is None
+
+
+def test_la_desambiguacion_vale_contra_los_objetos_reales():
+    """Fija el supuesto del que depende `action_from_order`.
+
+    La funcion distingue Move de Pokemon por hasattr, sin importar poke_env,
+    porque state/ es puro. Este test SI importa la libreria — los tests pueden,
+    src/ no — para que si una version futura le diera `.id` a Pokemon, falle
+    ruidosamente en vez de clasificar todos los cambios como movimientos.
+    """
+    from poke_env.battle import Move, Pokemon
+
+    mon = Pokemon(gen=6, species="charizard")
+    mv = Move("flamethrower", gen=6)
+    assert not hasattr(mon, "id") and hasattr(mon, "species")
+    assert hasattr(mv, "id") and not hasattr(mv, "species")
 ```
 
 - [ ] **Step 2: Correr y verificar que falla**
@@ -526,7 +556,7 @@ def action_from_order(order: Any) -> dict | None:
 ```bash
 cd apps/agent && uv run pytest tests/state/test_actions.py -v
 ```
-Esperado: PASS, 5 tests.
+Esperado: PASS, 8 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -742,7 +772,10 @@ def serialize_battle(battle: Any) -> dict:
         "gen": battle.gen,
         "field": {
             "weather": _conditions(battle.weather),
-            "terrain": _conditions(battle.fields),
+            # `battle.fields` no son solo terrenos: incluye Trick Room, Gravity
+            # y Wonder Room. La clave se llama field_effects para no mentirle a
+            # quien consuma el dataset en la fase de entrenamiento.
+            "field_effects": _conditions(battle.fields),
             "my_side": _conditions(battle.side_conditions),
             "opponent_side": _conditions(battle.opponent_side_conditions),
         },
@@ -935,6 +968,7 @@ que juegue bien, es que grabe bien.
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import Any
 
@@ -944,6 +978,22 @@ from poke_env.player import RandomPlayer
 from ..state.actions import action_from_order
 from ..state.serializer import serialize_battle
 from .protocol import ProtocolRecorder
+
+
+logger = logging.getLogger(__name__)
+
+
+def battle_tag_from(split_messages: list[list[str]]) -> str | None:
+    """El battle_tag llega como una linea `>battle-...`.
+
+    Funcion pura y separada a proposito: es la unica logica de este modulo que
+    se puede testear sin levantar un WebSocket, y de ella depende que un lote
+    de protocolo se guarde o se pierda.
+    """
+    for parts in split_messages:
+        if parts and parts[0].startswith(">"):
+            return parts[0][1:].strip()
+    return None
 
 
 def local_server_configuration(ws_url: str) -> ServerConfiguration:
@@ -966,16 +1016,20 @@ class LudexPlayer(RandomPlayer):
         self.steps: dict[str, list[dict]] = defaultdict(list)
 
     def _handle_battle_message(self, split_messages: list[list[str]]) -> Any:
-        # El battle_tag llega como primera linea con formato `>battle-...`.
-        tag = None
-        for parts in split_messages:
-            if parts and parts[0].startswith(">"):
-                tag = parts[0][1:].strip()
-                break
+        tag = battle_tag_from(split_messages)
         if tag is None and len(self.recorders) == 1:
+            # Rama de respaldo: hoy inalcanzable, porque poke-env garantiza el
+            # tag en la primera linea. Se conserva por si esa garantia cambia.
             tag = next(iter(self.recorders))
         if tag:
             self.recorders[tag].record(split_messages)
+        else:
+            # Nunca descartar en silencio: el protocolo es la fuente de verdad
+            # y perder un lote rompe la re-derivacion del estado.
+            logger.warning(
+                "lote de protocolo sin battle_tag, %d lineas descartadas",
+                len(split_messages),
+            )
         return super()._handle_battle_message(split_messages)
 
     def choose_move(self, battle: Any) -> Any:
@@ -990,7 +1044,55 @@ class LudexPlayer(RandomPlayer):
         return order
 ```
 
-- [ ] **Step 2: Verificar que importa y que el corte se sostiene**
+- [ ] **Step 2: Escribir los tests de la parte testeable sin red**
+
+`apps/agent/tests/showdown/test_client.py`:
+```python
+import logging
+
+from ludex_agent.showdown.client import battle_tag_from, local_server_configuration
+
+
+def _split(raw: str) -> list[str]:
+    return raw.split("|")
+
+
+def test_extrae_el_tag_de_la_primera_linea():
+    lote = [[">battle-gen6randombattle-1"], _split("|init|battle")]
+    assert battle_tag_from(lote) == "battle-gen6randombattle-1"
+
+
+def test_encuentra_el_tag_aunque_no_sea_la_primera_linea():
+    lote = [_split("|init|battle"), [">battle-gen9ou-42"]]
+    assert battle_tag_from(lote) == "battle-gen9ou-42"
+
+
+def test_sin_linea_de_tag_devuelve_none():
+    assert battle_tag_from([_split("|init|battle"), _split("|turn|1")]) is None
+
+
+def test_lote_vacio_y_lineas_vacias_no_revientan():
+    assert battle_tag_from([]) is None
+    assert battle_tag_from([[], [""]]) is None
+
+
+def test_descarta_espacios_alrededor_del_tag():
+    assert battle_tag_from([[">battle-x-1  "]]) == "battle-x-1"
+
+
+def test_la_config_local_conserva_la_url_del_websocket():
+    cfg = local_server_configuration("ws://localhost:8100/showdown/websocket")
+    assert cfg.websocket_url == "ws://localhost:8100/showdown/websocket"
+```
+
+- [ ] **Step 3: Correr los tests**
+
+```bash
+cd apps/agent && uv run pytest tests/showdown/test_client.py -v
+```
+Esperado: PASS, 6 tests.
+
+- [ ] **Step 4: Verificar que importa y que el corte se sostiene**
 
 ```bash
 cd apps/agent && uv run python -c "from ludex_agent.showdown.client import LudexPlayer, local_server_configuration; print('import OK')"
@@ -998,7 +1100,7 @@ grep -rn "sqlalchemy\|asyncpg" src/ludex_agent/showdown/ && echo "FALLA: showdow
 ```
 Esperado: `import OK` y la línea `OK`.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git commit -m "feat(agent): cliente de showdown que graba mientras juega" -- apps/agent/
@@ -1021,6 +1123,7 @@ git commit -m "feat(agent): cliente de showdown que graba mientras juega" -- app
 `apps/agent/tests/db/test_repository.py`:
 ```python
 import os
+import re
 
 import pytest
 from sqlalchemy import text
@@ -1028,6 +1131,17 @@ from sqlalchemy import text
 from ludex_agent.config import load_settings
 from ludex_agent.db.repository import BattleRepository
 from ludex_agent.db.session import make_engine, session_factory
+
+def _normalizar(texto: str) -> str:
+    """Deja solo alfanumericos en minuscula.
+
+    Los ids de poke-env no llevan puntuacion (`mrmime`, `farfetchd`) pero el
+    protocolo usa el nombre visible (`Mr. Mime`, `Farfetch'd`). Sin quitar
+    puntos y apostrofes, el test da falsos positivos de fuga — verificado
+    contra una batalla real donde fallo con Mr. Mime en el turno 10.
+    """
+    return re.sub(r"[^a-z0-9]", "", texto.lower())
+
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"), reason="necesita la base levantada"
@@ -1117,6 +1231,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import ARRAY, ForeignKey, Numeric, String, Text
+from sqlalchemy.dialects.postgresql import ENUM as PGEnum
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -1125,16 +1240,28 @@ class Base(DeclarativeBase):
     pass
 
 
+# Los tipos ENUM ya existen en la base: `create_type=False` evita que
+# SQLAlchemy intente recrearlos. Tiparlos como Text haria que un insert por ORM
+# mande un string plano a una columna enum y falle en asyncpg.
+PlayedByKind = PGEnum(name="played_by_kind", create_type=False)
+BattleSource = PGEnum(name="battle_source", create_type=False)
+BattleResult = PGEnum(name="battle_result", create_type=False)
+ActionSource = PGEnum(name="action_source", create_type=False)
+
+
 class Battle(Base):
     __tablename__ = "battles"
     id: Mapped[int] = mapped_column(primary_key=True)
     battle_tag: Mapped[str] = mapped_column(Text, unique=True)
+    tournament_id: Mapped[int | None] = mapped_column(nullable=True)
+    round_id: Mapped[int | None] = mapped_column(nullable=True)
     format: Mapped[str] = mapped_column(Text)
     p1: Mapped[str] = mapped_column(Text)
     p2: Mapped[str] = mapped_column(Text)
     winner: Mapped[str | None] = mapped_column(Text, nullable=True)
-    played_by: Mapped[str] = mapped_column(Text)
-    source: Mapped[str] = mapped_column(Text)
+    played_by: Mapped[str] = mapped_column(PlayedByKind)
+    source: Mapped[str] = mapped_column(BattleSource)
+    replay_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column()
 
 
@@ -1144,6 +1271,7 @@ class BattleTurn(Base):
     player_side: Mapped[str] = mapped_column(Text, primary_key=True)
     turn_number: Mapped[int] = mapped_column(primary_key=True)
     protocol_lines: Mapped[list[str]] = mapped_column(ARRAY(String))
+    agent_reasoning: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class Trajectory(Base):
@@ -1153,7 +1281,8 @@ class Trajectory(Base):
     gen_id: Mapped[int] = mapped_column()
     format: Mapped[str] = mapped_column(Text)
     player_side: Mapped[str] = mapped_column(Text)
-    final_result: Mapped[str | None] = mapped_column(Text, nullable=True)
+    final_result: Mapped[str | None] = mapped_column(BattleResult, nullable=True)
+    elo_bucket: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column()
 
 
@@ -1167,7 +1296,7 @@ class TrajectoryStep(Base):
     state_schema_version: Mapped[int] = mapped_column()
     legal_actions: Mapped[list] = mapped_column(JSONB)
     action_taken: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    action_source: Mapped[str] = mapped_column(Text)
+    action_source: Mapped[str] = mapped_column(ActionSource)
     reward: Mapped[float | None] = mapped_column(Numeric, nullable=True)
 ```
 
@@ -1237,9 +1366,17 @@ class BattleRepository:
                    legal_actions, action_taken, action_source)
                 VALUES (:tj, :t, CAST(:st AS jsonb), :v, CAST(:la AS jsonb),
                         CAST(:at AS jsonb), CAST(:src AS action_source))
+                -- state_schema_version y action_source TAMBIEN se actualizan:
+                -- si un paso se reescribe tras un bump de version, dejar la
+                -- version vieja con el estado nuevo hace que la fila mienta
+                -- sobre su propio formato. `reward` queda deliberadamente
+                -- afuera, para no pisar el que ya escribio finalize().
                 ON CONFLICT (trajectory_id, turn_number) DO UPDATE
-                  SET state = EXCLUDED.state, legal_actions = EXCLUDED.legal_actions,
-                      action_taken = EXCLUDED.action_taken
+                  SET state = EXCLUDED.state,
+                      state_schema_version = EXCLUDED.state_schema_version,
+                      legal_actions = EXCLUDED.legal_actions,
+                      action_taken = EXCLUDED.action_taken,
+                      action_source = EXCLUDED.action_source
             """), {"tj": trajectory_id, "t": turn, "st": json.dumps(state), "v": version,
                    "la": json.dumps(legal),
                    "at": json.dumps(action) if action is not None else None,
@@ -1315,6 +1452,11 @@ from .state.schema import STATE_SCHEMA_VERSION
 
 app = typer.Typer()
 
+# Una batalla de gen6randombattle ronda los 60-120 turnos y tarda segundos.
+# Este techo es holgado a proposito: solo existe para que un server colgado
+# no deje el proceso esperando indefinidamente.
+BATTLE_TIMEOUT_SECONDS = 180
+
 
 async def play(n: int, fmt: str) -> list[str]:
     settings = load_settings()
@@ -1329,7 +1471,10 @@ async def play(n: int, fmt: str) -> list[str]:
         account_configuration=AccountConfiguration(f"Rival{suffix}", None),
         server_configuration=server, battle_format=fmt, log_level=40,
     )
-    await agent.battle_against(rival, n_battles=n)
+    # Sin timeout, una batalla que no termina —server colgado, conexion
+    # cortada— deja el proceso esperando para siempre y no persiste nada.
+    async with asyncio.timeout(BATTLE_TIMEOUT_SECONDS * n):
+        await agent.battle_against(rival, n_battles=n)
 
     engine = make_engine(settings.database_url)
     repo = BattleRepository(session_factory(engine))
@@ -1377,7 +1522,48 @@ if __name__ == "__main__":
     app()
 ```
 
-- [ ] **Step 2: Escribir los dos tests que importan**
+- [ ] **Step 2: Cargar el `.env` para los tests**
+
+Sin esto, los tests que necesitan `DATABASE_URL` se SALTEAN en silencio cuando la
+variable no esta exportada a mano. Verificado: `pytest` sin la variable da
+"33 passed, 2 skipped"; con ella, "35 passed". Un test salteado se ve casi igual
+que uno que pasa, y es el mismo modo de falla que ya mordio en la fase anterior.
+
+`apps/agent/tests/conftest.py`:
+```python
+"""Carga el .env de la raiz del repo antes de coleccionar tests.
+
+Sin esto los tests que necesitan DATABASE_URL se saltean en silencio: verdes
+para quien lo escribio, silenciosamente mas debiles para el resto. `setdefault`
+para que una variable ya exportada en el entorno siempre gane.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+
+def _load_dotenv() -> None:
+    # apps/agent/tests/conftest.py -> parents[3] es la raiz del repo
+    env_path = Path(__file__).resolve().parents[3] / ".env"
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_dotenv()
+```
+
+Verificalo: `cd apps/agent && uv run pytest tests/ -q` **sin** `DATABASE_URL`
+exportada debe dar cero skips.
+
+- [ ] **Step 3: Escribir los dos tests que importan**
 
 `apps/agent/tests/integration/test_play.py`:
 ```python
@@ -1388,6 +1574,7 @@ from sqlalchemy import text
 
 from ludex_agent.config import load_settings
 from ludex_agent.cli import play
+from ludex_agent.db.repository import BattleRepository
 from ludex_agent.db.session import make_engine, session_factory
 from ludex_agent.state.schema import STATE_SCHEMA_VERSION
 
@@ -1457,19 +1644,33 @@ async def test_no_hay_fuga_de_informacion_del_rival(jugadas):
             """), {"tags": list(jugadas)})).all()
             assert filas, "no hay pasos que verificar"
 
+            revisados = 0
             for turno, estado, side, battle_id in filas:
-                acumulado = (await s.execute(text("""
-                    SELECT string_agg(array_to_string(protocol_lines, ' '), ' ')
-                    FROM battle_turns
+                # Se comparan LINEAS sueltas, no el protocolo concatenado. Pegar
+                # todo y sacarle los separadores crea un blob donde una especie
+                # puede "aparecer" a caballo entre dos tokens sin relacion, y una
+                # fuga real pasaria como revelada.
+                lineas = (await s.execute(text("""
+                    SELECT unnest(protocol_lines) FROM battle_turns
                     WHERE battle_id = :b AND player_side = :ps AND turn_number <= :t
-                """), {"b": battle_id, "ps": side, "t": turno})).scalar_one() or ""
+                """), {"b": battle_id, "ps": side, "t": turno})).scalars().all()
+                normalizadas = [_normalizar(l) for l in lineas]
+
                 for mon in estado["opponent"]["pokemon"]:
-                    especie = mon["species"].replace("-", "").lower()
-                    visto = especie in acumulado.replace("-", "").replace(" ", "").lower()
+                    revisados += 1
+                    especie = _normalizar(mon["species"])
+                    visto = any(especie in linea for linea in normalizadas)
                     assert visto, (
                         f"FUGA: {mon['species']} aparece en el estado del turno "
                         f"{turno} pero el protocolo no lo revelo hasta ahi"
                     )
+
+            # Canario: sin esto, un serializador que dejara `opponent.pokemon`
+            # siempre vacio haria que el loop no itere nunca y el test pasara en
+            # verde sin haber verificado una sola especie.
+            assert revisados > 0, (
+                "ningun paso tenia pokemon del rival: el test no verifico nada"
+            )
     finally:
         await engine.dispose()
 
@@ -1489,37 +1690,100 @@ async def test_la_version_de_esquema_esta_en_todas_las_filas(jugadas):
         await engine.dispose()
 
 
-async def test_reejecutar_no_duplica(jugadas):
-    """El runner es idempotente por battle_tag."""
+async def test_repersistir_la_misma_batalla_no_duplica(jugadas):
+    """Idempotencia REAL: se vuelve a guardar una batalla ya guardada.
+
+    La version anterior de este test solo contaba filas de una unica corrida,
+    donde cada battle_tag es unico por construccion del loop: pasaba en verde
+    aunque el ON CONFLICT estuviera roto o ausente. Para ejercer la garantia
+    hay que reescribir la MISMA batalla y verificar que no aparece una fila
+    nueva y que devuelve el mismo id.
+    """
+    engine = make_engine(load_settings().database_url)
+    try:
+        factory = session_factory(engine)
+        repo = BattleRepository(factory)
+        tag = jugadas[0]
+        async with factory() as s:
+            antes = (await s.execute(
+                text("SELECT count(*) FROM battles"))).scalar_one()
+            # `winner` TIENE que venir en el SELECT y volver tal cual: el
+            # ON CONFLICT hace `SET winner = EXCLUDED.winner`, asi que mandar
+            # None aca borraria el ganador real de una batalla ya jugada. Este
+            # test verifica idempotencia; no debe destruir el dato que verifica.
+            fila = (await s.execute(text(
+                "SELECT id, format, p1, p2, winner FROM battles WHERE battle_tag = :t"),
+                {"t": tag})).one()
+
+        de_nuevo = await repo.save_battle(
+            battle_tag=tag, fmt=fila[1], p1=fila[2], p2=fila[3],
+            winner=fila[4], source="local", played_by="bot",
+        )
+
+        async with factory() as s:
+            ganador = (await s.execute(text(
+                "SELECT winner FROM battles WHERE battle_tag = :t"),
+                {"t": tag})).scalar_one()
+        assert ganador == fila[4], "re-persistir no debe alterar el ganador"
+
+        async with factory() as s:
+            despues = (await s.execute(
+                text("SELECT count(*) FROM battles"))).scalar_one()
+
+        assert de_nuevo == fila[0], "el mismo battle_tag debe devolver el mismo id"
+        assert despues == antes, "re-persistir no debe crear una fila nueva"
+    finally:
+        await engine.dispose()
+
+
+async def test_cada_paso_de_estado_tiene_su_protocolo(jugadas):
+    """La propiedad que hace REVERSIBLE al serializador.
+
+    Si manana se descubre que el serializador tenia un defecto, el historico se
+    re-deriva desde el protocolo crudo en vez de descartarse. Eso solo vale si
+    CADA paso de estado tiene su protocolo, del mismo jugador y del mismo turno.
+    Contar filas de cada lado por separado no alcanza: hay que verificar la
+    correspondencia turno a turno.
+    """
     engine = make_engine(load_settings().database_url)
     try:
         async with session_factory(engine)() as s:
-            for tag in jugadas:
-                n = (await s.execute(text(
-                    "SELECT count(*) FROM battles WHERE battle_tag=:t"),
-                    {"t": tag})).scalar_one()
-                assert n == 1
+            huerfanos = (await s.execute(text("""
+                SELECT count(*) FROM trajectory_steps ts
+                JOIN trajectories t ON t.id = ts.trajectory_id
+                JOIN battles b ON b.id = t.battle_id
+                WHERE b.battle_tag = ANY(:tags)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM battle_turns bt
+                      WHERE bt.battle_id = t.battle_id
+                        AND bt.player_side = t.player_side
+                        AND bt.turn_number = ts.turn_number)
+            """), {"tags": list(jugadas)})).scalar_one()
+        assert huerfanos == 0, (
+            f"{huerfanos} pasos de estado sin su protocolo crudo: el historico "
+            "de esas batallas no se podria re-derivar"
+        )
     finally:
         await engine.dispose()
 ```
 
-- [ ] **Step 3: Levantar el server local y correr**
+- [ ] **Step 4: Levantar el server local y correr**
 
 ```bash
 docker compose --profile local up -d showdown
 sleep 5 && curl -sf http://localhost:8100/ -o /dev/null && echo "showdown OK"
 cd apps/agent && DATABASE_URL="postgres://ludex:ludex@localhost:15432/ludex" uv run pytest tests/integration/ -v
 ```
-Esperado: PASS, 5 tests. Tarda unos minutos: son dos batallas reales.
+Esperado: PASS, 8 tests. Tarda unos minutos: son dos batallas reales.
 
-- [ ] **Step 4: Correr el runner a mano**
+- [ ] **Step 5: Correr el runner a mano**
 
 ```bash
 cd apps/agent && DATABASE_URL="postgres://ludex:ludex@localhost:15432/ludex" uv run python -m ludex_agent.cli --n 5
 ```
 Esperado: `5 batallas persistidas`.
 
-- [ ] **Step 5: Verificar la re-derivación**
+- [ ] **Step 6: Verificar la re-derivación**
 
 Es la propiedad que hace reversible el serializador. Con el protocolo guardado, un consumidor futuro tiene que poder reconstruir el estado.
 
@@ -1554,14 +1818,14 @@ PY
 ```
 Esperado: una línea por batalla y `OK` al final. Pegá la salida en el reporte.
 
-- [ ] **Step 6: Verificar que no hay generación hardcodeada**
+- [ ] **Step 7: Verificar que no hay generación hardcodeada**
 
 ```bash
 cd /Users/miguelhernandez/Documents/ludex && grep -rin "gen6" apps/agent/src/
 ```
 Esperado: cero resultados. Las apariciones válidas están en `tests/` y en los valores por defecto de `config.py`, que son configuración.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git commit -m "feat(agent): runner y tests de fuga y re-derivacion" -- apps/agent/
