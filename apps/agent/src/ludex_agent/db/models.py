@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import ARRAY, ForeignKey, Numeric, Text, func
+from sqlalchemy import ARRAY, DateTime, ForeignKey, Numeric, Text, func
 from sqlalchemy.dialects.postgresql import ENUM as PGEnum
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -40,7 +40,12 @@ class Battle(Base):
     played_by: Mapped[str] = mapped_column(PlayedByKind)
     source: Mapped[str] = mapped_column(BattleSource)
     replay_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    # I5 (review de merge): `Mapped[datetime]` sin tipo explicito compila a
+    # TIMESTAMP WITHOUT TIME ZONE; el DDL dice `timestamptz` (`timestamp
+    # with time zone`). `DateTime(timezone=True)` espeja el DDL exacto.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class BattleTurn(Base):
@@ -63,7 +68,10 @@ class Trajectory(Base):
     player_side: Mapped[str] = mapped_column(Text)
     final_result: Mapped[str | None] = mapped_column(BattleResult, nullable=True)
     elo_bucket: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    # I5 (review de merge): mismo motivo que `Battle.created_at`.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class TrajectoryStep(Base):

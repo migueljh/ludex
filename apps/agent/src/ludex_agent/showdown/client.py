@@ -308,6 +308,19 @@ class LudexPlayer(RandomPlayer):
         # vez en choose_move deja a _correct_step_turns sin necesidad de
         # tocar `self.battles`/`battle` para nada.
         self._sides: dict[str, str] = {}
+        # I3 (review de merge): contador consultable de pasos perdidos, para
+        # que "no hay huecos hoy" (0 huecos de decision_index medidos sobre
+        # toda la base) deje de depender solo de que nadie mire. Se
+        # incrementa en `cli._persist_one`, en el momento en que un paso se
+        # descarta sin persistir (`step is None` o `step["state"] is None`):
+        # ese es el UNICO lugar donde un paso se pierde de verdad del
+        # dataset, asi que es el unico que cuenta (evita contar dos veces el
+        # mismo paso: `wait_for_pending_steps`, mas abajo, detecta el mismo
+        # caso ANTES pero solo loguea, no incrementa). Es el mismo rol que
+        # cumpliria un `turn_alignment_timeouts`: un numero que un runner
+        # desatendido (miles de batallas, `agent play -n grande`) puede
+        # loguear o alertar sin tener que grepear el log linea por linea.
+        self.lost_step_count: int = 0
 
     async def _handle_battle_message(self, split_messages: list[list[str]]) -> Any:
         tag = battle_tag_from(split_messages)
@@ -475,7 +488,11 @@ class LudexPlayer(RandomPlayer):
         Guarda defensiva (I-3 de la review de merge): si algun paso quedara
         sin finalizar —no deberia pasar nunca, dado como esta escrito
         `_handle_battle_message`— loguea en vez de persistir un `None` en
-        silencio.
+        silencio. El conteo consultable (`lost_step_count`) se lleva en un
+        unico lugar, `cli._persist_one` (que es donde el paso efectivamente
+        se descarta del dataset): este metodo solo corre ANTES de leer
+        `self.steps[tag]` para persistir, asi que contar aca tambien
+        duplicaria el mismo paso perdido dos veces.
         """
         sin_finalizar = [
             i for i, s in enumerate(self.steps.get(tag, [])) if s is not None and s["state"] is None

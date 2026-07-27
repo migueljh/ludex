@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from typing import Any
 from urllib.parse import urlsplit
 
 import typer
@@ -14,6 +16,8 @@ from .db.repository import BattleRepository
 from .db.session import make_engine, session_factory
 from .showdown.client import LudexPlayer, local_server_configuration
 from .state.schema import STATE_SCHEMA_VERSION
+
+logger = logging.getLogger(__name__)
 
 app = typer.Typer()
 
@@ -100,6 +104,30 @@ async def play(n: int, fmt: str, *, source: str = "local") -> list[str]:
     return tags
 
 
+def _battle_outcome(battle: Any) -> tuple[str | None, str, float]:
+    """Deriva `(winner, result, reward)` de una batalla YA terminada.
+
+    I6 (review de merge): `battle.won` de poke-env es un `Optional[bool]`
+    que vale `None` en DOS situaciones bien distintas: "todavia no termino" Y
+    "empate" (`tied()` nunca toca `_won`, solo `won_by()` lo hace, y este
+    metodo solo se llama con un nombre de ganador). El codigo anterior hacia
+    `battle.player_username if battle.won else battle.opponent_username`,
+    que colapsa esas dos situaciones en la rama `else`: un empate quedaba
+    grabado con el RIVAL como `winner` (un hecho falso en `battles`), con
+    `final_result='loss'` (dejando `'tie'` del enum inalcanzable) y con
+    `reward=-1` para una batalla que no se perdio.
+
+    Se llama solo cuando `battle.finished` es verdadero, asi que `None` en
+    este punto SOLO puede significar empate. `reward=0` para el empate: ni
+    castiga ni premia, coherente con `+1`/`-1` de las otras dos ramas.
+    """
+    if battle.won is True:
+        return battle.player_username, "win", 1.0
+    if battle.won is False:
+        return battle.opponent_username, "loss", -1.0
+    return None, "tie", 0.0
+
+
 async def _persist_one(
     agent: LudexPlayer, repo: BattleRepository, tag: str, fmt: str, source: str
 ) -> None:
@@ -114,10 +142,14 @@ async def _persist_one(
     else:
         p1, p2 = battle.opponent_username, battle.player_username
 
+    winner: str | None = None
+    result: str | None = None
+    reward: float | None = None
+    if battle.finished:
+        winner, result, reward = _battle_outcome(battle)
+
     battle_id = await repo.save_battle(
-        battle_tag=tag, fmt=fmt, p1=p1, p2=p2,
-        winner=(battle.player_username if battle.won else battle.opponent_username)
-        if battle.finished else None,
+        battle_tag=tag, fmt=fmt, p1=p1, p2=p2, winner=winner,
         source=source, played_by="bot",
     )
     recorder = agent.recorders[tag]
@@ -135,17 +167,34 @@ async def _persist_one(
     # D21 (C2): decision_index es el indice de la lista, que ya numera una
     # vez por decision (una vez por llamada a choose_move), no por turno.
     for decision_index, step in enumerate(agent.steps[tag]):
-        if step is None:
+        # I3 (review de merge): este camino era el mismo modo de falla de C2
+        # recreado -- perder una decision del dataset sin que nadie se
+        # entere. Hoy no ocurre nunca (0 huecos de decision_index medidos
+        # sobre toda la base), pero si el dia de mañana se graban miles de
+        # batallas desatendidas, un hueco tiene que dejar rastro: un warning
+        # con el detalle y un contador consultable (`agent.lost_step_count`),
+        # no un `continue` mudo. `step["state"] is None` cubre ademas el paso
+        # defensivo de `wait_for_pending_steps` (paso reservado que nunca se
+        # llego a materializar): sin este chequeo aca tambien, ese paso no
+        # es `None` pero igual revienta con un TypeError al leer
+        # `step["state"]["legal_actions"]`, cambiando una perdida silenciosa
+        # por un crash a mitad de la persistencia de la batalla.
+        if step is None or step.get("state") is None:
+            agent.lost_step_count += 1
+            logger.warning(
+                "paso %d de %s se descarta sin persistir (%s): la decision "
+                "se pierde del dataset (lost_step_count=%d)",
+                decision_index, tag,
+                "step es None" if step is None else "step['state'] es None",
+                agent.lost_step_count,
+            )
             continue
         await repo.save_step(
             traj, decision_index, step["turn"], step["state"], STATE_SCHEMA_VERSION,
             step["state"]["legal_actions"], step["action_taken"], "agent",
         )
     if battle.finished:
-        await repo.finalize(
-            traj, result="win" if battle.won else "loss",
-            reward=1 if battle.won else -1,
-        )
+        await repo.finalize(traj, result=result, reward=reward)
 
 
 @app.command()
