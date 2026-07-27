@@ -193,6 +193,20 @@ aceptación §9), para poder comparar tras un bump de versión del paquete:
 | type_chart  |   324 |   361 |
 | learnsets   | 62198 | 65624 |
 
+**Nota: por qué gen 6 da 618 movimientos y no los 621 del dex nacional hasta
+ORAS.** Los 618 son los usables. Los 5 que faltan para 621 están en la data
+del paquete pero el filtro `isAvailable` (D6) los excluye correctamente:
+
+- `thousandarrows`, `thousandwaves` (firma de Zygarde-Completo) y
+  `lightofruin` (firma de Floette-Eterna): `gen=6` pero
+  `isNonstandard: 'Unobtainable'` — existen en el código de XY/ORAS y no son
+  obtenibles en ningún juego.
+- `paleowave` y `shadowstrike`: `isNonstandard: 'CAP'` — son movimientos del
+  proyecto CAP de Smogon, no movimientos reales.
+
+618 + 3 unobtainables = 621 del dex nacional; los 2 CAP no cuentan en ninguna
+suma contra el dex nacional. Nadie vuelva a investigar esta diferencia.
+
 Motivo: son los mismos conteos que `seedGeneration` imprime y que
 `seed_runs` (D4) persiste por corrida. Tenerlos también acá, fijos al lado de
 la versión pineada del paquete, da un punto de comparación estático sin tener
@@ -281,3 +295,44 @@ estrictamente aditivo, así que no puede perder datos como el intento fallido.
 Requiere su propia rebanada: cambia los conteos, necesita tests de las dos
 clases de forma, y la regla de filtrado por `sourceSpecies` hay que definirla
 junto con `round_availability` en la fase de torneo.
+
+**Por qué esa solución es viable: `pokemon.evolves_from` guarda la
+preevolución de la FORMA, no la de su especie base.** El seed lo resuelve con
+`dex.species.get(s.prevo).id` (`packages/seed/src/extract/species.ts`), y
+`prevo` de `ninetalesalola` es `vulpixalola`, no `vulpix`. Verificado contra
+la base (gen 9):
+
+```
+     showdown_id   | base_species | evolves_from
+-------------------+--------------+--------------
+ ninetalesalola    | ninetales    | vulpixalola
+ vulpixalola       | vulpix       | (null)
+```
+
+Eso significa que quien consulte puede caminar la línea evolutiva **real** de
+la forma con un recursive CTE sobre `evolves_from` y descartar los métodos
+cuyo `sourceSpecies` no pertenezca a esa línea, sin necesitar ningún dato
+adicional. Es la razón por la que la solución aditiva no genera falsos
+positivos permanentes: heredar de más en el seed es inofensivo mientras el
+filtro de consulta pueda reconstruir la línea correcta, y puede.
+
+## D15 — `moves.accuracy IS NULL` significa "nunca falla", no "desconocida"
+
+Showdown codifica los movimientos que no pueden fallar (Swift, Aerial Ace,
+Thunder bajo lluvia...) con `accuracy: true` en vez de un número.
+`extractMoves` (`packages/seed/src/extract/moves.ts`) convierte ese `true` en
+`NULL`, y es el **único** valor especial de la columna: todo `accuracy` no
+nulo es un porcentaje entero (100 = siempre acierta salvo modificadores de
+precisión/evasión).
+
+Motivo: la alternativa —inventar un centinela numérico como 0 o 101— rompería
+cualquier agregado (`avg`, `min`) y cualquier comparación numérica sin que la
+base lo impida. `NULL` es el valor que SQL ya reserva para "no aplica", y la
+semántica "no aplica porque no hay tirada de precisión" es exactamente la del
+juego.
+
+Riesgo que esta decisión cierra: un consumidor que lea `accuracy IS NULL`
+como "precisión desconocida" (por ejemplo, un extractor de features que lo
+impute como dato faltante) estaría tomando la decisión exactamente opuesta a
+la correcta — son los movimientos MÁS confiables del juego. Quien arme
+features debe traducir `NULL` a "nunca falla", no a "faltante".
