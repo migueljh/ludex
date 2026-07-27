@@ -187,6 +187,98 @@ async def test_repersistir_la_misma_batalla_no_duplica(jugadas):
         await engine.dispose()
 
 
+async def test_la_accion_de_la_fila_corresponde_a_su_propio_turno(jugadas):
+    """C1: `action_taken` de la fila del turno N tiene que aparecer en el
+    protocolo del turno N, no del N+1.
+
+    Antes del arreglo, poke-env llama a `choose_move` en cuanto parsea el
+    `|request|`, que Showdown manda ya resuelto y en su propio frame, antes de
+    narrar el turno. La accion que se graba en la fila `turno=N` en realidad
+    se ejecuta en el bloque de protocolo N+1. Ningun otro test lo detecta
+    porque ninguno cruza `action_taken` contra el protocolo del MISMO turno.
+    """
+    engine = make_engine(load_settings().database_url)
+    try:
+        async with session_factory(engine)() as s:
+            filas = (await s.execute(text("""
+                SELECT ts.turn_number,
+                       regexp_replace(
+                           lower(coalesce(ts.action_taken->>'id', ts.action_taken->>'species')),
+                           '[^a-z0-9]', '', 'g') AS accion,
+                       t.player_side, t.battle_id
+                FROM trajectory_steps ts
+                JOIN trajectories t ON t.id = ts.trajectory_id
+                JOIN battles b ON b.id = t.battle_id
+                WHERE b.battle_tag = ANY(:tags) AND ts.action_taken IS NOT NULL
+            """), {"tags": list(jugadas)})).all()
+            assert filas, "no hay pasos con accion para verificar"
+
+            revisados = 0
+            for turno, accion, side, battle_id in filas:
+                lineas = (await s.execute(text("""
+                    SELECT unnest(protocol_lines) FROM battle_turns
+                    WHERE battle_id = :b AND player_side = :ps AND turn_number = :t
+                """), {"b": battle_id, "ps": side, "t": turno})).scalars().all()
+                candidatas = [
+                    _normalizar(l) for l in lineas
+                    if l.startswith(f"|move|{side}a:") or l.startswith(f"|switch|{side}a:")
+                ]
+                revisados += 1
+                visto = any(accion in linea for linea in candidatas)
+                assert visto, (
+                    f"la accion '{accion}' de la fila turno={turno} no aparece "
+                    f"en el protocolo de ESE turno (bloque {turno}), lado {side}"
+                )
+
+            assert revisados > 0, (
+                "ninguna fila tenia accion para verificar: el test no verifico nada"
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_los_switches_grabados_cierran_contra_el_protocolo(jugadas):
+    """C2: la cantidad de decisiones de switch grabadas tiene que cerrar
+    contra los `|switch|` propios del protocolo, descontando la entrada
+    inicial del team preview (que es un `|switch|` en el protocolo pero no
+    una decision de la politica).
+
+    Antes del arreglo, `save_step` upsertea por `(trajectory_id, turn_number)`
+    y un cambio forzado tras un debilitamiento no avanza el turno: la segunda
+    decision pisa a la primera y el cambio forzado desaparece en silencio.
+    """
+    engine = make_engine(load_settings().database_url)
+    try:
+        async with session_factory(engine)() as s:
+            for tag in jugadas:
+                battle_id, side = (await s.execute(text("""
+                    SELECT t.battle_id, t.player_side FROM trajectories t
+                    JOIN battles b ON b.id = t.battle_id WHERE b.battle_tag = :tag
+                """), {"tag": tag})).one()
+
+                switches_protocolo = (await s.execute(text("""
+                    SELECT count(*) FROM battle_turns bt, LATERAL unnest(bt.protocol_lines) l
+                    WHERE bt.battle_id = :b AND bt.player_side = :ps
+                      AND l LIKE '|switch|' || :ps || 'a:%'
+                """), {"b": battle_id, "ps": side})).scalar_one()
+
+                switches_grabados = (await s.execute(text("""
+                    SELECT count(*) FROM trajectory_steps ts
+                    JOIN trajectories t ON t.id = ts.trajectory_id
+                    WHERE t.battle_id = :b AND t.player_side = :ps
+                      AND ts.action_taken ->> 'kind' = 'switch'
+                """), {"b": battle_id, "ps": side})).scalar_one()
+
+                assert switches_grabados == switches_protocolo - 1, (
+                    f"{tag}: {switches_protocolo} switches en el protocolo, "
+                    f"{switches_grabados} grabados como decision (se espera "
+                    f"{switches_protocolo - 1}, descontando la entrada inicial "
+                    "del team preview)"
+                )
+    finally:
+        await engine.dispose()
+
+
 async def test_cada_paso_de_estado_tiene_su_protocolo(jugadas):
     """La propiedad que hace REVERSIBLE al serializador.
 
