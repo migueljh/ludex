@@ -235,3 +235,49 @@ que hay en la tabla" queda visible comparando corridas de `seed_runs` en vez
 de quedar escondida detrás de un contador que solo mide escrituras. Decidir
 si el pipeline debe borrar filas obsoletas (y cómo: soft delete, `DELETE`
 directo, etc.) es una decisión de diseño más grande, para otra rebanada.
+
+## D14 — Problema conocido: herencia en formas con línea evolutiva propia
+
+`inheritanceChain` (en `packages/seed/src/extract/learnsets.ts`) camina la cadena
+de preevoluciones de la **especie base**, no la de la **forma**. Cuando una forma
+tiene su propia línea evolutiva, hereda de la línea equivocada.
+
+**Impacto en gen 6, la generación del torneo actual: ninguno.** Afecta a tres
+formas —`gourgeistsmall`, `gourgeistlarge`, `gourgeistsuper`— cuyas
+preevoluciones propias son los `pumpkaboo` del mismo tamaño. Verificado: los 4
+movimientos que aporta `pumpkaboosuper` son todos de evento (`6S0`) y
+`pumpkaboo` ya los tiene, así que las cuatro formas de Gourgeist terminan con el
+movepool correcto de 66 entradas.
+
+**Impacto en gen 9: real.** Afecta a las líneas regionales. `ninetalesalola`
+produce la cadena `[ninetalesalola, ninetales, vulpix]` en vez de
+`[ninetalesalola, vulpixalola]`: pierde `moonblast`, que `vulpixalola` aporta
+como movimiento huevo, y hereda movimientos de `vulpix`, que es otra especie con
+otro tipo (Fuego contra Hielo/Hada).
+
+### Por qué no se arregló acá
+
+Se intentó el arreglo mecánico —caminar `own.prevo || own.baseSpecies`— y
+**regresionó gen 6**: al ser un o-exclusivo, `gourgeistsmall` y `gourgeistlarge`
+quedaron con cero movimientos y `gourgeistsuper` con cuatro, porque ni la forma
+ni su preevolución propia tienen learnset propio y ya no se caía a la base. Se
+revirtió y se restauró la base.
+
+El problema es que dos clases de forma necesitan reglas opuestas y el paquete no
+las distingue con ninguna bandera: `changesFrom` es `undefined` para todas y
+`cosmeticFormes` no cubre los tamaños de Gourgeist.
+
+- **Formas de tamaño** (Gourgeist, Pumpkaboo): comparten movepool con su base y
+  necesitan **ambas** ramas de la cadena.
+- **Formas regionales** (Alola, Hisui, Galar): son especies funcionalmente
+  distintas y heredar de la base es un falso positivo de legalidad.
+
+### Camino sugerido cuando toque
+
+Recorrer la **unión** de las dos cadenas, deduplicada, y dejar que la regla de
+legalidad filtre por `sourceSpecies` al consultar. Es lo que ya manda D3: el
+seed guarda todo lo que el paquete sabe y quien consulta decide qué acepta. Es
+estrictamente aditivo, así que no puede perder datos como el intento fallido.
+Requiere su propia rebanada: cambia los conteos, necesita tests de las dos
+clases de forma, y la regla de filtrado por `sourceSpecies` hay que definirla
+junto con `round_availability` en la fase de torneo.
