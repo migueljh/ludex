@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,8 +24,13 @@ def _split(raw: str) -> list[str]:
 def _player() -> LudexPlayer:
     from poke_env import AccountConfiguration
 
+    # Sufijo aleatorio, igual que hace `cli.py` con los jugadores reales. Con
+    # un nombre fijo, dos corridas seguidas de la suite chocan contra el
+    # servidor local con `|nametaken|` y los tests de integracion erran en
+    # bloque — un rojo que no tiene NADA que ver con lo que se esta probando.
+    sufijo = random.randint(1000, 9999)
     return LudexPlayer(
-        account_configuration=AccountConfiguration("Foo", None),
+        account_configuration=AccountConfiguration(f"Foo{sufijo}", None),
         battle_format="gen6randombattle",
         log_level=50,
         server_configuration=local_server_configuration(

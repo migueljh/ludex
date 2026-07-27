@@ -122,6 +122,14 @@ def _find_action_line(
     clave = _normalize(action_taken.get("id") or action_taken.get("species") or "")
     if not clave:
         return None
+    # Hidden Power: poke-env nombra la accion con el tipo (`hiddenpowerice`)
+    # pero Showdown NUNCA lo narra — la linea dice solo "Hidden Power". Sin
+    # este recorte la busqueda no matchea jamas y la fila se queda etiquetada
+    # un turno antes. Recorte especifico a Hidden Power, no una regla generica
+    # de prefijos: hay 17 Hidden Power que comparten el id base y una regla
+    # amplia colapsaria movimientos que no tienen nada que ver.
+    if clave.startswith("hiddenpower"):
+        clave = "hiddenpower"
     prefix_move = f"|move|{side}a:"
     prefix_switch = f"|switch|{side}a:"
     prefix_cant = f"|cant|{side}a:"
