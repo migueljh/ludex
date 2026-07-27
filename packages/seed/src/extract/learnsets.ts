@@ -35,28 +35,28 @@ export function parseLearnCode(code: string, sourceSpecies: string): LearnMethod
 }
 
 /**
- * Muchas formas (Rotom-Wash, Meowth-Galar) tienen learnset propio ademas del
- * de su especie base: hay que leer ambos, no reemplazar uno por el otro. Las
- * megas y formas como Deoxys-Attack no tienen entrada propia en absoluto -
- * directLearnset() para su id devuelve {} y la cadena termina aportando lo
- * mismo que antes, solo lo de baseSpecies. Su prevo es "".
+ * La herencia de formas es ADITIVA: recorre la rama propia de la forma y la
+ * rama de baseSpecies, deduplicadas. Elegir `own.prevo || own.baseSpecies`
+ * pierde una de las dos: las formas regionales necesitan su prevo regional,
+ * mientras Gourgeist necesita conservar tambien Gourgeist -> Pumpkaboo.
  */
 function inheritanceChain(dex: ModdedDex, speciesId: string): string[] {
   const chain: string[] = [];
   const seen = new Set<string>();
   const own = dex.species.get(speciesId);
-  let current = own;
-  if (own.name !== own.baseSpecies) {
-    chain.push(own.id);
-    seen.add(own.id);
-    current = dex.species.get(own.baseSpecies);
-  }
-  while (current?.exists && !seen.has(current.id)) {
-    seen.add(current.id);
-    chain.push(current.id);
-    if (!current.prevo) break;
-    current = dex.species.get(current.prevo);
-  }
+
+  const appendBranch = (startId: string): void => {
+    let current = dex.species.get(startId);
+    while (current?.exists && !seen.has(current.id)) {
+      seen.add(current.id);
+      chain.push(current.id);
+      if (!current.prevo) break;
+      current = dex.species.get(current.prevo);
+    }
+  };
+
+  appendBranch(own.id);
+  if (own.name !== own.baseSpecies) appendBranch(dex.species.get(own.baseSpecies).id);
   return chain;
 }
 

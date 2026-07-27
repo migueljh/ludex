@@ -23,14 +23,11 @@ describe("learnset audit", () => {
     const arceusBugGen6 = output.match(/6:arceusbug[\s\S]*?(?=\n(?:6|9):)/)?.[0] ?? "";
     expect(arceusBugGen6).not.toContain("db_extra: blastburn");
 
-    // Casos medidos contra pokemon-showdown@0.11.10 y la base real.
-    expect(output).toContain("9:ninetalesalola");
+    // D14 cerró los 15 db_missing de formas regionales, incluido Moonblast.
     const rows = JSON.parse(readFileSync(jsonPath, "utf8")) as Array<{
       gen: number; species: string; move: string; direction: string;
     }>;
-    expect(rows).toContainEqual(expect.objectContaining({
-      gen: 9, species: "ninetalesalola", move: "moonblast", direction: "db_missing",
-    }));
+    expect(rows.filter((row) => row.direction === "db_missing")).toEqual([]);
     expect(rows).toContainEqual(expect.objectContaining({
       gen: 9, species: "ninetalesalola", move: "ember", direction: "db_extra",
     }));

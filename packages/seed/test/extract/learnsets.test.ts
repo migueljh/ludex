@@ -120,3 +120,131 @@ describe("extractLearnsets gen 6", () => {
     expect(rows).toHaveLength(62198);
   });
 });
+
+const D14_MISSING_GEN9 = [
+  ["arcaninehisui", "headsmash"],
+  ["dugtrioalola", "thrash"],
+  ["electrodehisui", "leechseed"],
+  ["electrodehisui", "worryseed"],
+  ["golemalola", "screech"],
+  ["golemalola", "zapcannon"],
+  ["graveleralola", "screech"],
+  ["graveleralola", "zapcannon"],
+  ["mukalola", "assurance"],
+  ["mukalola", "clearsmog"],
+  ["ninetalesalola", "moonblast"],
+  ["persianalola", "flatter"],
+  ["persianalola", "partingshot"],
+  ["sandslashalola", "mirrorcoat"],
+  ["zoroarkhisui", "comeuppance"],
+] as const;
+
+const D14_ADDITIONAL_EVENT_MOVES_GEN9 = [
+  ["lycanrocdusk", "happyhour"],
+  ["ninetalesalola", "celebrate"],
+  ["polteageistantique", "celebrate"],
+] as const;
+
+/** La cadena anterior a D14: forma propia + rama exclusiva de baseSpecies. */
+function legacyInheritanceChain(dex: ReturnType<typeof loadGen>, speciesId: string): string[] {
+  const chain: string[] = [];
+  const seen = new Set<string>();
+  const own = dex.species.get(speciesId);
+  let current = own;
+  if (own.name !== own.baseSpecies) {
+    chain.push(own.id);
+    seen.add(own.id);
+    current = dex.species.get(own.baseSpecies);
+  }
+  while (current?.exists && !seen.has(current.id)) {
+    seen.add(current.id);
+    chain.push(current.id);
+    if (!current.prevo) break;
+    current = dex.species.get(current.prevo);
+  }
+  return chain;
+}
+
+async function legacyMoveIds(
+  dex: ReturnType<typeof loadGen>,
+  speciesId: string,
+): Promise<Set<string>> {
+  const legalMoves = new Set(
+    dex.moves.all().filter((move) => isAvailable(dex, move)).map((move) => move.id),
+  );
+  const result = new Set<string>();
+  for (const ancestorId of legacyInheritanceChain(dex, speciesId)) {
+    const learnset = (await dex.species.getLearnsetData(ancestorId))?.learnset ?? {};
+    for (const [moveId, codes] of Object.entries(learnset)) {
+      if (
+        legalMoves.has(moveId)
+        && (codes as string[]).some((code) => Number(code[0]) <= dex.gen)
+      ) {
+        result.add(moveId);
+      }
+    }
+  }
+  return result;
+}
+
+describe("D14: herencia aditiva de formas", () => {
+  const extracted = new Map<number, LearnsetRow[]>();
+
+  beforeAll(async () => {
+    extracted.set(6, await extractLearnsets(loadGen(6)));
+    extracted.set(9, await extractLearnsets(loadGen(9)));
+  }, 180_000);
+
+  it("suma los 15 movimientos faltantes de las líneas regionales", () => {
+    const keys = new Set(
+      extracted.get(9)!.map((row) => `${row.speciesId}/${row.moveId}`),
+    );
+    for (const [speciesId, moveId] of D14_MISSING_GEN9) {
+      expect(keys, `${speciesId}/${moveId}`).toContain(`${speciesId}/${moveId}`);
+    }
+  });
+
+  it("incluye también los tres movimientos de evento de las ramas propias", () => {
+    const keys = new Set(
+      extracted.get(9)!.map((row) => `${row.speciesId}/${row.moveId}`),
+    );
+    for (const [speciesId, moveId] of D14_ADDITIONAL_EVENT_MOVES_GEN9) {
+      expect(keys, `${speciesId}/${moveId}`).toContain(`${speciesId}/${moveId}`);
+    }
+  });
+
+  it("no resta ningún movimiento de la cadena legacy, especie por especie", async () => {
+    for (const gen of [6, 9] as const) {
+      const dex = loadGen(gen);
+      const currentBySpecies = new Map<string, Set<string>>();
+      for (const row of extracted.get(gen)!) {
+        const moves = currentBySpecies.get(row.speciesId) ?? new Set<string>();
+        moves.add(row.moveId);
+        currentBySpecies.set(row.speciesId, moves);
+      }
+      for (const species of dex.species.all().filter((entry) => isAvailable(dex, entry))) {
+        const legacy = await legacyMoveIds(dex, species.id);
+        const current = currentBySpecies.get(species.id) ?? new Set<string>();
+        const lost = [...legacy].filter((moveId) => !current.has(moveId));
+        expect(lost, `gen ${gen} ${species.id} perdió movimientos`).toEqual([]);
+      }
+    }
+  }, 180_000);
+
+  it("conserva las cuatro formas Gourgeist de gen 6 con 66 movimientos", () => {
+    const rows = extracted.get(6)!;
+    for (const speciesId of [
+      "gourgeist", "gourgeistsmall", "gourgeistlarge", "gourgeistsuper",
+    ]) {
+      expect(
+        rows.filter((row) => row.speciesId === speciesId),
+        speciesId,
+      ).toHaveLength(66);
+    }
+  });
+
+  it("los totales por generación nunca bajan del baseline", () => {
+    expect(extracted.get(6)).toHaveLength(62_198);
+    expect(extracted.get(9)).toHaveLength(65_642);
+  });
+});

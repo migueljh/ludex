@@ -250,71 +250,59 @@ de quedar escondida detrás de un contador que solo mide escrituras. Decidir
 si el pipeline debe borrar filas obsoletas (y cómo: soft delete, `DELETE`
 directo, etc.) es una decisión de diseño más grande, para otra rebanada.
 
-## D14 — Problema conocido: herencia en formas con línea evolutiva propia
+## D14 — Resuelto: herencia aditiva en formas con línea evolutiva propia
 
-`inheritanceChain` (en `packages/seed/src/extract/learnsets.ts`) camina la cadena
-de preevoluciones de la **especie base**, no la de la **forma**. Cuando una forma
-tiene su propia línea evolutiva, hereda de la línea equivocada.
+`inheritanceChain` (en `packages/seed/src/extract/learnsets.ts`) recorre la
+**unión ordenada y deduplicada** de dos ramas:
 
-**Impacto en gen 6, la generación del torneo actual: ninguno.** Afecta a tres
-formas —`gourgeistsmall`, `gourgeistlarge`, `gourgeistsuper`— cuyas
-preevoluciones propias son los `pumpkaboo` del mismo tamaño. Verificado: los 4
-movimientos que aporta `pumpkaboosuper` son todos de evento (`6S0`) y
-`pumpkaboo` ya los tiene, así que las cuatro formas de Gourgeist terminan con el
-movepool correcto de 66 entradas.
+1. la forma y su cadena de preevoluciones propias;
+2. la especie base y su cadena de preevoluciones.
 
-**Impacto en gen 9: real.** Afecta a las líneas regionales. `ninetalesalola`
-produce la cadena `[ninetalesalola, ninetales, vulpix]` en vez de
-`[ninetalesalola, vulpixalola]`: pierde `moonblast`, que `vulpixalola` aporta
-como movimiento huevo, y hereda movimientos de `vulpix`, que es otra especie con
-otro tipo (Fuego contra Hielo/Hada).
+La forma conserva así su learnset propio y todo lo heredado. `sourceSpecies`
+permanece en cada entrada de `learn_methods`, por lo que el seed sigue guardando
+todo lo que conoce el paquete (D3) sin aplanar cómo se obtuvo cada movimiento.
 
-### Por qué no se arregló acá
+La alternativa excluyente `own.prevo || own.baseSpecies` está expresamente
+descartada. Ya se intentó en fase 1 y regresionó gen 6: `gourgeistsmall` y
+`gourgeistlarge` quedaron con cero movimientos y `gourgeistsuper` con cuatro,
+porque tomar la preevolución propia impedía caer también a la rama base. Ambas
+ramas son necesarias; elegir una no es una simplificación equivalente.
 
-Se intentó el arreglo mecánico —caminar `own.prevo || own.baseSpecies`— y
-**regresionó gen 6**: al ser un o-exclusivo, `gourgeistsmall` y `gourgeistlarge`
-quedaron con cero movimientos y `gourgeistsuper` con cuatro, porque ni la forma
-ni su preevolución propia tienen learnset propio y ya no se caía a la base. Se
-revirtió y se restauró la base.
+La implementación se verificó especie por especie contra la resolución previa:
+el conjunto anterior debe ser subconjunto del nuevo, tanto en gen 6 como en gen
+9. Además, las cuatro formas de Gourgeist conservan exactamente 66 movimientos.
 
-El problema es que dos clases de forma necesitan reglas opuestas y el paquete no
-las distingue con ninguna bandera: `changesFrom` es `undefined` para todas y
-`cosmeticFormes` no cubre los tamaños de Gourgeist.
+Resultado con `pokemon-showdown@0.11.10`:
 
-- **Formas de tamaño** (Gourgeist, Pumpkaboo): comparten movepool con su base y
-  necesitan **ambas** ramas de la cadena.
-- **Formas regionales** (Alola, Hisui, Galar): son especies funcionalmente
-  distintas y heredar de la base es un falso positivo de legalidad.
+- Gen 6: 62.198 learnsets antes y después (delta 0).
+- Gen 9: 65.624 antes, 65.642 después (delta +18).
+- Los 15 faltantes detectados por el auditor quedaron presentes, incluido
+  `ninetalesalola/moonblast`.
+- La unión reveló además tres movimientos de evento en ramas propias:
+  `ninetalesalola/celebrate`, `lycanrocdusk/happyhour` y
+  `polteageistantique/celebrate`. El auditor estricto rechaza los dos primeros
+  porque el evento no se transfiere de gen 7 a gen 9; el tercero es un límite
+  más fuerte, porque el oráculo dice que Polteageist-Antique no aprende
+  Celebrate de ninguna forma. Son movimientos de regalo sin relevancia
+  competitiva y quedan documentados como límite conocido de esta resolución
+  aditiva.
 
-### Camino sugerido cuando toque
+Se probó excluir, al heredar, métodos cuyo tipo fuera `event` y cuya generación
+fuera anterior a la objetivo. La regla resultó demasiado amplia: gen 6 bajó de
+62.198 a 61.918 filas y perdió movimientos legacy especie por especie (entre
+ellos cinco de Charizard-Mega-X). Se revirtió. No debe reintroducirse sin una
+regla de compatibilidad de eventos más completa que preserve la monotonía.
 
-Recorrer la **unión** de las dos cadenas, deduplicada, y dejar que la regla de
-legalidad filtre por `sourceSpecies` al consultar. Es lo que ya manda D3: el
-seed guarda todo lo que el paquete sabe y quien consulta decide qué acepta. Es
-estrictamente aditivo, así que no puede perder datos como el intento fallido.
-Requiere su propia rebanada: cambia los conteos, necesita tests de las dos
-clases de forma, y la regla de filtrado por `sourceSpecies` hay que definirla
-junto con `round_availability` en la fase de torneo.
+El re-seed se ejecutó dos veces sobre la base poblada y mantuvo los mismos
+conteos. El arreglo no depende de tablas vacías y respeta el pipeline
+upsert-only de D13.
 
-**Por qué esa solución es viable: `pokemon.evolves_from` guarda la
-preevolución de la FORMA, no la de su especie base.** El seed lo resuelve con
-`dex.species.get(s.prevo).id` (`packages/seed/src/extract/species.ts`), y
-`prevo` de `ninetalesalola` es `vulpixalola`, no `vulpix`. Verificado contra
-la base (gen 9):
-
-```
-     showdown_id   | base_species | evolves_from
--------------------+--------------+--------------
- ninetalesalola    | ninetales    | vulpixalola
- vulpixalola       | vulpix       | (null)
-```
-
-Eso significa que quien consulte puede caminar la línea evolutiva **real** de
-la forma con un recursive CTE sobre `evolves_from` y descartar los métodos
-cuyo `sourceSpecies` no pertenezca a esa línea, sin necesitar ningún dato
-adicional. Es la razón por la que la solución aditiva no genera falsos
-positivos permanentes: heredar de más en el seed es inofensivo mientras el
-filtro de consulta pueda reconstruir la línea correcta, y puede.
+Quien necesite legalidad estricta puede caminar la línea evolutiva **real** de
+la forma con un recursive CTE sobre `evolves_from` y evaluar los métodos y su
+generación de origen. `sourceSpecies` permite reconstruir la procedencia, pero
+los tres eventos demuestran que pertenecer a la línea correcta no alcanza por
+sí solo: también hay reglas de transferencia y compatibilidad de eventos que
+el consumidor deberá aplicar.
 
 ## D15 — `moves.accuracy IS NULL` significa "nunca falla", no "desconocida"
 
