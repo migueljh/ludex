@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import ARRAY, ForeignKey, Numeric, String, Text
+from sqlalchemy import ARRAY, ForeignKey, Numeric, Text, func
 from sqlalchemy.dialects.postgresql import ENUM as PGEnum
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -40,7 +40,7 @@ class Battle(Base):
     played_by: Mapped[str] = mapped_column(PlayedByKind)
     source: Mapped[str] = mapped_column(BattleSource)
     replay_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class BattleTurn(Base):
@@ -48,7 +48,9 @@ class BattleTurn(Base):
     battle_id: Mapped[int] = mapped_column(ForeignKey("battles.id"), primary_key=True)
     player_side: Mapped[str] = mapped_column(Text, primary_key=True)
     turn_number: Mapped[int] = mapped_column(primary_key=True)
-    protocol_lines: Mapped[list[str]] = mapped_column(ARRAY(String))
+    # DDL: `text[]`. `ARRAY(String)` mapea a `varchar[]`, un tipo distinto en
+    # Postgres (minor de la review final): `ARRAY(Text)` espeja el DDL exacto.
+    protocol_lines: Mapped[list[str]] = mapped_column(ARRAY(Text))
     agent_reasoning: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
@@ -61,15 +63,24 @@ class Trajectory(Base):
     player_side: Mapped[str] = mapped_column(Text)
     final_result: Mapped[str | None] = mapped_column(BattleResult, nullable=True)
     elo_bucket: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class TrajectoryStep(Base):
+    """D21 (C2): la PK es `(trajectory_id, decision_index)`, no `turn_number`.
+
+    Un cambio forzado tras un debilitamiento no avanza `battle.turn`, asi que
+    `turn_number` NO puede ser parte de la clave: dos decisiones distintas
+    pueden compartir turno. `decision_index` cuenta decisiones (una vez por
+    llamada a `choose_move`), no turnos.
+    """
+
     __tablename__ = "trajectory_steps"
     trajectory_id: Mapped[int] = mapped_column(
         ForeignKey("trajectories.id"), primary_key=True
     )
-    turn_number: Mapped[int] = mapped_column(primary_key=True)
+    decision_index: Mapped[int] = mapped_column(primary_key=True)
+    turn_number: Mapped[int] = mapped_column()
     state: Mapped[dict] = mapped_column(JSONB)
     state_schema_version: Mapped[int] = mapped_column()
     legal_actions: Mapped[list] = mapped_column(JSONB)
