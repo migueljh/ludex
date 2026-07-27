@@ -1,0 +1,7 @@
+# Contexto de build del servicio calc (packages/calc/Dockerfile): el repo
+# entero es el contexto, pero nada de esto debe copiarse a la imagen.
+**/node_modules
+.git
+.worktrees
+.superpowers
+**/*.tmp.mts

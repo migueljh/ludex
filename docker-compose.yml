@@ -40,5 +40,23 @@ services:
       # toda la red local.
       - "127.0.0.1:${SHOWDOWN_LOCAL_PORT}:8000"
 
+  calc:
+    build:
+      context: .
+      dockerfile: packages/calc/Dockerfile
+    environment:
+      # Adentro del contenedor necesita 0.0.0.0; la exposicion al host queda
+      # restringida abajo. Funcion pura sin autenticacion: misma regla que
+      # Postgres (D11), nunca publicado en toda la red.
+      HOST: 0.0.0.0
+      PORT: 8200
+    ports:
+      - "127.0.0.1:${CALC_PORT:-8200}:8200"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8200/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
 volumes:
   pgdata:
