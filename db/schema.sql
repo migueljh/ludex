@@ -53,7 +53,8 @@ CREATE TYPE public.battle_source AS ENUM (
     'challenge',
     'ladder',
     'local',
-    'import'
+    'import',
+    'test'
 );
 
 
@@ -417,7 +418,8 @@ CREATE TABLE public.trajectory_steps (
     legal_actions jsonb NOT NULL,
     action_taken jsonb,
     action_source public.action_source NOT NULL,
-    reward numeric
+    reward numeric,
+    decision_index integer NOT NULL
 );
 
 
@@ -679,7 +681,7 @@ ALTER TABLE ONLY public.trajectories
 --
 
 ALTER TABLE ONLY public.trajectory_steps
-    ADD CONSTRAINT trajectory_steps_pkey PRIMARY KEY (trajectory_id, turn_number);
+    ADD CONSTRAINT trajectory_steps_pkey PRIMARY KEY (trajectory_id, decision_index);
 
 
 --
@@ -874,4 +876,6 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20260725000002'),
     ('20260725000003'),
     ('20260726000001'),
-    ('20260727000005');
+    ('20260727000005'),
+    ('20260727000006'),
+    ('20260727000007');
