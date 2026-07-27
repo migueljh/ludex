@@ -102,3 +102,14 @@ def test_incluye_las_acciones_legales():
 def test_es_serializable_a_json():
     import json
     json.dumps(serialize_battle(_battle()))
+
+
+def test_campo_de_efectos_de_campo_se_llama_field_effects():
+    # battle.fields no son solo terrenos: incluye Trick Room, Gravity y Wonder
+    # Room. La clave se llama field_effects para no mentirle a quien consuma
+    # el dataset en la fase de entrenamiento. Se compara el set completo de
+    # claves para que un rename de vuelta al nombre viejo no pase inadvertido.
+    s = serialize_battle(_battle())
+    assert set(s["field"].keys()) == {
+        "weather", "field_effects", "my_side", "opponent_side",
+    }
