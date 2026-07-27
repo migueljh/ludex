@@ -8,7 +8,9 @@ services:
     ports:
       # 15432 en el host: 5432 lo ocupa otro proyecto del usuario. Adentro del
       # contenedor sigue siendo 5432, asi que el servicio migrate no cambia.
-      - "15432:5432"
+      # Bindeado solo a loopback: Postgres usa credenciales de desarrollo
+      # (ludex/ludex) y no debe quedar alcanzable desde el resto de la red.
+      - "127.0.0.1:15432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -34,7 +36,9 @@ services:
     profiles: ["local"]
     build: ./docker/showdown
     ports:
-      - "${SHOWDOWN_LOCAL_PORT}:8000"
+      # El server corre con --no-security: bindeado solo a loopback, nunca a
+      # toda la red local.
+      - "127.0.0.1:${SHOWDOWN_LOCAL_PORT}:8000"
 
 volumes:
   pgdata:

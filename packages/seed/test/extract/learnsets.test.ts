@@ -66,12 +66,30 @@ describe("extractLearnsets gen 6", () => {
     expect(dd.methods.every((m) => m.sourceSpecies !== "charizard")).toBe(true);
   });
 
-  it("da a las formas el learnset de su especie base", () => {
+  it("da a las megaevoluciones (sin learnset propio) el de su especie base", () => {
+    // Las megas no tienen entrada propia en getLearnsetData, asi que su cadena
+    // de herencia no aporta nada ademas de lo de baseSpecies: el conteo debe
+    // coincidir exactamente.
     const megaMoves = rows.filter((r) => r.speciesId === "charizardmegax");
     const baseMoves = rows.filter((r) => r.speciesId === "charizard");
     expect(megaMoves.length).toBe(baseMoves.length);
     expect(megaMoves.length).toBeGreaterThan(100);
     expect(of("charizardmegax", "dragondance")).toBeDefined();
+  });
+
+  it("las formas con learnset propio conservan sus movimientos ademas de heredar", () => {
+    // Rotom-Wash SI tiene entrada propia en getLearnsetData (a diferencia de
+    // las megas) y Hidrobomba es su STAB de firma. inheritanceChain debe
+    // anteponer el id propio a la cadena, no reemplazarlo por baseSpecies:
+    // si vuelve a reemplazar, esta fila desaparece sin que ningun otro test
+    // lo note.
+    const hydroPump = of("rotomwash", "hydropump");
+    expect(hydroPump).toBeDefined();
+    expect(hydroPump!.methods.every((m) => m.sourceSpecies === "rotomwash")).toBe(true);
+
+    const rotomWashMoves = rows.filter((r) => r.speciesId === "rotomwash");
+    const rotomMoves = rows.filter((r) => r.speciesId === "rotom");
+    expect(rotomWashMoves.length).toBeGreaterThan(rotomMoves.length);
   });
 
   it("no genera filas para especies fuera de la generacion", () => {
@@ -94,11 +112,11 @@ describe("extractLearnsets gen 6", () => {
   it("resuelve mas filas de las que hay directas: el canario de la herencia", () => {
     // 49321 son los pares (especie, movimiento) con gen <= 6 que existen
     // DIRECTAMENTE en getLearnsetData, sin resolver herencia. La herencia solo
-    // puede sumar filas, nunca restar, asi que 62157 > 49321 es la senal de que
+    // puede sumar filas, nunca restar, asi que 62198 > 49321 es la senal de que
     // la cadena corrio. Si esto baja a ~49321, se rompio la resolucion por
     // baseSpecies (las 48 megas de gen 6 quedandose sin movimientos) o la de
     // prevo. Sin esta asercion la regresion pasa con los tests en verde.
     expect(rows.length).toBeGreaterThan(49321);
-    expect(rows).toHaveLength(62157);
+    expect(rows).toHaveLength(62198);
   });
 });

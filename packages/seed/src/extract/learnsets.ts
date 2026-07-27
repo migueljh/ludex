@@ -35,14 +35,22 @@ export function parseLearnCode(code: string, sourceSpecies: string): LearnMethod
 }
 
 /**
- * Las formas (megas, Deoxys-Attack) no tienen learnset propio y su prevo es "".
- * Hay que resolver primero a baseSpecies y despues caminar la cadena prevo.
+ * Muchas formas (Rotom-Wash, Meowth-Galar) tienen learnset propio ademas del
+ * de su especie base: hay que leer ambos, no reemplazar uno por el otro. Las
+ * megas y formas como Deoxys-Attack no tienen entrada propia en absoluto -
+ * directLearnset() para su id devuelve {} y la cadena termina aportando lo
+ * mismo que antes, solo lo de baseSpecies. Su prevo es "".
  */
 function inheritanceChain(dex: ModdedDex, speciesId: string): string[] {
   const chain: string[] = [];
   const seen = new Set<string>();
-  let current = dex.species.get(speciesId);
-  if (current.name !== current.baseSpecies) current = dex.species.get(current.baseSpecies);
+  const own = dex.species.get(speciesId);
+  let current = own;
+  if (own.name !== own.baseSpecies) {
+    chain.push(own.id);
+    seen.add(own.id);
+    current = dex.species.get(own.baseSpecies);
+  }
   while (current?.exists && !seen.has(current.id)) {
     seen.add(current.id);
     chain.push(current.id);

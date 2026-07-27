@@ -121,10 +121,10 @@ Con `pokemon-showdown@0.11.10`, contando pares `(especie, código)` con
 `gen <= 6` directamente desde `getLearnsetData` sin resolver herencia, hay
 **49321** pares. Después de que `extractLearnsets` (ver D3, `packages/seed/src/extract/learnsets.ts`)
 resuelve la herencia por `baseSpecies` y por cadena `prevo`, el número de filas
-`(pokemon, move)` resueltas para gen 6 es **62157**.
+`(pokemon, move)` resueltas para gen 6 es **62198**.
 
 Motivo: la herencia solo puede sumar filas (una especie nunca pierde un
-movimiento que ya tenía directo), así que 62157 > 49321 es la primera señal de
+movimiento que ya tenía directo), así que 62198 > 49321 es la primera señal de
 que la cadena de herencia corrió. Si un reseed futuro devuelve un número igual
 o menor a 49321 para gen 6, algo rompió la resolución de `baseSpecies` o de
 `prevo` (por ejemplo, las 48 megaevoluciones de gen 6 quedando sin aportar
@@ -134,11 +134,29 @@ inspeccionar fila por fila.
 **Este canario está enforced**, no solo documentado: el test "resuelve mas
 filas de las que hay directas" en `packages/seed/test/extract/learnsets.test.ts`
 afirma `rows.length` tanto `toBeGreaterThan(49321)` (la relación conceptual,
-sobrevive a cambios de versión del paquete) como `toHaveLength(62157)` (el
+sobrevive a cambios de versión del paquete) como `toHaveLength(62198)` (el
 valor exacto pineado, detecta cualquier deriva). Se verificó rompiendo a
 propósito la resolución de `baseSpecies` en `inheritanceChain`: el conteo cae
 a 52482 filas y el test falla, mientras que sin esta aserción exacta el chequeo
 `toBeGreaterThan(49321)` solo hubiera pasado en falso (52482 > 49321 igual).
+
+**Corrección post-review (mismo valor de este canario, actualizado):** el
+valor **62157** que este documento fijaba antes no era el correcto, sino el de
+un segundo bug en la misma función, distinto del que este canario prueba.
+`inheritanceChain` *reemplazaba* la forma por su `baseSpecies` en vez de
+*anteponerla* (`current = dex.species.get(current.baseSpecies)` en vez de
+empujar primero el id propio), así que toda forma con learnset propio —no solo
+las megas, que en efecto no tienen uno— perdía sus movimientos directos.
+Afectaba a Rotom-Wash/Heat/etc, Kyurem-Black/White, Meowstic hembra,
+Wormadam-Sandy/Trash, Pikachu-Cosplay (19 especies en gen 6) y también, en el
+sentido inverso, a formas como Meowth-Galar, que aparecía con sus 84 filas
+todas atribuidas a `sourceSpecies: "meowth"`. El fix antepone el id propio a la
+cadena (`[idPropio, baseSpecies, ...prevos]`) en vez de saltar directo a
+`baseSpecies`; el `seen` Set ya existente evita duplicar la forma base consigo
+misma, y las megaevoluciones (sin entrada propia en `getLearnsetData`) quedan
+con el mismo conteo que su especie base, sin cambios. Ver
+`packages/seed/test/extract/learnsets.test.ts`, test "las formas con learnset
+propio conservan sus movimientos ademas de heredar".
 
 ## D11 — Puerto del host movido a 15432
 
@@ -173,7 +191,7 @@ aceptación §9), para poder comparar tras un bump de versión del paquete:
 | items       |   283 |   248 |
 | abilities   |   191 |   310 |
 | type_chart  |   324 |   361 |
-| learnsets   | 62157 | 64921 |
+| learnsets   | 62198 | 65624 |
 
 Motivo: son los mismos conteos que `seedGeneration` imprime y que
 `seed_runs` (D4) persiste por corrida. Tenerlos también acá, fijos al lado de
@@ -181,6 +199,39 @@ la versión pineada del paquete, da un punto de comparación estático sin tener
 que ir a buscar una corrida vieja en la base cuando se evalúe un bump de
 `pokemon-showdown`.
 
+Fila `learnsets` corregida tras el fix de D10 (antes decía 62157/64921, los
+valores con el bug de `inheritanceChain` todavía presente).
+
 El server local de Showdown (D5, `docker/showdown/Dockerfile`) pinea
 `SHOWDOWN_REF=v0.11.10`, la misma versión exacta que `pokemon-showdown` en
 `packages/seed/package.json` (D4).
+
+## D13 — `seed_runs.row_counts` guarda conteos reales de tabla, no filas escritas
+
+`finishRun` (`packages/seed/src/load/runs.ts`) ahora corre `count(*)` por
+tabla, filtrado por `gen_id` (y por `pokemon.gen_id` vía join para
+`learnsets`, que no tiene `gen_id` propio), y guarda eso en
+`seed_runs.row_counts`. Antes guardaba lo que devolvía `upsertBatch`: la
+cantidad de filas *enviadas* en la corrida, no las que quedaron en la tabla.
+
+Motivo: el pipeline es enteramente upsert — no hay un solo `DELETE` ni
+`TRUNCATE` en `packages/seed/src/`. Si un bump futuro de `pokemon-showdown`
+deja de traer una especie o un movimiento que antes existía, la fila vieja
+sobrevive para siempre (nadie la borra) y un contador de filas *escritas*
+reportaría el número nuevo (más chico) sin que quede registro de que la tabla
+en realidad todavía tiene la fila zombie de más. Eso rompe la promesa de D4:
+"`seed_runs` responde por qué en treinta segundos" — con filas zombie
+respondía mal, porque el número que guardaba no era el estado real de la
+tabla.
+
+**Alcance de este arreglo, explícitamente acotado:** esto NO agrega borrado de
+filas obsoletas. Sigue sin haber ningún `DELETE`/`TRUNCATE` en el pipeline, así
+que una especie o movimiento retirado en un bump de versión seguiría vivo en
+la tabla indefinidamente, y una fase posterior que lea legalidad de
+`learnsets` lo seguiría viendo como legal. Lo único que cambia es que
+`row_counts` ahora refleja el estado real de la tabla para esa generación, así
+que si eso pasa, la discrepancia entre "lo que bajó `pokemon-showdown`" y "lo
+que hay en la tabla" queda visible comparando corridas de `seed_runs` en vez
+de quedar escondida detrás de un contador que solo mide escrituras. Decidir
+si el pipeline debe borrar filas obsoletas (y cómo: soft delete, `DELETE`
+directo, etc.) es una decisión de diseño más grande, para otra rebanada.

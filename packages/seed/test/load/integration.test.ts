@@ -5,7 +5,7 @@ import { seedGeneration } from "../../src/cli.js";
 
 const GEN6_COUNTS = {
   pokemon: 834, moves: 618, items: 283, abilities: 191, typeChart: 324,
-  learnsets: 62157,
+  learnsets: 62198,
 };
 
 describe("seedGeneration", () => {
@@ -90,9 +90,15 @@ describe("seedGeneration", () => {
 
   it("convive con otra generacion sin colisionar", async () => {
     await seedGeneration(9);
+    // Filtrado a (6, 9): un GROUP BY sin filtro depende de que la base tenga
+    // EXACTAMENTE esas dos generaciones. La primera vez que alguien corra
+    // `pnpm seed --gen 7` contra esta misma base, ese toEqual queda roto de
+    // forma permanente aunque nada este mal. Este test verifica lo suyo, no
+    // el estado global de la base.
     const { rows } = await pool.query(`
       SELECT g.gen_number, count(*)::int AS c
       FROM pokemon p JOIN generations g ON g.id = p.gen_id
+      WHERE g.gen_number IN (6, 9)
       GROUP BY g.gen_number ORDER BY g.gen_number`);
     expect(rows).toEqual([
       { gen_number: 6, c: 834 },

@@ -39,16 +39,16 @@ export async function seedGeneration(genNumber: number): Promise<Record<string, 
     const genId = await upsertGeneration(pool, genNumber, label);
     const runId = await startRun(pool, genId, version);
 
-    const counts: Record<string, number> = {
-      pokemon: await loadSpecies(pool, genId, species),
-      moves: await loadMoves(pool, genId, moves),
-      items: await loadItems(pool, genId, items),
-      abilities: await loadAbilities(pool, genId, abilities),
-      typeChart: await loadTypeChart(pool, genId, typeChart),
-      learnsets: await loadLearnsets(pool, genId, learnsets),
-    };
+    await loadSpecies(pool, genId, species);
+    await loadMoves(pool, genId, moves);
+    await loadItems(pool, genId, items);
+    await loadAbilities(pool, genId, abilities);
+    await loadTypeChart(pool, genId, typeChart);
+    await loadLearnsets(pool, genId, learnsets);
 
-    await finishRun(pool, runId, counts);
+    // Conteos reales de la tabla, no filas escritas: ver el comentario de
+    // finishRun en load/runs.ts y D13 en docs/DECISIONS.md.
+    const counts = await finishRun(pool, runId, genId);
     for (const [table, n] of Object.entries(counts)) {
       console.log(`  ${table.padEnd(12)} ${n}`);
     }
