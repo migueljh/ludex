@@ -32,7 +32,12 @@ def _normalizar(texto: str) -> str:
 
 @pytest.fixture(scope="module")
 async def jugadas():
-    return await play(2, "gen6randombattle")
+    # I6 (review final): esta fixture juega batallas REALES contra el server
+    # local y las persiste en el MISMO Postgres que el dataset de
+    # entrenamiento. `source="test"` las marca sinteticas (D19,
+    # migracion 20260727000007) para que sean excluibles con
+    # `source <> 'test'` en vez de mezclarse en silencio.
+    return await play(2, "gen6randombattle", source="test")
 
 
 async def test_persiste_batallas_turnos_y_pasos(jugadas):
@@ -76,7 +81,14 @@ async def test_no_hay_fuga_de_informacion_del_rival(jugadas):
     protocolo no lo revelo hasta ese turno. El protocolo persistido es el juez.
     Si un modelo se entrena con informacion que un jugador no tiene, es inutil
     en batalla real.
+
+    Invariante de TODO el dataset (review final, I1): antes filtraba por
+    `battle_tag = ANY(:tags)`, es decir solo esta corrida. Corrido sin ese
+    filtro habria encontrado I1 el dia que paso (un lote de protocolo perdido
+    en silencio en una batalla vieja). `jugadas` sigue siendo un parametro
+    para forzar que la fixture juegue algo antes de verificar.
     """
+    assert jugadas, "la fixture no jugo nada"
     engine = make_engine(load_settings().database_url)
     try:
         async with session_factory(engine)() as s:
@@ -84,10 +96,8 @@ async def test_no_hay_fuga_de_informacion_del_rival(jugadas):
                 SELECT ts.turn_number, ts.state, t.player_side, t.battle_id
                 FROM trajectory_steps ts
                 JOIN trajectories t ON t.id = ts.trajectory_id
-                JOIN battles b ON b.id = t.battle_id
-                WHERE b.battle_tag = ANY(:tags)
                 ORDER BY t.battle_id, ts.turn_number
-            """), {"tags": list(jugadas)})).all()
+            """))).all()
             assert filas, "no hay pasos que verificar"
 
             revisados = 0
@@ -122,15 +132,14 @@ async def test_no_hay_fuga_de_informacion_del_rival(jugadas):
 
 
 async def test_la_version_de_esquema_esta_en_todas_las_filas(jugadas):
+    """Invariante de TODO el dataset (review final): sin filtro de tags."""
+    assert jugadas, "la fixture no jugo nada"
     engine = make_engine(load_settings().database_url)
     try:
         async with session_factory(engine)() as s:
-            distintas = (await s.execute(text("""
-                SELECT DISTINCT ts.state_schema_version FROM trajectory_steps ts
-                JOIN trajectories t ON t.id = ts.trajectory_id
-                JOIN battles b ON b.id = t.battle_id
-                WHERE b.battle_tag = ANY(:tags)
-            """), {"tags": list(jugadas)})).scalars().all()
+            distintas = (await s.execute(text(
+                "SELECT DISTINCT state_schema_version FROM trajectory_steps"
+            ))).scalars().all()
             assert distintas == [STATE_SCHEMA_VERSION]
     finally:
         await engine.dispose()
@@ -168,7 +177,7 @@ async def test_repersistir_la_misma_batalla_no_duplica(jugadas):
 
         de_nuevo = await repo.save_battle(
             battle_tag=tag, fmt=fila[1], p1=fila[2], p2=fila[3],
-            winner=fila[4], source="local", played_by="bot",
+            winner=fila[4], source="test", played_by="bot",
         )
 
         async with factory() as s:
@@ -287,21 +296,25 @@ async def test_cada_paso_de_estado_tiene_su_protocolo(jugadas):
     CADA paso de estado tiene su protocolo, del mismo jugador y del mismo turno.
     Contar filas de cada lado por separado no alcanza: hay que verificar la
     correspondencia turno a turno.
+
+    Invariante de TODO el dataset (review final, I1): antes filtraba por
+    `battle_tag = ANY(:tags)` y solo habria detectado I1 si el lote perdido
+    hubiera sido de esta misma corrida. Corrido sin el filtro es la unica
+    manera de que este test hubiera atrapado I1 el dia que paso.
     """
+    assert jugadas, "la fixture no jugo nada"
     engine = make_engine(load_settings().database_url)
     try:
         async with session_factory(engine)() as s:
             huerfanos = (await s.execute(text("""
                 SELECT count(*) FROM trajectory_steps ts
                 JOIN trajectories t ON t.id = ts.trajectory_id
-                JOIN battles b ON b.id = t.battle_id
-                WHERE b.battle_tag = ANY(:tags)
-                  AND NOT EXISTS (
+                WHERE NOT EXISTS (
                       SELECT 1 FROM battle_turns bt
                       WHERE bt.battle_id = t.battle_id
                         AND bt.player_side = t.player_side
                         AND bt.turn_number = ts.turn_number)
-            """), {"tags": list(jugadas)})).scalar_one()
+            """))).scalar_one()
         assert huerfanos == 0, (
             f"{huerfanos} pasos de estado sin su protocolo crudo: el historico "
             "de esas batallas no se podria re-derivar"
