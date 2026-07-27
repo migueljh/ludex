@@ -6,3 +6,6 @@ dist/
 .claude/settings.json
 .claude/settings.local.json
 .worktrees/
+
+# Dumps de la base: binarios pesados y con data, nunca al repo
+*.dump
