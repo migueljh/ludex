@@ -776,8 +776,15 @@ Esperado: FAIL, `Cannot find module '../../src/extract/dex.js'`.
 `packages/seed/src/extract/dex.ts`:
 ```ts
 import { createRequire } from "node:module";
-import { Dex } from "pokemon-showdown";
+// `import { Dex }` falla bajo el loader ESM nativo de Node: esbuild compila
+// pokemon-showdown de forma que sus exports quedan como getters no
+// configurables, que cjs-module-lexer no detecta (reporta cero exports
+// nombrados). Vitest no lo muestra porque usa su propio interop. El import por
+// defecto mas desestructuracion funciona con cualquier modulo CJS y evita tener
+// que parchear el paquete.
+import showdown from "pokemon-showdown";
 
+const { Dex } = showdown;
 const require = createRequire(import.meta.url);
 
 export type ModdedDex = ReturnType<typeof Dex.mod>;
@@ -1712,7 +1719,12 @@ Esperado: FAIL, no existe `src/load/client.js`.
 
 `packages/seed/src/load/client.ts`:
 ```ts
-import { Pool } from "pg";
+// Mismo problema de interop que en extract/dex.ts: pg asigna sus propiedades
+// dinamicamente en el constructor, asi que `import { Pool }` no resuelve bajo
+// el loader ESM nativo. El import de TIPO si puede ser nombrado, porque se
+// borra en compilacion y nunca llega al runtime.
+import pg from "pg";
+import type { Pool } from "pg";
 
 /** Postgres admite 65535 parametros por sentencia; se deja margen. */
 const MAX_PARAMS = 30_000;
@@ -1722,7 +1734,7 @@ export function createPool(): Pool {
   if (!connectionString) {
     throw new Error("Falta DATABASE_URL. Copiar .env.example a .env.");
   }
-  return new Pool({ connectionString });
+  return new pg.Pool({ connectionString });
 }
 
 export async function withPool<T>(fn: (pool: Pool) => Promise<T>): Promise<T> {
@@ -2063,7 +2075,7 @@ Esperado: FAIL, no existe `src/cli.js`.
 
 `packages/seed/src/cli.ts`:
 ```ts
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { GENERATION_LABELS, loadGen, packageVersion } from "./extract/dex.js";
@@ -2078,6 +2090,12 @@ import {
   loadTypeChart, upsertGeneration,
 } from "./load/tables.js";
 import { finishRun, startRun } from "./load/runs.js";
+
+// El CLI corre en el host y necesita DATABASE_URL. Sin esto, `pnpm seed --gen 6`
+// falla desde cualquier shell que no la tenga exportada a mano, que es el modo
+// de falla que ya se corrigio para los tests en vitest.config.ts.
+const envPath = fileURLToPath(new URL("../../../.env", import.meta.url));
+if (existsSync(envPath)) process.loadEnvFile(envPath);
 
 export async function seedGeneration(genNumber: number): Promise<Record<string, number>> {
   const dex = loadGen(genNumber);
