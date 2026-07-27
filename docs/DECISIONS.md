@@ -336,3 +336,40 @@ como "precisión desconocida" (por ejemplo, un extractor de features que lo
 impute como dato faltante) estaría tomando la decisión exactamente opuesta a
 la correcta — son los movimientos MÁS confiables del juego. Quien arme
 features debe traducir `NULL` a "nunca falla", no a "faltante".
+
+## D16 — Cálculo de daño: servicio Node con `@smogon/calc`
+
+`@smogon/calc` es la calculadora oficial de Smogon, mantenida y parametrizada
+por generación. No hay equivalente en Python.
+
+Motivo: el cálculo contempla los 16 rolls de daño, STAB, efectividad, clima,
+pantallas, habilidades que modifican daño, objetos, críticos, quemadura y
+multi-golpes, con diferencias por generación. Una reimplementación en Python
+no falla ruidosamente: devuelve números sutilmente equivocados, y el agente
+decide "esto no lo mata" cuando sí lo mataba.
+
+Costo aceptado: un contenedor más y una llamada HTTP local por turno,
+despreciable frente a la latencia de un LLM. Ventaja: la web de la fase 4 le
+pega al mismo servicio.
+
+`packages/seed` seguirá siendo Node, pero es una herramienta de build: no hay
+Node vivo durante una batalla salvo el servicio de calc.
+
+**Implementación (2026-07-26):** `packages/calc`, servicio HTTP sin estado
+(POST `/calc`, GET `/health`), pineado a **`@smogon/calc@0.11.0`** con versión
+exacta en `package.json` (misma regla que D4: el paquete contiene los números
+de la fórmula vía `@pkmn/data`, así que su versión afecta el comportamiento
+observable). La imagen se construye con `pnpm install --frozen-lockfile`
+sobre el lockfile del monorepo, que es lo que congela también las
+dependencias transitivas. `GET /health` expone `calc_version` para auditar
+bumps. Se bindea a `127.0.0.1` en compose (regla de D11).
+
+Dos comportamientos del paquete que el contrato tiene que conocer, medidos en
+la inspección (ver `.superpowers/sdd/kimi-calc.md`):
+
+- El paquete **no valida nada**: un movimiento inexistente calcula daño 0 sin
+  error, y `item`/`ability`/`nature` inválidos se ignoran en silencio. La
+  validación de existencia (por generación, via `toID`) es del servicio.
+- Strings exactos o silencio: `weather: 'Harsh Sun'` no lanza error pero se
+  ignora (el tipo del paquete es `'Harsh Sunshine'`). El contrato solo admite
+  los strings exactos del paquete.
