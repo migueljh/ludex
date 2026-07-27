@@ -26,13 +26,25 @@ describe("extractSpecies", () => {
     const base = byId(gen6, "charizard");
     expect(base.forme).toBeNull();
     expect(base.isDefault).toBe(true);
-    expect(base.baseSpecies).toBe("Charizard");
+    expect(base.baseSpecies).toBe("charizard");
+    expect(base.baseSpeciesName).toBe("Charizard");
 
     const mega = byId(gen6, "charizardmegax");
     expect(mega.forme).toBe("Mega-X");
     expect(mega.isDefault).toBe(false);
-    expect(mega.baseSpecies).toBe("Charizard");
+    // D2: baseSpecies es el id normalizado (joinea con showdownId); el nombre
+    // legible queda en baseSpeciesName.
+    expect(mega.baseSpecies).toBe("charizard");
+    expect(mega.baseSpeciesName).toBe("Charizard");
     expect(mega.dexNum).toBe(base.dexNum);
+  });
+
+  it("baseSpecies es siempre el showdownId de otra fila de la misma gen", () => {
+    for (const rows of [gen6, gen9]) {
+      const ids = new Set(rows.map((s) => s.showdownId));
+      const huerfanos = rows.filter((s) => !ids.has(s.baseSpecies));
+      expect(huerfanos).toEqual([]);
+    }
   });
 
   it("mapea los campos escalares", () => {

@@ -48,6 +48,33 @@ describe("extractMoves", () => {
     expect(th.power).toBe(0);
   });
 
+  it("clasifica power_kind en los cinco casos", () => {
+    // fixed_damage se deriva de `damage` ('level'), NO de basePowerCallback:
+    // seismictoss no tiene callback y un derivador basado en callback lo
+    // clasificaria mal.
+    expect(byId("seismictoss").powerKind).toBe("fixed_damage");
+    expect(byId("dragonrage").powerKind).toBe("fixed_damage");
+    expect(byId("gyroball").powerKind).toBe("variable");
+    expect(byId("toxic").powerKind).toBe("status");
+    expect(byId("flamethrower").powerKind).toBe("standard");
+    expect(byId("superfang").powerKind).toBe("special");
+  });
+
+  it("fija la distribucion medida de power_kind (pokemon-showdown@0.11.10)", () => {
+    // Valores medidos sobre los 618/685 movimientos unicos; no estimados.
+    const dist = (rows: typeof gen6) => {
+      const d: Record<string, number> = {};
+      for (const m of rows) d[m.powerKind] = (d[m.powerKind] ?? 0) + 1;
+      return d;
+    };
+    expect(dist(gen6)).toEqual({
+      status: 225, standard: 335, variable: 38, special: 16, fixed_damage: 4,
+    });
+    expect(dist(gen9)).toEqual({
+      standard: 416, status: 214, variable: 39, special: 14, fixed_damage: 2,
+    });
+  });
+
   it("no repite showdownId", () => {
     expect(new Set(gen6.map((m) => m.showdownId)).size).toBe(gen6.length);
   });

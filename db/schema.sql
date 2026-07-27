@@ -153,8 +153,17 @@ CREATE TABLE public.moves (
     priority integer NOT NULL,
     target text NOT NULL,
     flags jsonb NOT NULL,
-    description text
+    description text,
+    power_kind text,
+    CONSTRAINT moves_power_kind_check CHECK ((power_kind = ANY (ARRAY['status'::text, 'variable'::text, 'fixed_damage'::text, 'special'::text, 'standard'::text])))
 );
+
+
+--
+-- Name: COLUMN moves.power_kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.moves.power_kind IS 'Derivado por el seed, en este orden: status si category=Status; variable si tiene basePowerCallback; fixed_damage si tiene damage numerico o ''level''; special si basePower=0 y ninguna anterior; standard si basePower>0. NULL solo entre esta migracion y el proximo seed de la generacion.';
 
 
 --
@@ -195,7 +204,8 @@ CREATE TABLE public.pokemon (
     abilities jsonb NOT NULL,
     weight_kg numeric,
     evolves_from text,
-    tier text
+    tier text,
+    base_species_name text NOT NULL
 );
 
 
@@ -605,4 +615,5 @@ ALTER TABLE ONLY public.usage_stats
 INSERT INTO public.schema_migrations (version) VALUES
     ('20260725000001'),
     ('20260725000002'),
-    ('20260725000003');
+    ('20260725000003'),
+    ('20260726000001');

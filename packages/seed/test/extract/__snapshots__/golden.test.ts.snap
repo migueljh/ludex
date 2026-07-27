@@ -6,7 +6,8 @@ exports[`golden files gen 6 > especie base con evolucion 1`] = `
     "0": "Blaze",
     "H": "Solar Power",
   },
-  "baseSpecies": "Charizard",
+  "baseSpecies": "charizard",
+  "baseSpeciesName": "Charizard",
   "baseStats": {
     "atk": 84,
     "def": 78,
@@ -130,7 +131,8 @@ exports[`golden files gen 6 > forma alternativa que comparte dex_num 1`] = `
   "abilities": {
     "0": "Tough Claws",
   },
-  "baseSpecies": "Charizard",
+  "baseSpecies": "charizard",
+  "baseSpeciesName": "Charizard",
   "baseStats": {
     "atk": 130,
     "def": 111,
@@ -341,6 +343,7 @@ exports[`golden files gen 6 > movimiento con flags y precision 1`] = `
   },
   "name": "Flamethrower",
   "power": 90,
+  "powerKind": "standard",
   "pp": 15,
   "priority": 0,
   "showdownId": "flamethrower",

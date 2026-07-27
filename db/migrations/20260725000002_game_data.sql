@@ -33,6 +33,9 @@ CREATE TABLE moves (
   type        text NOT NULL,
   category    text NOT NULL,
   power       int  NOT NULL,
+  -- accuracy NULL = "nunca falla" (Showdown usa accuracy === true, ej. Swift).
+  -- Es el unico valor especial de la columna y NO significa "desconocida"
+  -- (ver D15 en docs/DECISIONS.md).
   accuracy    int,
   pp          int  NOT NULL,
   priority    int  NOT NULL,

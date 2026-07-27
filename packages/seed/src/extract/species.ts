@@ -13,7 +13,9 @@ export function extractSpecies(dex: ModdedDex): SpeciesRow[] {
       showdownId: s.id,
       dexNum: s.num,
       name: s.name,
-      baseSpecies: s.baseSpecies,
+      // Misma normalizacion que evolvesFrom: el id, no el nombre legible (D2).
+      baseSpecies: dex.species.get(s.baseSpecies).id,
+      baseSpeciesName: s.baseSpecies,
       forme: orNull(s.forme),
       isDefault: s.name === s.baseSpecies,
       types: [...s.types],
