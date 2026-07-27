@@ -53,11 +53,8 @@ class ProtocolRecorder:
     def line_count(self) -> int:
         """Cuantas lineas de protocolo se grabaron hasta ahora, para este tag.
 
-        Barato de leer en un loop de espera (a diferencia de `all_lines`, que
-        copia la lista entera). Lo usa `LudexPlayer._materialize_step` (C1)
-        para detectar que llego una lote nueva sin depender del numero de
-        turno: un cambio forzado tras un debilitamiento trae narracion nueva
-        sin mover `_current_turn`.
+        Barato de leer (a diferencia de `all_lines`, que copia la lista
+        entera).
         """
         return len(self._entries)
 

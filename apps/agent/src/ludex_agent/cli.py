@@ -127,9 +127,10 @@ async def _persist_one(
     traj = await repo.save_trajectory(
         battle_id, gen_number=battle.gen, fmt=fmt, player_side=side
     )
-    # C1: la materializacion del estado de cada paso corre en tareas de fondo
-    # (ver LudexPlayer._materialize_step); hay que esperarlas ANTES de leer
-    # agent.steps[tag], si no se puede encontrar un placeholder sin serializar.
+    # C1 (ver LudexPlayer._finalize_pending_steps, D22): la materializacion
+    # del estado ahora es sincronica, dentro del manejo de mensajes; esto
+    # solo corrige la etiqueta de turno contra el protocolo antes de leer
+    # agent.steps[tag].
     await agent.wait_for_pending_steps(tag)
     # D21 (C2): decision_index es el indice de la lista, que ya numera una
     # vez por decision (una vez por llamada a choose_move), no por turno.

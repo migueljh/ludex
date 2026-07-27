@@ -6,29 +6,20 @@ que juegue bien, es que grabe bien.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
-import time
 from collections import defaultdict
 from typing import Any
 
 from poke_env import ServerConfiguration
 from poke_env.player import RandomPlayer
 
-from ..state.actions import action_from_order
+from ..state.actions import action_from_order, legal_actions
 from ..state.serializer import serialize_battle
 from .protocol import ProtocolRecorder
 
 
 logger = logging.getLogger(__name__)
-
-# C1 (review final, causa raiz re-medida: ver docs/DECISIONS.md D20). La
-# brecha real medida con la materializacion diferida (sonda_defer.py, 3
-# batallas completas, 160 decisiones) fue de 0 a ~11ms. Este techo es
-# generoso a proposito para que casi nunca se llegue a usar; si se llega, se
-# serializa con lo que haya (el desfase de siempre), nunca peor que hoy.
-TURN_ALIGNMENT_TIMEOUT_SECONDS = 0.2
 
 
 def battle_tag_from(split_messages: list[list[str]]) -> str | None:
@@ -161,44 +152,72 @@ class LudexPlayer(RandomPlayer):
     Un ProtocolRecorder por battle_tag, nunca compartido entre jugadores: el
     |request| de cada uno trae su propio equipo.
 
-    ## C1 — por que la serializacion se DIFIERE, y por que NO se espera antes
-    de responder (ver docs/DECISIONS.md D20 para la version completa)
+    ## C-1 (review de merge) — por que la materializacion vuelve a ser
+    SINCRONICA, y por que ESO no resucita la carrera que esta reescritura
+    reemplaza (ver docs/DECISIONS.md D22 para la version completa)
 
-    La primera version de este arreglo esperaba, DENTRO de
-    `_handle_battle_message` y ANTES de delegar en `super()` (que es quien
-    dispara `choose_move`), a que la narracion del turno alcanzara al
-    `|request|`. Instrumentado en vivo (`sonda_causalidad.py`, en el
-    scratchpad de la sesion de arreglos), esto NUNCA se resuelve solo: la
-    narracion de un turno es la RESPUESTA del servidor a que ambos jugadores
-    ya eligieron para ESE turno. Retrasar nuestra propia respuesta 500ms
-    retrasa la narracion exactamente 500ms (no es "ya estaba en el cable",
-    es consecuencia causal de responder). Esperar antes de responder es
-    esperar algo que no puede llegar sin que primero respondamos: con
-    max_concurrent_battles=1 y las dos puntas (agente y rival) en el mismo
-    proceso, esto agota el timeout en el 100% de las decisiones de una
-    batalla real (medido con `sonda_deteccion_c1_v2.py`), sin arreglar nada.
+    El diseño anterior (D20, commit `3ea7caf`) diferia la serializacion
+    entera —`legal_actions` INCLUIDO— a una task de fondo (`asyncio.create_
+    task`) que esperaba, con un timeout de 0.2s, a que llegara narracion
+    nueva antes de llamar a `serialize_battle(battle)`. El problema no era el
+    timeout: es que `battle` es un objeto MUTABLE compartido, y para cuando
+    esa task por fin corre, el planificador de asyncio puede haber
+    despachado YA la SIGUIENTE decision (`choose_move` de la N+1) antes de
+    que la task de la decision N llegara a ejecutarse. La foto que se toma
+    en ese momento es la del punto de decision N+1, no la de N: la fila queda
+    con `action_taken` de N y `legal_actions`/`state` de N+1. Medido contra
+    la base real: 7 de 6625 filas (~0.11%) con `action_taken` fuera de su
+    propia `legal_actions` — un piso, no un techo, porque es una carrera
+    contra el planificador, no un desfase sistematico: en una maquina
+    cargada, con GC pausando el loop, o con mas batallas concurrentes, puede
+    empeorar sin que nada lo acote.
 
-    La version que SI funciona: `choose_move` sigue devolviendo la orden de
-    inmediato (sin tocar la latencia de juego), pero la SERIALIZACION del
-    paso se difiere a una task de fondo que espera, acotado, a que lleguen
-    mas lineas de protocolo antes de fotografiar el estado. Como esa espera
-    ya NO bloquea nuestra respuesta, el servidor puede seguir, y la
-    narracion llega sola (medido: 0-11ms sobre 160 decisiones reales, cero
-    timeouts). El orden de los pasos se preserva reservando el indice de la
-    lista ANTES de lanzar la task (ver `choose_move`), no dejando que cada
-    task decida su propia posicion.
+    La correccion: **nada que tenga que ser consistente con la decision se
+    lee de `battle` despues de que la decision paso**. `choose_move` captura
+    TODO lo que define la decision (`legal_actions`, `action_taken`,
+    `decision_turn`) en el mismo instante sincronico de siempre — eso nunca
+    fue el problema, `battle.available_moves`/`available_switches` ya
+    reflejan el estado correcto en ese momento porque vienen del `|request|`,
+    que `parse_request` ya proceso antes de que poke-env llame a
+    `choose_move` (ver `player.py:289-294` en poke-env).
+
+    Lo que SI hacia falta esperar es el lado del rival (D20 original: mi
+    equipo llega fresco por el `|request|`, pero Showdown narra "lo que paso
+    en el turno" —incluida la revelacion del rival— DESPUES del `|request|`,
+    en el MISMO lote). La clave (ver `_handle_battle_message`): ese lote
+    COMPLETO ya esta grabado en `self.recorders[tag]` ANTES de que
+    `super()._handle_battle_message()` procese una sola linea (el recorder
+    graba de una sola vez, no incrementalmente), y para cuando esa llamada a
+    `super()` REGRESA, poke-env ya proceso el lote entero —incluida la
+    narracion que estaba pendiente cuando `choose_move` corrio a mitad de
+    camino— y actualizo `battle.opponent_team` en consecuencia. Por eso
+    `_finalize_pending_steps` corre ENTRE que `super()._handle_battle_message`
+    regresa y que nuestro propio `_handle_battle_message` regresa: sigue
+    siendo parte de la MISMA llamada sincronica que proceso el lote, nunca una
+    task planificada aparte, asi que NINGUNA decision futura puede
+    "adelantarsele": la unica forma de que se procese el lote de la decision
+    N+1 es que esta llamada retorne primero, y para entonces la decision N ya
+    quedo finalizada.
+
+    `legal_actions` y `turn` de cada paso SIEMPRE se sobreescriben con el
+    valor capturado en `choose_move` (nunca con lo que `serialize_battle`
+    recalcularia en el momento de finalizar): eso es lo que hace que
+    `action_taken in legal_actions` valga por CONSTRUCCION, no por
+    casualidad de timing.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.recorders: dict[str, ProtocolRecorder] = defaultdict(ProtocolRecorder)
         self.steps: dict[str, list[dict | None]] = defaultdict(list)
-        self._pending_step_tasks: dict[str, list[asyncio.Task]] = defaultdict(list)
-        # I5/C1: cuantas veces salto el timeout de la espera de alineacion.
-        # La verificacion de esta rama exige reportar este numero; si un
-        # cambio futuro del servidor rompe el supuesto de orden medido, esto
-        # deja de ser silencioso.
-        self.turn_alignment_timeouts = 0
+        # Indices de self.steps[tag] cuyo "state" todavia es None: se llenan
+        # sincronicamente en _finalize_pending_steps, nunca en una task de
+        # fondo (ver docstring de la clase).
+        self._pending_finalize: dict[str, list[int]] = defaultdict(list)
+        # player_role no cambia en el curso de una batalla: capturarlo UNA
+        # vez en choose_move deja a _correct_step_turns sin necesidad de
+        # tocar `self.battles`/`battle` para nada.
+        self._sides: dict[str, str] = {}
 
     async def _handle_battle_message(self, split_messages: list[list[str]]) -> Any:
         tag = battle_tag_from(split_messages)
@@ -214,6 +233,12 @@ class LudexPlayer(RandomPlayer):
                 f"lote de protocolo sin battle_tag, {len(split_messages)} lineas "
                 "descartadas: se perderia la fuente de verdad de esa batalla"
             )
+        # Grabado ENTERO, de una sola vez, ANTES de delegar en super(): para
+        # cuando super() dispare choose_move a mitad de este mismo lote, el
+        # recorder ya tiene TODAS las lineas del lote (incluida la narracion
+        # que todavia no proceso poke-env). Esto es lo que permite que
+        # _correct_step_turns (que solo lee el recorder, nunca `battle`)
+        # jamas quede corriendo por detras de lo que ya se grabo.
         self.recorders[tag].record(split_messages)
 
         # Hallazgo nuevo (descubierto al implementar D21/C2, no estaba en el
@@ -241,126 +266,121 @@ class LudexPlayer(RandomPlayer):
                 self._discard_last_step(tag)
                 break
 
-        return await super()._handle_battle_message(split_messages)
+        result = await super()._handle_battle_message(split_messages)
+        # SIGUE siendo la misma llamada sincronica: ninguna otra invocacion de
+        # _handle_battle_message para este tag puede haber corrido entre
+        # medio. Si `choose_move` reservo un paso en algun punto de este
+        # mismo lote (typicamente cero o uno; en cadenas de cambio forzado,
+        # mas de uno), se finaliza AHORA, con `battle` ya al dia con TODA la
+        # narracion de este lote.
+        self._finalize_pending_steps(tag)
+        return result
 
     def _discard_last_step(self, tag: str) -> None:
         """Descarta el ultimo paso grabado: su eleccion fue rechazada por el
-        servidor y nunca se ejecuto. Cancela tambien su task de fondo, si
-        todavia esta pendiente."""
+        servidor y nunca se ejecuto.
+
+        Siempre llega ya finalizado (con `state` real, no `None`): el lote
+        que trae el rechazo es, por construccion, POSTERIOR al lote donde se
+        tomo esa decision, y ese lote anterior ya paso por
+        `_finalize_pending_steps` antes de que este pudiera empezar a
+        procesarse (ver `_handle_battle_message`)."""
         if self.steps[tag]:
             self.steps[tag].pop()
-        if self._pending_step_tasks[tag]:
-            task = self._pending_step_tasks[tag].pop()
-            if not task.done():
-                task.cancel()
 
     def choose_move(self, battle: Any) -> Any:
         order = super().choose_move(battle)
         tag = battle.battle_tag
-        recorder = self.recorders[tag]
+        self._sides.setdefault(tag, battle.player_role)
         action_taken = action_from_order(order)
-        # Capturado AHORA, sincronicamente: SIEMPRE <= el turno real en el
-        # que esta accion termina ejecutandose (ver `_find_action_line`).
-        decision_turn = battle.turn
-
-        # Reservar el indice ANTES de lanzar la task de fondo: dos decisiones
-        # seguidas (p.ej. un cambio forzado tras un debilitamiento, C2) no
-        # pueden competir por la misma posicion, y el orden de la lista tiene
-        # que reflejar el orden real de las decisiones, no el de quien
-        # termine de esperar primero.
+        # Todo esto se lee AHORA, sincronicamente, y nunca se vuelve a leer
+        # de `battle`: `available_moves`/`available_switches` ya reflejan el
+        # `|request|` que acaba de procesar `parse_request` (poke-env llama a
+        # choose_move DESPUES de eso), asi que estan tan al dia como pueden
+        # estarlo. `action_taken in legal_actions` queda garantizado por
+        # construccion porque las dos vienen de esta MISMA linea de codigo.
+        step = {
+            "turn": battle.turn,
+            "decision_turn": battle.turn,
+            "action_taken": action_taken,
+            "legal_actions": legal_actions(battle),
+            "state": None,  # se completa en _finalize_pending_steps
+        }
         index = len(self.steps[tag])
-        self.steps[tag].append(None)
-        baseline = recorder.line_count
-        task = asyncio.create_task(
-            self._materialize_step(
-                battle, recorder, tag, index, baseline, decision_turn, action_taken
-            )
-        )
-        self._pending_step_tasks[tag].append(task)
+        self.steps[tag].append(step)
+        self._pending_finalize[tag].append(index)
         return order
 
-    async def _materialize_step(
-        self,
-        battle: Any,
-        recorder: ProtocolRecorder,
-        tag: str,
-        index: int,
-        baseline: int,
-        decision_turn: int,
-        action_taken: dict | None,
-    ) -> None:
-        """Espera, acotado, a que llegue narracion nueva y RECIEN AHI serializa.
+    def _finalize_pending_steps(self, tag: str) -> None:
+        """Completa `state` (mi lado + el del rival + el resto del estado)
+        para cada paso reservado durante ESTE MISMO lote de protocolo.
 
-        No se compara contra el numero de turno (ni el de `battle.turn` ni el
-        de `recorder`): un cambio forzado tras un debilitamiento (C2) trae
-        narracion nueva SIN mover el numero de turno, asi que atar la espera
-        a un cambio de turno haria que esos casos agoten el timeout siempre.
-        El detector generico —lineas nuevas para este battle_tag, sean las
-        que sean— cubre ambos casos por igual.
+        Sincronico, nunca una task: se llama desde `_handle_battle_message`,
+        justo despues de que `super()._handle_battle_message()` termino de
+        procesar el lote completo (incluida la narracion que quedaba
+        pendiente cuando `choose_move` corrio a mitad de camino). No hay
+        forma de que otra decision se cuele entre medio: la unica manera de
+        que se procese el lote de la decision SIGUIENTE es que esta misma
+        llamada retorne primero.
+
+        `turn` y `legal_actions` se sobreescriben con lo capturado en
+        `choose_move` (nunca con lo que `serialize_battle` calcularia ahora):
+        eso es lo que preserva el invariante `action_taken in legal_actions`
+        aunque haya mas de un paso pendiente en el mismo lote (p.ej. un
+        cambio forzado tras un debilitamiento).
         """
-        start = time.monotonic()
-        while recorder.line_count == baseline and not battle.finished:
-            if time.monotonic() - start > TURN_ALIGNMENT_TIMEOUT_SECONDS:
-                self.turn_alignment_timeouts += 1
-                logger.warning(
-                    "timeout esperando narracion pendiente en %s (decision "
-                    "%d): %d lineas grabadas y ninguna nueva en %.0fms; se "
-                    "serializa con el desfase de siempre",
-                    tag, index, baseline, TURN_ALIGNMENT_TIMEOUT_SECONDS * 1000,
-                )
-                break
-            await asyncio.sleep(0.001)
-
-        state = serialize_battle(battle)
-        # La etiqueta de turno arranca en `decision_turn` (capturado
-        # sincronicamente en choose_move), NO en `state["turn"]`
-        # (=battle.turn en este instante): para cuando esta task corre,
-        # battle.turn ya puede haber avanzado de mas (el mismo desfase que
-        # motiva toda esta correccion), y usarlo como default dejaria una
-        # etiqueta peor que `decision_turn` en el caso EXCUSADO (mas abajo)
-        # donde no hay nada que corregir. `_correct_step_turns` la mueve
-        # HACIA ADELANTE hasta donde la decision se RESOLVIO: donde se
-        # ejecuto, o —si nunca se ejecuto— donde el protocolo muestra por que
-        # (`|cant|` por sueño o paralisis, `|faint|` propio antes de actuar).
-        # Solo si no hay ninguna de las dos evidencias se queda en
-        # `decision_turn`, que es siempre el mejor valor disponible. Se
-        # sobreescribe tambien dentro de `state`, para que la columna
-        # `turn_number` y `state->>'turn'` nunca diverjan dentro de la
-        # MISMA fila (ver la correccion simetrica en `_correct_step_turns`).
-        state["turn"] = decision_turn
-        self.steps[tag][index] = {
-            "turn": decision_turn,
-            "decision_turn": decision_turn,
-            "state": state,
-            "action_taken": action_taken,
-        }
+        pending = self._pending_finalize.get(tag)
+        if not pending:
+            return
+        battle = self.battles.get(tag)
+        if battle is None:
+            return
+        fresh_state = serialize_battle(battle)
+        for index in pending:
+            step = self.steps[tag][index]
+            if step is None:
+                continue
+            step["state"] = {
+                **fresh_state,
+                "turn": step["decision_turn"],
+                "legal_actions": step["legal_actions"],
+            }
+        self._pending_finalize[tag] = []
 
     async def wait_for_pending_steps(self, tag: str) -> None:
-        """Espera a que TODAS las materializaciones de fondo de esta batalla
-        terminen y CORRIGE la etiqueta de turno de cada paso contra el
-        protocolo. El runner tiene que llamar esto antes de leer
-        `self.steps[tag]`: si no, puede encontrar placeholders `None` sin
-        serializar, o turnos sin corregir."""
-        tasks = self._pending_step_tasks.get(tag, [])
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        """Corrige la etiqueta de turno de cada paso contra el protocolo.
+
+        Ya no hay tasks de fondo que esperar (ver docstring de la clase): la
+        materializacion del estado es sincronica, dentro del mismo manejo de
+        mensajes. Se mantiene el nombre y la firma `async` por compatibilidad
+        con `cli.py`, que llama esto antes de leer `self.steps[tag]`.
+
+        Guarda defensiva (I-3 de la review de merge): si algun paso quedara
+        sin finalizar —no deberia pasar nunca, dado como esta escrito
+        `_handle_battle_message`— loguea en vez de persistir un `None` en
+        silencio.
+        """
+        sin_finalizar = [
+            i for i, s in enumerate(self.steps.get(tag, [])) if s is not None and s["state"] is None
+        ]
+        if sin_finalizar:
+            logger.error(
+                "%d paso(s) de %s quedaron sin materializar (indices %s): "
+                "esto no deberia pasar nunca con la captura sincronica",
+                len(sin_finalizar), tag, sin_finalizar,
+            )
         self._correct_step_turns(tag)
 
     def _correct_step_turns(self, tag: str) -> None:
         """D20 (C1): corrige `turn` de cada paso contra el protocolo, EN
         ORDEN de decision y con un cursor global que solo avanza.
 
-        Por que una pasada final y no la correccion en cada task (la primera
-        version de este arreglo): las tasks de fondo terminan en el orden en
-        que le llega la narracion a CADA UNA, no necesariamente en el orden
-        en que se tomaron las decisiones. Corrigiendo aca, ya con todos los
-        pasos materializados y en la lista en su orden real (`choose_move`
-        reserva el indice sincronicamente), el cursor nunca puede
-        "adelantarsele" a una decision anterior ni reusar su linea.
+        Lee SOLO el recorder (protocolo crudo, D17), nunca `battle`: para
+        cuando esto corre la batalla puede haber terminado, y ademas no hace
+        falta nada mas que las lineas ya grabadas.
         """
         recorder = self.recorders[tag]
-        battle = self.battles.get(tag)
-        side = battle.player_role if battle is not None else None
+        side = self._sides.get(tag)
         if side is None:
             return
         cursor = 0

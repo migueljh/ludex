@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import random
 from types import SimpleNamespace
@@ -78,19 +77,22 @@ async def test_un_lote_sin_battle_tag_revienta_en_vez_de_perderse_en_silencio():
         await player._handle_battle_message(lote)
 
 
-# --- C1 (D20): materializacion diferida, no espera antes de responder ---
+# --- C-1 (review de merge, D22): materializacion SINCRONICA, sin task de
+# fondo ---
 #
-# La primera version de este arreglo esperaba, DENTRO de
-# `_handle_battle_message` y ANTES de delegar en `super()`, a que
-# `battle.turn` alcanzara a `recorder._current_turn`. Instrumentado en vivo
-# (sonda_deteccion_c1.py, en el scratchpad de la sesion), esa desigualdad NO
-# se cumple nunca: el lote que trae el |request| todavia no vio la linea
-# |turn| siguiente. Peor: esperar ahi bloquea nuestra propia respuesta, y la
-# narracion es la RESPUESTA del servidor a que ambos jugadores ya eligieron
-# (sonda_causalidad.py: retrasar la respuesta 500ms retrasa la narracion
-# exactamente 500ms). Por eso `choose_move` ya no espera nada: responde de
-# inmediato y DIFIERE la serializacion a `_materialize_step`, en una task de
-# fondo que no bloquea la respuesta.
+# El diseño anterior (D20, 3ea7caf) diferia la serializacion ENTERA a una
+# task de fondo que esperaba, con timeout, a que crecieran las lineas del
+# recorder. El problema: `battle` es mutable, y para cuando esa task por fin
+# corria, el planificador podia haber despachado YA la decision SIGUIENTE,
+# dejando la fila con `action_taken` de una decision y `legal_actions`/
+# `state` de otra (medido: 7/6625 filas). La correccion: `choose_move`
+# captura `legal_actions`/`action_taken`/`decision_turn` sincronicamente
+# (nunca se leen de nuevo de `battle`) y `_finalize_pending_steps` completa
+# el resto del `state` (mi lado + el del rival) tambien sincronicamente,
+# llamado desde `_handle_battle_message` justo despues de que
+# `super()._handle_battle_message()` termina de procesar el LOTE COMPLETO —
+# nunca en una task planificada aparte, asi que ninguna decision futura
+# puede colarse entre medio.
 
 
 def _recorder_con(lineas_por_lote: list[list[str]]) -> ProtocolRecorder:
@@ -100,149 +102,153 @@ def _recorder_con(lineas_por_lote: list[list[str]]) -> ProtocolRecorder:
     return recorder
 
 
-async def test_materialize_step_no_espera_si_ya_hay_lineas_nuevas(monkeypatch):
-    """Si para cuando se llama ya hay mas lineas que el baseline, no hace
-    falta ninguna espera: serializa de inmediato."""
-    player = _player()
-    battle = SimpleNamespace(turn=1, finished=False, battle_tag="battle-x-1")
-    recorder = _recorder_con([["|turn|1"], ["|move|p1a: X|Tackle|p2a: Y"]])
-    baseline = 1  # solo la linea de |turn|1
-    player.steps["battle-x-1"].append(None)  # el indice ya reservado por choose_move
-
-    calls = []
-    monkeypatch.setattr(
-        client_module, "serialize_battle",
-        lambda b: (calls.append(b), {"turn": 1, "legal_actions": []})[1],
-    )
-
-    await player._materialize_step(
-        battle, recorder, "battle-x-1", 0, baseline, 1,
-        {"kind": "move", "id": "tackle"},
-    )
-
-    assert player.turn_alignment_timeouts == 0
-    assert len(calls) == 1
-    assert player.steps["battle-x-1"][0]["action_taken"] == {"kind": "move", "id": "tackle"}
-
-
-async def test_materialize_step_espera_hasta_que_crezca_el_recorder(monkeypatch):
-    """El detector es generico (mas lineas, sean las que sean), no atado al
-    numero de turno: un cambio forzado tras un debilitamiento (C2) trae
-    narracion nueva sin mover el turno."""
-    player = _player()
-    battle = SimpleNamespace(turn=1, finished=False, battle_tag="battle-x-1")
-    recorder = _recorder_con([["|turn|1"]])
-    player.steps["battle-x-1"].append(None)
-
-    async def fake_sleep(seconds):
-        recorder.record([_split("|move|p1a: X|Tackle|p2a: Y")])
-
-    monkeypatch.setattr(client_module.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(
-        client_module, "serialize_battle", lambda b: {"turn": 1, "legal_actions": []}
-    )
-
-    await player._materialize_step(
-        battle, recorder, "battle-x-1", 0, recorder.line_count, 1,
-        {"kind": "move", "id": "tackle"},
-    )
-
-    assert player.turn_alignment_timeouts == 0
-    assert player.steps["battle-x-1"][0]["action_taken"] == {"kind": "move", "id": "tackle"}
-
-
-async def test_materialize_step_timeout_no_cuelga_si_no_llega_mas_narracion(monkeypatch):
-    """La batalla termino justo despues del |request| y no llega nada mas:
-    tiene que cortar por timeout, no colgarse."""
-    player = _player()
-    battle = SimpleNamespace(turn=5, finished=False, battle_tag="battle-x-1")
-    recorder = _recorder_con([["|turn|5"]])
-    player.steps["battle-x-1"].append(None)
-
-    reloj = {"t": 0.0}
-
-    def fake_monotonic():
-        return reloj["t"]
-
-    async def fake_sleep(seconds):
-        reloj["t"] += client_module.TURN_ALIGNMENT_TIMEOUT_SECONDS + 1
-
-    monkeypatch.setattr(client_module.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(client_module.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(
-        client_module, "serialize_battle", lambda b: {"turn": 5, "legal_actions": []}
-    )
-
-    await player._materialize_step(
-        battle, recorder, "battle-x-1", 0, recorder.line_count, 5, None
-    )
-
-    assert player.turn_alignment_timeouts == 1
-    assert player.steps["battle-x-1"][0] is not None  # igual serializa, con el desfase
-
-
-async def test_choose_move_reserva_el_indice_antes_de_la_task_de_fondo():
-    """Dos decisiones seguidas (p.ej. un cambio forzado tras un
-    debilitamiento) tienen que quedar en el orden en que se DECIDIERON, no en
-    el orden en que termine de esperar su propia task."""
-    player = _player()
-    tag = "battle-x-1"
-    player.recorders[tag].record([_split("|turn|1")])
-
-    class FakeOrder:
-        def __init__(self, mid):
+class FakeOrder:
+    def __init__(self, mid=None, species=None):
+        if species is not None:
+            self.order = SimpleNamespace(species=species)
+        else:
             self.order = SimpleNamespace(id=mid)
 
-    async def nunca_termina(*a, **kw):
-        # nunca completa de verdad en este test: solo importa que el indice
-        # ya haya sido reservado ANTES de que esta corra.
-        await asyncio.sleep(1000)
+
+def test_choose_move_captura_legal_actions_y_action_taken_sincronicamente():
+    """`legal_actions` y `action_taken` tienen que venir de la MISMA llamada
+    a `choose_move`: es lo que garantiza `action_taken in legal_actions` por
+    construccion, sin depender de ningun timing posterior."""
+    player = _player()
+    tag = "battle-x-1"
+
+    class FakeMove:
+        id = "tackle"
 
     battle = SimpleNamespace(
-        turn=1, finished=False, battle_tag=tag, player_role="p1",
+        turn=3, battle_tag=tag, player_role="p1",
+        available_moves=[FakeMove()], available_switches=[], can_mega_evolve=False,
+    )
+
+    with patch.object(
+        client_module.RandomPlayer, "choose_move",
+        lambda self, b: FakeOrder(mid="tackle"),
+    ):
+        player.choose_move(battle)
+
+    step = player.steps[tag][0]
+    assert step["action_taken"] == {"kind": "move", "id": "tackle"}
+    assert step["legal_actions"] == [{"kind": "move", "id": "tackle"}]
+    assert step["decision_turn"] == 3
+    assert step["state"] is None  # se completa en _finalize_pending_steps
+    assert player._sides[tag] == "p1"
+
+
+def test_choose_move_reserva_el_indice_en_orden_de_decision():
+    """Dos decisiones seguidas (p.ej. un cambio forzado tras un
+    debilitamiento) quedan en el orden en que se DECIDIERON."""
+    player = _player()
+    tag = "battle-x-1"
+    battle = SimpleNamespace(
+        turn=1, battle_tag=tag, player_role="p1",
+        available_moves=[], available_switches=[], can_mega_evolve=False,
     )
 
     calls = []
 
     def fake_super_choose_move(self, b):
-        order = FakeOrder(f"move{len(calls)}")
+        order = FakeOrder(mid=f"move{len(calls)}")
         calls.append(order)
         return order
 
     with patch.object(client_module.RandomPlayer, "choose_move", fake_super_choose_move):
-        with patch.object(player, "_materialize_step", nunca_termina):
-            player.choose_move(battle)
-            player.choose_move(battle)
+        player.choose_move(battle)
+        player.choose_move(battle)
 
     assert len(player.steps[tag]) == 2
-    assert all(s is None for s in player.steps[tag])
-    assert len(player._pending_step_tasks[tag]) == 2
-
-    for task in player._pending_step_tasks[tag]:
-        task.cancel()
-    await asyncio.gather(*player._pending_step_tasks[tag], return_exceptions=True)
+    assert [s["state"] for s in player.steps[tag]] == [None, None]
+    assert player._pending_finalize[tag] == [0, 1]
 
 
-async def test_wait_for_pending_steps_espera_todas_las_tasks():
+def test_finalize_pending_steps_completa_state_con_lo_capturado_en_choose_move(monkeypatch):
+    """`turn` y `legal_actions` del `state` finalizado tienen que quedar
+    exactamente como los capturo `choose_move`, NUNCA como los recalcularia
+    `serialize_battle` en el momento de finalizar (que podria reflejar ya la
+    decision SIGUIENTE si hay mas de un paso pendiente en el mismo lote)."""
     player = _player()
     tag = "battle-x-1"
+    player.steps[tag].append({
+        "turn": 3, "decision_turn": 3,
+        "action_taken": {"kind": "move", "id": "tackle"},
+        "legal_actions": [{"kind": "move", "id": "tackle"}],
+        "state": None,
+    })
+    player._pending_finalize[tag] = [0]
+    battle = SimpleNamespace()
+    player.battles[tag] = battle
 
-    async def marca(idx):
-        player.steps[tag][idx] = {"marcado": True}
+    monkeypatch.setattr(
+        client_module, "serialize_battle",
+        lambda b: {"turn": 999, "legal_actions": ["lo que sea"], "opponent": {"pokemon": []}},
+    )
 
-    player.steps[tag] = [None, None]
-    player._pending_step_tasks[tag] = [
-        asyncio.create_task(marca(0)), asyncio.create_task(marca(1))
-    ]
+    player._finalize_pending_steps(tag)
+
+    step = player.steps[tag][0]
+    assert step["state"]["turn"] == 3  # NO 999
+    assert step["state"]["legal_actions"] == [{"kind": "move", "id": "tackle"}]  # NO recalculado
+    assert step["state"]["opponent"] == {"pokemon": []}
+    assert player._pending_finalize[tag] == []
+
+
+def test_finalize_pending_steps_sin_pending_no_hace_nada():
+    player = _player()
+    player._finalize_pending_steps("tag-inexistente")  # no debe reventar
+
+
+def test_finalize_pending_steps_sin_battle_no_revienta():
+    player = _player()
+    tag = "battle-x-1"
+    player.steps[tag].append({
+        "turn": 1, "decision_turn": 1, "action_taken": None,
+        "legal_actions": [], "state": None,
+    })
+    player._pending_finalize[tag] = [0]
+    player._finalize_pending_steps(tag)  # sin player.battles[tag]: no revienta
+    assert player.steps[tag][0]["state"] is None  # queda sin finalizar, no crashea
+
+
+async def test_wait_for_pending_steps_corrige_turnos_sin_ninguna_task():
+    """Ya no hay tasks de fondo: solo corrige la etiqueta de turno."""
+    player = _player()
+    tag = "battle-x-1"
+    player.recorders[tag] = _recorder_con([["|turn|4", "|move|p1a: X|Tackle|p2a: Y"]])
+    player._sides[tag] = "p1"
+    player.steps[tag] = [{
+        "turn": 4, "decision_turn": 4, "state": {"turn": 4},
+        "action_taken": {"kind": "move", "id": "tackle"},
+    }]
 
     await player.wait_for_pending_steps(tag)
 
-    assert player.steps[tag] == [{"marcado": True}, {"marcado": True}]
+    assert player.steps[tag][0]["turn"] == 4
 
 
-async def test_wait_for_pending_steps_sin_tasks_no_revienta():
+async def test_wait_for_pending_steps_sin_pasos_no_revienta():
     player = _player()
     await player.wait_for_pending_steps("tag-inexistente")
+
+
+async def test_wait_for_pending_steps_loguea_si_algo_quedo_sin_finalizar(caplog):
+    """Guarda I-3: si un paso quedara con `state=None` (no deberia pasar con
+    la captura sincronica), tiene que quedar rastro en el log, no perderse
+    en silencio."""
+    player = _player()
+    tag = "battle-x-1"
+    player.steps[tag] = [{
+        "turn": 1, "decision_turn": 1, "state": None,
+        "action_taken": {"kind": "move", "id": "tackle"},
+    }]
+
+    with caplog.at_level(logging.ERROR):
+        await player.wait_for_pending_steps(tag)
+
+    assert any("sin materializar" in r.message for r in caplog.records)
 
 
 # --- _find_action_line / _correct_step_turns: correccion de la etiqueta de
@@ -362,7 +368,7 @@ def test_correct_step_turns_corrige_en_orden_con_un_cursor_que_avanza():
         ["|turn|4", "|move|p1a: X|Outrage|p2a: Y"],
         ["|turn|5", "|move|p1a: X|Outrage|p2a: Y"],
     ])
-    player.battles[tag] = SimpleNamespace(player_role="p1")
+    player._sides[tag] = "p1"
     player.steps[tag] = [
         {"turn": 4, "decision_turn": 4, "state": {},
          "action_taken": {"kind": "move", "id": "outrage"}},
@@ -384,7 +390,7 @@ def test_correct_step_turns_no_encuentra_mas_alla_del_margen():
         ["|turn|4", "|cant|p1a: X|par"],
         ["|turn|50", "|move|p1a: X|Outrage|p2a: Y"],
     ])
-    player.battles[tag] = SimpleNamespace(player_role="p1")
+    player._sides[tag] = "p1"
     player.steps[tag] = [
         {"turn": 4, "decision_turn": 4, "state": {},
          "action_taken": {"kind": "move", "id": "outrage"}},
@@ -397,12 +403,12 @@ def test_correct_step_turns_no_encuentra_mas_alla_del_margen():
     assert player.steps[tag][0]["turn"] == 4
 
 
-def test_correct_step_turns_sin_battle_no_revienta():
+def test_correct_step_turns_sin_side_conocido_no_revienta():
     player = _player()
-    player.steps["tag-sin-battle"] = [
+    player.steps["tag-sin-side"] = [
         {"turn": 1, "state": {}, "action_taken": {"kind": "move", "id": "x"}}
     ]
-    player._correct_step_turns("tag-sin-battle")  # no debe lanzar
+    player._correct_step_turns("tag-sin-side")  # no debe lanzar
 
 
 def test_normalize_saca_toda_la_puntuacion():
@@ -465,22 +471,19 @@ async def test_un_error_no_relacionado_no_descarta_nada():
     assert len(player.steps[tag]) == 1
 
 
-async def test_discard_last_step_cancela_la_task_de_fondo_pendiente():
+def test_discard_last_step_descarta_el_ultimo_paso():
+    """El paso descartado llega siempre ya finalizado (ver docstring de
+    `_discard_last_step`): no hay ninguna task de fondo que cancelar."""
     player = _player()
     tag = "battle-x-1"
-    player.steps[tag].append(None)
-
-    async def nunca_termina():
-        await asyncio.sleep(1000)
-
-    task = asyncio.create_task(nunca_termina())
-    player._pending_step_tasks[tag].append(task)
+    player.steps[tag].append({
+        "turn": 3, "decision_turn": 3, "state": {"turn": 3},
+        "action_taken": {"kind": "switch", "species": "regice"},
+    })
 
     player._discard_last_step(tag)
 
     assert player.steps[tag] == []
-    with pytest.raises(asyncio.CancelledError):
-        await task
 
 
 async def test_discard_last_step_sin_pasos_no_revienta():

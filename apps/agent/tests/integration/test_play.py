@@ -388,3 +388,44 @@ async def test_cada_paso_de_estado_tiene_su_protocolo(jugadas):
         )
     finally:
         await engine.dispose()
+
+
+async def test_la_accion_tomada_esta_dentro_de_su_propia_mascara(jugadas):
+    """C-1 (review de merge): `action_taken` tiene que estar SIEMPRE dentro de
+    `legal_actions` de su PROPIA fila. Es una asercion de una linea sobre la
+    base, y es la que faltaba para que la materializacion diferida de C1
+    (commit `3ea7caf`) no hubiera llegado a mergear: esa task de fondo puede
+    fotografiar el punto de decision SIGUIENTE (`battle` ya avanzo cuando la
+    task por fin corre), y la fila queda con la accion de una decision y la
+    mascara de otra. No es ruido: es una etiqueta imposible de entrenar.
+
+    Invariante de TODO el dataset (mismo patron que
+    `test_cada_paso_de_estado_tiene_su_protocolo`/`test_no_hay_fuga...`): sin
+    filtro de `battle_tag`, porque el defecto que esto tiene que atrapar ya
+    vive en filas de corridas anteriores a esta, y filtrar por `tags` de la
+    corrida actual las dejaria pasar en silencio (asi es como escaparon del
+    filtro `WHERE battle_tag = ANY(:tags)` de otros tests la primera vez).
+    """
+    assert jugadas, "la fixture no jugo nada"
+    engine = make_engine(load_settings().database_url)
+    try:
+        async with session_factory(engine)() as s:
+            filas = (await s.execute(text("""
+                SELECT b.battle_tag, ts.decision_index, ts.turn_number, ts.action_taken
+                FROM trajectory_steps ts
+                JOIN trajectories t ON t.id = ts.trajectory_id
+                JOIN battles b ON b.id = t.battle_id
+                WHERE ts.action_taken IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM jsonb_array_elements(ts.legal_actions) la
+                      WHERE la->>'kind' = ts.action_taken->>'kind'
+                        AND coalesce(la->>'id', '') = coalesce(ts.action_taken->>'id', '')
+                        AND coalesce(la->>'species', '') = coalesce(ts.action_taken->>'species', '')
+                  )
+            """))).all()
+        assert filas == [], (
+            f"{len(filas)} fila(s) con action_taken fuera de su propia "
+            f"legal_actions: {filas}"
+        )
+    finally:
+        await engine.dispose()
