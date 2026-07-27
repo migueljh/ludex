@@ -372,4 +372,14 @@ la inspección (ver `.superpowers/sdd/kimi-calc.md`):
   validación de existencia (por generación, via `toID`) es del servicio.
 - Strings exactos o silencio: `weather: 'Harsh Sun'` no lanza error pero se
   ignora (el tipo del paquete es `'Harsh Sunshine'`). El contrato solo admite
-  los strings exactos del paquete.
+  los strings exactos del paquete. **Y el allowlist de clima/terreno está
+  gateado por generación**: el paquete ignora en silencio valores fuera de la
+  mecánica de cada gen (`'Hail'` en gen 9 — el granizo pasó a llamarse
+  `'Snow'` y da +50% de Defensa al tipo Hielo—, los climas primordiales y los
+  terrenos antes de gen 5). Aceptarlos sería devolver "sin clima" disfrazado
+  de "con clima", la misma clase de bug que esta decisión existe para evitar.
+
+**Límite conocido (2026-07-27, review de calc):** el servicio corre como root
+dentro del contenedor. Con el bind a `127.0.0.1` y sin datos sensibles no es
+una vulnerabilidad activa, pero si alguna vez se expone fuera de localhost es
+lo primero a revisar, antes que rate limiting o auth.
