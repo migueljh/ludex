@@ -6,7 +6,7 @@ sección 11. Acá van solo las reglas operativas.
 
 ## Skills del proyecto — leelas antes de empezar
 
-En `.claude/` hay tres guías escritas para este repo. Cada una vive en un
+En `.claude/` hay cuatro guías escritas para este repo. Cada una vive en un
 `SKILL.md` y **condensa trampas que ya nos costaron trabajo tirado**:
 
 - **`.claude/migrations/SKILL.md`** — convenciones de esquema y migraciones con
@@ -17,6 +17,11 @@ En `.claude/` hay tres guías escritas para este repo. Cada una vive en un
   `packages/calc`, cualquier extractor de data de juego, o las tablas
   `pokemon`, `moves`, `learnsets`, `items`, `abilities`, `type_chart`. También
   al agregar una generación nueva.
+- **`.claude/agent-recording/SKILL.md`** — cómo graba el agente y qué
+  invariantes cumple el dataset. Al tocar `apps/agent`, el serializador, el
+  cliente de Showdown, el recorder, o las tablas `battles`, `battle_turns`,
+  `trajectories` y `trajectory_steps`. También al interpretar el protocolo de
+  Showdown o al agregar campos al estado.
 - **`.claude/verification/SKILL.md`** — cómo se verifica el trabajo antes de
   darlo por terminado. Al escribir tests, fijar conteos esperados, cerrar una
   rebanada, revisar código de otro agente, o cuando un test pasa y hay que
