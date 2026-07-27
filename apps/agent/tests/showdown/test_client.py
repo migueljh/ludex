@@ -265,10 +265,36 @@ def test_find_action_line_encuentra_el_turno_del_switch():
     assert turno == 5
 
 
-def test_find_action_line_sin_match_devuelve_none():
-    """P.ej. el movimiento elegido no se ejecuto (parasitado, congelado,
-    fallo): no hay linea que buscar, y el llamador deja el turno tal cual."""
+def test_find_action_line_ancla_en_cant_cuando_la_accion_no_se_ejecuto():
+    """El movimiento elegido no se ejecuto porque el juego lo impidio.
+
+    Showdown SI deja rastro: `|cant|`. La fila pertenece al turno donde la
+    decision se RESOLVIO, y esa resolucion es "no pudo moverse". Antes esto
+    devolvia None y la etiqueta se quedaba un turno atras: era el 100% del
+    residual que sobrevivio a la primera vuelta de C1.
+    """
     recorder = _recorder_con([["|turn|4", "|cant|p1a: X|par"]])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "move", "id": "tackle"}, 0, max_turn=4
+    ) == (4, 2)
+
+
+def test_find_action_line_ignora_un_faint_posterior_al_propio_movimiento():
+    """El respaldo NO puede robarle la resolucion a una accion que si se
+    ejecuto: si el pokemon propio se movio y RECIEN DESPUES lo debilitaron,
+    la evidencia buena es el `|move|`, no el `|faint|`."""
+    recorder = _recorder_con([[
+        "|turn|4", "|move|p1a: X|Tackle|p2a: Y", "|faint|p1a: X",
+    ]])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "move", "id": "tackle"}, 0, max_turn=4
+    ) == (4, 2)
+
+
+def test_find_action_line_sin_ninguna_evidencia_devuelve_none():
+    """Sin `|move|`, sin `|switch|`, sin `|cant|` y sin `|faint|` propio no
+    hay nada que corregir: el llamador deja el turno tal cual."""
+    recorder = _recorder_con([["|turn|4", "|move|p2a: Y|Tackle|p1a: X"]])
     assert _find_action_line(
         recorder, "p1", {"kind": "move", "id": "tackle"}, 0, max_turn=4
     ) is None
@@ -302,15 +328,22 @@ def test_find_action_line_no_reusa_una_linea_ya_consumida():
 
 
 def test_find_action_line_no_pasa_el_techo_de_turno():
-    """El techo (`max_turn`) evita que una decision excusada mas adelante
-    encuentre por accidente una repeticion lejana del mismo nombre."""
+    """El techo (`max_turn`) evita que una decision encuentre por accidente
+    una repeticion lejana del mismo nombre.
+
+    Lo que se prueba es que NO devuelve el turno 50. Devuelve el turno 4,
+    donde el `|cant|` muestra por que esa decision nunca se ejecuto: esa es
+    la resolucion real y es la etiqueta correcta.
+    """
     recorder = _recorder_con([
         ["|turn|4", "|cant|p1a: X|par"],
         ["|turn|50", "|move|p1a: X|Outrage|p2a: Y"],
     ])
-    assert _find_action_line(
+    encontrado = _find_action_line(
         recorder, "p1", {"kind": "move", "id": "outrage"}, 0, max_turn=6
-    ) is None
+    )
+    assert encontrado is not None
+    assert encontrado[0] == 4, "el techo tiene que impedir el salto al turno 50"
 
 
 def test_correct_step_turns_corrige_en_orden_con_un_cursor_que_avanza():

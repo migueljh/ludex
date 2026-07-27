@@ -98,9 +98,24 @@ def _find_action_line(
        capturado sincronicamente al decidir: SIEMPRE es <= el turno real,
        nunca un techo falso.
 
-    Si no hay match dentro del techo (la accion no se ejecuto: parasitado,
-    congelado, fallo, `[still]`), devuelve None: no hay nada que consumir ni
-    que corregir, y el llamador deja la etiqueta de turno sin cambios.
+    Si la accion no se ejecuto, Showdown SI deja rastro, y la primera version
+    de esta funcion no lo miraba: `|cant|` cuando el juego impidio la accion
+    (sueño, paralisis, congelamiento) y `|faint|` propio cuando al pokemon lo
+    debilitaron antes de poder actuar. Ese rastro aparece en el bloque donde
+    la decision se RESOLVIO, que es un turno mas adelante que `decision_turn`.
+    Sin mirarlo, esas filas quedaban etiquetadas un turno antes: era el 100%
+    del residual que sobrevivio a la primera vuelta de C1.
+
+    De ahi la definicion que gobierna `turn_number` en el dataset:
+
+        Una fila pertenece al turno en que su decision se RESOLVIO, sin
+        importar como se resolvio — se ejecuto, el juego la impidio, o al
+        pokemon lo debilitaron antes.
+
+    La linea de resolucion se usa solo como RESPALDO, nunca antes de agotar
+    la busqueda del `|move|`/`|switch|` real: un `|faint|` propio puede ser
+    posterior a una accion que si se ejecuto, y en ese caso la evidencia
+    buena es el `|move|`, no el debilitamiento.
     """
     if action_taken is None:
         return None
@@ -109,13 +124,27 @@ def _find_action_line(
         return None
     prefix_move = f"|move|{side}a:"
     prefix_switch = f"|switch|{side}a:"
+    prefix_cant = f"|cant|{side}a:"
+    prefix_faint = f"|faint|{side}a:"
+    respaldo: tuple[int, int] | None = None
+    se_movio_en: set[int] = set()
     for offset, (turn, line) in enumerate(recorder.entries_from(from_index)):
         if turn > max_turn:
             break
         if line.startswith(prefix_move) or line.startswith(prefix_switch):
             if clave in _normalize(line):
                 return turn, from_index + offset + 1
-    return None
+            if line.startswith(prefix_move):
+                se_movio_en.add(turn)
+        elif respaldo is None:
+            if line.startswith(prefix_cant):
+                respaldo = (turn, from_index + offset + 1)
+            elif line.startswith(prefix_faint) and turn not in se_movio_en:
+                # Un debilitamiento propio DESPUES de haberse movido en el
+                # mismo bloque no resuelve esta decision: resuelve la de
+                # alguien que ya actuo.
+                respaldo = (turn, from_index + offset + 1)
+    return respaldo
 
 
 class LudexPlayer(RandomPlayer):
@@ -282,11 +311,10 @@ class LudexPlayer(RandomPlayer):
         # motiva toda esta correccion), y usarlo como default dejaria una
         # etiqueta peor que `decision_turn` en el caso EXCUSADO (mas abajo)
         # donde no hay nada que corregir. `_correct_step_turns` la mueve
-        # HACIA ADELANTE si encuentra donde se ejecuto de verdad; si no
-        # encuentra nada (la accion elegida nunca se ejecuto: el propio
-        # pokemon se debilito por un rival mas rapido antes de que le tocara
-        # actuar — Showdown no deja NINGUN rastro de eso, ni `|cant|` ni
-        # `|-fail|`, no es un bug de esta captura) se queda en
+        # HACIA ADELANTE hasta donde la decision se RESOLVIO: donde se
+        # ejecuto, o —si nunca se ejecuto— donde el protocolo muestra por que
+        # (`|cant|` por sueño o paralisis, `|faint|` propio antes de actuar).
+        # Solo si no hay ninguna de las dos evidencias se queda en
         # `decision_turn`, que es siempre el mejor valor disponible. Se
         # sobreescribe tambien dentro de `state`, para que la columna
         # `turn_number` y `state->>'turn'` nunca diverjan dentro de la
