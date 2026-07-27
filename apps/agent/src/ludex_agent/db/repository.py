@@ -60,9 +60,17 @@ class BattleRepository:
                    legal_actions, action_taken, action_source)
                 VALUES (:tj, :t, CAST(:st AS jsonb), :v, CAST(:la AS jsonb),
                         CAST(:at AS jsonb), CAST(:src AS action_source))
+                -- state_schema_version y action_source TAMBIEN se actualizan:
+                -- si un paso se reescribe tras un bump de version, dejar la
+                -- version vieja con el estado nuevo hace que la fila mienta
+                -- sobre su propio formato. `reward` queda deliberadamente
+                -- afuera, para no pisar el que ya escribio finalize().
                 ON CONFLICT (trajectory_id, turn_number) DO UPDATE
-                  SET state = EXCLUDED.state, legal_actions = EXCLUDED.legal_actions,
-                      action_taken = EXCLUDED.action_taken
+                  SET state = EXCLUDED.state,
+                      state_schema_version = EXCLUDED.state_schema_version,
+                      legal_actions = EXCLUDED.legal_actions,
+                      action_taken = EXCLUDED.action_taken,
+                      action_source = EXCLUDED.action_source
             """), {"tj": trajectory_id, "t": turn, "st": json.dumps(state), "v": version,
                    "la": json.dumps(legal),
                    "at": json.dumps(action) if action is not None else None,
