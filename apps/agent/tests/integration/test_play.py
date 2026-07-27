@@ -30,6 +30,62 @@ def _normalizar(texto: str) -> str:
     return re.sub(r"[^a-z0-9]", "", texto.lower())
 
 
+def _clave_de_busqueda(accion: str) -> str:
+    """Reduce el id de Hidden Power a una clave que SI puede aparecer en el
+    protocolo (fix-final, residual de C1, causa 2).
+
+    poke-env distingue las 17 variantes de Hidden Power por tipo
+    (`hiddenpowerground`, `hiddenpowergrass`, ...: son 17 ids de movimiento
+    DISTINTOS, cada uno con su propio `.id`), pero Showdown narra la
+    ejecucion siempre como `|move|...|Hidden Power|...`, sin el tipo — el
+    tipo real es un dato oculto del set del pokemon (IVs), no algo que la
+    narracion publica revele. Normalizado, `hiddenpowerground` nunca es
+    substring de `hiddenpower`: comparar el id completo contra el protocolo
+    no matchea NUNCA, para ninguna de las 17 variantes, aunque la accion se
+    haya ejecutado. Verificado que esto es un defecto de esta comparacion y
+    no un bug del agente (6 batallas frescas: 5 Hidden Power elegidas, 5
+    ejecutadas segun el protocolo).
+
+    Recorta especificamente el prefijo "hiddenpower" en vez de pelar
+    cualquier sufijo de tipo en general: ya nos mordio una vez en el seed
+    tratar estas 17 variantes como si compartieran un unico id base para
+    otra cosa. Especifico a Hidden Power, no un pelado generico de sufijos
+    que podria de nuevo matchear de mas contra otro movimiento.
+    """
+    if accion.startswith("hiddenpower"):
+        return "hiddenpower"
+    return accion
+
+
+def _propio_no_actuo(lineas: list[str], side: str) -> bool:
+    """Causas 1 y 1bis del residual de C1 (fix-final-report.md): el
+    protocolo puede confirmar, sin narrar la accion elegida, que el juego
+    impidio que se ejecutara. Evidencia corroborante contra el protocolo
+    crudo (D17), no una excepcion a dedo.
+
+    - `|cant|{side}a:`: el propio pokemon quiso actuar y el juego se lo
+      impidio (dormido, paralizado, congelado). Es la causa mas frecuente
+      del residual medido sobre 6 batallas frescas (316 filas: 296
+      alineadas, 20 en el residual).
+    - `|faint|{side}a:` que aparece ANTES que cualquier `|move|{side}a:` en
+      el mismo bloque: el propio pokemon se debilito por un rival mas rapido
+      antes de que le tocara actuar. Showdown no deja ningun otro rastro de
+      esto (D20) — ni `|cant|`, ni `|-fail|`, nada — asi que la ausencia de
+      un `|move|` propio ANTES del `|faint|` es la unica evidencia posible.
+    """
+    prefix_cant = f"|cant|{side}a:"
+    prefix_move = f"|move|{side}a:"
+    prefix_faint = f"|faint|{side}a:"
+    if any(l.startswith(prefix_cant) for l in lineas):
+        return True
+    for l in lineas:
+        if l.startswith(prefix_move):
+            return False
+        if l.startswith(prefix_faint):
+            return True
+    return False
+
+
 @pytest.fixture(scope="module")
 async def jugadas():
     # I6 (review final): esta fixture juega batallas REALES contra el server
@@ -205,6 +261,15 @@ async def test_la_accion_de_la_fila_corresponde_a_su_propio_turno(jugadas):
     narrar el turno. La accion que se graba en la fila `turno=N` en realidad
     se ejecuta en el bloque de protocolo N+1. Ningun otro test lo detecta
     porque ninguno cruza `action_taken` contra el protocolo del MISMO turno.
+
+    fix-final (residual medido sobre 6 batallas frescas, 316 filas: 296
+    alineadas, 20 en el residual): de esas 20, 2 causas resultaron ser falsos
+    positivos de ESTE chequeo, no del agente, y se excusan explicitamente
+    (`_propio_no_actuo`, `_clave_de_busqueda`) con evidencia corroborante del
+    protocolo (D17) — nunca a dedo, sin evidencia. Una tercera causa (fila
+    corrida un turno, el mismo defecto de C1 pero residual: ver D20 y la
+    entrada final de fix-final-report.md) NO se excusa: si sobrevive, este
+    test tiene que seguir fallando por ella.
     """
     engine = make_engine(load_settings().database_url)
     try:
@@ -233,8 +298,10 @@ async def test_la_accion_de_la_fila_corresponde_a_su_propio_turno(jugadas):
                     if l.startswith(f"|move|{side}a:") or l.startswith(f"|switch|{side}a:")
                 ]
                 revisados += 1
-                visto = any(accion in linea for linea in candidatas)
-                assert visto, (
+                clave = _clave_de_busqueda(accion)
+                visto = any(clave in linea for linea in candidatas)
+                excusado = not visto and _propio_no_actuo(lineas, side)
+                assert visto or excusado, (
                     f"la accion '{accion}' de la fila turno={turno} no aparece "
                     f"en el protocolo de ESE turno (bloque {turno}), lado {side}"
                 )
