@@ -459,6 +459,31 @@ def test_traduce_una_orden_de_cambio():
 
 def test_orden_vacia_es_none():
     assert action_from_order(None) is None
+
+
+def test_orden_sin_contenido_es_none():
+    assert action_from_order(SimpleNamespace(order=None)) is None
+
+
+def test_orden_con_contenido_inesperado_es_none():
+    # Ni .id ni .species: no revienta, devuelve None.
+    assert action_from_order(SimpleNamespace(order=SimpleNamespace(raro=1))) is None
+
+
+def test_la_desambiguacion_vale_contra_los_objetos_reales():
+    """Fija el supuesto del que depende `action_from_order`.
+
+    La funcion distingue Move de Pokemon por hasattr, sin importar poke_env,
+    porque state/ es puro. Este test SI importa la libreria — los tests pueden,
+    src/ no — para que si una version futura le diera `.id` a Pokemon, falle
+    ruidosamente en vez de clasificar todos los cambios como movimientos.
+    """
+    from poke_env.battle import Move, Pokemon
+
+    mon = Pokemon(gen=6, species="charizard")
+    mv = Move("flamethrower", gen=6)
+    assert not hasattr(mon, "id") and hasattr(mon, "species")
+    assert hasattr(mv, "id") and not hasattr(mv, "species")
 ```
 
 - [ ] **Step 2: Correr y verificar que falla**
@@ -531,7 +556,7 @@ def action_from_order(order: Any) -> dict | None:
 ```bash
 cd apps/agent && uv run pytest tests/state/test_actions.py -v
 ```
-Esperado: PASS, 5 tests.
+Esperado: PASS, 8 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1515,7 +1540,7 @@ docker compose --profile local up -d showdown
 sleep 5 && curl -sf http://localhost:8100/ -o /dev/null && echo "showdown OK"
 cd apps/agent && DATABASE_URL="postgres://ludex:ludex@localhost:15432/ludex" uv run pytest tests/integration/ -v
 ```
-Esperado: PASS, 5 tests. Tarda unos minutos: son dos batallas reales.
+Esperado: PASS, 8 tests. Tarda unos minutos: son dos batallas reales.
 
 - [ ] **Step 4: Correr el runner a mano**
 
