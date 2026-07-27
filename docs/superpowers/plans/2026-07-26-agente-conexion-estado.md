@@ -1479,7 +1479,48 @@ if __name__ == "__main__":
     app()
 ```
 
-- [ ] **Step 2: Escribir los dos tests que importan**
+- [ ] **Step 2: Cargar el `.env` para los tests**
+
+Sin esto, los tests que necesitan `DATABASE_URL` se SALTEAN en silencio cuando la
+variable no esta exportada a mano. Verificado: `pytest` sin la variable da
+"33 passed, 2 skipped"; con ella, "35 passed". Un test salteado se ve casi igual
+que uno que pasa, y es el mismo modo de falla que ya mordio en la fase anterior.
+
+`apps/agent/tests/conftest.py`:
+```python
+"""Carga el .env de la raiz del repo antes de coleccionar tests.
+
+Sin esto los tests que necesitan DATABASE_URL se saltean en silencio: verdes
+para quien lo escribio, silenciosamente mas debiles para el resto. `setdefault`
+para que una variable ya exportada en el entorno siempre gane.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+
+def _load_dotenv() -> None:
+    # apps/agent/tests/conftest.py -> parents[3] es la raiz del repo
+    env_path = Path(__file__).resolve().parents[3] / ".env"
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_dotenv()
+```
+
+Verificalo: `cd apps/agent && uv run pytest tests/ -q` **sin** `DATABASE_URL`
+exportada debe dar cero skips.
+
+- [ ] **Step 3: Escribir los dos tests que importan**
 
 `apps/agent/tests/integration/test_play.py`:
 ```python
@@ -1605,7 +1646,7 @@ async def test_reejecutar_no_duplica(jugadas):
         await engine.dispose()
 ```
 
-- [ ] **Step 3: Levantar el server local y correr**
+- [ ] **Step 4: Levantar el server local y correr**
 
 ```bash
 docker compose --profile local up -d showdown
@@ -1614,14 +1655,14 @@ cd apps/agent && DATABASE_URL="postgres://ludex:ludex@localhost:15432/ludex" uv 
 ```
 Esperado: PASS, 8 tests. Tarda unos minutos: son dos batallas reales.
 
-- [ ] **Step 4: Correr el runner a mano**
+- [ ] **Step 5: Correr el runner a mano**
 
 ```bash
 cd apps/agent && DATABASE_URL="postgres://ludex:ludex@localhost:15432/ludex" uv run python -m ludex_agent.cli --n 5
 ```
 Esperado: `5 batallas persistidas`.
 
-- [ ] **Step 5: Verificar la re-derivación**
+- [ ] **Step 6: Verificar la re-derivación**
 
 Es la propiedad que hace reversible el serializador. Con el protocolo guardado, un consumidor futuro tiene que poder reconstruir el estado.
 
@@ -1656,14 +1697,14 @@ PY
 ```
 Esperado: una línea por batalla y `OK` al final. Pegá la salida en el reporte.
 
-- [ ] **Step 6: Verificar que no hay generación hardcodeada**
+- [ ] **Step 7: Verificar que no hay generación hardcodeada**
 
 ```bash
 cd /Users/miguelhernandez/Documents/ludex && grep -rin "gen6" apps/agent/src/
 ```
 Esperado: cero resultados. Las apariciones válidas están en `tests/` y en los valores por defecto de `config.py`, que son configuración.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git commit -m "feat(agent): runner y tests de fuga y re-derivacion" -- apps/agent/
