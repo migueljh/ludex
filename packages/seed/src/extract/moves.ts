@@ -1,5 +1,24 @@
 import { isAvailable, type ModdedDex } from "./dex.js";
-import type { MoveRow } from "../types.js";
+import type { MoveRow, PowerKind } from "../types.js";
+
+/**
+ * basePower 0 es ambiguo en Showdown (ver PowerKind en types.ts). Ojo: el daño
+ * fijo se expresa con `damage` (seismictoss: damage='level'), NO con
+ * basePowerCallback — derivarlo del callback deja a seismictoss y nightshade
+ * fuera. El orden importa: category primero, despues los mecanismos.
+ */
+function powerKindOf(m: {
+  category: string;
+  basePower: number;
+  basePowerCallback?: unknown;
+  damage?: unknown;
+}): PowerKind {
+  if (m.category === "Status") return "status";
+  if (typeof m.basePowerCallback === "function") return "variable";
+  if (typeof m.damage === "number" || m.damage === "level") return "fixed_damage";
+  if (m.basePower === 0) return "special";
+  return "standard";
+}
 
 /**
  * En gen 6 los 17 Hidden Power (base + 16 tipos) comparten id 'hiddenpower'.
@@ -27,7 +46,8 @@ export function extractMoves(dex: ModdedDex): MoveRow[] {
       type: m.type,
       category: m.category,
       power: m.basePower,
-      // Showdown usa true para "nunca falla".
+      powerKind: powerKindOf(m),
+      // Showdown usa true para "nunca falla"; null NO es "desconocida" (D15).
       accuracy: m.accuracy === true ? null : m.accuracy,
       pp: m.pp,
       priority: m.priority,

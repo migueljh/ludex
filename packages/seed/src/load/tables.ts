@@ -19,21 +19,21 @@ export async function upsertGeneration(
 export const loadSpecies = (pool: Pool, genId: number, rows: SpeciesRow[]) =>
   upsertBatch(pool, {
     table: "pokemon",
-    columns: ["gen_id", "showdown_id", "dex_num", "name", "base_species", "forme",
-      "is_default", "types", "base_stats", "abilities", "weight_kg", "evolves_from", "tier"],
+    columns: ["gen_id", "showdown_id", "dex_num", "name", "base_species", "base_species_name",
+      "forme", "is_default", "types", "base_stats", "abilities", "weight_kg", "evolves_from", "tier"],
     conflict: ["gen_id", "showdown_id"],
-    rows: rows.map((s) => [genId, s.showdownId, s.dexNum, s.name, s.baseSpecies, s.forme,
-      s.isDefault, s.types, JSON.stringify(s.baseStats), JSON.stringify(s.abilities),
+    rows: rows.map((s) => [genId, s.showdownId, s.dexNum, s.name, s.baseSpecies, s.baseSpeciesName,
+      s.forme, s.isDefault, s.types, JSON.stringify(s.baseStats), JSON.stringify(s.abilities),
       s.weightKg, s.evolvesFrom, s.tier]),
   });
 
 export const loadMoves = (pool: Pool, genId: number, rows: MoveRow[]) =>
   upsertBatch(pool, {
     table: "moves",
-    columns: ["gen_id", "showdown_id", "name", "type", "category", "power",
+    columns: ["gen_id", "showdown_id", "name", "type", "category", "power", "power_kind",
       "accuracy", "pp", "priority", "target", "flags", "description"],
     conflict: ["gen_id", "showdown_id"],
-    rows: rows.map((m) => [genId, m.showdownId, m.name, m.type, m.category, m.power,
+    rows: rows.map((m) => [genId, m.showdownId, m.name, m.type, m.category, m.power, m.powerKind,
       m.accuracy, m.pp, m.priority, m.target, JSON.stringify(m.flags), m.description]),
   });
 
