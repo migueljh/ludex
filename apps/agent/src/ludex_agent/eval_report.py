@@ -79,6 +79,7 @@ def build_benchmark_record(
     fmt: str,
     route: ModelRoute,
     pricing: PricingTable,
+    status: str | None = None,
 ) -> BenchmarkRecord:
     if RUN_ID_PATTERN.fullmatch(run_id) is None:
         raise ValueError("run_id must match [a-z0-9-]+")
@@ -106,15 +107,15 @@ def build_benchmark_record(
         if interval is not None
         else None
     )
-    cost_per_battle = (
+    observed_cost_per_battle = (
         total_cost / Decimal(result.completed)
-        if complete and result.completed and total_cost is not None
+        if result.completed and total_cost is not None
         else None
     )
     return BenchmarkRecord(
         run_id=run_id,
         created_at=created_at.isoformat(),
-        status="complete" if complete else "aborted",
+        status=status or ("complete" if complete else "aborted"),
         provider=provider,
         model=model,
         opponent=opponent,
@@ -131,16 +132,16 @@ def build_benchmark_record(
         metrics=dict(metrics),
         calls_per_battle=(
             Decimal(calls) / Decimal(result.completed)
-            if complete and result.completed
+            if result.completed
             else None
         ),
         invalid_recovered_pct=_ratio(recovered, turns_total),
         fallback_pct=_ratio(fallback, turns_total),
         total_cost=total_cost,
-        cost_per_battle=cost_per_battle,
+        cost_per_battle=observed_cost_per_battle,
         projected_10k_cost=(
-            cost_per_battle * Decimal(10_000)
-            if cost_per_battle is not None
+            observed_cost_per_battle * Decimal(10_000)
+            if observed_cost_per_battle is not None
             else None
         ),
         pricing_table_id=pricing.table_id,
@@ -153,6 +154,17 @@ def write_run_json(record: BenchmarkRecord, path: str | Path) -> None:
     target = Path(path)
     if target.exists():
         raise FileExistsError(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(record.to_json_dict(), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+
+
+def write_run_snapshot(record: BenchmarkRecord, path: str | Path) -> None:
+    target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
     temporary.write_text(

@@ -9,6 +9,7 @@ from ludex_agent.eval_report import (
     append_ledger_row,
     build_benchmark_record,
     write_run_json,
+    write_run_snapshot,
 )
 from ludex_agent.graph.provider import ModelRoute
 
@@ -64,7 +65,7 @@ def test_registro_completo_deriva_porcentajes_y_costo_por_batalla():
     assert record.projected_10k_cost == Decimal("6.0000")
 
 
-def test_corrida_abortada_no_publica_winrate_ni_costo_por_batalla():
+def test_corrida_parcial_conserva_costo_observado_por_batalla():
     result = BenchmarkResult(
         requested=15,
         completed=4,
@@ -90,14 +91,16 @@ def test_corrida_abortada_no_publica_winrate_ni_costo_por_batalla():
             max_tokens=16_000,
         ),
         pricing=PricingTable.load(),
+        status="running",
     )
 
-    assert record.status == "aborted"
+    assert record.status == "running"
     assert record.win_rate is None
     assert record.wilson95 is None
     assert record.total_cost is not None
-    assert record.cost_per_battle is None
-    assert record.projected_10k_cost is None
+    assert record.calls_per_battle == Decimal("75")
+    assert record.cost_per_battle == Decimal("0.00725")
+    assert record.projected_10k_cost == Decimal("72.50000")
 
 
 def test_json_y_ledger_rechazan_sobrescritura_y_conservan_fuente(tmp_path):
@@ -133,6 +136,42 @@ def test_json_y_ledger_rechazan_sobrescritura_y_conservan_fuente(tmp_path):
     assert "test-minimax.json" in markdown
     with pytest.raises(FileExistsError):
         write_run_json(record, artifact)
+
+
+def test_snapshot_parcial_se_reemplaza_atomicamente(tmp_path):
+    artifact = tmp_path / "runs" / "partial.json"
+    base = dict(
+        run_id="partial",
+        created_at=datetime(2026, 7, 28, 12, tzinfo=timezone.utc),
+        metrics=_metrics(),
+        opponent="simple_heuristics",
+        fmt="gen6randombattle",
+        route=ModelRoute(protocol="chat_completions"),
+        pricing=PricingTable.load(),
+        status="running",
+    )
+    first = build_benchmark_record(
+        result=BenchmarkResult(
+            requested=15, completed=1, wins=1, losses=0, ties=0,
+            provider="open_code_zen", model="minimax-m2.7",
+        ),
+        **base,
+    )
+    second = build_benchmark_record(
+        result=BenchmarkResult(
+            requested=15, completed=2, wins=1, losses=1, ties=0,
+            provider="open_code_zen", model="minimax-m2.7",
+        ),
+        **base,
+    )
+
+    write_run_snapshot(first, artifact)
+    write_run_snapshot(second, artifact)
+
+    rendered = artifact.read_text()
+    assert '"completed": 2' in rendered
+    assert '"wins": 1' in rendered
+    assert not artifact.with_suffix(".json.tmp").exists()
 
 
 def test_run_id_no_permite_rutas_ni_espacios():

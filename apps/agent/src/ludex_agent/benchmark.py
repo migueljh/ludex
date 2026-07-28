@@ -65,26 +65,46 @@ async def run_benchmark(
     persist_battle: Callable[[str], Awaitable[None] | None] | None = None,
     provider: str | None = None,
     model: str | None = None,
+    on_progress: Callable[
+        [BenchmarkResult], Awaitable[None] | None
+    ] | None = None,
 ) -> BenchmarkResult:
-    before = set(agent.battles)
-    await agent.battle_against(opponent, n_battles=n)
-    new_tags = [tag for tag in agent.battles if tag not in before]
-    if persist:
-        if persist_battle is None:
-            raise ValueError("persist=True requires persist_battle")
-        for tag in new_tags:
-            pending = persist_battle(tag)
+    if persist and persist_battle is None:
+        raise ValueError("persist=True requires persist_battle")
+
+    def current_result() -> BenchmarkResult:
+        return BenchmarkResult(
+            requested=n,
+            completed=(
+                agent.n_won_battles
+                + agent.n_lost_battles
+                + agent.n_tied_battles
+            ),
+            wins=agent.n_won_battles,
+            losses=agent.n_lost_battles,
+            ties=agent.n_tied_battles,
+            provider=provider,
+            model=model,
+        )
+
+    async def report_progress() -> None:
+        if on_progress is not None:
+            pending = on_progress(current_result())
             if inspect.isawaitable(pending):
                 await pending
-    completed = (
-        agent.n_won_battles + agent.n_lost_battles + agent.n_tied_battles
-    )
-    return BenchmarkResult(
-        requested=n,
-        completed=completed,
-        wins=agent.n_won_battles,
-        losses=agent.n_lost_battles,
-        ties=agent.n_tied_battles,
-        provider=provider,
-        model=model,
-    )
+
+    try:
+        for _ in range(n):
+            known = set(agent.battles)
+            await agent.battle_against(opponent, n_battles=1)
+            if persist:
+                for tag in agent.battles:
+                    if tag not in known:
+                        pending = persist_battle(tag)
+                        if inspect.isawaitable(pending):
+                            await pending
+            await report_progress()
+    except BaseException:
+        await report_progress()
+        raise
+    return current_result()

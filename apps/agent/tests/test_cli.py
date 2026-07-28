@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import logging
 import random
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from ludex_agent.benchmark import BenchmarkResult
 from ludex_agent.graph.provider import FatalProviderError
 from typer.testing import CliRunner
 
@@ -19,6 +21,7 @@ from ludex_agent.cli import (
     _battle_outcome,
     _benchmark_provider,
     _persist_one,
+    _progress_summary,
     app,
 )
 from ludex_agent.graph.provider import DecisionMetrics
@@ -56,6 +59,82 @@ def test_benchmark_expone_registro_y_tabla_de_precios():
     assert "--pricing" in result.stdout
     assert "--ledger" in result.stdout
     assert "--record" in result.stdout
+
+
+def test_progreso_muestra_batallas_usage_y_costo_acumulado():
+    record = SimpleNamespace(
+        completed=3,
+        requested=15,
+        wins=1,
+        losses=2,
+        ties=0,
+        metrics={
+            "calls_total": 87,
+            "input_tokens": 123_456,
+            "output_tokens": 7_890,
+        },
+        total_cost=Decimal("0.1432"),
+        pricing_currency="USD",
+    )
+
+    assert _progress_summary(record) == (
+        "progress=3/15 w-l-t=1-2-0 calls=87 "
+        "tokens=123456/7890 cost=USD 0.1432"
+    )
+
+
+def test_benchmark_imprime_progreso_antes_del_resultado_final(monkeypatch):
+    async def fake_benchmark_command(*, on_progress, **kwargs):
+        progress = BenchmarkResult(
+            requested=2, completed=1, wins=1, losses=0, ties=0,
+            provider="open_code_zen", model="mimo-v2.5-free",
+        )
+        metrics = {
+            "turns_total": 3,
+            "calls_total": 4,
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": 0,
+            "turns_model_invalid": 0,
+            "turns_fallback": 0,
+            "turns_deadline_affected": 0,
+            "key_rotations": 0,
+        }
+        await on_progress(progress, metrics)
+        return (
+            BenchmarkResult(
+                requested=2, completed=2, wins=1, losses=1, ties=0,
+                provider="open_code_zen", model="mimo-v2.5-free",
+            ),
+            metrics,
+        )
+
+    monkeypatch.setattr(
+        "ludex_agent.cli._benchmark_command", fake_benchmark_command
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark", "--n", "2", "--opponent", "simple_heuristics",
+            "--provider", "open_code_zen", "--model", "mimo-v2.5-free",
+            "--no-record",
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "SHOWDOWN_WS_URL": "ws://localhost:8100/showdown/websocket",
+            "LUDEX_PROVIDER": "open_code_zen",
+            "LUDEX_MODEL": "mimo-v2.5-free",
+            "OPEN_CODE_ZEN_API_KEY": "fake-key",
+            "OPEN_CODE_ZEN_BASE_URL": "https://opencode.ai/zen/v1",
+        },
+    )
+
+    assert result.exit_code == 0
+    assert "progress=1/2 w-l-t=1-0-0 calls=4" in result.stdout
+    assert result.stdout.index("progress=1/2") < result.stdout.index(
+        "completed=2/2"
+    )
 
 
 def test_provider_smoke_usa_flags_como_los_comandos_del_plan():

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,9 +42,10 @@ from .graph.provider import (
 from .graph.workflow import build_decision_graph
 from .eval_cost import DEFAULT_PRICING_PATH, PricingTable
 from .eval_report import (
+    BenchmarkRecord,
     append_ledger_row,
     build_benchmark_record,
-    write_run_json,
+    write_run_snapshot,
 )
 from .state.schema import STATE_SCHEMA_VERSION
 
@@ -61,6 +63,22 @@ DEFAULT_RUNS_PATH = AGENT_ROOT / "evals" / "runs"
 # review final: antes era `* n`, presupuestando el lote entero y haciendose
 # cada vez mas probable de saltar cuanto mas grande el lote).
 BATTLE_TIMEOUT_SECONDS = 180
+
+
+def _progress_summary(record: BenchmarkRecord) -> str:
+    metrics = record.metrics
+    cost = (
+        f"{record.pricing_currency} {record.total_cost}"
+        if record.total_cost is not None
+        else "unknown"
+    )
+    return (
+        f"progress={record.completed}/{record.requested} "
+        f"w-l-t={record.wins}-{record.losses}-{record.ties} "
+        f"calls={metrics.get('calls_total', 0)} "
+        f"tokens={metrics.get('input_tokens', 0)}/"
+        f"{metrics.get('output_tokens', 0)} cost={cost}"
+    )
 
 
 async def _check_showdown_reachable(ws_url: str) -> None:
@@ -339,6 +357,9 @@ def provider_smoke_command(
 async def _benchmark_command(
     *, n: int, opponent: str, concurrency: int, persist: bool,
     provider_name: str, model: str, fmt: str,
+    on_progress: Callable[
+        [BenchmarkResult, Mapping[str, int]], Awaitable[None] | None
+    ] | None = None,
 ) -> tuple[BenchmarkResult, dict[str, int]]:
     settings = load_settings()
     await _check_showdown_reachable(settings.showdown_ws_url)
@@ -383,12 +404,19 @@ async def _benchmark_command(
         assert repo is not None
         await _persist_one(agent, repo, tag, fmt, "local")
 
+    async def report_progress(result: BenchmarkResult) -> None:
+        if on_progress is not None:
+            pending = on_progress(result, metrics.snapshot())
+            if pending is not None:
+                await pending
+
     try:
         try:
             result = await run_benchmark(
                 agent, rival, n=n, persist=persist,
                 persist_battle=persist_tag if persist else None,
                 provider=provider_name, model=model,
+                on_progress=report_progress,
             )
         except ProviderError as exc:
             completed = (
@@ -412,7 +440,7 @@ async def _benchmark_command(
 def benchmark_command(
     n: int = 300,
     opponent: str = "random",
-    concurrency: int = 20,
+    concurrency: int = 1,
     persist: bool = False,
     provider: str | None = None,
     model: str | None = None,
@@ -436,10 +464,38 @@ def benchmark_command(
         datetime.now(timezone.utc).strftime("%Y%m%dt%H%M%Sz")
         + f"-{provider_name}-{model_name}".replace("_", "-").replace(".", "-")
     )
+    artifact = DEFAULT_RUNS_PATH / f"{effective_run_id}.json"
+    if record and artifact.exists():
+        raise typer.BadParameter(
+            f"ya existe el artefacto de corrida: {artifact}"
+        )
+    pricing_table = PricingTable.load(pricing)
+    created_at = datetime.now(timezone.utc)
+    effective_route = selected_route or ModelRoute(protocol=provider_name)
+
+    async def report_progress(
+        progress: BenchmarkResult, metrics: Mapping[str, int]
+    ) -> None:
+        partial = build_benchmark_record(
+            run_id=effective_run_id,
+            created_at=created_at,
+            result=progress,
+            metrics=metrics,
+            opponent=opponent,
+            fmt=fmt or settings.showdown_battle_format,
+            route=effective_route,
+            pricing=pricing_table,
+            status="running",
+        )
+        if record:
+            write_run_snapshot(partial, artifact)
+        typer.echo(_progress_summary(partial))
+
     result, metrics = asyncio.run(_benchmark_command(
         n=n, opponent=opponent, concurrency=concurrency, persist=persist,
         provider_name=provider_name, model=model_name,
         fmt=fmt or settings.showdown_battle_format,
+        on_progress=report_progress,
     ))
     typer.echo(
         f"completed={result.completed}/{result.requested} "
@@ -454,15 +510,14 @@ def benchmark_command(
     else:
         typer.echo(f"ABORTED: {result.failure}")
     typer.echo(f"decision_metrics={metrics}")
-    pricing_table = PricingTable.load(pricing)
     benchmark_record = build_benchmark_record(
         run_id=effective_run_id,
-        created_at=datetime.now(timezone.utc),
+        created_at=created_at,
         result=result,
         metrics=metrics,
         opponent=opponent,
         fmt=fmt or settings.showdown_battle_format,
-        route=selected_route or ModelRoute(protocol=provider_name),
+        route=effective_route,
         pricing=pricing_table,
     )
     typer.echo(
@@ -472,8 +527,7 @@ def benchmark_command(
         f"total_cost={benchmark_record.total_cost}"
     )
     if record:
-        artifact = DEFAULT_RUNS_PATH / f"{effective_run_id}.json"
-        write_run_json(benchmark_record, artifact)
+        write_run_snapshot(benchmark_record, artifact)
         append_ledger_row(benchmark_record, ledger, artifact)
         typer.echo(f"benchmark_record={artifact}")
     if result.failure:

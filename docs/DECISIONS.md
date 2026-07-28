@@ -877,3 +877,12 @@ corrida fija ambos al empezar y, si su infraestructura se agota, aborta
 ruidosamente con el progreso alcanzado. La cadena entre proveedores queda
 reservada para partidas interactivas, donde terminar la batalla importa más que
 la comparabilidad estadística.
+
+Los benchmarks pagos se ejecutan secuencialmente y escriben un snapshot JSON
+atómico después de cada batalla. Cada línea de progreso informa batallas,
+resultado acumulado, llamadas, tokens y costo. Si la corrida se interrumpe
+durante una batalla, se fuerza un último snapshot con el usage acumulado hasta
+ese instante aunque el contador de batallas no haya avanzado. El ledger
+Markdown recibe una fila solamente al cierre normal o aborto clasificado; un
+snapshot con `status="running"` es deliberadamente recuperable y no se presenta
+como resultado comparable.
