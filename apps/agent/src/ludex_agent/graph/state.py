@@ -10,10 +10,14 @@ class GraphInput(TypedDict):
 
 
 class GraphState(TypedDict, total=False):
+    raw_state: dict[str, Any]
     battle_state: dict[str, Any]
     damage: list[dict[str, Any]]
     action: dict[str, Any]
     action_path: str
+    reasoning: str
+    turn_id: str
+    deadline: float
 
 
 _TOP_LEVEL = (
