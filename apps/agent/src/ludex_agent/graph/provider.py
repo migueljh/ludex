@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
+from anthropic import APIConnectionError as AnthropicAPIConnectionError
+from openai import APIConnectionError as OpenAIAPIConnectionError
 from pydantic import ValidationError
 
 
@@ -282,7 +284,13 @@ def _classified(exc: Exception) -> ProviderError:
         return TransientProviderError("provider server error")
     if status in (401, 403):
         return FatalProviderError("provider authentication failed")
-    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, httpx.TransportError)):
+    if isinstance(exc, (
+        asyncio.TimeoutError,
+        TimeoutError,
+        httpx.TransportError,
+        OpenAIAPIConnectionError,
+        AnthropicAPIConnectionError,
+    )):
         return TransientProviderError("provider transport failed")
     detail = type(exc).__name__
     if isinstance(exc, ValidationError):

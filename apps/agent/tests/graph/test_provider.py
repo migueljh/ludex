@@ -1,7 +1,10 @@
 import asyncio
 import time
 
+import httpx
 import pytest
+from anthropic import APITimeoutError as AnthropicAPITimeoutError
+from openai import APITimeoutError as OpenAIAPITimeoutError
 from pydantic import BaseModel, Field, ValidationError
 
 from ludex_agent.graph.provider import (
@@ -383,3 +386,39 @@ async def test_timeout_asyncio_se_clasifica_como_transitorio():
     assert await provider.complete(
         "p", deadline=time.monotonic() + 1, turn_id="t"
     ) == {"ok": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "timeout_error",
+    [
+        OpenAIAPITimeoutError(httpx.Request("POST", "https://provider.test")),
+        AnthropicAPITimeoutError(
+            httpx.Request("POST", "https://provider.test")
+        ),
+    ],
+)
+async def test_timeout_de_sdk_se_reintenta_como_infraestructura(timeout_error):
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([
+        timeout_error,
+        ProviderCompletion(
+            payload={"ok": True},
+            usage=CompletionUsage(input_tokens=3, output_tokens=1),
+        ),
+    ])
+    provider = KeyRotatingProvider(
+        "provider", ("a",), backend, metrics=metrics, transient_retries=1
+    )
+
+    result = await provider.complete(
+        "mismo prompt", deadline=time.monotonic() + 1, turn_id="battle:9"
+    )
+
+    assert result == {"ok": True}
+    assert backend.calls == [
+        ("mismo prompt", "a"),
+        ("mismo prompt", "a"),
+    ]
+    assert metrics.snapshot()["turns_transient_affected"] == 1
+    assert metrics.snapshot()["calls_total"] == 1
