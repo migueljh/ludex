@@ -335,7 +335,7 @@ Con `completed=15`, `wins=5`, `turns_total=300`, `turns_model_invalid=3`,
 
 ```python
 assert record.calls_per_battle == Decimal("20")
-assert record.invalid_recovered_pct == Decimal("0.6666666667")
+assert record.invalid_recovered_pct == Decimal("0.0066666667")
 assert record.fallback_pct == Decimal("0.0033333333")
 assert record.projected_10k_cost == record.cost_per_battle * 10_000
 ```
