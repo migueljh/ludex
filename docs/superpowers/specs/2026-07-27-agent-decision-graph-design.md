@@ -146,11 +146,13 @@ Flujo:
 2. inválida o malformada: un único reintento con el error, la acción recibida
    y la máscara exacta;
 3. reintento válido: `action_path="llm_retry"`;
-4. segundo fallo, excepción o timeout: ranking determinista,
+4. segunda respuesta inválida: ranking determinista,
    `action_path="fallback"`.
 
 Nunca se elige al azar. El resultado del grafo incluye `action`, `reasoning`,
 `alternatives`, `action_path` y diagnósticos de los intentos.
+Los fallos de infraestructura siguen el protocolo separado de la sección
+siguiente y nunca se convierten en fallback.
 
 ## Proveedores y secretos
 
@@ -158,8 +160,10 @@ Configuración:
 
 - nombre del proveedor;
 - nombre del modelo;
-- nombre de la variable de entorno que contiene la clave;
-- timeout.
+- nombre de la variable de entorno que contiene la clave primaria;
+- para proveedores que lo soportan, nombre separado de la variable que
+  contiene el pool de claves;
+- timeout por request y presupuesto total de decisión.
 
 El adapter de producción usa la inicialización por `model_provider` y `model`
 de LangChain; la integración concreta del proveedor debe estar instalada. La
@@ -173,6 +177,72 @@ de respuestas o errores. No hay claves configuradas en el entorno actual; por
 eso el porcentaje real de propuestas ilegales del LLM queda pendiente. Los
 resultados de fakes se reportan como pruebas de control de flujo, nunca como
 métrica de modelo.
+
+### Clasificación de fallos y rotación
+
+El protocolo del proveedor distingue tres resultados:
+
+1. respuesta estructurada, que luego puede ser válida o inválida;
+2. error de infraestructura recuperable;
+3. error fatal de configuración o autenticación.
+
+Para Gemini, `GOOGLE_API_KEY` es la clave primaria y `GOOGLE_API_KEYS` es un
+pool separado por comas. No se concatenan como una sola variable conceptual:
+la primaria se intenta primero y el pool aporta las siguientes. Los valores se
+deduplican en memoria y nunca se imprimen.
+
+La máquina de reintentos separa transporte de semántica:
+
+- **429/cuota:** marca el turno como afectado por cuota, rota a la siguiente
+  clave y repite exactamente el mismo prompt. No consume el reintento del
+  contrato de acción.
+- **5xx o timeout de red:** marca el turno como afectado por infraestructura y
+  repite el mismo prompt con backoff acotado. Tampoco consume el reintento del
+  contrato.
+- **JSON inválido o acción ilegal:** cuenta como fallo del modelo. Recién ahí
+  se construye el segundo prompt con el error.
+- **401/403, proveedor mal configurado, pool agotado o presupuesto total
+  vencido:** la decisión falla ruidosamente. No produce `fallback` ni una fila
+  que pueda confundirse con una decisión válida del LLM.
+
+Una rotación puede ocurrir tanto en el primer prompt como en el prompt
+semántico de reintento. En ambos casos se repite el pedido que estaba en curso;
+jamás vuelve al prompt anterior ni avanza el contador semántico.
+
+### Presupuesto temporal medido
+
+Una sonda real contra `127.0.0.1:8100`, con `/timer on`, produjo:
+
+```text
+|inactive|Time left: 300 sec this turn | 300 sec total | 60 sec grace
+```
+
+El presupuesto total por decisión será configurable y tendrá default de 240
+segundos; el límite de Showdown tendrá default medido de 300 segundos. La carga
+de configuración exige `decision_budget < showdown_turn_limit`. Cada request y
+backoff usa el deadline total restante, de modo que una cadena de rotaciones no
+puede extenderse indefinidamente. Los 60 segundos restantes absorben envío de
+la orden y scheduling local.
+
+### Contadores consultables
+
+`DecisionMetrics` mantiene contadores monotónicos y expone un snapshot:
+
+- turnos totales;
+- turnos con respuesta válida al primer intento;
+- turnos con JSON o acción inválida en el primer intento;
+- turnos recuperados por el reintento semántico;
+- turnos terminados en fallback;
+- turnos afectados por 429;
+- turnos afectados por 5xx o timeout;
+- rotaciones de clave;
+- fallos fatales por pool agotado o presupuesto.
+
+Los contadores “turnos afectados” cuentan cada turno una sola vez por clase,
+aunque haya varios 429 o timeouts; `rotaciones de clave` sí cuenta cada evento.
+El runner y el benchmark imprimen el snapshot al terminar. Así puede
+distinguirse una corrida limpia de una que sobrevivió mediante rotaciones sin
+contaminar `action_path`.
 
 ## Persistencia
 
@@ -229,13 +299,18 @@ guardando `action_source="agent"` y agrega el `action_path` del paso.
 
 El comando de benchmark:
 
-- no persiste batallas;
+- no persiste batallas por default;
+- con `--persist`, usa el mismo camino de persistencia del runner actual para
+  guardar batallas y trayectorias;
 - permite elegir política actual, rival, generación/formato, `n` y
   concurrencia;
 - crea procesos/jugadores aislados por matchup para no acumular recorders;
 - reporta wins, losses, ties, winrate y Wilson 95%;
 - puede emitir JSON para comparar corridas.
 
+Es la misma herramienta que crecerá en la fase 7 para escribir la fila
+agregada de `evals` cuando esa tabla exista; no se creará un segundo runner.
+El opt-in evita contaminar el dataset normal con partidas contra heurísticos.
 Los tres resultados de línea de base quedan en un artefacto versionado junto al
 comando y en el reporte final.
 
@@ -267,3 +342,10 @@ comando y en el reporte final.
   movimientos rivales revelados o ningún cálculo utilizable.
 - Calc usa únicamente información observable. Los movimientos no revelados y
   sets desconocidos no se inventan ni se obtienen de data oculta.
+- Una orden puede ser rechazada por Showdown (`[Unavailable choice]` o
+  `[Invalid choice]`). Existe `_discard_last_step`, pero hoy busca líneas
+  `|error|` dentro del canal de mensajes de batalla y se observó que esos
+  errores no llegan por ese canal. La fila puede quedar grabada como si la
+  acción hubiera ocurrido. Resolver y medir ese canal queda fuera de esta
+  rebanada; el riesgo puede aumentar cuando el LLM elija acciones
+  condicionadas con más frecuencia que RandomPlayer.
