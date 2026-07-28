@@ -19,6 +19,7 @@ from ludex_agent.graph.provider import (
     ProviderPoolExhausted,
     QuotaExceeded,
     TransientProviderError,
+    _LangChainBackend,
     _classified,
     anthropic_sdk_base_url,
     load_model_routes,
@@ -164,7 +165,11 @@ def test_rutas_de_modelo_eligen_el_protocolo_real():
     ) == ModelRoute(protocol="chat_completions")
     assert model_route(
         routes, "open_code_zen", "qwen3.5-plus"
-    ) == ModelRoute(protocol="messages")
+    ) == ModelRoute(
+        protocol="messages",
+        max_tokens=1024,
+        timeout_seconds=60,
+    )
     assert model_route(
         routes, "open_code_zen", "qwen3.6-plus"
     ) == ModelRoute(protocol="messages")
@@ -181,6 +186,50 @@ def test_rutas_de_modelo_eligen_el_protocolo_real():
 def test_modelo_sin_ruta_falla_antes_de_llamar_al_proveedor():
     with pytest.raises(ValueError, match="sin ruta"):
         model_route(load_model_routes(), "open_code_zen", "modelo-inventado")
+
+
+@pytest.mark.asyncio
+async def test_backend_messages_aplica_timeout_y_limite_de_salida(monkeypatch):
+    captured = {}
+
+    class FakeMessage:
+        content = '{"action":{"kind":"move","id":"tackle"},"reasoning":"ok"}'
+        usage_metadata = {
+            "input_tokens": 10,
+            "output_tokens": 5,
+        }
+        response_metadata = {}
+
+    class FakeChatAnthropic:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def ainvoke(self, prompt):
+            return FakeMessage()
+
+    monkeypatch.setattr(
+        "langchain_anthropic.ChatAnthropic", FakeChatAnthropic
+    )
+    backend = _LangChainBackend(
+        kind="anthropic",
+        model="qwen3.5-plus",
+        response_schema=BaseModel,
+        timeout_seconds=30,
+        base_url="https://opencode.ai/zen/v1",
+        route=ModelRoute(
+            protocol="messages",
+            max_tokens=1024,
+            timeout_seconds=60,
+        ),
+    )
+
+    result = await backend.complete(
+        "prompt", api_key="secret", deadline=time.monotonic() + 240
+    )
+
+    assert result.payload["action"]["id"] == "tackle"
+    assert captured["timeout"] == 60
+    assert captured["max_tokens"] == 1024
 
 
 @pytest.mark.asyncio

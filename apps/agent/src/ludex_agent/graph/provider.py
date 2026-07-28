@@ -73,6 +73,7 @@ class ModelRoute:
     temperature: float = 0.0
     thinking: str | None = None
     max_tokens: int | None = None
+    timeout_seconds: float | None = None
 
 
 DEFAULT_MODEL_ROUTES = (
@@ -97,6 +98,7 @@ def load_model_routes(
             temperature=float(raw.get("temperature", 0)),
             thinking=raw.get("thinking"),
             max_tokens=raw.get("max_tokens"),
+            timeout_seconds=raw.get("timeout_seconds"),
         )
     return routes
 
@@ -432,9 +434,13 @@ class _LangChainBackend:
         self.kind = kind
         self.model = model
         self.response_schema = response_schema
-        self.timeout_seconds = timeout_seconds
         self.base_url = base_url
         self.route = route or ModelRoute(protocol=kind)
+        self.timeout_seconds = (
+            self.route.timeout_seconds
+            if self.route.timeout_seconds is not None
+            else timeout_seconds
+        )
 
     async def complete(
         self, prompt: str, *, api_key: str, deadline: float
@@ -450,12 +456,15 @@ class _LangChainBackend:
         elif self.kind == "anthropic":
             from langchain_anthropic import ChatAnthropic
 
-            model = ChatAnthropic(
+            anthropic_options: dict[str, Any] = dict(
                 model_name=self.model, api_key=api_key,
                 base_url=anthropic_sdk_base_url(self.base_url),
                 temperature=self.route.temperature,
                 max_retries=0, timeout=self.timeout_seconds,
             )
+            if self.route.max_tokens is not None:
+                anthropic_options["max_tokens"] = self.route.max_tokens
+            model = ChatAnthropic(**anthropic_options)
         else:
             from langchain_openai import ChatOpenAI
 

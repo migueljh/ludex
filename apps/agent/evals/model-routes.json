@@ -19,7 +19,9 @@
     {
       "provider": "open_code_zen",
       "model": "qwen3.5-plus",
-      "protocol": "messages"
+      "protocol": "messages",
+      "max_tokens": 1024,
+      "timeout_seconds": 60
     },
     {
       "provider": "open_code_zen",

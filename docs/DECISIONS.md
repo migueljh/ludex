@@ -831,11 +831,13 @@ entre proveedores se permite al jugar, pero queda prohibida en benchmark:
 proveedor y modelo permanecen fijos o la medición aborta informando cuántas
 batallas terminó, sin publicar un winrate comparable.
 
-El presupuesto total por decisión es 240 s, por debajo de los 300 s medidos
-en el reloj del Showdown local (más 60 s de gracia). Fotografía, máscara y
-mapa acción→`BattleOrder` se capturan sincrónicamente antes del primer
-`await`; el grafo nunca relee el `Battle` mutable. El corrector de turnos
-continúa juzgando contra protocolo crudo y no fue modificado.
+El presupuesto interno total por decisión es 240 s. No representa un reloj
+permanente de Showdown: la batalla solo tiene límite por turno cuando su timer
+está activado. Cuando sí lo está, este presupuesto debe revisarse contra el
+margen real de ese servidor. Fotografía, máscara y mapa acción→`BattleOrder`
+se capturan sincrónicamente antes del primer `await`; el grafo nunca relee el
+`Battle` mutable. El corrector de turnos continúa juzgando contra protocolo
+crudo y no fue modificado.
 
 Baseline random, `gen6randombattle`, 300 batallas por rival, concurrencia 20:
 47,67% contra RandomPlayer (143–157), 11,67% contra MaxBasePowerPlayer
@@ -864,7 +866,8 @@ vacío en vez de inventarse.
 Las rutas de modelo son explícitas. MiniMax, DeepSeek y MiMo usan
 `/chat/completions`; Kimi K2.6 usa ese protocolo con `thinking=enabled`,
 temperatura 1 y límite de salida medido. Qwen por OpenCode Zen usa
-`/messages`. El SDK Anthropic agrega `/v1/messages`, por lo que para esa ruta
+`/messages`, con timeout de 60 s y máximo de 1.024 tokens de salida para
+acotar latencia y costo. El SDK Anthropic agrega `/v1/messages`, por lo que para esa ruta
 se elimina el `/v1` final de la base configurada. Zen/Qwen rechaza tanto el
 `json_schema` nativo de Claude como las tools forzadas: su contrato es JSON
 textual estricto, sometido después a la misma validación, reintento semántico y
