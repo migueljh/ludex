@@ -186,8 +186,8 @@ LEDGER_HEADER = """# Benchmarks de modelos
 Registro acumulativo. El costo se calcula con usage real; una celda vacía
 significa desconocido o no comparable, nunca cero implícito.
 
-| Fecha | Run | Proveedor/modelo | Batallas | W-L-T | Winrate | Wilson 95% | Llamadas/batalla | Tokens in/out | Costo total | Costo/batalla | 10.000 batallas | Ilegales retry/fallback | Deadlines | Rotaciones | Precios |
-|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---|---:|---:|---|
+| Fecha | Run | Proveedor/modelo | Batallas | W-L-T | Winrate | Wilson 95% | Llamadas/batalla | Tokens in/out | Costo total | Costo/batalla | 10.000 batallas | Ilegales retry/fallback | Transitorios | Deadlines | Rotaciones | Precios |
+|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---|
 """
 
 
@@ -221,10 +221,28 @@ def append_ledger_row(
         f"{_display(record.projected_10k_cost)} | "
         f"{_display(record.invalid_recovered_pct, percent=True)}/"
         f"{_display(record.fallback_pct, percent=True)} | "
+        f"{metrics.get('turns_transient_affected', 0)} | "
         f"{metrics.get('turns_deadline_affected', 0)} | "
         f"{metrics.get('key_rotations', 0)} | "
         f"{record.pricing_table_id} |\n"
     )
+    lines = existing.rstrip().splitlines()
+    separator_index = next(
+        (
+            index for index, line in enumerate(lines)
+            if line.startswith("|---")
+        ),
+        None,
+    )
+    if separator_index is None:
+        raise ValueError("ledger has no Markdown table separator")
+    insertion_index = separator_index + 1
+    while (
+        insertion_index < len(lines)
+        and lines[insertion_index].startswith("|")
+    ):
+        insertion_index += 1
+    lines.insert(insertion_index, row.rstrip())
     temporary = ledger.with_suffix(ledger.suffix + ".tmp")
-    temporary.write_text(existing.rstrip() + "\n" + row, encoding="utf-8")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
     temporary.replace(ledger)

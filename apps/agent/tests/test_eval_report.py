@@ -24,6 +24,7 @@ def _metrics():
         "reasoning_tokens": 900,
         "turns_model_invalid": 3,
         "turns_fallback": 1,
+        "turns_transient_affected": 7,
         "turns_deadline_affected": 0,
         "key_rotations": 0,
     }
@@ -136,6 +137,45 @@ def test_json_y_ledger_rechazan_sobrescritura_y_conservan_fuente(tmp_path):
     assert "test-minimax.json" in markdown
     with pytest.raises(FileExistsError):
         write_run_json(record, artifact)
+
+
+def test_ledger_inserta_la_corrida_en_la_tabla_antes_de_notas(tmp_path):
+    result = BenchmarkResult(
+        requested=15,
+        completed=15,
+        wins=5,
+        losses=10,
+        ties=0,
+        provider="open_code_zen",
+        model="minimax-m2.7",
+    )
+    record = build_benchmark_record(
+        run_id="test-con-notas",
+        created_at=datetime(2026, 7, 28, 12, tzinfo=timezone.utc),
+        result=result,
+        metrics=_metrics(),
+        opponent="simple_heuristics",
+        fmt="gen6randombattle",
+        route=ModelRoute(protocol="chat_completions"),
+        pricing=PricingTable.load(),
+    )
+    artifact = tmp_path / "runs" / "test-con-notas.json"
+    ledger = tmp_path / "BENCHMARKS.md"
+    ledger.write_text(
+        "# Benchmarks de modelos\n\n"
+        "| Run | Transitorios |\n"
+        "|---|---:|\n"
+        "| anterior | 0 |\n\n"
+        "## Controles parciales\n\n"
+        "- evidencia histórica\n",
+        encoding="utf-8",
+    )
+
+    append_ledger_row(record, ledger, artifact)
+
+    markdown = ledger.read_text(encoding="utf-8")
+    assert markdown.index("test-con-notas") < markdown.index("## Controles parciales")
+    assert "| 7 |" in markdown
 
 
 def test_snapshot_parcial_se_reemplaza_atomicamente(tmp_path):
