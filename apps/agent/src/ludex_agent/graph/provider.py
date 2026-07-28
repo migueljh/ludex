@@ -53,11 +53,13 @@ class DecisionMetrics:
             "provider_switches": 0,
             "turns_quota_affected": 0,
             "turns_transient_affected": 0,
+            "turns_deadline_affected": 0,
             "turns_model_invalid": 0,
             "turns_fallback": 0,
         }
         self._quota_turns: set[str] = set()
         self._transient_turns: set[str] = set()
+        self._deadline_turns: set[str] = set()
         self._invalid_turns: set[str] = set()
         self._fallback_turns: set[str] = set()
 
@@ -76,6 +78,11 @@ class DecisionMetrics:
         if turn_id not in self._transient_turns:
             self._transient_turns.add(turn_id)
             self._counts["turns_transient_affected"] += 1
+
+    def deadline(self, turn_id: str) -> None:
+        if turn_id not in self._deadline_turns:
+            self._deadline_turns.add(turn_id)
+            self._counts["turns_deadline_affected"] += 1
 
     def model_invalid(self, turn_id: str) -> None:
         if turn_id not in self._invalid_turns:
@@ -168,6 +175,7 @@ class KeyRotatingProvider:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    self._metrics.deadline(turn_id)
                     raise DecisionDeadlineExceeded("decision deadline exhausted")
                 try:
                     async with asyncio.timeout(remaining):
@@ -176,6 +184,9 @@ class KeyRotatingProvider:
                         )
                 except Exception as raw:
                     error = _classified(raw)
+                    if isinstance(error, DecisionDeadlineExceeded):
+                        self._metrics.deadline(turn_id)
+                        raise error from None
                     if isinstance(error, QuotaExceeded):
                         self._metrics.quota(turn_id)
                         if key_index + 1 < len(self._keys):

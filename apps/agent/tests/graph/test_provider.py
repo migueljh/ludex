@@ -140,11 +140,13 @@ async def test_cadena_cambia_proveedor_solo_en_juego():
 @pytest.mark.asyncio
 async def test_deadline_expirado_no_invoca_proveedor():
     backend = ScriptedBackend([{"never": True}])
-    provider = KeyRotatingProvider("google", ("a",), backend)
+    metrics = DecisionMetrics()
+    provider = KeyRotatingProvider("google", ("a",), backend, metrics=metrics)
 
     with pytest.raises(DecisionDeadlineExceeded):
         await provider.complete("p", deadline=time.monotonic() - 1, turn_id="t")
     assert backend.calls == []
+    assert metrics.snapshot()["turns_deadline_affected"] == 1
 
 
 def test_errores_no_contienen_secretos_por_representacion():
