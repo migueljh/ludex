@@ -766,3 +766,40 @@ respaldo de `|win|`/`|tie|`, `_illusion_revela_a`);
 `apps/agent/tests/showdown/test_client.py` (8 tests nuevos);
 `apps/agent/tests/integration/test_play.py` (`_propio_no_actuo` con paridad
 de las 4 formas, `_illusion_revela`, `_formas_reveladas_por_cambio_de_forma`).
+
+## D24 — `websockets==16.0` se fuerza con un override de uv para el grafo local
+
+`poke-env==0.15.0` exige exactamente `websockets==16.0`. `langgraph==1.2.9`
+trae transitivamente `langgraph-sdk>=0.4.2`, cuyo metadata declara
+`websockets>=14,<16`; no existe una resolución normal compatible entre las
+últimas versiones. No se baja poke-env: el grabador y sus correctores de
+turnos dependen de su comportamiento observable y fueron verificados contra
+0.15.0.
+
+El agente usa `StateGraph` local, en proceso. No usa LangGraph Platform ni el
+transporte WebSocket de `langgraph-sdk`, por lo que se fijó
+`[tool.uv] override-dependencies = ["websockets==16.0"]`. No es una suposición
+silenciosa: un test importa poke-env y LangGraph juntos, compila y ejecuta un
+grafo mínimo; otro juega una batalla real en el mismo proceso. La suite del
+agente queda como canario del único consumidor real de websockets.
+
+Si se incorpora LangGraph Platform, este override deja de considerarse
+inocuo. Antes de habilitar el cliente remoto hay que retirar o reevaluar el
+override, resolver la matriz de versiones soportada por `langgraph-sdk` y
+ejercer sus transports —incluido streaming WebSocket— con integración real.
+
+## D25 — autoría y camino interno de una acción son ejes separados
+
+`trajectory_steps.action_source` responde quién decidió (`agent`, `human` u
+`opponent`). El nuevo `action_path` responde cómo llegó el agente a la
+decisión (`llm`, `llm_retry` o `fallback`). Para los tres caminos la autoría
+sigue siendo `agent`; mezclar `fallback` dentro de `action_source` volvería
+ambiguas consultas futuras sobre intervención humana.
+
+`action_path` es `text NULL` con un `CHECK` acotado, un desvío deliberado de
+los enums nativos usados en otras columnas. Este eje crecerá con la
+aprobación humana y el contexto, y Postgres no permite quitar valores de un
+enum con la misma facilidad. No sienta precedente general para reemplazar
+otros enums. `NULL` significa “fila histórica sin camino de decisión
+registrado”: las decisiones previas fueron aleatorias y asignarles un default
+sería inventar su procedencia.

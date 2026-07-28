@@ -3,6 +3,7 @@ import os
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from ludex_agent.config import load_settings
 from ludex_agent.db.repository import BattleRepository, BattleTagCollisionError
@@ -83,11 +84,12 @@ async def test_action_path_nullable_y_restringido(repo):
             "SELECT action_path FROM trajectory_steps "
             "WHERE trajectory_id=:t AND decision_index=0"
         ), {"t": tid})).scalar_one_or_none() is None
-        with pytest.raises(Exception, match="trajectory_steps_action_path_check"):
+        with pytest.raises(DBAPIError, match="trajectory_steps_action_path_check") as exc:
             await s.execute(text(
                 "UPDATE trajectory_steps SET action_path='random' "
                 "WHERE trajectory_id=:t AND decision_index=0"
             ), {"t": tid})
+        assert exc.value.orig.sqlstate == "23514"
 
 
 async def test_es_idempotente_por_battle_tag(repo):
