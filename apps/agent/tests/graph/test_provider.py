@@ -22,6 +22,7 @@ from ludex_agent.graph.provider import (
     TransientProviderError,
     _LangChainBackend,
     _classified,
+    _redacted,
     anthropic_sdk_base_url,
     load_model_routes,
     message_text_content,
@@ -619,6 +620,63 @@ async def test_error_transitorio_preserva_tipo_mensaje_y_causa_original(caplog):
         and "Connection reset by peer while decoding turn 42" in record.getMessage()
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_el_log_de_clasificacion_censura_la_clave_del_mensaje(caplog):
+    """El mensaje de error de un proveedor NO es texto de confianza: Gemini
+    manda la clave en el query string, así que un 429 o un error de
+    transporte puede arrastrar la clave entera dentro de `str(exc)`. Ese
+    texto crudo se loguea (es la única forma de diagnosticar el transporte),
+    y la regla del proyecto es que una clave no se imprime nunca. El detalle
+    diagnóstico —el tipo real de la excepción y la URL— tiene que sobrevivir
+    a la censura, o el log deja de servir para lo que se agregó."""
+    original = httpx.ConnectError(
+        "Connection reset for url "
+        "'https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.5-flash:generateContent?key=AIzaSyD-clave-de-prueba-000'"
+    )
+
+    class LeakyBackend:
+        async def complete(self, prompt, *, api_key, deadline):
+            raise original
+
+    provider = KeyRotatingProvider(
+        "google", ("k",), LeakyBackend(), transient_retries=0
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="ludex_agent.graph.provider"
+    ):
+        with pytest.raises(TransientProviderError):
+            await provider.complete(
+                "p", deadline=time.monotonic() + 1, turn_id="t"
+            )
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "AIzaSyD-clave-de-prueba-000" not in logged
+    assert "key=<redacted>" in logged
+    # La censura no puede comerse el diagnóstico: sin el tipo y la URL, el
+    # log no distingue un ConnectError de un ReadTimeout, que es lo único
+    # para lo que existe.
+    assert "ConnectError" in logged
+    assert "generativelanguage.googleapis.com" in logged
+    # `exc_info` reimprimiría el mensaje crudo sin pasar por la censura.
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_la_censura_no_deja_pasar_las_formas_de_clave_conocidas():
+    censurado = _redacted(
+        "AIzaSyD-000000000000000000 y sk-proj-abcdefghijklmnop y "
+        "Authorization: Bearer sk-ant-0123456789abcdef y ?api_key=zzzzzzzzzzzz"
+    )
+    for secreto in (
+        "AIzaSyD-000000000000000000",
+        "sk-proj-abcdefghijklmnop",
+        "sk-ant-0123456789abcdef",
+        "zzzzzzzzzzzz",
+    ):
+        assert secreto not in censurado
 
 
 @pytest.mark.asyncio

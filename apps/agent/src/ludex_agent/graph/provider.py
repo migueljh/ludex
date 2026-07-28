@@ -307,6 +307,30 @@ def _quota_retry_after_seconds(rendered: str) -> float | None:
     return float(match.group(1)) if match else None
 
 
+# Los mensajes de error de los proveedores NO son texto de confianza: varios
+# arrastran la URL de la request, y Gemini manda la clave en el query string
+# (`...?key=AIza...`), así que el mensaje crudo de un 429 o de un error de
+# transporte puede contener una clave entera. El log de `_classified` es el
+# único lugar donde ese texto crudo sale del proceso; se censura acá, antes
+# de escribirlo, y no en el llamador, para que no dependa de que cada sitio
+# de log se acuerde.
+_SECRET_PATTERNS = (
+    (
+        re.compile(r"(?i)\b(key|api[_-]?key|access[_-]?token|token)=[^&\s\"']+"),
+        r"\1=<redacted>",
+    ),
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}=*"), "Bearer <redacted>"),
+    (re.compile(r"AIza[0-9A-Za-z_-]{10,}"), "<redacted>"),
+    (re.compile(r"sk-[A-Za-z0-9_-]{12,}"), "<redacted>"),
+)
+
+
+def _redacted(text: str) -> str:
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def _classified(exc: Exception) -> ProviderError:
     if isinstance(exc, ProviderError):
         return exc
@@ -350,10 +374,16 @@ def _classified(exc: Exception) -> ProviderError:
     # causa real detrás de "provider transport failed"— solo quedan acá, en
     # el log y en `__cause__` (ver los `raise ... from` en
     # `KeyRotatingProvider.complete`, que ya no usan `from None`).
+    #
+    # Censurado (`_redacted`) y SIN `exc_info`: el traceback vuelve a
+    # imprimir el mensaje crudo del proveedor, sin pasar por la censura, y
+    # con él la clave que Gemini manda en el query string. El tipo original
+    # ya va en el mensaje, que es lo que hacía falta para distinguir un
+    # ConnectError de un ReadTimeout; la cadena completa sigue disponible en
+    # vivo por `__cause__`, que nunca se escribe a disco.
     logger.warning(
         "provider error classified as %s (original=%s: %s)",
-        type(classified).__name__, type(exc).__name__, rendered,
-        exc_info=exc,
+        type(classified).__name__, type(exc).__name__, _redacted(rendered),
     )
     return classified
 
