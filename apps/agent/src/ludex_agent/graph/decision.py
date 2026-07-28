@@ -108,6 +108,7 @@ async def decide(
     ))
     deadline = float(state.get("deadline", time.monotonic() + 240))
     previous_error: str | None = None
+    metrics.turn(turn_id)
 
     for semantic_attempt in range(2):
         raw = await provider.complete(

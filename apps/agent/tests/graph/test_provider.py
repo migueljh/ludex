@@ -77,6 +77,60 @@ async def test_429_rota_clave_y_repite_exactamente_el_mismo_prompt():
 
 
 @pytest.mark.asyncio
+async def test_429_envuelto_por_langchain_tambien_rota_la_clave():
+    metrics = DecisionMetrics()
+    wrapped = RuntimeError(
+        "Error calling model 'gemini-2.5-flash' "
+        "(RESOURCE_EXHAUSTED): 429 RESOURCE_EXHAUSTED"
+    )
+    backend = ScriptedBackend([wrapped, {"ok": True}])
+    provider = KeyRotatingProvider(
+        "google", ("key-a", "key-b"), backend, metrics=metrics
+    )
+
+    result = await provider.complete(
+        "mismo prompt", deadline=time.monotonic() + 1, turn_id="battle:wrapped"
+    )
+
+    assert result == {"ok": True}
+    assert backend.calls == [
+        ("mismo prompt", "key-a"),
+        ("mismo prompt", "key-b"),
+    ]
+    assert metrics.snapshot()["key_rotations"] == 1
+    assert metrics.snapshot()["turns_quota_affected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_clave_agotada_no_se_vuelve_a_probar_en_turnos_siguientes():
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([
+        QuotaExceeded("quota"),
+        {"turn": 1},
+        {"turn": 2},
+    ])
+    provider = KeyRotatingProvider(
+        "google", ("key-a", "key-b"), backend, metrics=metrics
+    )
+
+    first = await provider.complete(
+        "turno 1", deadline=time.monotonic() + 1, turn_id="battle:1"
+    )
+    second = await provider.complete(
+        "turno 2", deadline=time.monotonic() + 1, turn_id="battle:2"
+    )
+
+    assert first == {"turn": 1}
+    assert second == {"turn": 2}
+    assert backend.calls == [
+        ("turno 1", "key-a"),
+        ("turno 1", "key-b"),
+        ("turno 2", "key-b"),
+    ]
+    assert metrics.snapshot()["key_rotations"] == 1
+
+
+@pytest.mark.asyncio
 async def test_transitorio_reintenta_misma_clave_y_prompt():
     metrics = DecisionMetrics()
     backend = ScriptedBackend([TransientProviderError("5xx"), {"ok": True}])

@@ -99,6 +99,7 @@ async def test_segunda_respuesta_legal_registra_llm_retry():
 
     assert result["action_path"] == "llm_retry"
     assert result["action"] == {"kind": "move", "id": "thunderbolt"}
+    assert metrics.snapshot()["turns_total"] == 1
     assert metrics.snapshot()["turns_model_invalid"] == 1
     assert metrics.snapshot()["turns_fallback"] == 0
 

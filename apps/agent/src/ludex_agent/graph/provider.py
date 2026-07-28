@@ -49,6 +49,7 @@ class ProviderBackend(Protocol):
 class DecisionMetrics:
     def __init__(self) -> None:
         self._counts = {
+            "turns_total": 0,
             "key_rotations": 0,
             "provider_switches": 0,
             "turns_quota_affected": 0,
@@ -62,6 +63,12 @@ class DecisionMetrics:
         self._deadline_turns: set[str] = set()
         self._invalid_turns: set[str] = set()
         self._fallback_turns: set[str] = set()
+        self._turns: set[str] = set()
+
+    def turn(self, turn_id: str) -> None:
+        if turn_id not in self._turns:
+            self._turns.add(turn_id)
+            self._counts["turns_total"] += 1
 
     def key_rotation(self) -> None:
         self._counts["key_rotations"] += 1
@@ -132,7 +139,10 @@ def _classified(exc: Exception) -> ProviderError:
     if isinstance(exc, ProviderError):
         return exc
     status = _status_code(exc)
-    if status == 429:
+    rendered = str(exc)
+    if status == 429 or (
+        "RESOURCE_EXHAUSTED" in rendered and "429" in rendered
+    ):
         return QuotaExceeded("provider quota exhausted")
     if status is not None and status >= 500:
         return TransientProviderError("provider server error")
@@ -160,6 +170,7 @@ class KeyRotatingProvider:
         self._backend = backend
         self._metrics = metrics or DecisionMetrics()
         self._transient_retries = transient_retries
+        self._first_available_key = 0
 
     def __repr__(self) -> str:
         return (
@@ -170,7 +181,8 @@ class KeyRotatingProvider:
     async def complete(
         self, prompt: str, *, deadline: float, turn_id: str
     ) -> dict[str, Any]:
-        for key_index, key in enumerate(self._keys):
+        for key_index in range(self._first_available_key, len(self._keys)):
+            key = self._keys[key_index]
             transient_attempts = 0
             while True:
                 remaining = deadline - time.monotonic()
@@ -189,6 +201,9 @@ class KeyRotatingProvider:
                         raise error from None
                     if isinstance(error, QuotaExceeded):
                         self._metrics.quota(turn_id)
+                        self._first_available_key = max(
+                            self._first_available_key, key_index + 1
+                        )
                         if key_index + 1 < len(self._keys):
                             self._metrics.key_rotation()
                             break
