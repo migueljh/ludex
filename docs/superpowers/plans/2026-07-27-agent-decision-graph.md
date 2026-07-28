@@ -774,3 +774,26 @@ git add -f -- .superpowers/sdd/gpt-grafo.md
 git commit -m "docs(agent): record decision graph guarantees" -- \
   docs/DECISIONS.md .superpowers/sdd/gpt-grafo.md
 ```
+
+---
+
+### Deferred Task: Vectorizar la auditoría de fuga y separar sus dos alcances
+
+**Nombre:** `vectorize-information-leak-audit`
+
+**Problema medido:** con 484 batallas y 29.880 pasos,
+`test_no_hay_fuga_de_informacion_del_rival` pasa en 178 segundos. Hace una
+consulta acumulativa a `battle_turns` por paso (`turn_number <= N`), por lo
+que el costo crece linealmente con el corpus y repite trabajo dentro de cada
+batalla.
+
+**Trabajo futuro, deliberadamente fuera de esta rebanada:**
+
+1. Reemplazar el N+1 por una consulta única con JOIN/agregación que entregue
+   a cada paso el protocolo visible hasta su turno.
+2. Mantener en la suite rápida la verificación de las batallas recién jugadas.
+3. Mover la verificación de todo el corpus a `packages/dataset-audit`, para
+   ejecutarla deliberadamente antes de merge.
+4. Conservar ambas coberturas: filtrar la suite a la corrida actual no
+   reemplaza la auditoría histórica que ya encontró defectos en batallas
+   viejas.
