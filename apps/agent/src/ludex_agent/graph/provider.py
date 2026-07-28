@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
@@ -34,6 +35,33 @@ class DecisionDeadlineExceeded(ProviderError):
     pass
 
 
+@dataclass(frozen=True)
+class CompletionUsage:
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
+    model: str | None = None
+
+    def __post_init__(self) -> None:
+        values = (
+            self.input_tokens,
+            self.output_tokens,
+            self.cached_input_tokens,
+            self.reasoning_tokens,
+        )
+        if any(value < 0 for value in values):
+            raise ValueError("token usage cannot be negative")
+        if self.cached_input_tokens > self.input_tokens:
+            raise ValueError("cached input tokens cannot exceed input tokens")
+
+
+@dataclass(frozen=True)
+class ProviderCompletion:
+    payload: dict[str, Any]
+    usage: CompletionUsage
+
+
 class DecisionProvider(Protocol):
     async def complete(
         self, prompt: str, *, deadline: float, turn_id: str
@@ -43,13 +71,18 @@ class DecisionProvider(Protocol):
 class ProviderBackend(Protocol):
     async def complete(
         self, prompt: str, *, api_key: str, deadline: float
-    ) -> dict[str, Any]: ...
+    ) -> ProviderCompletion: ...
 
 
 class DecisionMetrics:
     def __init__(self) -> None:
         self._counts = {
             "turns_total": 0,
+            "calls_total": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": 0,
             "key_rotations": 0,
             "provider_switches": 0,
             "turns_quota_affected": 0,
@@ -72,6 +105,13 @@ class DecisionMetrics:
 
     def key_rotation(self) -> None:
         self._counts["key_rotations"] += 1
+
+    def usage(self, usage: CompletionUsage) -> None:
+        self._counts["calls_total"] += 1
+        self._counts["input_tokens"] += usage.input_tokens
+        self._counts["output_tokens"] += usage.output_tokens
+        self._counts["cached_input_tokens"] += usage.cached_input_tokens
+        self._counts["reasoning_tokens"] += usage.reasoning_tokens
 
     def provider_switch(self) -> None:
         self._counts["provider_switches"] += 1
@@ -191,9 +231,11 @@ class KeyRotatingProvider:
                     raise DecisionDeadlineExceeded("decision deadline exhausted")
                 try:
                     async with asyncio.timeout(remaining):
-                        return await self._backend.complete(
+                        completion = await self._backend.complete(
                             prompt, api_key=key, deadline=deadline
                         )
+                    self._metrics.usage(completion.usage)
+                    return completion.payload
                 except Exception as raw:
                     error = _classified(raw)
                     if isinstance(error, DecisionDeadlineExceeded):
@@ -283,7 +325,7 @@ class _LangChainBackend:
 
     async def complete(
         self, prompt: str, *, api_key: str, deadline: float
-    ) -> dict[str, Any]:
+    ) -> ProviderCompletion:
         if self.kind == "google":
             from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -306,10 +348,38 @@ class _LangChainBackend:
                 temperature=0, max_retries=0, timeout=self.timeout_seconds,
             )
         structured = model.with_structured_output(
-            self.response_schema, method="json_schema"
+            self.response_schema, method="json_schema", include_raw=True
         )
         result = await structured.ainvoke(prompt)
-        return result.model_dump() if hasattr(result, "model_dump") else dict(result)
+        raw = result["raw"]
+        parsed = result["parsed"]
+        usage = self._usage_from_message(raw)
+        if parsed is None:
+            payload = {"_invalid_response": raw.content}
+        else:
+            payload = (
+                parsed.model_dump()
+                if hasattr(parsed, "model_dump")
+                else dict(parsed)
+            )
+        return ProviderCompletion(payload=payload, usage=usage)
+
+    @staticmethod
+    def _usage_from_message(message: Any) -> CompletionUsage:
+        usage = getattr(message, "usage_metadata", None)
+        if not isinstance(usage, Mapping):
+            raise FatalProviderError("provider response did not include token usage")
+        input_details = usage.get("input_token_details") or {}
+        output_details = usage.get("output_token_details") or {}
+        response_metadata = getattr(message, "response_metadata", None) or {}
+        return CompletionUsage(
+            input_tokens=int(usage.get("input_tokens", 0)),
+            output_tokens=int(usage.get("output_tokens", 0)),
+            cached_input_tokens=int(input_details.get("cache_read", 0)),
+            reasoning_tokens=int(output_details.get("reasoning", 0)),
+            model=response_metadata.get("model_name")
+            or response_metadata.get("model"),
+        )
 
 
 class GeminiDecisionProvider(KeyRotatingProvider):

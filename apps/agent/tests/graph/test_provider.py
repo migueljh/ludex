@@ -4,10 +4,12 @@ import time
 import pytest
 
 from ludex_agent.graph.provider import (
+    CompletionUsage,
     DecisionDeadlineExceeded,
     DecisionMetrics,
     FatalProviderError,
     KeyRotatingProvider,
+    ProviderCompletion,
     ProviderChain,
     ProviderPoolExhausted,
     QuotaExceeded,
@@ -26,7 +28,12 @@ class ScriptedBackend:
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return response
+        if isinstance(response, ProviderCompletion):
+            return response
+        return ProviderCompletion(
+            payload=response,
+            usage=CompletionUsage(input_tokens=0, output_tokens=0),
+        )
 
 
 def test_pool_prioriza_principal_descarta_vacias_y_deduplica():
@@ -74,6 +81,39 @@ async def test_429_rota_clave_y_repite_exactamente_el_mismo_prompt():
     assert backend.calls == [("mismo prompt", "key-a"), ("mismo prompt", "key-b")]
     assert metrics.snapshot()["key_rotations"] == 1
     assert metrics.snapshot()["turns_quota_affected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_usage_se_suma_desde_cada_respuesta_exitosa():
+    metrics = DecisionMetrics()
+    usage = CompletionUsage(
+        input_tokens=120,
+        output_tokens=30,
+        cached_input_tokens=20,
+        reasoning_tokens=10,
+        model="minimax-m2.7",
+    )
+    backend = ScriptedBackend([
+        ProviderCompletion(payload={"turn": 1}, usage=usage),
+        ProviderCompletion(payload={"turn": 2}, usage=usage),
+    ])
+    provider = KeyRotatingProvider(
+        "open_code_zen", ("key-a",), backend, metrics=metrics
+    )
+
+    assert await provider.complete(
+        "turno 1", deadline=time.monotonic() + 1, turn_id="battle:1"
+    ) == {"turn": 1}
+    assert await provider.complete(
+        "turno 2", deadline=time.monotonic() + 1, turn_id="battle:2"
+    ) == {"turn": 2}
+
+    snapshot = metrics.snapshot()
+    assert snapshot["calls_total"] == 2
+    assert snapshot["input_tokens"] == 240
+    assert snapshot["output_tokens"] == 60
+    assert snapshot["cached_input_tokens"] == 40
+    assert snapshot["reasoning_tokens"] == 20
 
 
 @pytest.mark.asyncio
@@ -217,7 +257,10 @@ async def test_timeout_asyncio_se_clasifica_como_transitorio():
             self.calls += 1
             if self.calls == 1:
                 raise asyncio.TimeoutError
-            return {"ok": True}
+            return ProviderCompletion(
+                payload={"ok": True},
+                usage=CompletionUsage(input_tokens=1, output_tokens=1),
+            )
 
     backend = TimeoutBackend()
     provider = KeyRotatingProvider(

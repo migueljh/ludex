@@ -4,9 +4,11 @@ import pytest
 
 from ludex_agent.graph.decision import decide, normalize_action, validate_action
 from ludex_agent.graph.provider import (
+    CompletionUsage,
     DecisionMetrics,
     FakeDecisionProvider,
     KeyRotatingProvider,
+    ProviderCompletion,
     ProviderPoolExhausted,
     QuotaExceeded,
     TransientProviderError,
@@ -114,7 +116,10 @@ class ScriptedBackend:
         value = self.responses.pop(0)
         if isinstance(value, Exception):
             raise value
-        return value
+        return ProviderCompletion(
+            payload=value,
+            usage=CompletionUsage(input_tokens=1, output_tokens=1),
+        )
 
 
 @pytest.mark.asyncio
@@ -134,6 +139,7 @@ async def test_infraestructura_no_gasta_reintento_semantico_ni_hace_fallback(fai
 
     assert result["action_path"] == "llm"
     assert len(set(backend.prompts)) == 1
+    assert metrics.snapshot()["calls_total"] == 1
     assert metrics.snapshot()["turns_model_invalid"] == 0
     assert metrics.snapshot()["turns_fallback"] == 0
 
