@@ -1,0 +1,50 @@
+{
+  "run_id": "20260728-mimo-smoke",
+  "created_at": "2026-07-28T16:40:45.414821+00:00",
+  "status": "complete",
+  "provider": "open_code_zen",
+  "model": "mimo-v2.5-free",
+  "opponent": "simple_heuristics",
+  "format": "gen6randombattle",
+  "route": {
+    "protocol": "chat_completions",
+    "temperature": 0.0,
+    "thinking": null,
+    "max_tokens": null
+  },
+  "requested": 2,
+  "completed": 2,
+  "wins": 0,
+  "losses": 2,
+  "ties": 0,
+  "failure": null,
+  "win_rate": "0",
+  "wilson95": [
+    "0.0",
+    "0.6576197724933469"
+  ],
+  "metrics": {
+    "turns_total": 54,
+    "calls_total": 65,
+    "input_tokens": 156087,
+    "output_tokens": 7177,
+    "cached_input_tokens": 15552,
+    "reasoning_tokens": 0,
+    "key_rotations": 0,
+    "provider_switches": 0,
+    "turns_quota_affected": 0,
+    "turns_transient_affected": 0,
+    "turns_deadline_affected": 0,
+    "turns_model_invalid": 11,
+    "turns_fallback": 0
+  },
+  "calls_per_battle": "32.5",
+  "invalid_recovered_pct": "0.2037037037037037037037037037",
+  "fallback_pct": "0",
+  "total_cost": "0",
+  "cost_per_battle": "0",
+  "projected_10k_cost": "0",
+  "pricing_table_id": "2026-07-28-official",
+  "pricing_currency": "USD",
+  "pricing_source_url": "https://opencode.ai/docs/zen/"
+}
