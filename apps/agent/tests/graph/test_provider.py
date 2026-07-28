@@ -2,6 +2,7 @@ import asyncio
 import time
 
 import pytest
+from pydantic import BaseModel, Field, ValidationError
 
 from ludex_agent.graph.provider import (
     CompletionUsage,
@@ -21,6 +22,7 @@ from ludex_agent.graph.provider import (
     message_text_content,
     model_route,
     provider_keys,
+    provider_response_schema,
     structured_output_method,
     text_json_payload,
 )
@@ -33,6 +35,22 @@ def test_fallo_inesperado_conserva_tipo_pero_no_mensaje_sensible():
 
     assert str(classified) == "unexpected provider failure (RuntimeError)"
     assert "secret-value" not in str(classified)
+
+
+def test_validation_error_informa_solo_tipo_y_ubicacion():
+    class Positive(BaseModel):
+        value: int = Field(gt=0)
+
+    try:
+        Positive(value=-3)
+    except ValidationError as raw:
+        classified = _classified(raw)
+
+    assert str(classified) == (
+        "unexpected provider failure "
+        "(ValidationError: greater_than@value)"
+    )
+    assert "-3" not in str(classified)
 
 
 def test_base_anthropic_quita_v1_que_el_sdk_agrega_al_endpoint_messages():
@@ -72,6 +90,16 @@ def test_bloques_anthropic_extraen_el_texto_sin_serializar_el_envoltorio():
         {"type": "text", "text": '{"action":{"kind":"move","id":"tackle"}}'},
     ]) == '{"action":{"kind":"move","id":"tackle"}}'
     assert message_text_content("plain") == "plain"
+
+
+def test_backend_envia_schema_dict_y_deja_validacion_semantica_a_decide():
+    class Response(BaseModel):
+        action: dict
+
+    schema = provider_response_schema(Response)
+
+    assert isinstance(schema, dict)
+    assert schema["properties"]["action"]["type"] == "object"
 
 
 class ScriptedBackend:

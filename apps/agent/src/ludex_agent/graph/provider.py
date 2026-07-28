@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
+from pydantic import ValidationError
 
 
 class ProviderError(RuntimeError):
@@ -150,6 +151,11 @@ def message_text_content(content: Any) -> str:
     return ""
 
 
+def provider_response_schema(response_schema: type) -> dict[str, Any]:
+    """El backend estructura sintaxis; `decide` valida el contrato semántico."""
+    return response_schema.model_json_schema()
+
+
 class DecisionProvider(Protocol):
     async def complete(
         self, prompt: str, *, deadline: float, turn_id: str
@@ -278,9 +284,16 @@ def _classified(exc: Exception) -> ProviderError:
         return FatalProviderError("provider authentication failed")
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, httpx.TransportError)):
         return TransientProviderError("provider transport failed")
-    return FatalProviderError(
-        f"unexpected provider failure ({type(exc).__name__})"
-    )
+    detail = type(exc).__name__
+    if isinstance(exc, ValidationError):
+        shapes = [
+            f"{item['type']}@{'.'.join(map(str, item['loc']))}"
+            for item in exc.errors(
+                include_url=False, include_context=False, include_input=False
+            )
+        ]
+        detail += f": {','.join(shapes)}"
+    return FatalProviderError(f"unexpected provider failure ({detail})")
 
 
 class KeyRotatingProvider:
@@ -461,7 +474,9 @@ class _LangChainBackend:
                 usage=self._usage_from_message(raw),
             )
         structured = model.with_structured_output(
-            self.response_schema, method=output_method, include_raw=True
+            provider_response_schema(self.response_schema),
+            method=output_method,
+            include_raw=True,
         )
         result = await structured.ainvoke(prompt)
         raw = result["raw"]
