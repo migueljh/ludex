@@ -164,6 +164,9 @@ def test_rutas_de_modelo_eligen_el_protocolo_real():
         routes, "open_code_zen", "deepseek-v4-pro"
     ) == ModelRoute(protocol="chat_completions")
     assert model_route(
+        routes, "open_code_zen", "deepseek-v4-flash"
+    ) == ModelRoute(protocol="chat_completions")
+    assert model_route(
         routes, "open_code_zen", "qwen3.5-plus"
     ) == ModelRoute(
         protocol="messages",

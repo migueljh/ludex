@@ -58,6 +58,13 @@ def test_tabla_versionada_carga_modelos_y_fuentes_oficiales():
     assert minimax.checked_at == "2026-07-28"
     assert minimax.source_url == "https://opencode.ai/docs/zen/"
 
+    deepseek_flash = table.price("open_code_zen", "deepseek-v4-flash")
+    assert deepseek_flash.input_per_million == Decimal("0.14")
+    assert deepseek_flash.output_per_million == Decimal("0.28")
+    assert deepseek_flash.cached_input_per_million == Decimal("0.028")
+    assert deepseek_flash.checked_at == "2026-07-28"
+    assert deepseek_flash.source_url == "https://opencode.ai/docs/zen/"
+
 
 def test_modelo_sin_precio_deja_hueco_honesto():
     table = PricingTable.load()

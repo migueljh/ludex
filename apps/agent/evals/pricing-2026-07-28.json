@@ -40,6 +40,15 @@
     },
     {
       "provider": "open_code_zen",
+      "model": "deepseek-v4-flash",
+      "input_per_million": "0.14",
+      "output_per_million": "0.28",
+      "cached_input_per_million": "0.028",
+      "checked_at": "2026-07-28",
+      "source_url": "https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
       "model": "qwen3.5-plus",
       "input_per_million": "0.20",
       "output_per_million": "1.20",
