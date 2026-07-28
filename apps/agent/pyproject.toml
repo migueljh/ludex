@@ -3,11 +3,22 @@ name = "ludex-agent"
 version = "0.0.0"
 requires-python = ">=3.12"
 dependencies = [
+    "httpx==0.28.1",
+    "langchain-anthropic==1.5.0",
+    "langchain-google-genai==4.2.7",
+    "langchain-openai==1.4.0",
+    "langgraph==1.2.9",
     "poke-env==0.15.0",
+    "pydantic==2.13.4",
     "sqlalchemy[asyncio]==2.0.36",
     "asyncpg==0.30.0",
     "typer==0.15.1",
 ]
+
+[tool.uv]
+# poke-env uses websockets directly and requires 16.0. langgraph-sdk is only
+# present transitively for the unused remote LangGraph Platform client.
+override-dependencies = ["websockets==16.0"]
 
 [dependency-groups]
 dev = ["pytest==8.3.4", "pytest-asyncio==0.25.0"]
