@@ -851,3 +851,29 @@ Click 8.4.2, cuya firma ya no coincide con el formateador rich de Typer
 0.15.1. Se pineó `click==8.1.8`, comprobado contra el CLI real, y quedó un
 test que exige que `benchmark` aparezca en el help. No es un cambio de
 dominio ni una razón para actualizar Typer dentro de esta rebanada.
+
+## D28 — los benchmarks contabilizan usage real y fijan proveedor y modelo
+
+El costo de una corrida se calcula desde el `usage` devuelto por cada respuesta
+exitosa: tokens de entrada, lectura de caché, salida y razonamiento cuando el
+proveedor lo separa. No se estima un promedio por llamada. Los precios viven en
+un archivo externo fechado, con fuente y tarifas por millón de tokens; cada
+artefacto registra qué tabla usó. Si falta una tarifa necesaria, el costo queda
+vacío en vez de inventarse.
+
+Las rutas de modelo son explícitas. MiniMax, DeepSeek y MiMo usan
+`/chat/completions`; Kimi K2.6 usa ese protocolo con `thinking=enabled`,
+temperatura 1 y límite de salida medido. Qwen por OpenCode Zen usa
+`/messages`. El SDK Anthropic agrega `/v1/messages`, por lo que para esa ruta
+se elimina el `/v1` final de la base configurada. Zen/Qwen rechaza tanto el
+`json_schema` nativo de Claude como las tools forzadas: su contrato es JSON
+textual estricto, sometido después a la misma validación, reintento semántico y
+fallback que cualquier otra respuesta del modelo. Esto quedó comprobado contra
+el endpoint real y protegido por canarios.
+
+Rotar claves dentro de un proveedor no cambia la identidad de una medición.
+Cambiar de proveedor o modelo sí: está prohibido durante un benchmark. Una
+corrida fija ambos al empezar y, si su infraestructura se agota, aborta
+ruidosamente con el progreso alcanzado. La cadena entre proveedores queda
+reservada para partidas interactivas, donde terminar la batalla importa más que
+la comparabilidad estadística.
