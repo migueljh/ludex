@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 
 import httpx
@@ -415,6 +416,53 @@ async def test_deadline_expirado_no_invoca_proveedor():
 def test_errores_no_contienen_secretos_por_representacion():
     assert "secret" not in repr(QuotaExceeded())
     assert issubclass(FatalProviderError, Exception)
+
+
+@pytest.mark.asyncio
+async def test_error_transitorio_preserva_tipo_mensaje_y_causa_original(caplog):
+    """Diagnóstico bloqueado (D25): reclasificar sin conservar la excepción
+    original hacía indistinguibles un ConnectError, un ReadTimeout y un
+    PoolTimeout detrás del mismo "provider transport failed" — exactamente
+    lo que impedía diagnosticar los abortos de Kimi/DeepSeek/Gemini. La
+    clasificación pública (`str(classified)`) tiene que seguir fija (termina
+    en `evals/runs/*.json`, que se commitea), pero `__cause__` y el log
+    tienen que exponer el original completo."""
+    original = httpx.ConnectError(
+        "Connection reset by peer while decoding turn 42"
+    )
+
+    class FlakyBackend:
+        async def complete(self, prompt, *, api_key, deadline):
+            raise original
+
+    metrics = DecisionMetrics()
+    provider = KeyRotatingProvider(
+        "kimi", ("k",), FlakyBackend(), metrics=metrics, transient_retries=0
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="ludex_agent.graph.provider"
+    ):
+        with pytest.raises(TransientProviderError) as exc_info:
+            await provider.complete(
+                "p", deadline=time.monotonic() + 1, turn_id="t"
+            )
+
+    raised = exc_info.value
+    # La clasificación pública no cambia: sigue siendo el mensaje fijo, sin
+    # el detalle del proveedor (ese detalle podría contener información que
+    # no queremos en un JSON commiteado).
+    assert str(raised) == "provider transport failed"
+    # Pero la causa original queda enganchada para quien inspeccione la
+    # excepción (debugger, `traceback.print_exc()`, etc.).
+    assert raised.__cause__ is original
+    assert isinstance(raised.__cause__, httpx.ConnectError)
+    # Y el log —que no se commitea a ningún lado— sí trae tipo y mensaje.
+    assert any(
+        "ConnectError" in record.getMessage()
+        and "Connection reset by peer while decoding turn 42" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

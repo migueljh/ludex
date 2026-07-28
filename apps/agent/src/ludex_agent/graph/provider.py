@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ import httpx
 from anthropic import APIConnectionError as AnthropicAPIConnectionError
 from openai import APIConnectionError as OpenAIAPIConnectionError
 from pydantic import ValidationError
+
+logger = logging.getLogger(__name__)
 
 
 class ProviderError(RuntimeError):
@@ -281,29 +284,44 @@ def _classified(exc: Exception) -> ProviderError:
     if status == 429 or (
         "RESOURCE_EXHAUSTED" in rendered and "429" in rendered
     ):
-        return QuotaExceeded("provider quota exhausted")
-    if status is not None and status >= 500:
-        return TransientProviderError("provider server error")
-    if status in (401, 403):
-        return FatalProviderError("provider authentication failed")
-    if isinstance(exc, (
+        classified: ProviderError = QuotaExceeded("provider quota exhausted")
+    elif status is not None and status >= 500:
+        classified = TransientProviderError("provider server error")
+    elif status in (401, 403):
+        classified = FatalProviderError("provider authentication failed")
+    elif isinstance(exc, (
         asyncio.TimeoutError,
         TimeoutError,
         httpx.TransportError,
         OpenAIAPIConnectionError,
         AnthropicAPIConnectionError,
     )):
-        return TransientProviderError("provider transport failed")
-    detail = type(exc).__name__
-    if isinstance(exc, ValidationError):
-        shapes = [
-            f"{item['type']}@{'.'.join(map(str, item['loc']))}"
-            for item in exc.errors(
-                include_url=False, include_context=False, include_input=False
-            )
-        ]
-        detail += f": {','.join(shapes)}"
-    return FatalProviderError(f"unexpected provider failure ({detail})")
+        classified = TransientProviderError("provider transport failed")
+    else:
+        detail = type(exc).__name__
+        if isinstance(exc, ValidationError):
+            shapes = [
+                f"{item['type']}@{'.'.join(map(str, item['loc']))}"
+                for item in exc.errors(
+                    include_url=False, include_context=False, include_input=False
+                )
+            ]
+            detail += f": {','.join(shapes)}"
+        classified = FatalProviderError(f"unexpected provider failure ({detail})")
+    # No se puede diagnosticar lo que no se ve: la clasificación colapsa
+    # cualquier excepción de transporte a un puñado de mensajes fijos (a
+    # propósito, para no filtrar detalle de proveedor en `str(classified)`,
+    # que termina en `evals/runs/*.json` y de ahí en el repo). El tipo y
+    # mensaje ORIGINALES —ConnectError vs. ReadTimeout vs. PoolTimeout, la
+    # causa real detrás de "provider transport failed"— solo quedan acá, en
+    # el log y en `__cause__` (ver los `raise ... from` en
+    # `KeyRotatingProvider.complete`, que ya no usan `from None`).
+    logger.warning(
+        "provider error classified as %s (original=%s: %s)",
+        type(classified).__name__, type(exc).__name__, rendered,
+        exc_info=exc,
+    )
+    return classified
 
 
 class KeyRotatingProvider:
@@ -353,7 +371,7 @@ class KeyRotatingProvider:
                     error = _classified(raw)
                     if isinstance(error, DecisionDeadlineExceeded):
                         self._metrics.deadline(turn_id)
-                        raise error from None
+                        raise error from raw
                     if isinstance(error, QuotaExceeded):
                         self._metrics.quota(turn_id)
                         self._first_available_key = max(
@@ -364,13 +382,13 @@ class KeyRotatingProvider:
                             break
                         raise ProviderPoolExhausted(
                             f"{self.name}: all configured keys exhausted"
-                        ) from None
+                        ) from error
                     if isinstance(error, TransientProviderError):
                         self._metrics.transient(turn_id)
                         if transient_attempts < self._transient_retries:
                             transient_attempts += 1
                             continue
-                    raise error from None
+                    raise error from raw
         raise ProviderPoolExhausted(f"{self.name}: all configured keys exhausted")
 
 
