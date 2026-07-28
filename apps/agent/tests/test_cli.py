@@ -45,6 +45,7 @@ def test_cli_expone_benchmark_en_help():
     result = CliRunner().invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "benchmark" in result.stdout
+    assert "provider-smoke" in result.stdout
 
 
 def test_benchmark_expone_registro_y_tabla_de_precios():

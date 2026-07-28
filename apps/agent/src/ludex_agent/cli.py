@@ -302,6 +302,32 @@ def _benchmark_provider(
     )
 
 
+@app.command("provider-smoke")
+def provider_smoke_command(
+    provider: str,
+    model: str,
+) -> None:
+    """Una completion estructurada, sin Showdown ni persistencia."""
+    settings = load_settings()
+    metrics = DecisionMetrics()
+    selected = _benchmark_provider(
+        provider, model, settings.llm_request_timeout_seconds, metrics
+    )
+    prompt = (
+        "Elegí exactamente una acción legal y respondé con action y un "
+        "reasoning breve. legal_actions="
+        '[{"kind":"move","id":"tackle"},{"kind":"switch","species":"pikachu"}]'
+    )
+    payload = asyncio.run(selected.complete(
+        prompt,
+        deadline=time.monotonic() + settings.llm_request_timeout_seconds,
+        turn_id=f"provider-smoke:{provider}:{model}",
+    ))
+    parsed = DecisionResponse.model_validate(payload)
+    typer.echo(f"provider={provider} model={model} action={parsed.action}")
+    typer.echo(f"decision_metrics={metrics.snapshot()}")
+
+
 async def _benchmark_command(
     *, n: int, opponent: str, concurrency: int, persist: bool,
     provider_name: str, model: str, fmt: str,
