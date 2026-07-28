@@ -118,3 +118,26 @@ async def test_models_espeja_el_ddl_columna_por_columna():
             assert columnas_comparadas > 0, "no se comparo ninguna columna"
     finally:
         await engine.dispose()
+
+
+async def test_action_path_es_text_nullable_con_dominio_acotado():
+    engine = make_engine(load_settings().database_url)
+    try:
+        async with session_factory(engine)() as s:
+            column = (await s.execute(text("""
+                SELECT is_nullable, data_type
+                FROM information_schema.columns
+                WHERE table_schema='public'
+                  AND table_name='trajectory_steps'
+                  AND column_name='action_path'
+            """))).one()
+            definition = (await s.execute(text("""
+                SELECT pg_get_constraintdef(oid)
+                FROM pg_constraint
+                WHERE conname='trajectory_steps_action_path_check'
+            """))).scalar_one()
+
+        assert column == ("YES", "text")
+        assert all(value in definition for value in ("llm", "llm_retry", "fallback"))
+    finally:
+        await engine.dispose()

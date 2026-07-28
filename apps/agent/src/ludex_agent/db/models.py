@@ -94,4 +94,5 @@ class TrajectoryStep(Base):
     legal_actions: Mapped[list] = mapped_column(JSONB)
     action_taken: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     action_source: Mapped[str] = mapped_column(ActionSource)
+    action_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     reward: Mapped[float | None] = mapped_column(Numeric, nullable=True)

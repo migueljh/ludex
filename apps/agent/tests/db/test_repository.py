@@ -46,19 +46,48 @@ async def test_guarda_batalla_turno_trayectoria_y_paso(repo):
     )
     await repo.save_turn(bid, "p1", 1, ["|turn|1", "|move|p1a: X|Y"])
     tid = await repo.save_trajectory(bid, gen_number=6, fmt="gen6randombattle", player_side="p1")
-    await repo.save_step(tid, 0, 1, {"schema_version": 1}, 1, [{"kind": "move", "id": "y"}],
-                         {"kind": "move", "id": "y"}, "agent")
+    await repo.save_step(
+        tid, 0, 1, {"schema_version": 1}, 1,
+        [{"kind": "move", "id": "y"}],
+        {"kind": "move", "id": "y"}, "agent",
+        action_path="llm_retry",
+    )
     await repo.finalize(tid, result="win", reward=1)
 
     async with repo.factory() as s:
         row = (await s.execute(text(
-            "SELECT reward, state_schema_version, decision_index, turn_number "
+            "SELECT reward, state_schema_version, decision_index, turn_number, "
+            "action_source::text, action_path "
             "FROM trajectory_steps WHERE trajectory_id=:t"
         ), {"t": tid})).one()
         assert float(row[0]) == 1.0
         assert row[1] == 1
         assert row[2] == 0
         assert row[3] == 1
+        assert row[4] == "agent"
+        assert row[5] == "llm_retry"
+
+
+async def test_action_path_nullable_y_restringido(repo):
+    bid = await repo.save_battle(
+        battle_tag="battle-test-action-path", fmt="gen6randombattle",
+        p1="A", p2="B", winner=None, source=SOURCE, played_by="bot",
+    )
+    tid = await repo.save_trajectory(
+        bid, gen_number=6, fmt="gen6randombattle", player_side="p1"
+    )
+    await repo.save_step(tid, 0, 1, {}, 1, [], None, "agent", action_path=None)
+
+    async with repo.factory() as s:
+        assert (await s.execute(text(
+            "SELECT action_path FROM trajectory_steps "
+            "WHERE trajectory_id=:t AND decision_index=0"
+        ), {"t": tid})).scalar_one_or_none() is None
+        with pytest.raises(Exception, match="trajectory_steps_action_path_check"):
+            await s.execute(text(
+                "UPDATE trajectory_steps SET action_path='random' "
+                "WHERE trajectory_id=:t AND decision_index=0"
+            ), {"t": tid})
 
 
 async def test_es_idempotente_por_battle_tag(repo):

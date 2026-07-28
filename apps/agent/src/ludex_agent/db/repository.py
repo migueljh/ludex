@@ -90,7 +90,7 @@ class BattleRepository:
 
     async def save_step(self, trajectory_id: int, decision_index: int, turn: int,
                         state: dict, version: int, legal: list, action: dict | None,
-                        source: str) -> None:
+                        source: str, action_path: str | None = None) -> None:
         """D21 (C2): la clave es `(trajectory_id, decision_index)`.
 
         `decision_index` cuenta decisiones, no turnos, asi que un cambio
@@ -101,9 +101,10 @@ class BattleRepository:
             await s.execute(text("""
                 INSERT INTO trajectory_steps
                   (trajectory_id, decision_index, turn_number, state,
-                   state_schema_version, legal_actions, action_taken, action_source)
+                   state_schema_version, legal_actions, action_taken, action_source,
+                   action_path)
                 VALUES (:tj, :di, :t, CAST(:st AS jsonb), :v, CAST(:la AS jsonb),
-                        CAST(:at AS jsonb), CAST(:src AS action_source))
+                        CAST(:at AS jsonb), CAST(:src AS action_source), :path)
                 -- turn_number, state_schema_version y action_source TAMBIEN se
                 -- actualizan: si un paso se reescribe tras un bump de version,
                 -- dejar la version vieja con el estado nuevo hace que la fila
@@ -116,11 +117,12 @@ class BattleRepository:
                       state_schema_version = EXCLUDED.state_schema_version,
                       legal_actions = EXCLUDED.legal_actions,
                       action_taken = EXCLUDED.action_taken,
-                      action_source = EXCLUDED.action_source
+                      action_source = EXCLUDED.action_source,
+                      action_path = EXCLUDED.action_path
             """), {"tj": trajectory_id, "di": decision_index, "t": turn,
                    "st": json.dumps(state), "v": version, "la": json.dumps(legal),
                    "at": json.dumps(action) if action is not None else None,
-                   "src": source})
+                   "src": source, "path": action_path})
             await s.commit()
 
     async def finalize(self, trajectory_id: int, *, result: str,

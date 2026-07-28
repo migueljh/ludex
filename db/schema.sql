@@ -419,7 +419,9 @@ CREATE TABLE public.trajectory_steps (
     action_taken jsonb,
     action_source public.action_source NOT NULL,
     reward numeric,
-    decision_index integer NOT NULL
+    decision_index integer NOT NULL,
+    action_path text,
+    CONSTRAINT trajectory_steps_action_path_check CHECK ((action_path = ANY (ARRAY['llm'::text, 'llm_retry'::text, 'fallback'::text])))
 );
 
 
@@ -878,4 +880,5 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20260726000001'),
     ('20260727000005'),
     ('20260727000006'),
-    ('20260727000007');
+    ('20260727000007'),
+    ('20260727000008');
