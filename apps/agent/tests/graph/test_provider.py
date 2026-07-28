@@ -9,11 +9,14 @@ from ludex_agent.graph.provider import (
     DecisionMetrics,
     FatalProviderError,
     KeyRotatingProvider,
+    ModelRoute,
     ProviderCompletion,
     ProviderChain,
     ProviderPoolExhausted,
     QuotaExceeded,
     TransientProviderError,
+    load_model_routes,
+    model_route,
     provider_keys,
 )
 
@@ -64,6 +67,36 @@ def test_gemini_acepta_google_como_alias_secundario_sin_duplicar():
         "gemini-primary", "shared", "gemini-pool",
         "google-primary", "google-pool",
     )
+
+
+def test_rutas_de_modelo_eligen_el_protocolo_real():
+    routes = load_model_routes()
+
+    assert model_route(
+        routes, "open_code_zen", "minimax-m2.7"
+    ) == ModelRoute(protocol="chat_completions")
+    assert model_route(
+        routes, "open_code_zen", "deepseek-v4-pro"
+    ) == ModelRoute(protocol="chat_completions")
+    assert model_route(
+        routes, "open_code_zen", "qwen3.5-plus"
+    ) == ModelRoute(protocol="messages")
+    assert model_route(
+        routes, "open_code_zen", "qwen3.6-plus"
+    ) == ModelRoute(protocol="messages")
+    assert model_route(
+        routes, "kimi", "kimi-k2.6"
+    ) == ModelRoute(
+        protocol="chat_completions",
+        temperature=1.0,
+        thinking="enabled",
+        max_tokens=16_000,
+    )
+
+
+def test_modelo_sin_ruta_falla_antes_de_llamar_al_proveedor():
+    with pytest.raises(ValueError, match="sin ruta"):
+        model_route(load_model_routes(), "open_code_zen", "modelo-inventado")
 
 
 @pytest.mark.asyncio

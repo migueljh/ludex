@@ -31,6 +31,8 @@ from .graph.provider import (
     OpenAICompatibleDecisionProvider,
     ProviderChain,
     ProviderError,
+    load_model_routes,
+    model_route,
     provider_keys,
 )
 from .graph.workflow import build_decision_graph
@@ -248,6 +250,11 @@ def _benchmark_provider(
     keys = provider_keys(
         os.environ, primary_env, pool_env, aliases=aliases
     )
+    route = (
+        model_route(load_model_routes(), name, model)
+        if name in {"kimi", "open_code_zen"}
+        else None
+    )
     if name == "google":
         selected = GeminiDecisionProvider(
             keys, model=model, response_schema=DecisionResponse,
@@ -258,11 +265,22 @@ def _benchmark_provider(
             keys, model=model, response_schema=DecisionResponse,
             timeout_seconds=timeout, metrics=metrics,
         )
+    elif route is not None and route.protocol == "messages":
+        selected = AnthropicDecisionProvider(
+            keys, name=name, model=model,
+            base_url=os.environ.get(base_env) if base_env else None,
+            response_schema=DecisionResponse, timeout_seconds=timeout,
+            metrics=metrics, route=route,
+        )
+    elif route is not None and route.protocol == "responses":
+        raise RuntimeError(
+            f"{name}/{model}: protocolo responses todavía no implementado"
+        )
     else:
         selected = OpenAICompatibleDecisionProvider(
             name, keys, model=model, base_url=os.environ.get(base_env) if base_env else None,
             response_schema=DecisionResponse, timeout_seconds=timeout,
-            metrics=metrics,
+            metrics=metrics, route=route,
         )
     # Regla de medición: aunque exista LUDEX_PROVIDER_CHAIN, el benchmark
     # queda fijado al proveedor/modelo elegidos y nunca cruza de proveedor.

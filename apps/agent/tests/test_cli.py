@@ -14,7 +14,13 @@ from types import SimpleNamespace
 import pytest
 from typer.testing import CliRunner
 
-from ludex_agent.cli import _battle_outcome, _persist_one, app
+from ludex_agent.cli import (
+    _battle_outcome,
+    _benchmark_provider,
+    _persist_one,
+    app,
+)
+from ludex_agent.graph.provider import DecisionMetrics
 from ludex_agent.showdown.client import LudexPlayer, local_server_configuration
 
 
@@ -39,6 +45,14 @@ def test_cli_expone_benchmark_en_help():
     result = CliRunner().invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "benchmark" in result.stdout
+
+
+def test_benchmark_rechaza_modelo_sin_ruta_antes_de_llamarlo(monkeypatch):
+    monkeypatch.setenv("OPEN_CODE_ZEN_API_KEY", "fake-key")
+    with pytest.raises(ValueError, match="sin ruta"):
+        _benchmark_provider(
+            "open_code_zen", "modelo-inventado", 10, DecisionMetrics()
+        )
 
 
 class _FakeRepo:

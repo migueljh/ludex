@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
@@ -60,6 +62,53 @@ class CompletionUsage:
 class ProviderCompletion:
     payload: dict[str, Any]
     usage: CompletionUsage
+
+
+@dataclass(frozen=True)
+class ModelRoute:
+    protocol: str
+    temperature: float = 0.0
+    thinking: str | None = None
+    max_tokens: int | None = None
+
+
+DEFAULT_MODEL_ROUTES = (
+    Path(__file__).resolve().parents[3] / "evals" / "model-routes.json"
+)
+
+
+def load_model_routes(
+    path: str | Path = DEFAULT_MODEL_ROUTES,
+) -> dict[tuple[str, str], ModelRoute]:
+    document = json.loads(Path(path).read_text(encoding="utf-8"))
+    routes: dict[tuple[str, str], ModelRoute] = {}
+    for raw in document["routes"]:
+        key = (raw["provider"], raw["model"])
+        if key in routes:
+            raise ValueError(f"ruta de modelo duplicada: {key}")
+        protocol = raw["protocol"]
+        if protocol not in {"chat_completions", "messages", "responses"}:
+            raise ValueError(f"protocolo de modelo desconocido: {protocol}")
+        routes[key] = ModelRoute(
+            protocol=protocol,
+            temperature=float(raw.get("temperature", 0)),
+            thinking=raw.get("thinking"),
+            max_tokens=raw.get("max_tokens"),
+        )
+    return routes
+
+
+def model_route(
+    routes: Mapping[tuple[str, str], ModelRoute],
+    provider: str,
+    model: str,
+) -> ModelRoute:
+    try:
+        return routes[(provider, model)]
+    except KeyError:
+        raise ValueError(
+            f"modelo sin ruta explícita: {provider}/{model}"
+        ) from None
 
 
 class DecisionProvider(Protocol):
@@ -316,12 +365,14 @@ class _LangChainBackend:
         response_schema: type,
         timeout_seconds: float,
         base_url: str | None = None,
+        route: ModelRoute | None = None,
     ) -> None:
         self.kind = kind
         self.model = model
         self.response_schema = response_schema
         self.timeout_seconds = timeout_seconds
         self.base_url = base_url
+        self.route = route or ModelRoute(protocol=kind)
 
     async def complete(
         self, prompt: str, *, api_key: str, deadline: float
@@ -330,22 +381,32 @@ class _LangChainBackend:
             from langchain_google_genai import ChatGoogleGenerativeAI
 
             model = ChatGoogleGenerativeAI(
-                model=self.model, api_key=api_key, temperature=0,
+                model=self.model, api_key=api_key,
+                temperature=self.route.temperature,
                 retries=0, request_timeout=self.timeout_seconds,
             )
         elif self.kind == "anthropic":
             from langchain_anthropic import ChatAnthropic
 
             model = ChatAnthropic(
-                model_name=self.model, api_key=api_key, temperature=0,
+                model_name=self.model, api_key=api_key,
+                base_url=self.base_url,
+                temperature=self.route.temperature,
                 max_retries=0, timeout=self.timeout_seconds,
             )
         else:
             from langchain_openai import ChatOpenAI
 
+            extra_body: dict[str, Any] = {}
+            if self.route.thinking is not None:
+                extra_body["thinking"] = {"type": self.route.thinking}
+            if self.route.max_tokens is not None:
+                extra_body["max_tokens"] = self.route.max_tokens
             model = ChatOpenAI(
                 model=self.model, api_key=api_key, base_url=self.base_url,
-                temperature=0, max_retries=0, timeout=self.timeout_seconds,
+                temperature=self.route.temperature, max_retries=0,
+                timeout=self.timeout_seconds,
+                extra_body=extra_body or None,
             )
         structured = model.with_structured_output(
             self.response_schema, method="json_schema", include_raw=True
@@ -401,13 +462,13 @@ class OpenAICompatibleDecisionProvider(KeyRotatingProvider):
     def __init__(
         self, name: str, keys: Sequence[str], *, model: str, base_url: str | None,
         response_schema: type, timeout_seconds: float,
-        metrics: DecisionMetrics | None = None,
+        metrics: DecisionMetrics | None = None, route: ModelRoute | None = None,
     ) -> None:
         super().__init__(
             name, keys,
             _LangChainBackend(
                 kind="openai", model=model, response_schema=response_schema,
-                timeout_seconds=timeout_seconds, base_url=base_url,
+                timeout_seconds=timeout_seconds, base_url=base_url, route=route,
             ),
             metrics=metrics,
         )
@@ -417,12 +478,14 @@ class AnthropicDecisionProvider(KeyRotatingProvider):
     def __init__(
         self, keys: Sequence[str], *, model: str, response_schema: type,
         timeout_seconds: float, metrics: DecisionMetrics | None = None,
+        name: str = "anthropic", base_url: str | None = None,
+        route: ModelRoute | None = None,
     ) -> None:
         super().__init__(
-            "anthropic", keys,
+            name, keys,
             _LangChainBackend(
                 kind="anthropic", model=model, response_schema=response_schema,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=timeout_seconds, base_url=base_url, route=route,
             ),
             metrics=metrics,
         )

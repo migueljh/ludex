@@ -1,0 +1,38 @@
+{
+  "version": "2026-07-28",
+  "routes": [
+    {
+      "provider": "open_code_zen",
+      "model": "mimo-v2.5-free",
+      "protocol": "chat_completions"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "minimax-m2.7",
+      "protocol": "chat_completions"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "deepseek-v4-pro",
+      "protocol": "chat_completions"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "qwen3.5-plus",
+      "protocol": "messages"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "qwen3.6-plus",
+      "protocol": "messages"
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k2.6",
+      "protocol": "chat_completions",
+      "temperature": 1.0,
+      "thinking": "enabled",
+      "max_tokens": 16000
+    }
+  ]
+}
