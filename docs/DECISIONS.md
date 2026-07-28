@@ -897,3 +897,28 @@ batalla. `LudexPlayer` publica el primer fallo de fondo mediante un
 hilo. El runner corre cada batalla en carrera contra esa señal: si llega el
 fallo, cancela la espera, conserva el snapshot y propaga la excepción original.
 Así una corrida desatendida aborta ruidosamente en vez de quedar colgada.
+
+## D29 — el request propio activo prueba un switch oculto por Illusion
+
+Un Zoroark propio puede entrar disfrazado, salir antes de que Illusion se
+rompa y no aparecer nunca por su nombre en la narración pública. En
+`battle-gen6randombattle-1799`, el agente eligió Zoroark, Showdown narró
+`|switch|p1a: Barbaracle|...` y Zoroark salió antes de producir
+`|replace|...|Zoroark`. El corrector no encontró la especie elegida y dejó la
+decisión en el turno crudo 0 aunque se resolvió en el turno 1.
+
+El `|request|` privado propio es una clase adicional de evidencia positiva:
+después de resolver el cambio, `side.pokemon` identifica con `active: true` al
+Zoroark real aunque la línea pública conserve el disfraz. Se acepta sólo para
+una decisión de switch y sólo cuando `request.side.id` coincide con el lado
+propio que se está corrigiendo. Nunca se consulta un request del lado
+contrario: Illusion debe seguir ocultando la identidad del rival y el dataset
+no puede incorporar información que ese jugador no conoce.
+
+El request se parsea como JSON; no se busca la especie como substring. La
+línea contiene los seis Pokémon propios y el nombre de un miembro en banca no
+prueba que haya entrado. Sólo cuenta el objeto cuyo campo `active` es
+exactamente `true`, y su `ident` debe pertenecer al mismo lado. Aunque la
+evidencia se obtiene del request, el cursor global avanza después del
+`|switch|` público asociado en el mismo turno, para que una decisión posterior
+no pueda reutilizar esa línea.

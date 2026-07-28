@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import logging
 import re
 import time
@@ -135,6 +136,38 @@ def _illusion_revela_a(
     return False
 
 
+def _request_propio_confirma_activo(line: str, side: str, clave: str) -> bool:
+    """Confirma la especie activa desde el `|request|` privado propio.
+
+    El JSON contiene los seis miembros del equipo, por lo que buscar
+    `clave` como substring produciria falsos positivos para cualquier
+    pokemon en banca. Solo cuenta el miembro con `active: true`, y solo si
+    `side.id` coincide con el lado cuya decision se esta corrigiendo. Esto
+    impide usar un request ajeno para desenmascarar la Illusion del rival.
+    """
+    prefix = "|request|"
+    if not line.startswith(prefix):
+        return False
+    try:
+        request = json.loads(line[len(prefix):])
+    except (json.JSONDecodeError, TypeError):
+        return False
+    request_side = request.get("side")
+    if not isinstance(request_side, dict) or request_side.get("id") != side:
+        return False
+    pokemon = request_side.get("pokemon")
+    if not isinstance(pokemon, list):
+        return False
+    for member in pokemon:
+        if not isinstance(member, dict) or member.get("active") is not True:
+            continue
+        ident = member.get("ident")
+        if not isinstance(ident, str) or not ident.startswith(f"{side}: "):
+            return False
+        return _normalize(ident.split(": ", 1)[1]) == clave
+    return False
+
+
 def _find_action_line(
     recorder: ProtocolRecorder,
     side: str,
@@ -251,6 +284,7 @@ def _find_action_line(
     prefix_opp_encore = f"|move|{opp_side}a:"
     respaldo: tuple[int, int] | None = None
     respaldo_turn: int | None = None
+    request_activo_turn: int | None = None
     se_movio_en: set[int] = set()
     for offset, (turn, line) in enumerate(recorder.entries_from(from_index)):
         if turn > max_turn:
@@ -272,11 +306,23 @@ def _find_action_line(
             # apropiandose del `|move|...|Encore||[still]` de la decision
             # SIGUIENTE, dos turnos mas adelante).
             break
-        if line.startswith(prefix_move) or line.startswith(prefix_switch):
+        if (
+            not accion_es_movimiento
+            and _request_propio_confirma_activo(line, side, clave)
+        ):
+            # El request llega antes de la narracion publica del turno. La
+            # evidencia privada identifica al verdadero activo pese a
+            # Illusion, pero el cursor se consume recien al encontrar el
+            # `|switch|` propio asociado: devolver desde el request dejaria
+            # esa linea disponible para que la decision siguiente la robe.
+            request_activo_turn = turn
+        elif line.startswith(prefix_move) or line.startswith(prefix_switch):
             if clave in _normalize(line):
                 return turn, from_index + offset + 1
             if line.startswith(prefix_move):
                 se_movio_en.add(turn)
+            elif request_activo_turn == turn:
+                return turn, from_index + offset + 1
             elif (
                 not accion_es_movimiento
                 and _illusion_revela_a(recorder, from_index + offset + 1, side, clave)

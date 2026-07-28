@@ -730,6 +730,60 @@ def test_find_action_line_illusion_no_revelada_no_confirma_nada():
     ) is None
 
 
+def test_find_action_line_request_propio_confirma_illusion_no_revelada():
+    """Si Zoroark sale antes de romper Illusion, el protocolo publico nunca
+    lo nombra. El request privado propio posterior al cambio si lo identifica
+    como el miembro activo y es evidencia positiva del turno de resolucion."""
+    recorder = _recorder_con([
+        [
+            "|turn|1",
+            '|request|{"side":{"id":"p1","pokemon":['
+            '{"ident":"p1: Zoroark","details":"Zoroark, L81, M","active":true},'
+            '{"ident":"p1: Druddigon","details":"Druddigon, L85, M","active":false}'
+            "]}}",
+            "|switch|p1a: Barbaracle|Barbaracle, L82, F|230/230",
+        ],
+        ["|turn|4", "|switch|p1a: Druddigon|Druddigon, L85, M|270/270"],
+    ])
+
+    assert _find_action_line(
+        recorder, "p1", {"kind": "switch", "species": "zoroark"}, 0, max_turn=1,
+    ) == (1, 3)
+
+
+def test_find_action_line_request_no_matchea_pokemon_en_banca():
+    """No se busca por substring en el JSON: Zoroark aparece en el equipo,
+    pero no es el miembro activo, por lo que no prueba que haya entrado."""
+    recorder = _recorder_con([[
+        "|turn|1",
+        '|request|{"side":{"id":"p1","pokemon":['
+        '{"ident":"p1: Druddigon","details":"Druddigon, L85, M","active":true},'
+        '{"ident":"p1: Zoroark","details":"Zoroark, L81, M","active":false}'
+        "]}}",
+        "|switch|p2a: Suicune|Suicune, L80|100/100",
+    ]])
+
+    assert _find_action_line(
+        recorder, "p1", {"kind": "switch", "species": "zoroark"}, 0, max_turn=1,
+    ) is None
+
+
+def test_find_action_line_request_del_rival_nunca_es_evidencia():
+    """La evidencia privada vale solo para nuestro lado. Aunque un request
+    ajeno expusiera Zoroark activo, no puede corregir una accion de p1."""
+    recorder = _recorder_con([[
+        "|turn|1",
+        '|request|{"side":{"id":"p2","pokemon":['
+        '{"ident":"p2: Zoroark","details":"Zoroark, L81, M","active":true}'
+        "]}}",
+        "|switch|p2a: Barbaracle|Barbaracle, L82, F|230/230",
+    ]])
+
+    assert _find_action_line(
+        recorder, "p1", {"kind": "switch", "species": "zoroark"}, 0, max_turn=1,
+    ) is None
+
+
 def test_choose_move_captura_actor_species():
     """El pokemon activo al momento de decidir se captura sincronicamente,
     igual que `legal_actions`/`action_taken`: es lo que permite que el
