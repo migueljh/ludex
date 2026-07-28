@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 from types import SimpleNamespace
@@ -888,6 +889,22 @@ async def test_excepcion_de_mensajes_se_publica_al_runner():
             await player._handle_battle_message(lote)
 
     assert await player.wait_for_background_failure() is failure
+
+
+async def test_cancelar_un_vigilante_no_cancela_el_future_compartido():
+    player = _player()
+    first_waiter = asyncio.create_task(player.wait_for_background_failure())
+    await asyncio.sleep(0)
+
+    first_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_waiter
+
+    failure = TransientProviderError("later failure")
+    second_waiter = asyncio.create_task(player.wait_for_background_failure())
+    player._background_failure.set_result(failure)
+
+    assert await second_waiter is failure
 
 
 def test_discard_last_step_descarta_el_ultimo_paso():

@@ -471,7 +471,9 @@ class LudexPlayer(RandomPlayer):
         )
 
     async def wait_for_background_failure(self) -> Exception:
-        return await asyncio.wrap_future(self._background_failure)
+        return await asyncio.shield(
+            asyncio.wrap_future(self._background_failure)
+        )
 
     async def _handle_battle_message(self, split_messages: list[list[str]]) -> Any:
         tag = battle_tag_from(split_messages)
