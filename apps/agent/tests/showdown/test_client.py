@@ -534,6 +534,121 @@ def test_correct_step_turns_autogolpe_por_confusion_no_le_roba_la_linea_a_la_sig
     )
 
 
+def test_find_action_line_ancla_en_encore_del_rival():
+    """fix-flaky (D23): reproduccion minima de
+    `battle-gen6randombattle-558` (cazada en vivo, ver docs/DECISIONS.md
+    D23). Skarmory elige Spikes; el rival lo encorea (prioridad +2) antes de
+    que Spikes se ejecute, y Showdown fuerza la repeticion del ultimo
+    movimiento usado (Stealth Rock) en su lugar. La accion elegida
+    ('spikes') no aparece en NINGUN lado del protocolo."""
+    recorder = _recorder_con([
+        [
+            "|turn|26",
+            "|move|p2a: Politoed|Encore|p1a: Skarmory",
+            "|-start|p1a: Skarmory|Encore",
+            "|move|p1a: Skarmory|Stealth Rock||[still]",
+            "|-fail|p1a: Skarmory",
+        ],
+    ])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "move", "id": "spikes"}, 0, max_turn=26,
+        actor_species="skarmory",
+    ) == (26, 2)
+
+
+def test_find_action_line_encore_no_bloquea_un_cambio():
+    """Regresion (fix-flaky, D23): Encore SOLO fuerza la repeticion de un
+    MOVIMIENTO, nunca bloquea un cambio — un pokemon encoreado se puede
+    cambiar libremente. Reproduccion minima de
+    `battle-gen6randombattle-684` (decision 22, cambio real a
+    Kangaskhan-Mega un turno despues del Encore): sin el chequeo de
+    `accion_es_movimiento`, el respaldo de Encore se apropiaba del turno de
+    la decision y la busqueda cortaba ahi, sin llegar nunca al `|switch|`
+    real."""
+    recorder = _recorder_con([
+        [
+            "|turn|22",
+            "|move|p2a: Shuckle|Encore|p1a: Gourgeist",
+            "|-start|p1a: Gourgeist|Encore",
+        ],
+        ["|turn|23", "|switch|p1a: Kangaskhan|Kangaskhan-Mega, L71, F|267/267"],
+    ])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "switch", "species": "kangaskhanmega"}, 0,
+        max_turn=25, actor_species="gourgeist",
+    ) == (23, 5)
+
+
+def test_find_action_line_encore_del_rival_no_roba_a_otro_pokemon():
+    """El respaldo de Encore, igual que cant/faint/confusion, solo puede
+    resolver la decision del pokemon que REALMENTE estaba en la cancha: un
+    Encore que nombra a OTRO pokemon del mismo lado no cuenta."""
+    recorder = _recorder_con([
+        ["|turn|9", "|move|p2a: Foo|Encore|p1a: Otro"],
+    ])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "move", "id": "spikes"}, 0, max_turn=9,
+        actor_species="skarmory",
+    ) is None
+
+
+def test_find_action_line_ancla_en_win():
+    """fix-flaky (D23): reproduccion minima de
+    `battle-gen6randombattle-571`. Raikou elige Substitute, pero la batalla
+    termina (el rival se remata con el retroceso de Struggle) antes de que
+    le toque jugarla. `|win|` no nombra a nadie: no hace falta chequear
+    actor ni lado, la trayectoria termina ahi sin decision siguiente."""
+    recorder = _recorder_con([
+        ["|turn|64", "|faint|p2a: Suicune", "|win|LudexBot7039"],
+    ])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "move", "id": "substitute"}, 0, max_turn=66,
+        actor_species="raikou",
+    ) == (64, 3)
+
+
+def test_find_action_line_ancla_en_tie():
+    recorder = _recorder_con([["|turn|40", "|tie|"]])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "move", "id": "substitute"}, 0, max_turn=40,
+    ) == (40, 2)
+
+
+def test_find_action_line_illusion_confirma_un_switch_disfrazado():
+    """fix-flaky (D23): reproduccion minima de
+    `battle-gen6randombattle-657`. Se elige cambiar a Zoroark, pero su
+    habilidad (Illusion) hace que Showdown narre el cambio con el nombre de
+    OTRO miembro del equipo (`Drapion`, el ultimo companero vivo) — nunca
+    "Zoroark". La unica evidencia es la revelacion posterior
+    (`|replace|.../-end|...|Illusion`), que en la batalla real tardo 14
+    turnos: muy por fuera de `ACTION_SEARCH_MARGIN_TURNS`, por eso esta
+    confirmacion no respeta `max_turn`."""
+    recorder = _recorder_con([
+        ["|turn|4", "|switch|p1a: Drapion|Drapion, L83, M|230/230"],
+        [
+            "|turn|17",
+            "|replace|p1a: Zoroark|Zoroark, L81, F",
+            "|-end|p1a: Zoroark|Illusion",
+        ],
+    ])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "switch", "species": "zoroark"}, 0, max_turn=4,
+    ) == (4, 2)
+
+
+def test_find_action_line_illusion_no_revelada_no_confirma_nada():
+    """Si la Illusion nunca se rompe (o el pokemon vuelve a cambiar antes de
+    revelarse), no hay evidencia: la busqueda no puede confirmar el switch y
+    devuelve None, igual que cualquier otro caso sin rastro."""
+    recorder = _recorder_con([
+        ["|turn|4", "|switch|p1a: Drapion|Drapion, L83, M|230/230"],
+        ["|turn|5", "|switch|p1a: Drapion|Drapion, L83, M|230/230"],
+    ])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "switch", "species": "zoroark"}, 0, max_turn=5,
+    ) is None
+
+
 def test_choose_move_captura_actor_species():
     """El pokemon activo al momento de decidir se captura sincronicamente,
     igual que `legal_actions`/`action_taken`: es lo que permite que el

@@ -60,6 +60,21 @@ def _normalize(text: str) -> str:
 ACTION_SEARCH_MARGIN_TURNS = 3
 
 
+def _ident_matches(field: str, actor_species: str | None) -> bool:
+    """Compara un campo `{side}a: Nombre` (ya extraido de una linea de
+    protocolo, en la posicion que sea) contra el pokemon que actua.
+
+    Extraida de `_actor_matches` (fix-cursor, D22) para reusarla en el
+    respaldo de Encore (fix-flaky, D23), donde el nombre del OBJETIVO esta
+    en `parts[4]` (`|move|{opp}a: Caster|Encore|{side}a: Target`), no en
+    `parts[2]` como en `|cant|`/`|faint|`/confusion.
+    """
+    if actor_species is None:
+        return True
+    ident = field.split(": ", 1)[-1]
+    return _normalize(ident) == actor_species
+
+
 def _actor_matches(parts: list[str], actor_species: str | None) -> bool:
     """El respaldo (`|cant|`/`|faint|`/autogolpe por confusion) solo puede
     resolver la decision del pokemon que REALMENTE estaba en la cancha
@@ -78,12 +93,43 @@ def _actor_matches(parts: list[str], actor_species: str | None) -> bool:
     con llamadores/tests que no lo conocen): no reduce ninguna cobertura
     existente, solo AGREGA una condicion cuando el dato esta disponible.
     """
-    if actor_species is None:
-        return True
     if len(parts) < 3:
-        return False
-    ident = parts[2].split(": ", 1)[-1]
-    return _normalize(ident) == actor_species
+        return actor_species is None
+    return _ident_matches(parts[2], actor_species)
+
+
+def _illusion_revela_a(
+    recorder: ProtocolRecorder, from_index: int, side: str, clave: str
+) -> bool:
+    """Confirma que un switch-in disfrazado por Illusion era en realidad
+    `clave` (fix-flaky, D23): cazado en vivo en
+    `battle-gen6randombattle-657` (Zoroark elegido, Showdown narra el
+    cambio como `|switch|p1a: Drapion|...` — el nombre del ULTIMO
+    companero de equipo vivo, nunca "Zoroark" — y solo revela la verdad 14
+    turnos despues, con `|replace|p1a: Zoroark|Zoroark, ...` seguido de
+    `|-end|p1a: Zoroark|Illusion`).
+
+    Sin techo: a diferencia de cant/faint/confusion/Encore (que resuelven
+    dentro de `ACTION_SEARCH_MARGIN_TURNS`), la Illusion se rompe cuando el
+    pokemon disfrazado recibe cierto tipo de golpe, o nunca si no lo recibe
+    — no hay ventana de turnos razonable que lo acote. Se corta apenas
+    aparece OTRO `|switch|{side}a:` propio: esa racha ya termino sin
+    revelarse, y seguir buscando mas alla arriesgaria confirmar la
+    revelacion de un pokemon DISTINTO que entro despues (el mismo riesgo de
+    "robo de linea" que el cursor global evita en los demas respaldos).
+    """
+    prefix_switch = f"|switch|{side}a:"
+    prefix_replace = f"|replace|{side}a:"
+    for _, line in recorder.entries_from(from_index):
+        if line.startswith(prefix_switch):
+            return False
+        if line.startswith(prefix_replace):
+            parts = line.split("|")
+            if len(parts) < 4:
+                return False
+            especie = _normalize(parts[3].split(",", 1)[0])
+            return especie == clave
+    return False
 
 
 def _find_action_line(
@@ -127,11 +173,34 @@ def _find_action_line(
     uno mas adelante. Sin mirarlo, esas filas quedaban etiquetadas un turno
     antes: era el 100% del residual que sobrevivio a la primera vuelta de C1.
 
+    **fix-flaky (D23): dos formas mas, cazadas cazando el defecto conocido
+    del residual de C1 en vivo (ver docs/DECISIONS.md D23), no teorizadas:**
+
+    - **El rival nos encoreo antes de que nuestra propia accion se
+      ejecutara**: `|move|{opp}a: Caster|Encore|{side}a: Name` nombrando a
+      NUESTRO propio actor. Encore tiene prioridad y, si el rival lo usa el
+      mismo turno en que nosotros ibamos a actuar, fuerza la repeticion de
+      NUESTRO ultimo movimiento usado en vez de la accion recien elegida —
+      Showdown nunca narra la accion elegida, solo la repeticion forzada
+      (`battle-gen6randombattle-558`: Skarmory elige Spikes, Politoed lo
+      encorea, Skarmory repite Stealth Rock; `battle-gen6randombattle-581`:
+      mismo patron con Volbeat/Thunder Wave). Sin este respaldo, el cursor
+      quedaba atrasado en `decision_turn` (nunca se corregia) en vez de
+      avanzar al turno donde realmente se resolvio.
+    - **La batalla termino antes de que la decision se resolviera**:
+      `|win|`/`|tie|` en cualquier punto de la ventana de busqueda. Un
+      `|win|`/`|tie|` cierra la trayectoria: no hay decision siguiente que
+      pueda robarle esta linea, asi que no hace falta chequear actor ni lado.
+      (`battle-gen6randombattle-571`: Raikou elige Substitute, pero Suicune
+      se remata solo con el retroceso de Struggle en el turno siguiente y la
+      batalla termina antes de que a Raikou le tocara jugar esa accion).
+
     De ahi la definicion que gobierna `turn_number` en el dataset:
 
         Una fila pertenece al turno en que su decision se RESOLVIO, sin
         importar como se resolvio — se ejecuto, el juego la impidio, al
-        pokemon lo debilitaron antes, o se autogolpeo por confusion.
+        pokemon lo debilitaron antes, se autogolpeo por confusion, el rival
+        lo encoreo primero, o la batalla termino antes de que le tocara.
 
     La linea de resolucion se usa solo como RESPALDO, nunca antes de agotar
     la busqueda del `|move|`/`|switch|` real: un `|faint|` propio puede ser
@@ -169,11 +238,14 @@ def _find_action_line(
     # amplia colapsaria movimientos que no tienen nada que ver.
     if clave.startswith("hiddenpower"):
         clave = "hiddenpower"
+    accion_es_movimiento = action_taken.get("kind") == "move"
+    opp_side = "p2" if side == "p1" else "p1"
     prefix_move = f"|move|{side}a:"
     prefix_switch = f"|switch|{side}a:"
     prefix_cant = f"|cant|{side}a:"
     prefix_faint = f"|faint|{side}a:"
     prefix_confusion = f"|-activate|{side}a:"
+    prefix_opp_encore = f"|move|{opp_side}a:"
     respaldo: tuple[int, int] | None = None
     respaldo_turn: int | None = None
     se_movio_en: set[int] = set()
@@ -202,6 +274,25 @@ def _find_action_line(
                 return turn, from_index + offset + 1
             if line.startswith(prefix_move):
                 se_movio_en.add(turn)
+            elif (
+                not accion_es_movimiento
+                and _illusion_revela_a(recorder, from_index + offset + 1, side, clave)
+            ):
+                # fix-flaky (D23): Illusion disfraza el switch-in con el
+                # NOMBRE de otro miembro del equipo (Showdown narra
+                # `|switch|{side}a: OtroNombre|...`, nunca el nombre real) —
+                # el cambio SI se ejecuto, solo que la clave elegida
+                # ("zoroark") nunca puede matchear contra esa linea. La unica
+                # evidencia posible es la revelacion posterior
+                # (`|replace|{side}a: Zoroark|Zoroark, ...`), que Showdown
+                # manda cuando la Illusion se rompe — sin techo de turno
+                # posible (`battle-gen6randombattle-657`: la revelacion
+                # tardo 14 turnos, muy por fuera de `ACTION_SEARCH_MARGIN_
+                # TURNS`), asi que esto es la UNICA excepcion de esta funcion
+                # que no respeta `max_turn`. Es un match REAL (el cambio si
+                # paso), no un respaldo de "no se ejecuto": por eso retorna
+                # directo en vez de guardarse en `respaldo`.
+                return turn, from_index + offset + 1
         elif respaldo is None:
             parts = line.split("|")
             if line.startswith(prefix_cant) and _actor_matches(parts, actor_species):
@@ -231,6 +322,45 @@ def _find_action_line(
                 # `|move|` ni `|cant|` — sin reconocerlo aca, la decision
                 # queda sin ninguna evidencia dentro de su propio bloque y la
                 # busqueda sigue de largo (ver docstring, defecto 1).
+                respaldo = (turn, from_index + offset + 1)
+                respaldo_turn = turn
+            elif (
+                accion_es_movimiento
+                and line.startswith(prefix_opp_encore)
+                and len(parts) >= 5
+                and parts[3] == "Encore"
+                and parts[4].startswith(f"{side}a:")
+                and turn not in se_movio_en
+                and _ident_matches(parts[4], actor_species)
+            ):
+                # fix-flaky (D23): el rival nos encoreo (prioridad +2) antes
+                # de que nuestra propia accion elegida se ejecutara. Showdown
+                # fuerza la repeticion de NUESTRO ultimo movimiento usado en
+                # vez de narrar la accion recien elegida — no hay `|move|`
+                # con la clave elegida en ningun lado. `parts[4]` (no
+                # `parts[2]`, que es quien LANZA Encore) tiene el objetivo:
+                # `|move|{opp}a: Caster|Encore|{side}a: Target`.
+                #
+                # `accion_es_movimiento`: Encore SOLO fuerza la repeticion de
+                # un MOVIMIENTO, nunca bloquea un cambio — un pokemon
+                # encoreado se puede cambiar libremente. Sin este chequeo,
+                # una decision de CAMBIO real (que resuelve mas adelante, en
+                # el turno del switch) se descartaba como si el Encore la
+                # hubiera bloqueado, cortando la busqueda ANTES de encontrar
+                # su linea real (medido en vivo: `battle-gen6randombattle-
+                # 684`, decision 22, cambio a Kangaskhan-Mega que SI ocurre
+                # un turno despues; el respaldo de Encore, sin este chequeo,
+                # se apropiaba del turno de la decision y la busqueda cortaba
+                # ahi, sin llegar nunca al `|switch|` real).
+                respaldo = (turn, from_index + offset + 1)
+                respaldo_turn = turn
+            elif line.startswith("|win|") or line.startswith("|tie|"):
+                # fix-flaky (D23): la batalla termino antes de que la
+                # decision se resolviera (el rival se remato con retroceso,
+                # o cualquier otro cierre repentino). No hace falta chequear
+                # actor ni lado: un `|win|`/`|tie|` cierra la trayectoria
+                # entera, asi que no hay decision siguiente a la que
+                # robarle esta linea.
                 respaldo = (turn, from_index + offset + 1)
                 respaldo_turn = turn
     return respaldo

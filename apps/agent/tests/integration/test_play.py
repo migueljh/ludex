@@ -57,32 +57,101 @@ def _clave_de_busqueda(accion: str) -> str:
     return accion
 
 
-def _propio_no_actuo(lineas: list[str], side: str) -> bool:
-    """Causas 1 y 1bis del residual de C1 (fix-final-report.md): el
-    protocolo puede confirmar, sin narrar la accion elegida, que el juego
-    impidio que se ejecutara. Evidencia corroborante contra el protocolo
-    crudo (D17), no una excepcion a dedo.
+def _illusion_revela(lineas_desde_el_switch: list[str], side: str, especie: str) -> bool:
+    """Espejo de `_illusion_revela_a` (`client.py`, D23) para el test: no es
+    una excusa de "no se ejecuto", es un caso hermano de Hidden Power
+    (`_clave_de_busqueda`) — la accion SI se ejecuto, pero la comparacion
+    directa por substring no la puede encontrar. Illusion disfraza el
+    switch-in con el nombre de OTRO miembro del equipo (Showdown narra
+    `|switch|{side}a: OtroNombre|...`, nunca la especie real), y solo revela
+    la verdad mas adelante (`|replace|{side}a: X|X, .../-end|...|Illusion`),
+    a veces muchos turnos despues (`battle-gen6randombattle-657`: 14 turnos).
+    Se corta apenas aparece OTRO switch propio: esa racha ya termino sin
+    revelarse.
+    """
+    prefix_switch = f"|switch|{side}a:"
+    prefix_replace = f"|replace|{side}a:"
+    for l in lineas_desde_el_switch:
+        if l.startswith(prefix_switch):
+            return False
+        if l.startswith(prefix_replace):
+            partes = l.split("|")
+            if len(partes) < 4:
+                return False
+            return _normalizar(partes[3].split(",", 1)[0]) == especie
+    return False
+
+
+def _propio_no_actuo(lineas: list[str], side: str, es_movimiento: bool) -> bool:
+    """Cuatro formas conocidas de "la accion elegida nunca se ejecuto",
+    todas con evidencia corroborante en el protocolo crudo (D17), nunca una
+    excepcion a dedo. Tiene que reconocer las MISMAS formas que el respaldo
+    de produccion (`_find_action_line`/`client.py`), o un caso real cae en
+    un falso negativo de ESTE chequeo, no del agente (fix-flaky, D23: eso es
+    exactamente lo que causaba la falla intermitente de este test — la
+    causa 3 de abajo ya estaba reconocida en `client.py` desde D22 pero
+    nunca se replico aca).
 
     - `|cant|{side}a:`: el propio pokemon quiso actuar y el juego se lo
-      impidio (dormido, paralizado, congelado). Es la causa mas frecuente
-      del residual medido sobre 6 batallas frescas (316 filas: 296
-      alineadas, 20 en el residual).
+      impidio (dormido, paralizado, congelado). Causa mas frecuente del
+      residual medido sobre 6 batallas frescas (fix-final-report.md: 316
+      filas, 296 alineadas, 20 en el residual).
     - `|faint|{side}a:` que aparece ANTES que cualquier `|move|{side}a:` en
       el mismo bloque: el propio pokemon se debilito por un rival mas rapido
       antes de que le tocara actuar. Showdown no deja ningun otro rastro de
       esto (D20) — ni `|cant|`, ni `|-fail|`, nada — asi que la ausencia de
       un `|move|` propio ANTES del `|faint|` es la unica evidencia posible.
+    - `|-activate|{side}a: Name|confusion` (D22, fix-cursor): el pokemon se
+      autogolpeo por confusion en vez de ejecutar la accion elegida. Estaba
+      reconocida en `client.py` desde D22 pero NO aca: cazada en vivo
+      (fix-flaky, `battle-gen6randombattle-552`, decision con Tyrantrum
+      eligiendo Head Smash) haciendo fallar este mismo test de forma
+      intermitente durante meses sin que nadie lo hubiera medido.
+    - `|move|{opp}a: Caster|Encore|{side}a: Name` (D23, fix-flaky): el rival
+      nos encoreo (prioridad +2) antes de que la accion recien elegida se
+      ejecutara. Showdown fuerza la repeticion de nuestro ULTIMO movimiento
+      usado, nunca narra la accion elegida
+      (`battle-gen6randombattle-558`/`-581`, cazadas en vivo). Encore SOLO
+      fuerza la repeticion de un MOVIMIENTO — nunca bloquea un cambio, asi
+      que esta excusa no aplica cuando la accion elegida era un switch
+      (`es_movimiento=False`): sin ese chequeo, un cambio real que resuelve
+      un turno mas tarde (`battle-gen6randombattle-684`, decision 22, cambio
+      a Kangaskhan-Mega) se excusaria por error en vez de exigir que
+      aparezca su propia linea.
+    - `|win|`/`|tie|` (D23, fix-flaky): la batalla termino antes de que la
+      decision se resolviera (`battle-gen6randombattle-571`: Raikou elige
+      Substitute, Suicune se remata solo con el retroceso de Struggle antes
+      de que le tocara jugarla).
     """
+    opp_side = "p2" if side == "p1" else "p1"
     prefix_cant = f"|cant|{side}a:"
     prefix_move = f"|move|{side}a:"
     prefix_faint = f"|faint|{side}a:"
+    prefix_confusion = f"|-activate|{side}a:"
+    prefix_opp_move = f"|move|{opp_side}a:"
     if any(l.startswith(prefix_cant) for l in lineas):
         return True
+    if any(l.startswith("|win|") or l.startswith("|tie|") for l in lineas):
+        return True
+    if es_movimiento:
+        for l in lineas:
+            if l.startswith(prefix_opp_move):
+                partes = l.split("|")
+                if (
+                    len(partes) >= 5
+                    and partes[3] == "Encore"
+                    and partes[4].startswith(f"{side}a:")
+                ):
+                    return True
     for l in lineas:
         if l.startswith(prefix_move):
             return False
         if l.startswith(prefix_faint):
             return True
+        if l.startswith(prefix_confusion):
+            partes = l.split("|")
+            if len(partes) >= 4 and partes[3] == "confusion":
+                return True
     return False
 
 
@@ -284,6 +353,50 @@ def _forma_mega_revelada(
             return f"{base}megay"
         return f"{base}mega"
     return None
+
+
+def _formas_reveladas_por_cambio_de_forma(
+    lineas_crudas: list[str], side: str, especie_normalizada: str
+) -> list[str]:
+    """TODAS las formas reveladas por `|-formechange|{side}a: Nombre|Forma,
+    ...|...` o `|detailschange|{side}a: Nombre|Forma, ...` para este pokemon
+    hasta este turno, como ids de dex normalizados (fix-flaky, D23: hallado
+    verificando la suite completa, no reportado por el usuario -- causa
+    independiente del defecto que motivo esta tarea, en el MISMO test de
+    fugas).
+
+    A diferencia de una mega evolucion (`-mega`, un solo cambio,
+    irreversible en la batalla), un cambio de forma por movimiento puede ir
+    y volver: el Relic Song de Meloetta alterna Aria/Pirouette CADA vez que
+    se usa (verificado: `battle-gen6randombattle-680`, turno 24,
+    `|-formechange|p2a: Meloetta|Meloetta-Pirouette|[msg]` cambia sus tipos,
+    publicamente, de Normal/Psiquico a Normal/Lucha -- comparar solo contra
+    el tipo ESTATICO del dex marcaba esto como fuga, igual que Protean/
+    Libero antes de `_tipos_por_cambio_dinamico`). Se devuelven TODAS, no
+    solo la ultima, por la misma razon que esa funcion: `state` puede
+    quedar un turno atras del cambio mas reciente.
+
+    `detailschange` (no solo `-formechange`): la Reversion Primal
+    (Groudon/Kyogre con su orbe) narra la especie nueva SOLO ahi --
+    `|detailschange|p2a: Groudon|Groudon-Primal, L64` -- y `-primal` (la
+    otra linea que la acompaña) solo nombra el item, nunca la especie
+    (verificado: `battle-gen6randombattle-713`, turno 21, tipos Fuego/
+    Tierra de Groudon-Primal marcados como fuga contra el Tierra puro del
+    dex base). Mismo campo, misma posicion (`parts[3]`, hasta la primera
+    coma): un solo parseo cubre ambas lineas.
+    """
+    prefijos = (f"|-formechange|{side}a:", f"|detailschange|{side}a:")
+    resultado: list[str] = []
+    for linea in lineas_crudas:
+        if not linea.startswith(prefijos):
+            continue
+        parts = linea.split("|")
+        if len(parts) < 4:
+            continue
+        if not _es_esa_especie(_ident_normalizado(parts), especie_normalizada):
+            continue
+        resultado.append(_normalizar(parts[3].split(",", 1)[0]))
+    return resultado
 
 
 def _objetivos_de_transform(
@@ -588,8 +701,8 @@ async def test_no_hay_fuga_de_informacion_del_rival(jugadas):
                         "el default 100 que Showdown omite"
                     )
 
-                    # --- types: dato de dex, no de batalla (con dos
-                    # excepciones, ambas explicitamente narradas). Una vez
+                    # --- types: dato de dex, no de batalla (con tres
+                    # excepciones, todas explicitamente narradas). Una vez
                     # que la especie esta revelada (ya verificado arriba),
                     # sus tipos no agregan un canal de fuga propio -- se
                     # verifica CONSISTENCIA contra el dex, no presencia en
@@ -601,6 +714,10 @@ async def test_no_hay_fuga_de_informacion_del_rival(jugadas):
                     # DINAMICO con `-start|typechange` (ver
                     # `_tipos_por_cambio_dinamico`) -- ahi el tipo revelado
                     # explicitamente en el protocolo manda sobre el dex.
+                    # Excepcion 3 (fix-flaky, D23): un cambio de FORMA por
+                    # movimiento (Relic Song de Meloetta, Aria<->Pirouette)
+                    # narra `-formechange` en vez de `-start|typechange` --
+                    # ver `_formas_reveladas_por_cambio_de_forma`.
                     revisados["types"] += 1
                     tipos_estado = sorted(t.lower() for t in mon["types"])
                     candidatos: list[list[str]] = []
@@ -618,6 +735,10 @@ async def test_no_hay_fuga_de_informacion_del_rival(jugadas):
                     entrada_mega = _dex_lookup(forma_mega, dex) if forma_mega else None
                     if entrada_mega is not None:
                         candidatos.append(sorted(entrada_mega["types"]))
+                    for forma in _formas_reveladas_por_cambio_de_forma(lineas, rival_side, especie):
+                        entrada_forma = _dex_lookup(forma, dex)
+                        if entrada_forma is not None:
+                            candidatos.append(sorted(entrada_forma["types"]))
                     for mio in mis_objetivos:
                         # Transform copia el tipo del objetivo (mi propio
                         # pokemon): tampoco es informacion oculta.
@@ -781,6 +902,7 @@ async def test_la_accion_de_la_fila_corresponde_a_su_propio_turno(jugadas):
                        regexp_replace(
                            lower(coalesce(ts.action_taken->>'id', ts.action_taken->>'species')),
                            '[^a-z0-9]', '', 'g') AS accion,
+                       ts.action_taken->>'kind' AS kind,
                        t.player_side, t.battle_id
                 FROM trajectory_steps ts
                 JOIN trajectories t ON t.id = ts.trajectory_id
@@ -790,7 +912,7 @@ async def test_la_accion_de_la_fila_corresponde_a_su_propio_turno(jugadas):
             assert filas, "no hay pasos con accion para verificar"
 
             revisados = 0
-            for turno, accion, side, battle_id in filas:
+            for turno, accion, kind, side, battle_id in filas:
                 lineas = (await s.execute(text("""
                     SELECT unnest(protocol_lines) FROM battle_turns
                     WHERE battle_id = :b AND player_side = :ps AND turn_number = :t
@@ -802,7 +924,26 @@ async def test_la_accion_de_la_fila_corresponde_a_su_propio_turno(jugadas):
                 revisados += 1
                 clave = _clave_de_busqueda(accion)
                 visto = any(clave in linea for linea in candidatas)
-                excusado = not visto and _propio_no_actuo(lineas, side)
+                if not visto and kind == "switch":
+                    # fix-flaky (D23): Illusion puede disfrazar ESTE switch
+                    # con el nombre de otro pokemon; la unica evidencia esta
+                    # mas adelante en la MISMA trayectoria, sin techo de
+                    # turno posible (ver `_illusion_revela`). Se trae
+                    # `protocol_lines` SIN desanidar y se aplana en Python,
+                    # ordenado por turno: `unnest` + `ORDER BY` en la MISMA
+                    # consulta no garantiza que el orden entre filas distintas
+                    # respete el orden de turnos para el aplanado secuencial
+                    # que necesita `_illusion_revela`.
+                    turnos_posteriores = (await s.execute(text("""
+                        SELECT protocol_lines FROM battle_turns
+                        WHERE battle_id = :b AND player_side = :ps AND turn_number > :t
+                        ORDER BY turn_number
+                    """), {"b": battle_id, "ps": side, "t": turno})).scalars().all()
+                    lineas_posteriores = [
+                        l for bloque in turnos_posteriores for l in bloque
+                    ]
+                    visto = _illusion_revela(lineas_posteriores, side, clave)
+                excusado = not visto and _propio_no_actuo(lineas, side, es_movimiento=kind == "move")
                 assert visto or excusado, (
                     f"la accion '{accion}' de la fila turno={turno} no aparece "
                     f"en el protocolo de ESE turno (bloque {turno}), lado {side}"

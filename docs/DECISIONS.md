@@ -516,6 +516,18 @@ un campo (`action_executed: bool`), o se aceptan tal cual (la etiqueta de
 turno sigue siendo la del momento en que se decidió, que es honesta aunque no
 tenga una línea de protocolo que la confirme)?
 
+**Corrección (fix-flaky, D23): este párrafo estaba desactualizado y describe
+un caso que ya NO es cierto.** Para cuando se escribió, sonaba plausible que
+un debilitamiento propio no dejara rastro — pero un pokémon que se debilita
+SIEMPRE narra `|faint|` (es la propia mecánica de Showdown, no algo opcional),
+y ese rastro es exactamente el segundo de los tres que `_find_action_line`
+reconoce (ver el resumen al principio de esta entrada). Cazando el defecto
+intermitente de `test_la_accion_de_la_fila_corresponde_a_su_propio_turno`
+(D23) sobre ~14 casos reales capturados en vivo, **ninguno** resultó ser
+"cero rastro alcanzable": los 14 se explicaron con evidencia positiva y se
+cerraron. El límite que sí sigue abierto, mucho más angosto que lo que este
+párrafo describía, queda documentado en D23.
+
 ## D21 — C2: `trajectory_steps` se identifica por `(trajectory_id, decision_index)`, no por `(trajectory_id, turn_number)`
 
 Un cambio de reemplazo forzado tras un debilitamiento **no avanza
@@ -649,3 +661,108 @@ ninguno de los dos mecanismos de esta entrada lo toca. Datos de dataset real
 (`source='local'`) anteriores a este arreglo conservan 9 filas con
 `turn_number` retrocedido en 7 trayectorias (Minor 9 de review-merge.md, ya
 señalado como deuda de higiene, no tocado en esta tarea).
+
+## D23 — fix-flaky: `test_la_accion_de_la_fila_corresponde_a_su_propio_turno`
+fallaba ~1 de cada 10 corridas por CUATRO causas reales, ninguna "sin rastro"
+
+**Encargo:** el test fallaba de forma intermitente (del orden de 1 en 10
+corridas), y la hipótesis heredada (D20: "acción cuyo pokémon muere sin dejar
+rastro alcanzable") era una explicación no medida. Se pidió cazar el defecto
+en vivo, capturar casos reales de la base (las filas persisten aunque el test
+falle) y NO aceptar una excusa sin diagnosticar qué la necesita — precedente
+explícito: una explicación que cubría 3 de 20 casos se había presentado antes
+como si cubriera todo (fix-final-report.md).
+
+**Método:** loop de `pytest` contra el test solo (cada corrida juega 2
+batallas nuevas via la fixture `jugadas`), capturando el log en cada falla.
+Con el `battle_tag` del mensaje de assertion se identifica la fila exacta
+(`turn_number`, `decision_index`, `action_taken`) y se vuelca el protocolo
+crudo de `battle_turns` para ese turno y los siguientes. Se juntaron **14
+casos reales** en dos tandas (4 + 10, sobre ~90 corridas), no solo los 3
+pedidos como mínimo — la instrucción de no cerrar con una muestra chica
+aplicaba en ambas direcciones.
+
+**Resultado: CUATRO causas reales, todas con evidencia positiva en el
+protocolo crudo. Cero casos de "no hay rastro".**
+
+1. **Autogolpe por confusión (5 de 14 casos) — no era un defecto del
+   grabador, era un defecto del TEST.** `_find_action_line` (`client.py`)
+   reconoce el autogolpe por confusión desde D22 (fix-cursor). Pero el
+   helper del test, `_propio_no_actuo`, es una reimplementación
+   INDEPENDIENTE de la misma lógica — nunca se actualizó cuando D22 agregó
+   ese tercer caso. El test fallaba sobre filas correctamente etiquetadas
+   por el grabador; el defecto era que el propio chequeo de verificación no
+   sabía reconocer una de sus tres excusas conocidas. Arreglo: se agregó el
+   reconocimiento de `|-activate|{side}a: Name|confusion` a
+   `_propio_no_actuo`, en paridad con producción.
+2. **El rival encorea antes de que la acción elegida se ejecute (3 de 14
+   casos, ej. `battle-gen6randombattle-558`, `-581`, `-624`) — defecto real,
+   no reconocido ni en producción ni en el test.** Encore tiene prioridad
+   (+2) y, si el rival lo usa el mismo turno en que se iba a actuar, fuerza
+   la repetición del ÚLTIMO movimiento propio en vez de narrar la acción
+   recién elegida — Showdown nunca deja una línea con esa acción. Arreglo:
+   nuevo respaldo en `_find_action_line` que reconoce
+   `|move|{opp}a: X|Encore|{side}a: Name` (nombrando al mismo actor) como
+   evidencia de que la decisión se resolvió ahí. **Con un guardrail medido
+   en carne propia**: Encore solo bloquea MOVIMIENTOS, nunca cambios — la
+   primera versión de este arreglo, sin distinguir `action_taken.kind`,
+   causó una regresión nueva (`battle-gen6randombattle-684`, decisión 22, un
+   cambio real a Kangaskhan-Mega que resuelve un turno después) al cortar la
+   búsqueda antes de encontrar la línea real. Detectada corriendo la suite
+   completa después del primer intento del arreglo, no asumida.
+3. **La batalla termina antes de que la decisión se resuelva (1 de 14 casos,
+   `battle-gen6randombattle-571`) — defecto real, no reconocido.** Raikou
+   elige Substitute; el Suicune rival se remata solo con el retroceso de
+   Struggle en el turno siguiente y la batalla termina (`|win|`) antes de
+   que le tocara jugar esa acción. Arreglo: `|win|`/`|tie|` como respaldo
+   incondicional (sin chequeo de actor/lado: cierran la trayectoria entera,
+   no hay decisión siguiente a la que robarle la línea).
+4. **Illusion disfraza un switch-in con el nombre de otro pokémon (1 de 14
+   casos, `battle-gen6randombattle-657`) — defecto real, arquitectónicamente
+   distinto de los otros tres.** Se elige cambiar a Zoroark; Showdown narra
+   el cambio con el nombre del ÚLTIMO compañero de equipo vivo
+   (`|switch|p1a: Drapion|...`), nunca "Zoroark" — la comparación por
+   substring no puede encontrarlo nunca. La única evidencia es la
+   revelación posterior (`|replace|{side}a: X|X, .../-end|...|Illusion`),
+   que en el caso real tardó **14 turnos**: muy por fuera de
+   `ACTION_SEARCH_MARGIN_TURNS` (3). Es la única excepción de
+   `_find_action_line` que no respeta `max_turn` — la revelación de Illusion
+   no tiene ventana razonable, y no hay riesgo de "robo de línea" porque se
+   corta apenas aparece OTRO switch propio sin revelarse antes.
+
+**No en el alcance original, encontrado verificando la suite completa (no
+solo el test que motivó la tarea):** dos defectos independientes en
+`test_no_hay_fuga_de_informacion_del_rival` — Relic Song de Meloetta
+(`|-formechange|`, alterna Aria/Pirouette, tipos Normal/Psíquico ↔
+Normal/Lucha) y la Reversión Primal de Groudon/Kyogre (`|detailschange|`,
+cambia tipos) no estaban cubiertos por `_tipos_por_cambio_dinamico` (que solo
+reconocía `-start|typechange`, el patrón de Protean/Libero). Mismo tipo de
+causa —un cambio de forma público y narrado, tratado como si no lo
+estuviera—, mismo arreglo (nueva función espejo,
+`_formas_reveladas_por_cambio_de_forma`, con lookup a dex). No se habría
+encontrado sin correr la suite completa repetidamente como pedía la
+verificación.
+
+**Por qué no se declaró "límite conocido, no resoluble" para ninguno de los
+cuatro:** los tres primeros dejan evidencia acotada dentro de
+`ACTION_SEARCH_MARGIN_TURNS` (2-3 turnos como mucho, medido). El cuarto
+(Illusion) tiene evidencia NO acotada en el tiempo, pero sigue siendo
+evidencia positiva real, nunca ambigua (`|replace|.../-end|...|Illusion` es
+inconfundible y específico a una especie), así que se implementó igual en
+vez de excusarlo. El párrafo de D20 que hablaba de "ningún rastro" describía
+una situación que, medida ahora, no ocurre: un debilitamiento SIEMPRE narra
+`|faint|` (ver corrección agregada a D20).
+
+**Verificación:** 14 casos reales documentados con protocolo crudo pegado
+(fix-flaky.md); tests unitarios nuevos en `test_client.py` reproduciendo cada
+causa en miniatura (incluida la regresión del guardrail de Encore/switch);
+suite completa corrida repetidamente en verde tras cada arreglo, incluida la
+corrida que expuso la regresión de Encore/switch y las dos causas de
+Meloetta/Groudon.
+
+**Archivos tocados:** `apps/agent/src/ludex_agent/showdown/client.py`
+(`_ident_matches`, respaldo de Encore con guardrail `action_taken.kind`,
+respaldo de `|win|`/`|tie|`, `_illusion_revela_a`);
+`apps/agent/tests/showdown/test_client.py` (8 tests nuevos);
+`apps/agent/tests/integration/test_play.py` (`_propio_no_actuo` con paridad
+de las 4 formas, `_illusion_revela`, `_formas_reveladas_por_cambio_de_forma`).
