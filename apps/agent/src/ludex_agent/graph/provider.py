@@ -295,7 +295,7 @@ class GeminiDecisionProvider(KeyRotatingProvider):
 
 class OpenAICompatibleDecisionProvider(KeyRotatingProvider):
     def __init__(
-        self, name: str, keys: Sequence[str], *, model: str, base_url: str,
+        self, name: str, keys: Sequence[str], *, model: str, base_url: str | None,
         response_schema: type, timeout_seconds: float,
         metrics: DecisionMetrics | None = None,
     ) -> None:

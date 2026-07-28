@@ -4,17 +4,36 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from typing import Any
 from urllib.parse import urlsplit
 
 import typer
 from poke_env import AccountConfiguration
-from poke_env.player import RandomPlayer
+from poke_env.player import (
+    MaxBasePowerPlayer,
+    RandomPlayer,
+    SimpleHeuristicsPlayer,
+)
 
+from .benchmark import BenchmarkResult, run_benchmark
 from .config import load_settings
 from .db.repository import BattleRepository
 from .db.session import make_engine, session_factory
 from .showdown.client import LudexPlayer, local_server_configuration
+from .graph.calc import CalcClient
+from .graph.decision import DecisionResponse
+from .graph.provider import (
+    AnthropicDecisionProvider,
+    DecisionMetrics,
+    GeminiDecisionProvider,
+    OpenAICompatibleDecisionProvider,
+    ProviderChain,
+    ProviderError,
+    provider_keys,
+)
+from .graph.workflow import build_decision_graph
 from .state.schema import STATE_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
@@ -192,6 +211,7 @@ async def _persist_one(
         await repo.save_step(
             traj, decision_index, step["turn"], step["state"], STATE_SCHEMA_VERSION,
             step["state"]["legal_actions"], step["action_taken"], "agent",
+            action_path=step.get("action_path"),
         )
     if battle.finished:
         await repo.finalize(traj, result=result, reward=reward)
@@ -204,6 +224,154 @@ def run(n: int = 5, fmt: str | None = None) -> None:
     # `load_settings().showdown_battle_format` decida.
     tags = asyncio.run(play(n, fmt or load_settings().showdown_battle_format))
     typer.echo(f"{len(tags)} batallas persistidas")
+
+
+def _benchmark_provider(
+    name: str, model: str, timeout: float, metrics: DecisionMetrics
+) -> ProviderChain:
+    providers = {
+        "google": ("GOOGLE_API_KEY", "GOOGLE_API_KEYS", None),
+        "kimi": ("KIMI_API_KEY", None, "KIMI_BASE_URL"),
+        "open_code_zen": (
+            "OPEN_CODE_ZEN_API_KEY", None, "OPEN_CODE_ZEN_BASE_URL",
+        ),
+        "anthropic": ("ANTHROPIC_API_KEY", None, None),
+        "openai": ("OPENAI_API_KEY", None, None),
+    }
+    if name not in providers:
+        raise RuntimeError(f"proveedor desconocido: {name}")
+    primary_env, pool_env, base_env = providers[name]
+    keys = provider_keys(os.environ, primary_env, pool_env)
+    if name == "google":
+        selected = GeminiDecisionProvider(
+            keys, model=model, response_schema=DecisionResponse,
+            timeout_seconds=timeout, metrics=metrics,
+        )
+    elif name == "anthropic":
+        selected = AnthropicDecisionProvider(
+            keys, model=model, response_schema=DecisionResponse,
+            timeout_seconds=timeout, metrics=metrics,
+        )
+    else:
+        selected = OpenAICompatibleDecisionProvider(
+            name, keys, model=model, base_url=os.environ.get(base_env) if base_env else None,
+            response_schema=DecisionResponse, timeout_seconds=timeout,
+            metrics=metrics,
+        )
+    # Regla de medición: aunque exista LUDEX_PROVIDER_CHAIN, el benchmark
+    # queda fijado al proveedor/modelo elegidos y nunca cruza de proveedor.
+    return ProviderChain(
+        [selected], allow_cross_provider=False, metrics=metrics
+    )
+
+
+async def _benchmark_command(
+    *, n: int, opponent: str, concurrency: int, persist: bool,
+    provider_name: str, model: str, fmt: str,
+) -> tuple[BenchmarkResult, dict[str, int]]:
+    settings = load_settings()
+    await _check_showdown_reachable(settings.showdown_ws_url)
+    server = local_server_configuration(settings.showdown_ws_url)
+    metrics = DecisionMetrics()
+    selected = _benchmark_provider(
+        provider_name, model, settings.llm_request_timeout_seconds, metrics
+    )
+    calculator = CalcClient(
+        os.environ.get("CALC_BASE_URL", "http://127.0.0.1:8200"),
+        timeout_seconds=settings.llm_request_timeout_seconds,
+    )
+    graph = build_decision_graph(calculator, selected, metrics)
+    suffix = str(time.time_ns())[-8:]
+    common = {
+        "server_configuration": server,
+        "battle_format": fmt,
+        "log_level": 40,
+        "max_concurrent_battles": concurrency,
+    }
+    agent = LudexPlayer(
+        account_configuration=AccountConfiguration(f"Bench{suffix}", None),
+        decision_graph=graph,
+        decision_budget_seconds=settings.decision_budget_seconds,
+        **common,
+    )
+    opponent_types = {
+        "random": RandomPlayer,
+        "max_base_power": MaxBasePowerPlayer,
+        "simple_heuristics": SimpleHeuristicsPlayer,
+    }
+    if opponent not in opponent_types:
+        raise RuntimeError(f"oponente desconocido: {opponent}")
+    rival = opponent_types[opponent](
+        account_configuration=AccountConfiguration(f"Opp{suffix}", None),
+        **common,
+    )
+    engine = make_engine(settings.database_url) if persist else None
+    repo = BattleRepository(session_factory(engine)) if engine is not None else None
+
+    async def persist_tag(tag: str) -> None:
+        assert repo is not None
+        await _persist_one(agent, repo, tag, fmt, "local")
+
+    try:
+        try:
+            result = await run_benchmark(
+                agent, rival, n=n, persist=persist,
+                persist_battle=persist_tag if persist else None,
+                provider=provider_name, model=model,
+            )
+        except ProviderError as exc:
+            completed = (
+                agent.n_won_battles + agent.n_lost_battles
+                + agent.n_tied_battles
+            )
+            result = BenchmarkResult(
+                requested=n, completed=completed,
+                wins=agent.n_won_battles, losses=agent.n_lost_battles,
+                ties=agent.n_tied_battles, provider=provider_name,
+                model=model, failure=f"{type(exc).__name__}: {exc}",
+            )
+    finally:
+        await calculator.aclose()
+        if engine is not None:
+            await engine.dispose()
+    return result, metrics.snapshot()
+
+
+@app.command("benchmark")
+def benchmark_command(
+    n: int = 300,
+    opponent: str = "random",
+    concurrency: int = 20,
+    persist: bool = False,
+    provider: str | None = None,
+    model: str | None = None,
+    fmt: str | None = None,
+) -> None:
+    settings = load_settings()
+    provider_name = provider or settings.llm_provider
+    model_name = model or settings.llm_model
+    if not model_name:
+        raise typer.BadParameter("falta --model o LUDEX_MODEL")
+    result, metrics = asyncio.run(_benchmark_command(
+        n=n, opponent=opponent, concurrency=concurrency, persist=persist,
+        provider_name=provider_name, model=model_name,
+        fmt=fmt or settings.showdown_battle_format,
+    ))
+    typer.echo(
+        f"completed={result.completed}/{result.requested} "
+        f"provider={provider_name} model={model_name}"
+    )
+    if result.comparable:
+        low, high = result.interval or (0, 0)
+        typer.echo(
+            f"wins={result.wins} losses={result.losses} ties={result.ties} "
+            f"winrate={result.win_rate:.4%} wilson95=[{low:.4%}, {high:.4%}]"
+        )
+    else:
+        typer.echo(f"ABORTED: {result.failure}")
+    typer.echo(f"decision_metrics={metrics}")
+    if result.failure:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

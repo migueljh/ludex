@@ -12,8 +12,9 @@ import random
 from types import SimpleNamespace
 
 import pytest
+from typer.testing import CliRunner
 
-from ludex_agent.cli import _battle_outcome, _persist_one
+from ludex_agent.cli import _battle_outcome, _persist_one, app
 from ludex_agent.showdown.client import LudexPlayer, local_server_configuration
 
 
@@ -34,12 +35,19 @@ def _player() -> LudexPlayer:
     )
 
 
+def test_cli_expone_benchmark_en_help():
+    result = CliRunner().invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "benchmark" in result.stdout
+
+
 class _FakeRepo:
     """Doble de `BattleRepository`: registra lo que se le pide grabar, sin
     tocar ninguna base."""
 
     def __init__(self) -> None:
         self.saved_steps: list[tuple] = []
+        self.saved_step_kwargs: list[dict] = []
         self.finalized: tuple | None = None
         self.saved_battle_kwargs: dict | None = None
 
@@ -55,6 +63,7 @@ class _FakeRepo:
 
     async def save_step(self, *args, **kwargs) -> None:
         self.saved_steps.append(args)
+        self.saved_step_kwargs.append(kwargs)
 
     async def finalize(self, *args, **kwargs) -> None:
         self.finalized = (args, kwargs)
@@ -197,3 +206,24 @@ async def test_persist_one_no_pierde_pasos_validos_junto_a_uno_perdido():
 
     assert player.lost_step_count == 1
     assert len(repo.saved_steps) == 1
+
+
+async def test_persist_one_separa_action_path_de_action_source():
+    player = _player()
+    tag = "battle-path-1"
+    player.battles[tag] = SimpleNamespace(
+        battle_tag=tag, player_role="p1", player_username="Bot",
+        opponent_username="Rival", finished=False, won=None, gen=6,
+    )
+    player.steps[tag] = [{
+        "turn": 1, "decision_turn": 1,
+        "state": {"legal_actions": [{"kind": "move", "id": "tackle"}]},
+        "action_taken": {"kind": "move", "id": "tackle"},
+        "action_path": "llm_retry",
+    }]
+    repo = _FakeRepo()
+
+    await _persist_one(player, repo, tag, "gen6randombattle", "test")
+
+    assert repo.saved_steps[0][-1] == "agent"
+    assert repo.saved_step_kwargs[0] == {"action_path": "llm_retry"}

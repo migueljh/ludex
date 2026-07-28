@@ -1,0 +1,31 @@
+{
+  "measured_at": "2026-07-27",
+  "source_commit": "eaa17888d129496a4489a19cc0d444d064385e99",
+  "format": "gen6randombattle",
+  "battles_per_opponent": 300,
+  "concurrency": 20,
+  "confidence": 0.95,
+  "opponents": {
+    "random": {
+      "wins": 143,
+      "losses": 157,
+      "ties": 0,
+      "win_rate": 0.4767,
+      "wilson_interval": [0.4208, 0.5331]
+    },
+    "max_base_power": {
+      "wins": 35,
+      "losses": 265,
+      "ties": 0,
+      "win_rate": 0.1167,
+      "wilson_interval": [0.0851, 0.1579]
+    },
+    "simple_heuristics": {
+      "wins": 9,
+      "losses": 291,
+      "ties": 0,
+      "win_rate": 0.03,
+      "wilson_interval": [0.0159, 0.056]
+    }
+  }
+}

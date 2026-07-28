@@ -34,6 +34,9 @@ class CalcClient:
     ) -> None:
         await self._client.aclose()
 
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
     async def health(self) -> bool:
         response = await self._client.get("/health")
         response.raise_for_status()
