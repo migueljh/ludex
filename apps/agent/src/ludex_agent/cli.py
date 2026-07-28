@@ -6,6 +6,8 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -28,6 +30,7 @@ from .graph.provider import (
     AnthropicDecisionProvider,
     DecisionMetrics,
     GeminiDecisionProvider,
+    ModelRoute,
     OpenAICompatibleDecisionProvider,
     ProviderChain,
     ProviderError,
@@ -36,11 +39,21 @@ from .graph.provider import (
     provider_keys,
 )
 from .graph.workflow import build_decision_graph
+from .eval_cost import DEFAULT_PRICING_PATH, PricingTable
+from .eval_report import (
+    append_ledger_row,
+    build_benchmark_record,
+    write_run_json,
+)
 from .state.schema import STATE_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
 app = typer.Typer()
+AGENT_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[4]
+DEFAULT_LEDGER_PATH = REPO_ROOT / "docs" / "BENCHMARKS.md"
+DEFAULT_RUNS_PATH = AGENT_ROOT / "evals" / "runs"
 
 # Una batalla de gen6randombattle ronda los 60-120 turnos y tarda segundos.
 # Este techo es holgado a proposito: solo existe para que un server colgado
@@ -370,12 +383,25 @@ def benchmark_command(
     provider: str | None = None,
     model: str | None = None,
     fmt: str | None = None,
+    run_id: str | None = None,
+    pricing: Path = DEFAULT_PRICING_PATH,
+    ledger: Path = DEFAULT_LEDGER_PATH,
+    record: bool = True,
 ) -> None:
     settings = load_settings()
     provider_name = provider or settings.llm_provider
     model_name = model or settings.llm_model
     if not model_name:
         raise typer.BadParameter("falta --model o LUDEX_MODEL")
+    selected_route = (
+        model_route(load_model_routes(), provider_name, model_name)
+        if provider_name in {"kimi", "open_code_zen"}
+        else None
+    )
+    effective_run_id = run_id or (
+        datetime.now(timezone.utc).strftime("%Y%m%dt%H%M%Sz")
+        + f"-{provider_name}-{model_name}".replace("_", "-").replace(".", "-")
+    )
     result, metrics = asyncio.run(_benchmark_command(
         n=n, opponent=opponent, concurrency=concurrency, persist=persist,
         provider_name=provider_name, model=model_name,
@@ -394,6 +420,28 @@ def benchmark_command(
     else:
         typer.echo(f"ABORTED: {result.failure}")
     typer.echo(f"decision_metrics={metrics}")
+    pricing_table = PricingTable.load(pricing)
+    benchmark_record = build_benchmark_record(
+        run_id=effective_run_id,
+        created_at=datetime.now(timezone.utc),
+        result=result,
+        metrics=metrics,
+        opponent=opponent,
+        fmt=fmt or settings.showdown_battle_format,
+        route=selected_route or ModelRoute(protocol=provider_name),
+        pricing=pricing_table,
+    )
+    typer.echo(
+        f"usage_calls={metrics.get('calls_total', 0)} "
+        f"input_tokens={metrics.get('input_tokens', 0)} "
+        f"output_tokens={metrics.get('output_tokens', 0)} "
+        f"total_cost={benchmark_record.total_cost}"
+    )
+    if record:
+        artifact = DEFAULT_RUNS_PATH / f"{effective_run_id}.json"
+        write_run_json(benchmark_record, artifact)
+        append_ledger_row(benchmark_record, ledger, artifact)
+        typer.echo(f"benchmark_record={artifact}")
     if result.failure:
         raise typer.Exit(code=1)
 

@@ -47,6 +47,15 @@ def test_cli_expone_benchmark_en_help():
     assert "benchmark" in result.stdout
 
 
+def test_benchmark_expone_registro_y_tabla_de_precios():
+    result = CliRunner().invoke(app, ["benchmark", "--help"])
+    assert result.exit_code == 0
+    assert "--run-id" in result.stdout
+    assert "--pricing" in result.stdout
+    assert "--ledger" in result.stdout
+    assert "--record" in result.stdout
+
+
 def test_benchmark_rechaza_modelo_sin_ruta_antes_de_llamarlo(monkeypatch):
     monkeypatch.setenv("OPEN_CODE_ZEN_API_KEY", "fake-key")
     with pytest.raises(ValueError, match="sin ruta"):
