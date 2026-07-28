@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections import defaultdict
 from typing import Any
 
@@ -426,8 +427,16 @@ class LudexPlayer(RandomPlayer):
     casualidad de timing.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        decision_graph: Any = None,
+        decision_budget_seconds: float = 240,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
+        self.decision_graph = decision_graph
+        self.decision_budget_seconds = decision_budget_seconds
         self.recorders: dict[str, ProtocolRecorder] = defaultdict(ProtocolRecorder)
         self.steps: dict[str, list[dict | None]] = defaultdict(list)
         # Indices de self.steps[tag] cuyo "state" todavia es None: se llenan
@@ -522,6 +531,8 @@ class LudexPlayer(RandomPlayer):
             self.steps[tag].pop()
 
     def choose_move(self, battle: Any) -> Any:
+        if self.decision_graph is not None:
+            return self._choose_move_with_graph(battle)
         order = super().choose_move(battle)
         tag = battle.battle_tag
         self._sides.setdefault(tag, battle.player_role)
@@ -570,6 +581,63 @@ class LudexPlayer(RandomPlayer):
         self.steps[tag].append(step)
         self._pending_finalize[tag].append(index)
         return order
+
+    def _choose_move_with_graph(self, battle: Any) -> Any:
+        """Captura fotografía y órdenes antes de devolver una coroutine."""
+        tag = battle.battle_tag
+        self._sides.setdefault(tag, battle.player_role)
+        snapshot = serialize_battle(battle)
+        captured_legal = legal_actions(battle)
+        snapshot = {**snapshot, "legal_actions": captured_legal}
+
+        action_orders: dict[tuple[tuple[str, Any], ...], Any] = {}
+        for move in battle.available_moves:
+            action = {"kind": "move", "id": move.id}
+            action_orders[tuple(sorted(action.items()))] = self.create_order(move)
+            if getattr(battle, "can_mega_evolve", False):
+                mega_action = {**action, "mega": True}
+                action_orders[tuple(sorted(mega_action.items()))] = self.create_order(
+                    move, mega=True
+                )
+        for mon in battle.available_switches:
+            action = {"kind": "switch", "species": mon.species}
+            action_orders[tuple(sorted(action.items()))] = self.create_order(mon)
+
+        actor = getattr(battle, "active_pokemon", None)
+        actor_species = (
+            _normalize(getattr(actor, "base_species", "") or actor.species)
+            if actor is not None else None
+        )
+        index = len(self.steps[tag])
+        step = {
+            "turn": battle.turn,
+            "decision_turn": battle.turn,
+            "action_taken": None,
+            "action_path": None,
+            "legal_actions": captured_legal,
+            "actor_species": actor_species,
+            "state": snapshot,
+        }
+        self.steps[tag].append(step)
+        graph_input = {
+            "raw_state": snapshot,
+            "turn_id": f"{tag}:{index}",
+            "deadline": time.monotonic() + self.decision_budget_seconds,
+        }
+
+        async def run_graph() -> Any:
+            result = await self.decision_graph.ainvoke(graph_input)
+            action = result["action"]
+            order = action_orders.get(tuple(sorted(action.items())))
+            if order is None:
+                raise RuntimeError(
+                    f"decision graph returned action outside captured mask: {action!r}"
+                )
+            step["action_taken"] = action
+            step["action_path"] = result["action_path"]
+            return order
+
+        return run_graph()
 
     def _finalize_pending_steps(self, tag: str) -> None:
         """Completa `state` (mi lado + el del rival + el resto del estado)

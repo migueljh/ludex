@@ -20,7 +20,7 @@ def _split(raw: str) -> list[str]:
     return raw.split("|")
 
 
-def _player() -> LudexPlayer:
+def _player(**kwargs) -> LudexPlayer:
     from poke_env import AccountConfiguration
 
     # Sufijo aleatorio, igual que hace `cli.py` con los jugadores reales. Con
@@ -35,6 +35,7 @@ def _player() -> LudexPlayer:
         server_configuration=local_server_configuration(
             "ws://localhost:8100/showdown/websocket"
         ),
+        **kwargs,
     )
 
 
@@ -163,6 +164,84 @@ def test_choose_move_reserva_el_indice_en_orden_de_decision():
     assert len(player.steps[tag]) == 2
     assert [s["state"] for s in player.steps[tag]] == [None, None]
     assert player._pending_finalize[tag] == [0, 1]
+
+
+async def test_grafo_usa_foto_y_mapa_capturados_antes_del_primer_await():
+    tag = "battle-graph-1"
+
+    class FakeMove:
+        id = "tackle"
+
+    battle = SimpleNamespace(
+        turn=3, battle_tag=tag, player_role="p1",
+        available_moves=[FakeMove()], available_switches=[],
+        can_mega_evolve=False, active_pokemon=None,
+    )
+
+    class MutatingGraph:
+        async def ainvoke(self, graph_input):
+            assert graph_input["raw_state"]["legal_actions"] == [
+                {"kind": "move", "id": "tackle"}
+            ]
+            battle.available_moves = [SimpleNamespace(id="surf")]
+            battle.turn = 99
+            return {
+                "action": {"kind": "move", "id": "tackle"},
+                "action_path": "llm",
+            }
+
+    player = _player(decision_graph=MutatingGraph(), decision_budget_seconds=5)
+    with patch.object(
+        client_module, "serialize_battle",
+        lambda b: {
+            "turn": b.turn,
+            "legal_actions": [
+                {"kind": "move", "id": move.id}
+                for move in b.available_moves
+            ],
+        },
+    ):
+        pending = player.choose_move(battle)
+        # La coroutine todavía no empezó: si snapshot/mapa se construyeran
+        # dentro de ella, esta mutación contaminaría la decisión.
+        battle.available_moves = [SimpleNamespace(id="surf")]
+        battle.turn = 99
+        order = await pending
+
+    step = player.steps[tag][0]
+    assert order.order.id == "tackle"
+    assert step["decision_turn"] == 3
+    assert step["legal_actions"] == [{"kind": "move", "id": "tackle"}]
+    assert step["state"]["turn"] == 3
+    assert step["action_taken"] == {"kind": "move", "id": "tackle"}
+    assert step["action_path"] == "llm"
+
+
+async def test_grafo_mapea_variante_mega_a_su_battle_order():
+    tag = "battle-graph-mega"
+    move = SimpleNamespace(id="meteormash")
+    battle = SimpleNamespace(
+        turn=1, battle_tag=tag, player_role="p1",
+        available_moves=[move], available_switches=[],
+        can_mega_evolve=True, active_pokemon=None,
+    )
+
+    class MegaGraph:
+        async def ainvoke(self, graph_input):
+            return {
+                "action": {"kind": "move", "id": "meteormash", "mega": True},
+                "action_path": "fallback",
+            }
+
+    player = _player(decision_graph=MegaGraph())
+    with patch.object(
+        client_module, "serialize_battle",
+        lambda b: {"turn": 1, "legal_actions": client_module.legal_actions(b)},
+    ):
+        order = await player.choose_move(battle)
+
+    assert order.mega is True
+    assert player.steps[tag][0]["action_path"] == "fallback"
 
 
 def test_finalize_pending_steps_completa_state_con_lo_capturado_en_choose_move(monkeypatch):
