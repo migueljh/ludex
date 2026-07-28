@@ -304,8 +304,8 @@ def _benchmark_provider(
 
 @app.command("provider-smoke")
 def provider_smoke_command(
-    provider: str,
-    model: str,
+    provider: str = typer.Option(...),
+    model: str = typer.Option(...),
 ) -> None:
     """Una completion estructurada, sin Showdown ni persistencia."""
     settings = load_settings()

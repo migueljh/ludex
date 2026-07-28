@@ -57,6 +57,13 @@ def test_benchmark_expone_registro_y_tabla_de_precios():
     assert "--record" in result.stdout
 
 
+def test_provider_smoke_usa_flags_como_los_comandos_del_plan():
+    result = CliRunner().invoke(app, ["provider-smoke", "--help"])
+    assert result.exit_code == 0
+    assert "--provider" in result.stdout
+    assert "--model" in result.stdout
+
+
 def test_benchmark_rechaza_modelo_sin_ruta_antes_de_llamarlo(monkeypatch):
     monkeypatch.setenv("OPEN_CODE_ZEN_API_KEY", "fake-key")
     with pytest.raises(ValueError, match="sin ruta"):
