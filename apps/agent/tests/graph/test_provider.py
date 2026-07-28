@@ -340,6 +340,162 @@ async def test_clave_agotada_no_se_vuelve_a_probar_en_turnos_siguientes():
     assert metrics.snapshot()["key_rotations"] == 1
 
 
+class FakeClock:
+    """Reloj inyectable para probar enfriamiento sin depender de que un
+    `time.sleep` real termine antes de que expire la ventana de la prueba."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.mark.asyncio
+async def test_clave_enfriada_no_se_reintenta_antes_de_que_expire_el_enfriamiento():
+    """Canario (mitad 1 de 2, D25): revivir el bug de las 98 rotaciones sería
+    volver a probar key-a en el turno 2 aunque su enfriamiento de 30s recién
+    lleva 10s. Tiene que seguir descartada -- igual que con la exclusión
+    permanente que esto reemplaza -- hasta que el enfriamiento expire de
+    verdad."""
+    clock = FakeClock()
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([
+        QuotaExceeded("quota"),
+        {"turn": 1},
+        {"turn": 2},
+    ])
+    provider = KeyRotatingProvider(
+        "google", ("key-a", "key-b"), backend, metrics=metrics,
+        clock=clock, quota_cooldown_seconds=30.0,
+    )
+
+    first = await provider.complete(
+        "turno 1", deadline=time.monotonic() + 1, turn_id="battle:1"
+    )
+    clock.advance(10.0)  # menos que los 30s de enfriamiento
+    second = await provider.complete(
+        "turno 2", deadline=time.monotonic() + 1, turn_id="battle:2"
+    )
+
+    assert first == {"turn": 1}
+    assert second == {"turn": 2}
+    assert backend.calls == [
+        ("turno 1", "key-a"),
+        ("turno 1", "key-b"),
+        ("turno 2", "key-b"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clave_enfriada_vuelve_a_estar_disponible_tras_el_enfriamiento():
+    """Canario (mitad 2 de 2, D25): la razón de todo este cambio es que la
+    exclusión permanente anterior NUNCA dejaba volver a una clave, ni
+    siquiera cuando el límite era por minuto (el caso real de Gemini,
+    verificado: 39 llamadas y 10 rotaciones con 11 claves configuradas,
+    evals/runs/20260728-gemini25flash-5.json). Pasado el enfriamiento,
+    key-a -- la preferida, primera en el pool -- tiene que volver a
+    intentarse antes que key-b."""
+    clock = FakeClock()
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([
+        QuotaExceeded("quota"),
+        {"turn": 1},
+        {"turn": 2},
+    ])
+    provider = KeyRotatingProvider(
+        "google", ("key-a", "key-b"), backend, metrics=metrics,
+        clock=clock, quota_cooldown_seconds=30.0,
+    )
+
+    await provider.complete(
+        "turno 1", deadline=time.monotonic() + 1, turn_id="battle:1"
+    )
+    clock.advance(31.0)  # ya expiró el enfriamiento de 30s
+    second = await provider.complete(
+        "turno 2", deadline=time.monotonic() + 1, turn_id="battle:2"
+    )
+
+    assert second == {"turn": 2}
+    assert backend.calls == [
+        ("turno 1", "key-a"),
+        ("turno 1", "key-b"),
+        ("turno 2", "key-a"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_todas_las_claves_enfriando_espera_si_el_deadline_alcanza():
+    """Si TODAS las claves están enfriándose pero el deadline del turno deja
+    tiempo de sobra para que la primera se libere, hay que esperar en vez de
+    rendirse: el turno todavía puede resolverse con la misma llamada."""
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([
+        QuotaExceeded("quota"),
+        QuotaExceeded("quota"),
+        {"ok": True},
+    ])
+    provider = KeyRotatingProvider(
+        "google", ("key-a", "key-b"), backend, metrics=metrics,
+        quota_cooldown_seconds=0.05,
+    )
+
+    result = await provider.complete(
+        "p", deadline=time.monotonic() + 2, turn_id="t"
+    )
+
+    assert result == {"ok": True}
+    assert backend.calls == [("p", "key-a"), ("p", "key-b"), ("p", "key-a")]
+
+
+@pytest.mark.asyncio
+async def test_todas_las_claves_enfriando_no_espera_si_el_deadline_no_alcanza():
+    """Si el enfriamiento no va a expirar antes del deadline del turno,
+    `ProviderPoolExhausted` tiene que salir YA -- no esperar 5s con un
+    deadline de 50ms."""
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([QuotaExceeded("quota"), QuotaExceeded("quota")])
+    provider = KeyRotatingProvider(
+        "google", ("key-a", "key-b"), backend, metrics=metrics,
+        quota_cooldown_seconds=5.0,
+    )
+
+    with pytest.raises(ProviderPoolExhausted):
+        await provider.complete(
+            "p", deadline=time.monotonic() + 0.05, turn_id="t"
+        )
+
+
+def test_quota_extrae_retry_delay_del_formato_documentado_por_langchain_google_genai():
+    """`langchain_google_genai` (ver `_common.py`, campo `max_retries` de
+    `ChatGoogleGenerativeAI`) documenta este MISMO formato como la forma
+    soportada de recuperar `retry_delay` de un 429 de Gemini: el SDK lo
+    aplana a texto y descarta la estructura. No es una regex inventada."""
+    wrapped = RuntimeError(
+        "Error calling model 'gemini-2.5-flash' (RESOURCE_EXHAUSTED): "
+        "429 RESOURCE_EXHAUSTED. {'error': {'code': 429}} "
+        "[retry_delay {\n  seconds: 42\n}\n]"
+    )
+
+    classified = _classified(wrapped)
+
+    assert isinstance(classified, QuotaExceeded)
+    assert classified.retry_after == 42.0
+
+
+def test_quota_sin_retry_delay_deja_retry_after_en_none():
+    classified = _classified(RuntimeError(
+        "Error calling model 'gemini-2.5-flash' (RESOURCE_EXHAUSTED): "
+        "429 RESOURCE_EXHAUSTED"
+    ))
+
+    assert isinstance(classified, QuotaExceeded)
+    assert classified.retry_after is None
+
+
 @pytest.mark.asyncio
 async def test_transitorio_reintenta_misma_clave_y_prompt():
     metrics = DecisionMetrics()

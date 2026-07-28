@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import httpx
 from anthropic import APIConnectionError as AnthropicAPIConnectionError
@@ -24,7 +25,19 @@ class ProviderError(RuntimeError):
 
 
 class QuotaExceeded(ProviderError):
-    pass
+    """`retry_after`, cuando el proveedor lo informa, es el tiempo en
+    segundos que `KeyRotatingProvider` debería esperar antes de reintentar
+    ESTA clave (ver `_quota_retry_after_seconds`). `None` dice "el
+    proveedor no lo dijo", y el llamador cae a su propio default."""
+
+    def __init__(
+        self,
+        message: str = "provider quota exhausted",
+        *,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class TransientProviderError(ProviderError):
@@ -276,6 +289,24 @@ def _status_code(exc: Exception) -> int | None:
     return status if isinstance(status, int) else None
 
 
+# Gemini (google.rpc.RetryInfo) manda un `retry_delay` estructurado en el
+# 429, pero `langchain_google_genai` lo aplana a texto antes de que nos
+# llegue -- lo confirma su propio docstring
+# (`.venv/.../langchain_google_genai/_common.py`, campo `max_retries`, que
+# documenta esta MISMA regex como la forma soportada de recuperar el valor
+# porque "el SDK ignora retry_delay y usa backoff fijo"). No es una
+# suposición: es el patrón que la librería aguas arriba dice que hay que
+# usar. Ningún otro proveedor de esta rueda expone un equivalente parseable
+# hoy, así que `retry_after` queda en `None` para todos los demás 429 y el
+# llamador cae a su propio default.
+_QUOTA_RETRY_DELAY_RE = re.compile(r"retry_delay\s*\{\s*seconds:\s*(\d+)")
+
+
+def _quota_retry_after_seconds(rendered: str) -> float | None:
+    match = _QUOTA_RETRY_DELAY_RE.search(rendered)
+    return float(match.group(1)) if match else None
+
+
 def _classified(exc: Exception) -> ProviderError:
     if isinstance(exc, ProviderError):
         return exc
@@ -284,7 +315,10 @@ def _classified(exc: Exception) -> ProviderError:
     if status == 429 or (
         "RESOURCE_EXHAUSTED" in rendered and "429" in rendered
     ):
-        classified: ProviderError = QuotaExceeded("provider quota exhausted")
+        classified: ProviderError = QuotaExceeded(
+            "provider quota exhausted",
+            retry_after=_quota_retry_after_seconds(rendered),
+        )
     elif status is not None and status >= 500:
         classified = TransientProviderError("provider server error")
     elif status in (401, 403):
@@ -325,6 +359,20 @@ def _classified(exc: Exception) -> ProviderError:
 
 
 class KeyRotatingProvider:
+    # Default conservador cuando el proveedor no informa `retry_after` (ver
+    # `_quota_retry_after_seconds`): 60s es lo que la propia documentación de
+    # `langchain_google_genai` usa como fallback para 429 de Gemini. No
+    # distingue cuota diaria de límite por minuto -- no hay señal parseable
+    # para eso hoy (ver docstring de `_quota_retry_after_seconds`) -- así que
+    # una clave con cuota DIARIA agotada también vuelve a intentarse cada
+    # 60s. Es un desperdicio acotado (una llamada perdida por minuto, no por
+    # turno), muy distinto del bug que esto reemplaza (exclusión permanente
+    # de por vida del proceso) y del bug anterior a ese (reintentar TODAS las
+    # claves agotadas en CADA turno). Documentado en vez de adivinado: si el
+    # proveedor deja distinguir cuota diaria de límite por minuto en el
+    # futuro, este es el lugar para hacerlo.
+    DEFAULT_QUOTA_COOLDOWN_SECONDS = 60.0
+
     def __init__(
         self,
         name: str,
@@ -333,6 +381,8 @@ class KeyRotatingProvider:
         *,
         metrics: DecisionMetrics | None = None,
         transient_retries: int = 2,
+        quota_cooldown_seconds: float = DEFAULT_QUOTA_COOLDOWN_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not keys:
             raise ValueError(f"{name}: no API keys configured")
@@ -341,7 +391,17 @@ class KeyRotatingProvider:
         self._backend = backend
         self._metrics = metrics or DecisionMetrics()
         self._transient_retries = transient_retries
-        self._first_available_key = 0
+        self._quota_cooldown_seconds = quota_cooldown_seconds
+        self._clock = clock
+        # Enfriamiento por clave (D25/fix-transporte), no exclusión
+        # permanente: una clave con 429 vuelve a estar disponible pasado
+        # `_cooldown_until[key_index]`, nunca antes. Ausente == disponible
+        # desde el arranque. Reemplaza a `_first_available_key`, que solo
+        # avanzaba y nunca volvía: con 11 claves de Gemini (límite por
+        # MINUTO, no diario) eso quemaba el pool entero en ~3-4 llamadas por
+        # clave y nunca se recuperaba, ni siquiera entre batallas del mismo
+        # run (ver docs/DECISIONS.md).
+        self._cooldown_until: dict[int, float] = {}
 
     def __repr__(self) -> str:
         return (
@@ -352,44 +412,76 @@ class KeyRotatingProvider:
     async def complete(
         self, prompt: str, *, deadline: float, turn_id: str
     ) -> dict[str, Any]:
-        for key_index in range(self._first_available_key, len(self._keys)):
-            key = self._keys[key_index]
-            transient_attempts = 0
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self._metrics.deadline(turn_id)
-                    raise DecisionDeadlineExceeded("decision deadline exhausted")
-                try:
-                    async with asyncio.timeout(remaining):
-                        completion = await self._backend.complete(
-                            prompt, api_key=key, deadline=deadline
-                        )
-                    self._metrics.usage(completion.usage)
-                    return completion.payload
-                except Exception as raw:
-                    error = _classified(raw)
-                    if isinstance(error, DecisionDeadlineExceeded):
+        while True:
+            now = self._clock()
+            for key_index in range(len(self._keys)):
+                cooldown_until = self._cooldown_until.get(key_index)
+                if cooldown_until is not None and cooldown_until > now:
+                    continue
+                key = self._keys[key_index]
+                transient_attempts = 0
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         self._metrics.deadline(turn_id)
-                        raise error from raw
-                    if isinstance(error, QuotaExceeded):
-                        self._metrics.quota(turn_id)
-                        self._first_available_key = max(
-                            self._first_available_key, key_index + 1
-                        )
-                        if key_index + 1 < len(self._keys):
+                        raise DecisionDeadlineExceeded("decision deadline exhausted")
+                    try:
+                        async with asyncio.timeout(remaining):
+                            completion = await self._backend.complete(
+                                prompt, api_key=key, deadline=deadline
+                            )
+                        self._metrics.usage(completion.usage)
+                        return completion.payload
+                    except Exception as raw:
+                        error = _classified(raw)
+                        if isinstance(error, DecisionDeadlineExceeded):
+                            self._metrics.deadline(turn_id)
+                            raise error from raw
+                        if isinstance(error, QuotaExceeded):
+                            self._metrics.quota(turn_id)
+                            retry_after = (
+                                error.retry_after
+                                if error.retry_after is not None
+                                else self._quota_cooldown_seconds
+                            )
+                            self._cooldown_until[key_index] = (
+                                self._clock() + retry_after
+                            )
                             self._metrics.key_rotation()
                             break
-                        raise ProviderPoolExhausted(
-                            f"{self.name}: all configured keys exhausted"
-                        ) from error
-                    if isinstance(error, TransientProviderError):
-                        self._metrics.transient(turn_id)
-                        if transient_attempts < self._transient_retries:
-                            transient_attempts += 1
-                            continue
-                    raise error from raw
-        raise ProviderPoolExhausted(f"{self.name}: all configured keys exhausted")
+                        if isinstance(error, TransientProviderError):
+                            self._metrics.transient(turn_id)
+                            if transient_attempts < self._transient_retries:
+                                transient_attempts += 1
+                                continue
+                        raise error from raw
+
+            # Se recorrieron todas las claves sin devolver ni lanzar: cada
+            # una está enfriándose (recién puesta a enfriar en este mismo
+            # pase, o ya lo estaba de un turno anterior). No es
+            # `ProviderPoolExhausted` todavía -- eso es solo para cuando
+            # ESPERAR no alcanza el deadline del turno (ver comentario del
+            # canario en tests/graph/test_provider.py).
+            now = self._clock()
+            cooldowns = [
+                until for until in self._cooldown_until.values() if until > now
+            ]
+            if not cooldowns:
+                # No debería poder pasar (guardia defensiva): si ninguna
+                # clave está enfriando, el for de arriba tendría que haber
+                # devuelto o lanzado. Falla ruidoso en vez de loopear en
+                # silencio.
+                raise ProviderPoolExhausted(
+                    f"{self.name}: all configured keys exhausted"
+                )
+            soonest = min(cooldowns)
+            wait_seconds = soonest - now
+            remaining_deadline = deadline - time.monotonic()
+            if wait_seconds <= 0 or wait_seconds >= remaining_deadline:
+                raise ProviderPoolExhausted(
+                    f"{self.name}: all configured keys exhausted"
+                )
+            await asyncio.sleep(wait_seconds)
 
 
 class ProviderChain:

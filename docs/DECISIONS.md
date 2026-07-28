@@ -922,3 +922,44 @@ exactamente `true`, y su `ident` debe pertenecer al mismo lado. Aunque la
 evidencia se obtiene del request, el cursor global avanza después del
 `|switch|` público asociado en el mismo turno, para que una decisión posterior
 no pueda reutilizar esa línea.
+
+## D30 — `KeyRotatingProvider` enfría claves con 429, no las descarta para siempre
+
+`_first_available_key` solo avanzaba: una clave con `QuotaExceeded` quedaba
+excluida el resto del proceso, incluso entre batallas de la misma corrida (el
+`KeyRotatingProvider` se construye una vez por benchmark, no una vez por
+batalla). Corrida real, `evals/runs/20260728-gemini25flash-5.json`: 39
+llamadas, 10 rotaciones, 11 claves configuradas — unas 3,5 llamadas por
+clave antes de darla por muerta. Ninguna cuota diaria se agota así de rápido;
+es la firma de un límite por MINUTO, que se libera solo, y que el código
+trataba como si fuera definitivo.
+
+Es hija directa del fix anterior (D-sin-número, no registrada: "no
+reintentar en cada turno una clave ya agotada", que evitaba las ~98
+rotaciones de una corrida más vieja). Ese fix corrigió el síntoma
+—reintentar CADA turno— pero sobrecorrigió a "nunca más".
+
+El reemplazo es enfriamiento por clave: `_cooldown_until[key_index]` guarda
+hasta cuándo una clave sigue no disponible; pasado ese momento, vuelve a
+intentarse, empezando otra vez por la preferida (índice 0). Si Gemini
+informa `retry_delay` (el 429 de `google.rpc.RetryInfo`, aplanado a texto
+por `langchain_google_genai` — confirmado contra el propio docstring de la
+librería en `_common.py`, que documenta la regex
+`retry_delay\s*\{\s*seconds:\s*(\d+)` como la forma soportada de
+recuperarlo), se usa ese valor. Si no, cae a un default de 60s, el mismo que
+usa la documentación de `langchain_google_genai` como fallback.
+
+No se distingue cuota diaria de límite por minuto: no hay señal parseable
+para eso hoy (el `retry_delay`, cuando aparece, ya resuelve el caso
+interesante — el límite por minuto — y una cuota diaria simplemente vuelve a
+fallar y se reenfría). El costo de no distinguir es acotado — una llamada
+perdida por default cada 60s contra una clave con cuota diaria agotada — y
+muy distinto de los dos bugs anteriores (exclusión permanente, o reintentar
+todo el pool en cada turno).
+
+Cuando TODAS las claves están enfriándose, `ProviderPoolExhausted` solo se
+lanza si esperar a que la primera se libere no entra en el deadline del
+turno; si entra, `complete()` duerme ese tramo y reintenta. Dos canarios
+(`tests/graph/test_provider.py`) fijan ambas direcciones: una clave enfriada
+no se reintenta antes de tiempo, y sí vuelve después — revertido el fix,
+los seis tests nuevos fallan.
