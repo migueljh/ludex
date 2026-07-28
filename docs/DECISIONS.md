@@ -803,3 +803,47 @@ enum con la misma facilidad. No sienta precedente general para reemplazar
 otros enums. `NULL` significa “fila histórica sin camino de decisión
 registrado”: las decisiones previas fueron aleatorias y asignarles un default
 sería inventar su procedencia.
+
+## D26 — el grafo separa fallos de infraestructura de fallos semánticos
+
+La decisión por turno corre localmente como
+`parse_state → calc_damage → decide`. El prompt recibe solamente la fotografía
+allowlisted, la máscara legal y resultados deterministas de calc. El respaldo
+prioriza KO garantizado (`min_damage >= HP restante`), acota el daño esperado
+al HP restante y, en cambios forzados, elige por minimax del peor daño
+esperado relativo.
+
+Hay dos reintentos distintos y no comparten contador:
+
+- 429 rota la clave dentro del proveedor y repite exactamente el mismo pedido.
+- 5xx/timeout reintenta el mismo pedido sin consumir el reintento semántico.
+- JSON inválido o acción fuera de máscara consume el único reintento semántico;
+  una segunda respuesta inválida usa `fallback`.
+
+Las excepciones de proveedor heredan de `RuntimeError`, nunca de `ValueError`.
+Por eso atraviesan el bucle semántico: pool/cadena agotados y deadline vencido
+abortan ruidosamente y jamás producen `action_path='fallback'`. La cadena
+entre proveedores se permite al jugar, pero queda prohibida en benchmark:
+proveedor y modelo permanecen fijos o la medición aborta informando cuántas
+batallas terminó, sin publicar un winrate comparable.
+
+El presupuesto total por decisión es 240 s, por debajo de los 300 s medidos
+en el reloj del Showdown local (más 60 s de gracia). Fotografía, máscara y
+mapa acción→`BattleOrder` se capturan sincrónicamente antes del primer
+`await`; el grafo nunca relee el `Battle` mutable. El corrector de turnos
+continúa juzgando contra protocolo crudo y no fue modificado.
+
+Baseline random, `gen6randombattle`, 300 batallas por rival, concurrencia 20:
+47,67% contra RandomPlayer (143–157), 11,67% contra MaxBasePowerPlayer
+(35–265) y 3,00% contra SimpleHeuristicsPlayer (9–291). Se versionó completo
+en `apps/agent/evals/random-baseline.json`. Las métricas LLM reales quedan
+**pendientes por falta de clave**, no en cero.
+
+## D27 — Typer 0.15.1 requiere Click 8.1.8 en este proyecto
+
+Al agregar el subcomando `benchmark`, `--help` falló con
+`Parameter.make_metavar() missing ... ctx`: el lock había resuelto
+Click 8.4.2, cuya firma ya no coincide con el formateador rich de Typer
+0.15.1. Se pineó `click==8.1.8`, comprobado contra el CLI real, y quedó un
+test que exige que `benchmark` aparezca en el help. No es un cambio de
+dominio ni una razón para actualizar Typer dentro de esta rebanada.
