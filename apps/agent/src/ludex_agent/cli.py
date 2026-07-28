@@ -49,7 +49,7 @@ from .state.schema import STATE_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
-app = typer.Typer()
+app = typer.Typer(pretty_exceptions_show_locals=False)
 AGENT_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_LEDGER_PATH = REPO_ROOT / "docs" / "BENCHMARKS.md"
@@ -318,11 +318,15 @@ def provider_smoke_command(
         "reasoning breve. legal_actions="
         '[{"kind":"move","id":"tackle"},{"kind":"switch","species":"pikachu"}]'
     )
-    payload = asyncio.run(selected.complete(
-        prompt,
-        deadline=time.monotonic() + settings.llm_request_timeout_seconds,
-        turn_id=f"provider-smoke:{provider}:{model}",
-    ))
+    try:
+        payload = asyncio.run(selected.complete(
+            prompt,
+            deadline=time.monotonic() + settings.llm_request_timeout_seconds,
+            turn_id=f"provider-smoke:{provider}:{model}",
+        ))
+    except ProviderError as exc:
+        typer.echo(f"ABORTED: {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1) from None
     parsed = DecisionResponse.model_validate(payload)
     typer.echo(f"provider={provider} model={model} action={parsed.action}")
     typer.echo(f"decision_metrics={metrics.snapshot()}")
