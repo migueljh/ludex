@@ -80,7 +80,10 @@ Métricas LLM reales: **pendientes por falta de API key**.
 - Ejecutar el benchmark real cuando el dueño configure una clave.
 - El auditor global encontró 39 violaciones históricas `action_turn`, todas
   en seis batallas `source='test'` (`-266`, `-267`, `-269`, `-271`, `-272`,
-  `-276`, grabadas el 2026-07-27 antes de este grafo). Las otras cinco
+  `-276`, grabadas el 2026-07-27 antes de este grafo). Son residuo conocido
+  de pruebas anteriores a los arreglos del corrector y están excluidas del
+  dataset de entrenamiento por el contrato `source='test'`: no son un
+  defecto abierto ni contaminan datos de entrenamiento. Las otras cinco
   invariantes pasan: 0 fuga, 0 re-derivación, 0 reward, 0 versión y 0
   huérfanos. No se reescribió ni borró data en este encargo.
 - `vectorize-information-leak-audit`: reemplazar el N+1 de la prueba de fuga,

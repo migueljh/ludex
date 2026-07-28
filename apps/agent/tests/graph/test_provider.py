@@ -41,6 +41,24 @@ def test_pool_prioriza_principal_descarta_vacias_y_deduplica():
     assert keys == ("principal", "secundaria", "tercera")
 
 
+def test_gemini_acepta_google_como_alias_secundario_sin_duplicar():
+    keys = provider_keys(
+        {
+            "GEMINI_API_KEY": "gemini-primary",
+            "GEMINI_API_KEYS": "shared,gemini-pool",
+            "GOOGLE_API_KEY": "google-primary",
+            "GOOGLE_API_KEYS": "shared,google-pool",
+        },
+        "GEMINI_API_KEY",
+        "GEMINI_API_KEYS",
+        aliases=(("GOOGLE_API_KEY", "GOOGLE_API_KEYS"),),
+    )
+    assert keys == (
+        "gemini-primary", "shared", "gemini-pool",
+        "google-primary", "google-pool",
+    )
+
+
 @pytest.mark.asyncio
 async def test_429_rota_clave_y_repite_exactamente_el_mismo_prompt():
     metrics = DecisionMetrics()

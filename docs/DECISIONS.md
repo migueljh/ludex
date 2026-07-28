@@ -820,6 +820,10 @@ Hay dos reintentos distintos y no comparten contador:
 - JSON inválido o acción fuera de máscara consume el único reintento semántico;
   una segunda respuesta inválida usa `fallback`.
 
+Gemini toma primero `GEMINI_API_KEY/GEMINI_API_KEYS`, que son los nombres del
+entorno real. `GOOGLE_API_KEY/GOOGLE_API_KEYS` se aceptan después como aliases
+compatibles y se deduplican; las claves siguen existiendo solo en memoria.
+
 Las excepciones de proveedor heredan de `RuntimeError`, nunca de `ValueError`.
 Por eso atraviesan el bucle semántico: pool/cadena agotados y deadline vencido
 abortan ruidosamente y jamás producen `action_path='fallback'`. La cadena

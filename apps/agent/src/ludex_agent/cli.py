@@ -230,7 +230,7 @@ def _benchmark_provider(
     name: str, model: str, timeout: float, metrics: DecisionMetrics
 ) -> ProviderChain:
     providers = {
-        "google": ("GOOGLE_API_KEY", "GOOGLE_API_KEYS", None),
+        "google": ("GEMINI_API_KEY", "GEMINI_API_KEYS", None),
         "kimi": ("KIMI_API_KEY", None, "KIMI_BASE_URL"),
         "open_code_zen": (
             "OPEN_CODE_ZEN_API_KEY", None, "OPEN_CODE_ZEN_BASE_URL",
@@ -241,7 +241,13 @@ def _benchmark_provider(
     if name not in providers:
         raise RuntimeError(f"proveedor desconocido: {name}")
     primary_env, pool_env, base_env = providers[name]
-    keys = provider_keys(os.environ, primary_env, pool_env)
+    aliases = (
+        (("GOOGLE_API_KEY", "GOOGLE_API_KEYS"),)
+        if name == "google" else ()
+    )
+    keys = provider_keys(
+        os.environ, primary_env, pool_env, aliases=aliases
+    )
     if name == "google":
         selected = GeminiDecisionProvider(
             keys, model=model, response_schema=DecisionResponse,

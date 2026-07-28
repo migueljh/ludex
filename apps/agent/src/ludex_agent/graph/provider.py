@@ -92,11 +92,19 @@ class DecisionMetrics:
 
 
 def provider_keys(
-    environ: Mapping[str, str], primary_env: str, pool_env: str | None = None
+    environ: Mapping[str, str],
+    primary_env: str,
+    pool_env: str | None = None,
+    *,
+    aliases: Sequence[tuple[str, str | None]] = (),
 ) -> tuple[str, ...]:
-    candidates = [environ.get(primary_env, "")]
-    if pool_env:
-        candidates.extend(environ.get(pool_env, "").split(","))
+    candidates: list[str] = []
+    for current_primary, current_pool in (
+        (primary_env, pool_env), *aliases
+    ):
+        candidates.append(environ.get(current_primary, ""))
+        if current_pool:
+            candidates.extend(environ.get(current_pool, "").split(","))
     result: list[str] = []
     for candidate in candidates:
         key = candidate.strip()

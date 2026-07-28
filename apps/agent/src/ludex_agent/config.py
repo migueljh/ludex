@@ -26,7 +26,7 @@ class Settings:
 
 
 _PROVIDERS: dict[str, tuple[str, str | None, str | None]] = {
-    "google": ("GOOGLE_API_KEY", "GOOGLE_API_KEYS", None),
+    "google": ("GEMINI_API_KEY", "GEMINI_API_KEYS", None),
     "kimi": ("KIMI_API_KEY", None, "KIMI_BASE_URL"),
     "open_code_zen": (
         "OPEN_CODE_ZEN_API_KEY", None, "OPEN_CODE_ZEN_BASE_URL",

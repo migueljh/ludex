@@ -30,8 +30,8 @@ def test_configura_proveedor_pool_base_url_y_cadena_sin_leer_claves():
         "LUDEX_PROVIDER": "google",
         "LUDEX_MODEL": "gemini-test",
         "LUDEX_PROVIDER_CHAIN": "kimi,open_code_zen",
-        "GOOGLE_API_KEY": "secreto-principal",
-        "GOOGLE_API_KEYS": "secreto-2,secreto-3",
+        "GEMINI_API_KEY": "secreto-principal",
+        "GEMINI_API_KEYS": "secreto-2,secreto-3",
         "KIMI_BASE_URL": "https://api.moonshot.ai/v1",
         "OPEN_CODE_ZEN_BASE_URL": "https://opencode.ai/zen/v1",
         "OPEN_CODE_ZEN_MODEL": "claude-haiku-4-5",
@@ -39,8 +39,8 @@ def test_configura_proveedor_pool_base_url_y_cadena_sin_leer_claves():
 
     assert s.llm_provider == "google"
     assert s.llm_model == "gemini-test"
-    assert s.llm_api_key_env == "GOOGLE_API_KEY"
-    assert s.llm_api_keys_env == "GOOGLE_API_KEYS"
+    assert s.llm_api_key_env == "GEMINI_API_KEY"
+    assert s.llm_api_keys_env == "GEMINI_API_KEYS"
     assert s.llm_base_url is None
     assert s.llm_provider_chain == ("kimi", "open_code_zen")
     assert "secreto" not in repr(s)
