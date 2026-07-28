@@ -111,6 +111,45 @@ def model_route(
         ) from None
 
 
+def anthropic_sdk_base_url(base_url: str | None) -> str | None:
+    """Adapta una base API completa al SDK, que agrega `/v1/messages`."""
+    if base_url is None:
+        return None
+    return base_url.removesuffix("/").removesuffix("/v1")
+
+
+def structured_output_method(kind: str, base_url: str | None) -> str:
+    """Los gateways `messages` no necesariamente implementan tools."""
+    if kind == "anthropic" and base_url is not None:
+        return "text_json"
+    return "json_schema"
+
+
+def text_json_payload(content: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return {"_invalid_response": content}
+    if not isinstance(parsed, dict):
+        return {"_invalid_response": content}
+    return parsed
+
+
+def message_text_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [
+            block["text"]
+            for block in content
+            if isinstance(block, Mapping)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ]
+        return "".join(texts)
+    return ""
+
+
 class DecisionProvider(Protocol):
     async def complete(
         self, prompt: str, *, deadline: float, turn_id: str
@@ -239,7 +278,9 @@ def _classified(exc: Exception) -> ProviderError:
         return FatalProviderError("provider authentication failed")
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, httpx.TransportError)):
         return TransientProviderError("provider transport failed")
-    return FatalProviderError("unexpected provider failure")
+    return FatalProviderError(
+        f"unexpected provider failure ({type(exc).__name__})"
+    )
 
 
 class KeyRotatingProvider:
@@ -390,7 +431,7 @@ class _LangChainBackend:
 
             model = ChatAnthropic(
                 model_name=self.model, api_key=api_key,
-                base_url=self.base_url,
+                base_url=anthropic_sdk_base_url(self.base_url),
                 temperature=self.route.temperature,
                 max_retries=0, timeout=self.timeout_seconds,
             )
@@ -408,8 +449,19 @@ class _LangChainBackend:
                 timeout=self.timeout_seconds,
                 extra_body=extra_body or None,
             )
+        output_method = structured_output_method(self.kind, self.base_url)
+        if output_method == "text_json":
+            raw = await model.ainvoke(
+                prompt
+                + "\nRespondé únicamente con un objeto JSON válido, sin "
+                "Markdown ni texto fuera del objeto."
+            )
+            return ProviderCompletion(
+                payload=text_json_payload(message_text_content(raw.content)),
+                usage=self._usage_from_message(raw),
+            )
         structured = model.with_structured_output(
-            self.response_schema, method="json_schema", include_raw=True
+            self.response_schema, method=output_method, include_raw=True
         )
         result = await structured.ainvoke(prompt)
         raw = result["raw"]

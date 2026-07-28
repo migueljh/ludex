@@ -327,7 +327,11 @@ def provider_smoke_command(
     except ProviderError as exc:
         typer.echo(f"ABORTED: {type(exc).__name__}: {exc}")
         raise typer.Exit(code=1) from None
-    parsed = DecisionResponse.model_validate(payload)
+    try:
+        parsed = DecisionResponse.model_validate(payload)
+    except (ValueError, TypeError):
+        typer.echo("ABORTED: invalid model response")
+        raise typer.Exit(code=1) from None
     typer.echo(f"provider={provider} model={model} action={parsed.action}")
     typer.echo(f"decision_metrics={metrics.snapshot()}")
 

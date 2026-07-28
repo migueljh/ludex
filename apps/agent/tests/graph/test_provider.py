@@ -15,10 +15,63 @@ from ludex_agent.graph.provider import (
     ProviderPoolExhausted,
     QuotaExceeded,
     TransientProviderError,
+    _classified,
+    anthropic_sdk_base_url,
     load_model_routes,
+    message_text_content,
     model_route,
     provider_keys,
+    structured_output_method,
+    text_json_payload,
 )
+
+
+def test_fallo_inesperado_conserva_tipo_pero_no_mensaje_sensible():
+    error = RuntimeError("request failed with api_key=secret-value")
+
+    classified = _classified(error)
+
+    assert str(classified) == "unexpected provider failure (RuntimeError)"
+    assert "secret-value" not in str(classified)
+
+
+def test_base_anthropic_quita_v1_que_el_sdk_agrega_al_endpoint_messages():
+    assert anthropic_sdk_base_url(
+        "https://opencode.ai/zen/v1"
+    ) == "https://opencode.ai/zen"
+    assert anthropic_sdk_base_url(
+        "https://api.anthropic.com"
+    ) == "https://api.anthropic.com"
+    assert anthropic_sdk_base_url(None) is None
+
+
+def test_compatibilidad_anthropic_usa_tools_y_nativo_conserva_json_schema():
+    assert structured_output_method("anthropic", None) == "json_schema"
+    assert structured_output_method(
+        "anthropic", "https://opencode.ai/zen/v1"
+    ) == "text_json"
+    assert structured_output_method(
+        "openai", "https://opencode.ai/zen/v1"
+    ) == "json_schema"
+
+
+def test_json_textual_se_parsea_y_markdown_se_trata_como_respuesta_invalida():
+    assert text_json_payload(
+        '{"action":{"kind":"move","id":"tackle"},"reasoning":"safe"}'
+    ) == {
+        "action": {"kind": "move", "id": "tackle"},
+        "reasoning": "safe",
+    }
+    assert text_json_payload("```json\n{\"action\": {}}\n```") == {
+        "_invalid_response": "```json\n{\"action\": {}}\n```"
+    }
+
+
+def test_bloques_anthropic_extraen_el_texto_sin_serializar_el_envoltorio():
+    assert message_text_content([
+        {"type": "text", "text": '{"action":{"kind":"move","id":"tackle"}}'},
+    ]) == '{"action":{"kind":"move","id":"tackle"}}'
+    assert message_text_content("plain") == "plain"
 
 
 class ScriptedBackend:

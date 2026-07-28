@@ -92,6 +92,34 @@ def test_provider_smoke_sanitiza_fallo_sin_traceback_ni_clave(monkeypatch):
     assert "super-secret-key" not in result.stdout
 
 
+def test_provider_smoke_sanitiza_respuesta_semanticamente_invalida(monkeypatch):
+    class InvalidProvider:
+        async def complete(self, prompt, *, deadline, turn_id):
+            return {"_invalid_response": "contenido privado del modelo"}
+
+    monkeypatch.setattr(
+        "ludex_agent.cli._benchmark_provider",
+        lambda *args, **kwargs: InvalidProvider(),
+    )
+    result = CliRunner().invoke(
+        app,
+        ["provider-smoke", "--provider", "fake", "--model", "fake-model"],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "SHOWDOWN_WS_URL": "ws://localhost:8100/showdown/websocket",
+            "LUDEX_PROVIDER": "google",
+            "LUDEX_MODEL": "fake",
+            "GEMINI_API_KEY": "super-secret-key",
+        },
+    )
+
+    assert result.exit_code == 1
+    assert "ABORTED: invalid model response" in result.stdout
+    assert "Traceback" not in result.stdout
+    assert "contenido privado" not in result.stdout
+    assert "super-secret-key" not in result.stdout
+
+
 def test_benchmark_rechaza_modelo_sin_ruta_antes_de_llamarlo(monkeypatch):
     monkeypatch.setenv("OPEN_CODE_ZEN_API_KEY", "fake-key")
     with pytest.raises(ValueError, match="sin ruta"):
