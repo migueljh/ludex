@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import math
 from dataclasses import dataclass
@@ -93,10 +94,34 @@ async def run_benchmark(
             if inspect.isawaitable(pending):
                 await pending
 
+    async def play_one() -> None:
+        wait_for_failure = getattr(
+            agent, "wait_for_background_failure", None
+        )
+        if wait_for_failure is None:
+            await agent.battle_against(opponent, n_battles=1)
+            return
+        battle_task = asyncio.create_task(
+            agent.battle_against(opponent, n_battles=1)
+        )
+        failure_task = asyncio.create_task(wait_for_failure())
+        await asyncio.wait(
+            {battle_task, failure_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if failure_task.done():
+            failure = failure_task.result()
+            battle_task.cancel()
+            await asyncio.gather(battle_task, return_exceptions=True)
+            raise failure
+        failure_task.cancel()
+        await asyncio.gather(failure_task, return_exceptions=True)
+        await battle_task
+
     try:
         for _ in range(n):
             known = set(agent.battles)
-            await agent.battle_against(opponent, n_battles=1)
+            await play_one()
             if persist:
                 for tag in agent.battles:
                     if tag not in known:

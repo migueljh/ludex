@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
+from ludex_agent.graph.provider import TransientProviderError
 from ludex_agent.showdown import client as client_module
 from ludex_agent.showdown.client import (
     LudexPlayer,
@@ -870,6 +871,23 @@ async def test_un_error_no_relacionado_no_descarta_nada():
         await player._handle_battle_message(lote)
 
     assert len(player.steps[tag]) == 1
+
+
+async def test_excepcion_de_mensajes_se_publica_al_runner():
+    player = _player()
+    failure = TransientProviderError("provider transport failed")
+
+    async def failing_super(self, split_messages):
+        raise failure
+
+    lote = [_split(">battle-test-failure"), _split("|turn|1")]
+    with patch.object(
+        client_module.RandomPlayer, "_handle_battle_message", failing_super
+    ):
+        with pytest.raises(TransientProviderError):
+            await player._handle_battle_message(lote)
+
+    assert await player.wait_for_background_failure() is failure
 
 
 def test_discard_last_step_descarta_el_ultimo_paso():

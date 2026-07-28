@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from ludex_agent.benchmark import (
@@ -5,6 +7,7 @@ from ludex_agent.benchmark import (
     run_benchmark,
     wilson_interval,
 )
+from ludex_agent.graph.provider import TransientProviderError
 
 
 def test_wilson_reproduce_intervalo_medido_de_random():
@@ -100,6 +103,29 @@ async def test_interrupcion_conserva_el_ultimo_progreso_completo():
         )
 
     assert progress == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_fallo_de_tarea_de_mensajes_aborta_batalla_colgada():
+    class FailingAgent(FakeAgent):
+        cancelled = False
+
+        async def battle_against(self, opponent, n_battles):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cancelled = True
+
+        async def wait_for_background_failure(self):
+            await asyncio.sleep(0)
+            return TransientProviderError("provider transport failed")
+
+    agent = FailingAgent()
+
+    with pytest.raises(TransientProviderError, match="transport"):
+        await run_benchmark(agent, object(), n=1)
+
+    assert agent.cancelled is True
 
 
 def test_resultado_incompleto_no_publica_winrate_comparable():

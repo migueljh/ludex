@@ -889,3 +889,11 @@ ese instante aunque el contador de batallas no haya avanzado. El ledger
 Markdown recibe una fila solamente al cierre normal o aborto clasificado; un
 snapshot con `status="running"` es deliberadamente recuperable y no se presenta
 como resultado comparable.
+
+poke-env despacha cada mensaje en una task propia; una excepción de decisión
+puede quedar allí sin despertar el `battle_against` que espera el final de la
+batalla. `LudexPlayer` publica el primer fallo de fondo mediante un
+`concurrent.futures.Future`, porque el loop del cliente puede vivir en otro
+hilo. El runner corre cada batalla en carrera contra esa señal: si llega el
+fallo, cancela la espera, conserva el snapshot y propaga la excepción original.
+Así una corrida desatendida aborta ruidosamente en vez de quedar colgada.

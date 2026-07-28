@@ -6,6 +6,8 @@ que juegue bien, es que grabe bien.
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import logging
 import re
 import time
@@ -460,6 +462,16 @@ class LudexPlayer(RandomPlayer):
         # desatendido (miles de batallas, `agent play -n grande`) puede
         # loguear o alertar sin tener que grepear el log linea por linea.
         self.lost_step_count: int = 0
+        # poke-env procesa mensajes en `ps_client.loop`, que puede vivir en
+        # otro hilo distinto del loop que espera `battle_against`. Un Future
+        # de `concurrent.futures` permite publicar el fallo entre ambos loops
+        # sin depender de que la task interna de poke-env sea awaited.
+        self._background_failure: concurrent.futures.Future[Exception] = (
+            concurrent.futures.Future()
+        )
+
+    async def wait_for_background_failure(self) -> Exception:
+        return await asyncio.wrap_future(self._background_failure)
 
     async def _handle_battle_message(self, split_messages: list[list[str]]) -> Any:
         tag = battle_tag_from(split_messages)
@@ -508,7 +520,12 @@ class LudexPlayer(RandomPlayer):
                 self._discard_last_step(tag)
                 break
 
-        result = await super()._handle_battle_message(split_messages)
+        try:
+            result = await super()._handle_battle_message(split_messages)
+        except Exception as exc:
+            if not self._background_failure.done():
+                self._background_failure.set_result(exc)
+            raise
         # SIGUE siendo la misma llamada sincronica: ninguna otra invocacion de
         # _handle_battle_message para este tag puede haber corrido entre
         # medio. Si `choose_move` reservo un paso en algun punto de este
