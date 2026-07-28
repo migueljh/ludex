@@ -6,7 +6,10 @@
 
 **Architecture:** Un `StateGraph` async coordina `parse_state → calc_damage → decide`. El grafo consume únicamente una fotografía allowlisted y dependencias inyectadas (`DamageCalculator`, `DecisionProvider`); `LudexPlayer` captura fotografía y órdenes antes del primer `await`. Autoría (`action_source`) y camino interno (`action_path`) se persisten por separado.
 
-**Tech Stack:** Python 3.12, uv, poke-env 0.15.0, LangGraph 1.2.9, langchain-google-genai 4.2.7, HTTPX 0.28.1, Pydantic 2.13.4, PostgreSQL 16/dbmate 2.21, pytest 8.3.4.
+**Tech Stack:** Python 3.12, uv, poke-env 0.15.0, LangGraph 1.2.9,
+langchain-google-genai 4.2.7, langchain-openai 1.4.0,
+langchain-anthropic 1.5.0, HTTPX 0.28.1, Pydantic 2.13.4, PostgreSQL
+16/dbmate 2.21, pytest 8.3.4.
 
 ## Global Constraints
 
@@ -33,7 +36,10 @@
 - Modify: `apps/agent/tests/test_config.py`
 
 **Interfaces:**
-- Produces: `Settings.llm_provider`, `llm_model`, `llm_api_key_env`, `llm_api_keys_env`, `llm_request_timeout_seconds`, `decision_budget_seconds`, `showdown_turn_limit_seconds`.
+- Produces: `Settings.llm_provider`, `llm_model`, `llm_api_key_env`,
+  `llm_api_keys_env`, `llm_base_url`, `llm_provider_chain`,
+  `llm_request_timeout_seconds`, `decision_budget_seconds`,
+  `showdown_turn_limit_seconds`.
 
 - [ ] **Step 1: escribir tests RED de configuración**
 
@@ -46,6 +52,8 @@ settings = load_settings({
     "LUDEX_MODEL": "gemini-test",
     "LUDEX_API_KEY_ENV": "GOOGLE_API_KEY",
     "LUDEX_API_KEYS_ENV": "GOOGLE_API_KEYS",
+    "LUDEX_BASE_URL": "",
+    "LUDEX_PROVIDER_CHAIN": "kimi,open_code_zen",
     "LUDEX_LLM_REQUEST_TIMEOUT_SECONDS": "30",
     "LUDEX_DECISION_BUDGET_SECONDS": "240",
     "LUDEX_SHOWDOWN_TURN_LIMIT_SECONDS": "300",
@@ -56,6 +64,8 @@ assert settings.decision_budget_seconds == 240
 Verificar también que `decision_budget >= showdown_turn_limit`, timeout no
 positivo, proveedor/modelo vacíos y nombres de variables vacíos fallen con
 mensajes accionables, sin leer ni exponer el valor de la clave.
+Agregar casos para Kimi/OpenCode Zen con `base_url` válido y rechazar URLs que
+no sean HTTP(S).
 
 - [ ] **Step 2: confirmar RED**
 
@@ -75,6 +85,7 @@ Run:
 ```bash
 cd apps/agent
 uv add 'langgraph==1.2.9' 'langchain-google-genai==4.2.7' \
+  'langchain-openai==1.4.0' 'langchain-anthropic==1.5.0' \
   'httpx==0.28.1' 'pydantic==2.13.4'
 ```
 
@@ -346,6 +357,9 @@ git commit -m "feat(agent): calculate and rank battle damage" -- \
   - `DecisionProvider.complete(prompt: str, *, deadline: float) -> Awaitable[dict]`.
   - `FakeDecisionProvider(responses: list[dict | Exception])`.
   - `GeminiDecisionProvider`.
+  - `OpenAICompatibleDecisionProvider` para Kimi/OpenCode Zen.
+  - `AnthropicDecisionProvider`.
+  - `ProviderChain(providers, *, allow_cross_provider: bool)`.
   - `QuotaExceeded`, `TransientProviderError`, `FatalProviderError`,
     `ProviderPoolExhausted`, `DecisionDeadlineExceeded`.
   - `DecisionMetrics.snapshot() -> dict[str, int]`.
@@ -363,6 +377,8 @@ Probar estas secuencias:
 Verificar que `GOOGLE_API_KEY` precede a `GOOGLE_API_KEYS`, los vacíos se
 descartan, duplicados se deduplican y ninguna representación/log contiene las
 claves.
+Verificar por separado que agotar Gemini cambia a Kimi solo cuando
+`allow_cross_provider=True`; con `False`, propaga `ProviderPoolExhausted`.
 
 - [ ] **Step 2: confirmar RED**
 
@@ -377,12 +393,14 @@ Usar `ChatGoogleGenerativeAI(...).with_structured_output(...,
 method="json_schema")`. Mapear 429, 5xx y timeouts a excepciones propias; 401/403
 a fatal. El bucle de infraestructura recibe un deadline monotónico y nunca
 avanza el intento semántico.
+Para Kimi/OpenCode Zen construir el cliente OpenAI-compatible con la
+`base_url` de su configuración, sin inferir endpoints por nombre.
 
 - [ ] **Step 4: métricas por turno**
 
 Implementar sets internos de ids de turno para no contar dos veces
 `turns_quota_affected` ni `turns_transient_affected`; incrementar
-`key_rotations` por evento.
+`key_rotations` por evento y `provider_switches` por cambio interproveedor.
 
 - [ ] **Step 5: GREEN y rotura deliberada**
 
@@ -545,7 +563,7 @@ git commit -m "feat(agent): orchestrate decisions with LangGraph" -- \
 
 **Interfaces:**
 - Produces: `wilson_interval(wins, n, confidence=0.95)`, comando
-  `benchmark --opponent ... --n ... --concurrency ... [--persist] [--json ...]`.
+  `benchmark --provider ... --model ... --opponent ... --n ... --concurrency ... [--persist] [--json ...]`.
 
 - [ ] **Step 1: tests RED de Wilson y persistencia opt-in**
 
@@ -557,6 +575,8 @@ assert rounded(wilson_interval(143, 300)) == (0.4208, 0.5331)
 
 Verificar que sin `--persist` no se construye `BattleRepository`; con
 `--persist`, usa el mismo helper de persistencia del runner.
+Verificar que el benchmark siempre construye `ProviderChain` con
+`allow_cross_provider=False`, aunque la configuración normal tenga cadena.
 
 - [ ] **Step 2: confirmar RED**
 
@@ -570,6 +590,8 @@ uv run pytest tests/test_benchmark.py -q
 Mapear nombres exactos a `RandomPlayer`, `MaxBasePowerPlayer` y
 `SimpleHeuristicsPlayer`. Generación/formato vienen de argumentos/config.
 Imprimir métricas de decisión además del resultado deportivo.
+Ante `ProviderPoolExhausted` o fallo fatal, abortar y emitir `completed=N`,
+proveedor/modelo fijados y causa; no calcular ni imprimir un winrate final.
 
 - [ ] **Step 4: guardar baseline inspeccionado**
 
@@ -752,4 +774,3 @@ git add -f -- .superpowers/sdd/gpt-grafo.md
 git commit -m "docs(agent): record decision graph guarantees" -- \
   docs/DECISIONS.md .superpowers/sdd/gpt-grafo.md
 ```
-

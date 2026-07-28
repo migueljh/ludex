@@ -163,6 +163,7 @@ Configuración:
 - nombre de la variable de entorno que contiene la clave primaria;
 - para proveedores que lo soportan, nombre separado de la variable que
   contiene el pool de claves;
+- `base_url` opcional para proveedores OpenAI-compatible con endpoint propio;
 - timeout por request y presupuesto total de decisión.
 
 El adapter de producción usa la inicialización por `model_provider` y `model`
@@ -209,6 +210,38 @@ Una rotación puede ocurrir tanto en el primer prompt como en el prompt
 semántico de reintento. En ambos casos se repite el pedido que estaba en curso;
 jamás vuelve al prompt anterior ni avanza el contador semántico.
 
+### Cadena entre proveedores
+
+La rotación de claves y la cadena de proveedores son dos ejes distintos:
+
+- **rotación intraproveedor:** otra credencial del mismo modelo/proveedor;
+- **fallback interproveedor:** otro proveedor/modelo, por ejemplo Gemini →
+  Kimi → OpenCode Zen.
+
+Ambos responden a fallos de infraestructura y repiten el mismo pedido
+semántico. Ninguno incrementa los contadores de JSON/acción inválida ni produce
+`action_path="fallback"`. La cadena usa configuraciones completas, por lo que
+cada eslabón conserva proveedor, modelo, variable de clave, pool opcional y
+`base_url` opcional.
+
+Los nombres reales de entorno son:
+
+- Gemini: `GOOGLE_API_KEY`, pool `GOOGLE_API_KEYS`, endpoint nativo;
+- Kimi: `KIMI_API_KEY`, `KIMI_BASE_URL`;
+- OpenCode Zen: `OPEN_CODE_ZEN_API_KEY`, `OPEN_CODE_ZEN_BASE_URL`,
+  `OPEN_CODE_ZEN_MODEL`;
+- Anthropic: `ANTHROPIC_API_KEY`, endpoint nativo.
+
+Kimi y OpenCode Zen usan un adapter OpenAI-compatible con su `base_url`.
+Cambiar de proveedor incrementa un contador separado de las rotaciones de
+clave. Si se agota la cadena completa, la decisión falla ruidosamente.
+
+La cadena está permitida en partidas normales para no perder una batalla por
+una cuota agotada. Está **prohibida en benchmark**: proveedor y modelo quedan
+fijados al iniciar la corrida. Si ese proveedor agota sus claves o sufre un
+fallo fatal, el benchmark aborta, informa cuántas batallas completó y no
+publica el resultado parcial como winrate comparable.
+
 ### Presupuesto temporal medido
 
 Una sonda real contra `127.0.0.1:8100`, con `/timer on`, produjo:
@@ -236,6 +269,7 @@ la orden y scheduling local.
 - turnos afectados por 429;
 - turnos afectados por 5xx o timeout;
 - rotaciones de clave;
+- cambios de proveedor;
 - fallos fatales por pool agotado o presupuesto.
 
 Los contadores “turnos afectados” cuentan cada turno una sola vez por clase,
