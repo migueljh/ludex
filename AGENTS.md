@@ -4,6 +4,23 @@ Este archivo es para cualquier agente que toque el repo. Las decisiones de
 arquitectura están en `docs/DECISIONS.md` y el plan general en `docs/PLAN.md`,
 sección 11. Acá van solo las reglas operativas.
 
+## Gobernanza de tareas y revisiones
+
+El flujo operativo de Linear, los estados permitidos, el paquete de evidencias
+y la autoridad para aceptar o rechazar trabajo están definidos en
+`docs/AGENT_GOVERNANCE.md`. **Leelo antes de tomar una tarea o pedir una
+revisión.**
+
+- Linear es la fuente de verdad del estado operativo de una tarea.
+- El repo es la fuente de verdad de decisiones, diseños, planes, métricas,
+  código y evidencia ejecutable.
+- Un agente implementador puede mover su tarea a `In Review`, pero nunca a
+  `Completed`.
+- Solo el tech lead puede emitir el veredicto técnico que habilita
+  `Completed`, `Changes Requested`, `On Hold` o `Rejected`.
+- Ninguna tarea entra a revisión sin el `REVIEW PACKET` completo definido en
+  la guía.
+
 ## Skills del proyecto — leelas antes de empezar
 
 En `.claude/` hay cuatro guías escritas para este repo. Cada una vive en un
