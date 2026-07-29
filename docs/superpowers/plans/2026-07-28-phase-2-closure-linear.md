@@ -255,7 +255,7 @@ uv run pytest -q
 - [ ] Ejecutar el auditor global:
 
 ```bash
-pnpm --filter @ludex/dataset-audit audit
+pnpm --filter @ludex/dataset-audit run audit
 ```
 
 - [ ] Registrar volúmenes sin modificar la DB:
@@ -272,7 +272,8 @@ docker exec ludex-postgres-1 psql -U ludex -d ludex -c \
 - [ ] Ejecutar la búsqueda transversal de hardcodes:
 
 ```bash
-git grep -n -i "gen6" -- apps packages db ':!**/tests/**' ':!**/evals/**'
+git grep -n -i "gen6" -- apps packages db \
+  ':!**/tests/**' ':!**/test/**' ':!**/evals/**'
 ```
 
 - [ ] Crear en Linear una tabla con cada requisito de
@@ -671,8 +672,8 @@ pnpm --filter @ludex/dataset-audit test
 
 ```bash
 pnpm --filter @ludex/dataset-audit test
-pnpm --filter @ludex/dataset-audit audit --scope all
-pnpm --filter @ludex/dataset-audit audit --scope training
+pnpm --filter @ludex/dataset-audit run audit --scope all
+pnpm --filter @ludex/dataset-audit run audit --scope training
 ```
 
 - [ ] Romper individualmente la verificación de máscara y una clave rival;
@@ -1411,8 +1412,8 @@ uv run pytest -q
 - [ ] Ejecutar ambos scopes del auditor:
 
 ```bash
-pnpm --filter @ludex/dataset-audit audit --scope all
-pnpm --filter @ludex/dataset-audit audit --scope training
+pnpm --filter @ludex/dataset-audit run audit --scope all
+pnpm --filter @ludex/dataset-audit run audit --scope training
 ```
 
 - [ ] Consultar directamente máscara, rewards y metadata:
@@ -1449,7 +1450,8 @@ docker exec ludex-postgres-1 psql -U ludex -d ludex -c \
 - [ ] Ejecutar búsqueda de hardcodes:
 
 ```bash
-git grep -n -i "gen6" -- apps packages db ':!**/tests/**' ':!**/evals/**'
+git grep -n -i "gen6" -- apps packages db \
+  ':!**/tests/**' ':!**/test/**' ':!**/evals/**'
 ```
 
 - [ ] Revisar la matriz de F2-00 y exigir `implemented` para:
