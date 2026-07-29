@@ -26,3 +26,27 @@ significa desconocido o no comparable, nunca cero implícito.
   Hubo 0 acciones ilegales, 0 fallbacks, 0 deadlines, 0 rotaciones y un turno
   afectado por un error transitorio que se recuperó. No es una medición de
   winrate: dos batallas solo verifican funcionamiento y costo aproximado.
+
+## Fallos de transporte: qué se descartó
+
+Las dos corridas de Kimi abortaron sin completar una sola batalla, y el
+mensaje que quedó grabado era el fijo de la clasificación (`provider
+transport failed`), sin el tipo de excepción original. La hipótesis en
+estudio era una fuga de conexiones: `_LangChainBackend.complete` construye
+un cliente nuevo (`ChatOpenAI` / `ChatGoogleGenerativeAI` / `ChatAnthropic`)
+en CADA llamada y nunca lo cierra, así que parecía razonable que cientos de
+llamadas dejaran cientos de pools abiertos hasta agotar descriptores —
+encajaba con el síntoma (una llamada de humo pasa, el uso sostenido cae).
+
+**Está descartada, medida.** Un servidor local que imita un endpoint
+OpenAI-compatible y cuenta conexiones TCP, llamado por el código REAL del
+backend 300 veces seguidas: **1 conexión TCP total, 300 requests, 0
+errores, 20s**. El cliente subyacente se reutiliza, así que construir el
+wrapper por llamada no abre sockets nuevos. Sea lo que sea el fallo de
+Kimi, no es esto.
+
+Lo que queda para la próxima corrida real: el tipo de excepción original
+ahora sí se loguea (antes se perdía en la clasificación), así que el
+siguiente aborto va a decir si fue `ConnectError`, `ReadTimeout` o
+`PoolTimeout` en vez de esconderlo detrás del mensaje fijo. El diagnóstico
+está desbloqueado, no resuelto.
