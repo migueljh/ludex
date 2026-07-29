@@ -22,6 +22,7 @@ from poke_env.player import (
 
 from .benchmark import BenchmarkResult, run_benchmark
 from .config import load_settings
+from .db.context_repository import PostgresContextRepository
 from .db.repository import BattleRepository
 from .db.session import make_engine, session_factory
 from .showdown.client import LudexPlayer, local_server_configuration
@@ -372,7 +373,12 @@ async def _benchmark_command(
         os.environ.get("CALC_BASE_URL", "http://127.0.0.1:8200"),
         timeout_seconds=settings.llm_request_timeout_seconds,
     )
-    graph = build_decision_graph(calculator, selected, metrics)
+    engine = make_engine(settings.database_url)
+    factory = session_factory(engine)
+    context_repository = PostgresContextRepository(factory)
+    graph = build_decision_graph(
+        calculator, selected, metrics, context_repository
+    )
     suffix = str(time.time_ns())[-8:]
     common = {
         "server_configuration": server,
@@ -397,8 +403,7 @@ async def _benchmark_command(
         account_configuration=AccountConfiguration(f"Opp{suffix}", None),
         **common,
     )
-    engine = make_engine(settings.database_url) if persist else None
-    repo = BattleRepository(session_factory(engine)) if engine is not None else None
+    repo = BattleRepository(factory) if persist else None
 
     async def persist_tag(tag: str) -> None:
         assert repo is not None
@@ -431,8 +436,7 @@ async def _benchmark_command(
             )
     finally:
         await calculator.aclose()
-        if engine is not None:
-            await engine.dispose()
+        await engine.dispose()
     return result, metrics.snapshot()
 
 

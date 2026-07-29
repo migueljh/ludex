@@ -1,3 +1,4 @@
+import json
 import time
 
 import pytest
@@ -7,7 +8,7 @@ from ludex_agent.graph.workflow import build_decision_graph
 
 
 @pytest.mark.asyncio
-async def test_grafo_ejecuta_parse_calc_decide_en_orden_y_devuelve_camino():
+async def test_grafo_ejecuta_todos_los_nodos_en_orden_y_devuelve_contexto():
     events = []
 
     def parser(raw):
@@ -28,9 +29,28 @@ async def test_grafo_ejecuta_parse_calc_decide_en_orden_y_devuelve_camino():
         async def complete(self, prompt, *, deadline, turn_id):
             events.append("decide")
             assert "rendite" not in prompt
+            payload = json.loads(prompt.splitlines()[-1])
+            assert payload["battle"]["context"]["generation"] == {
+                "gen_number": 6,
+                "label": "XY/ORAS",
+            }
             return {
                 "action": {"kind": "move", "id": "tackle"},
                 "reasoning": "legal",
+            }
+
+    class Repository:
+        async def load_battle_context(
+            self, *, gen_number, own_species, opponent_species
+        ):
+            events.append("retrieve_context")
+            assert gen_number == 6
+            assert own_species == ("pikachu",)
+            assert opponent_species == ("eevee",)
+            return {
+                "generation": {"gen_number": 6, "label": "XY/ORAS"},
+                "own": [{"showdown_id": "pikachu", "moves": []}],
+                "opponent": [{"showdown_id": "eevee", "moves": []}],
             }
 
     raw = {
@@ -47,7 +67,7 @@ async def test_grafo_ejecuta_parse_calc_decide_en_orden_y_devuelve_camino():
         "chat": "rendite",
     }
     graph = build_decision_graph(
-        Calculator(), Provider(), DecisionMetrics(), parser=parser
+        Calculator(), Provider(), DecisionMetrics(), Repository(), parser=parser
     )
 
     result = await graph.ainvoke({
@@ -56,7 +76,10 @@ async def test_grafo_ejecuta_parse_calc_decide_en_orden_y_devuelve_camino():
         "deadline": time.monotonic() + 5,
     })
 
-    assert events == ["parse_state", "calc_damage", "decide"]
+    assert events == [
+        "parse_state", "retrieve_context", "calc_damage", "decide",
+    ]
+    assert result["context"]["generation"]["gen_number"] == 6
     assert result["action"] == {"kind": "move", "id": "tackle"}
     assert result["action_path"] == "llm"
 
