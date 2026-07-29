@@ -10,6 +10,7 @@ from ludex_agent.graph.workflow import build_decision_graph
 @pytest.mark.asyncio
 async def test_grafo_ejecuta_todos_los_nodos_en_orden_y_devuelve_contexto():
     events = []
+    rich_only_sentinel = "rich-only-sentinel-source-species"
 
     def parser(raw):
         events.append("parse_state")
@@ -29,10 +30,41 @@ async def test_grafo_ejecuta_todos_los_nodos_en_orden_y_devuelve_contexto():
         async def complete(self, prompt, *, deadline, turn_id):
             events.append("decide")
             assert "rendite" not in prompt
+            assert rich_only_sentinel not in prompt
+            assert "learn_methods" not in prompt
+            assert "sourceSpecies" not in prompt
+            assert "observed_moves" not in prompt
             payload = json.loads(prompt.splitlines()[-1])
-            assert payload["battle"]["context"]["generation"] == {
-                "gen_number": 6,
-                "label": "XY/ORAS",
+            assert payload["battle"]["context"] == {
+                "generation": {
+                    "gen_number": 6,
+                    "label": "XY/ORAS",
+                },
+                "own": [{
+                    "species": "pikachu",
+                    "known_moves": ["tackle"],
+                }],
+                "opponent": [{
+                    "species": "eevee",
+                    "base_types": ["Normal"],
+                    "base_stats": {},
+                    "possible_abilities": ["runaway"],
+                    "revealed_moves": [],
+                    "possible_moves": [],
+                }],
+                "moves": {
+                    "tackle": {
+                        "type": "Normal",
+                        "category": "Physical",
+                        "power": 50,
+                        "power_kind": "standard",
+                        "accuracy": 100,
+                        "priority": 0,
+                        "target": "normal",
+                        "description": "Hits the target.",
+                        "flags": {"contact": 1},
+                    },
+                },
             }
             return {
                 "action": {"kind": "move", "id": "tackle"},
@@ -49,8 +81,46 @@ async def test_grafo_ejecuta_todos_los_nodos_en_orden_y_devuelve_contexto():
             assert opponent_species == ("eevee",)
             return {
                 "generation": {"gen_number": 6, "label": "XY/ORAS"},
-                "own": [{"showdown_id": "pikachu", "moves": []}],
-                "opponent": [{"showdown_id": "eevee", "moves": []}],
+                "own": [{
+                    "showdown_id": "pikachu",
+                    "types": ["Electric"],
+                    "base_stats": {},
+                    "abilities": {"0": "Static"},
+                    "moves": [{
+                        "showdown_id": "surf",
+                        "learn_methods": [{
+                            "sourceSpecies": rich_only_sentinel,
+                        }],
+                    }],
+                }],
+                "opponent": [{
+                    "showdown_id": "eevee",
+                    "types": ["Normal"],
+                    "base_stats": {},
+                    "abilities": {"0": "Run Away"},
+                    "moves": [],
+                }],
+            }
+
+        async def load_moves(self, *, gen_number, move_ids):
+            assert gen_number == 6
+            assert move_ids == ("tackle",)
+            return {
+                "tackle": {
+                    "showdown_id": "tackle",
+                    "name": "Tackle",
+                    "type": "Normal",
+                    "category": "Physical",
+                    "power": 50,
+                    "power_kind": "standard",
+                    "accuracy": 100,
+                    "never_misses": False,
+                    "pp": 35,
+                    "priority": 0,
+                    "target": "normal",
+                    "flags": {"contact": 1},
+                    "description": "Hits the target.",
+                },
             }
 
     raw = {
@@ -80,8 +150,25 @@ async def test_grafo_ejecuta_todos_los_nodos_en_orden_y_devuelve_contexto():
         "parse_state", "retrieve_context", "calc_damage", "decide",
     ]
     assert result["context"]["generation"]["gen_number"] == 6
+    assert result["context"]["own"][0]["moves"][0]["learn_methods"] == [{
+        "sourceSpecies": rich_only_sentinel,
+    }]
+    assert result["prompt_context"]["own"][0]["known_moves"] == ["tackle"]
+    assert "context" not in result["battle_state"]
     assert result["action"] == {"kind": "move", "id": "tackle"}
     assert result["action_path"] == "llm"
+
+
+def test_grafo_exige_context_repository():
+    class Never:
+        async def calculate(self, request):
+            raise AssertionError
+
+        async def complete(self, prompt, *, deadline, turn_id):
+            raise AssertionError
+
+    with pytest.raises(TypeError):
+        build_decision_graph(Never(), Never(), DecisionMetrics())
 
 
 def test_grafo_se_compila_una_vez_al_construir():
@@ -92,5 +179,77 @@ def test_grafo_se_compila_una_vez_al_construir():
         async def complete(self, prompt, *, deadline, turn_id):
             raise AssertionError
 
-    graph = build_decision_graph(Never(), Never(), DecisionMetrics())
+        async def load_battle_context(
+            self, *, gen_number, own_species, opponent_species
+        ):
+            raise AssertionError
+
+        async def load_moves(self, *, gen_number, move_ids):
+            raise AssertionError
+
+    graph = build_decision_graph(
+        Never(), Never(), DecisionMetrics(), Never()
+    )
     assert hasattr(graph, "ainvoke")
+
+
+@pytest.mark.asyncio
+async def test_calc_damage_recibe_contexto_rico_no_prompt_context(monkeypatch):
+    import ludex_agent.graph.workflow as workflow
+
+    rich_sentinel = {
+        "learn_methods": [{
+            "sourceSpecies": "rich-context-for-f2-07",
+        }],
+    }
+
+    async def recording_calc(state, calculator):
+        assert state["context"]["rich_sentinel"] == rich_sentinel
+        assert state["prompt_context"] != state["context"]
+        return {"damage": []}
+
+    monkeypatch.setattr(workflow, "calc_damage", recording_calc)
+
+    class Repository:
+        async def load_battle_context(
+            self, *, gen_number, own_species, opponent_species
+        ):
+            return {
+                "generation": {"gen_number": 6, "label": "XY/ORAS"},
+                "own": [],
+                "opponent": [],
+                "rich_sentinel": rich_sentinel,
+            }
+
+        async def load_moves(self, *, gen_number, move_ids):
+            return {}
+
+    class Provider:
+        async def complete(self, prompt, *, deadline, turn_id):
+            return {
+                "action": {"kind": "switch", "species": "pikachu"},
+                "reasoning": "legal",
+            }
+
+    graph = build_decision_graph(
+        object(),
+        Provider(),
+        DecisionMetrics(),
+        Repository(),
+    )
+    result = await graph.ainvoke({
+        "raw_state": {
+            "gen": 6,
+            "me": {"pokemon": []},
+            "opponent": {"pokemon": []},
+            "field": {},
+            "legal_actions": [{
+                "kind": "switch",
+                "species": "pikachu",
+            }],
+        },
+        "turn_id": "battle:1",
+        "deadline": time.monotonic() + 5,
+    })
+
+    assert result["context"]["rich_sentinel"] == rich_sentinel

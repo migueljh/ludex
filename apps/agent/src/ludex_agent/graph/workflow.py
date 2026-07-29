@@ -18,7 +18,7 @@ def build_decision_graph(
     calculator: DamageCalculator,
     provider: DecisionProvider,
     metrics: DecisionMetrics,
-    repository: ContextRepository | None = None,
+    repository: ContextRepository,
     *,
     parser: Callable[[dict[str, Any]], dict[str, Any]] = allowlisted_state,
 ):
@@ -29,26 +29,20 @@ def build_decision_graph(
         return await calc_damage(state, calculator)
 
     async def context_node(state: GraphState) -> dict[str, Any]:
-        if repository is None:
-            battle = state["battle_state"]
-            return {
-                "context": {
-                    "generation": {
-                        "gen_number": battle["gen"],
-                        "label": None,
-                    },
-                    "own": [],
-                    "opponent": [],
-                },
-            }
         return await retrieve_context(state, repository)
 
     async def decide_node(state: GraphState) -> dict[str, Any]:
-        decision_state = dict(state)
-        decision_state["battle_state"] = {
-            **state["battle_state"],
-            "context": state.get("context", {}),
+        decision_state: GraphState = {
+            "battle_state": {
+                **state["battle_state"],
+                "context": state["prompt_context"],
+            },
+            "damage": state.get("damage", []),
         }
+        if "turn_id" in state:
+            decision_state["turn_id"] = state["turn_id"]
+        if "deadline" in state:
+            decision_state["deadline"] = state["deadline"]
         return await decide(decision_state, provider, metrics)
 
     builder = StateGraph(GraphState)

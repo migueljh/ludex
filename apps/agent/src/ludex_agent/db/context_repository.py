@@ -47,6 +47,44 @@ _SPECIES_CONTEXT = text("""
     ORDER BY p.showdown_id, m.showdown_id
 """)
 
+_MOVES_CONTEXT = text("""
+    SELECT
+      m.showdown_id,
+      m.name,
+      m.type,
+      m.category,
+      m.power,
+      m.power_kind,
+      m.accuracy,
+      m.pp,
+      m.priority,
+      m.target,
+      m.flags,
+      m.description
+    FROM moves m
+    WHERE m.gen_id = :gen_id
+      AND m.showdown_id = ANY(CAST(:move_ids AS text[]))
+    ORDER BY m.showdown_id
+""")
+
+
+def _standalone_move(row: Any) -> dict[str, object]:
+    return {
+        "showdown_id": row["showdown_id"],
+        "name": row["name"],
+        "type": row["type"],
+        "category": row["category"],
+        "power": row["power"],
+        "power_kind": row["power_kind"],
+        "accuracy": row["accuracy"],
+        "never_misses": row["accuracy"] is None,
+        "pp": row["pp"],
+        "priority": row["priority"],
+        "target": row["target"],
+        "flags": dict(row["flags"]),
+        "description": row["description"],
+    }
+
 
 class PostgresContextRepository:
     def __init__(self, factory: Any) -> None:
@@ -132,4 +170,52 @@ class PostgresContextRepository:
                 for showdown_id in opponent_species
                 if showdown_id in by_id
             ],
+        }
+
+    async def load_moves(
+        self,
+        *,
+        gen_number: int,
+        move_ids: tuple[str, ...],
+    ) -> dict[str, dict[str, object]]:
+        requested = tuple(dict.fromkeys(move_ids))
+        if not requested:
+            return {}
+
+        async with self.factory() as session:
+            generation = (
+                await session.execute(
+                    _GENERATION,
+                    {"gen_number": gen_number},
+                )
+            ).mappings().one_or_none()
+            if generation is None:
+                raise LookupError(f"generación no seedeada: {gen_number}")
+            rows = (
+                await session.execute(
+                    _MOVES_CONTEXT,
+                    {
+                        "gen_id": generation["id"],
+                        "move_ids": list(requested),
+                    },
+                )
+            ).mappings().all()
+
+        by_id = {
+            row["showdown_id"]: _standalone_move(row)
+            for row in rows
+        }
+        missing = [
+            move_id
+            for move_id in requested
+            if move_id not in by_id
+        ]
+        if missing:
+            raise LookupError(
+                "movimientos no seedeados para "
+                f"Gen {gen_number}: {', '.join(missing)}"
+            )
+        return {
+            move_id: by_id[move_id]
+            for move_id in requested
         }

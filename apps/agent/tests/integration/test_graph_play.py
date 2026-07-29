@@ -9,6 +9,7 @@ from sqlalchemy import text
 
 from ludex_agent.cli import _persist_one
 from ludex_agent.config import load_settings
+from ludex_agent.db.context_repository import PostgresContextRepository
 from ludex_agent.db.repository import BattleRepository
 from ludex_agent.db.session import make_engine, session_factory
 from ludex_agent.graph.calc import CalcClient
@@ -96,9 +97,14 @@ async def test_respuesta_ilegal_dos_veces_juega_y_persiste_fallback():
     settings = load_settings()
     server = local_server_configuration(settings.showdown_ws_url)
     suffix = str(time.time_ns())[-8:]
+    engine = make_engine(settings.database_url)
+    factory = session_factory(engine)
     calculator = CalcClient("http://127.0.0.1:8200", timeout_seconds=3)
     graph = build_decision_graph(
-        calculator, AlwaysIllegalProvider(), DecisionMetrics()
+        calculator,
+        AlwaysIllegalProvider(),
+        DecisionMetrics(),
+        PostgresContextRepository(factory),
     )
     common = {
         "server_configuration": server,
@@ -114,8 +120,7 @@ async def test_respuesta_ilegal_dos_veces_juega_y_persiste_fallback():
         account_configuration=AccountConfiguration(f"FbOpp{suffix}", None),
         **common,
     )
-    engine = make_engine(settings.database_url)
-    repo = BattleRepository(session_factory(engine))
+    repo = BattleRepository(factory)
     tags = []
     try:
         try:
