@@ -215,7 +215,8 @@ Paralelismo permitido después de `F2-00`:
 - **Bloquea:** F2-01, F2-04, F2-06
 
 **Objetivo:** Fijar el commit, los resultados y las discrepancias desde los que
-se medirá todo el cierre, sin modificar código ni datos.
+se medirá todo el cierre, sin modificar código ni datos productivos. Las suites
+que escriban filas `source='test'` deben medir y declarar el delta completo.
 
 **Evidencia conocida que debe reconfirmarse:** el grafo actual contiene
 `parse_state → calc_damage → decide`; el auditor independiente omite la máscara
@@ -239,6 +240,8 @@ legal y solo verifica `species`; existen discrepancias históricas de
 - [ ] Registrar `git rev-parse HEAD`, `git status --short --branch` y la lista
   exacta de cambios ajenos que no pertenecen a esta fase.
 - [ ] Confirmar servicios con `docker compose ps`; no reiniciar servicios sanos.
+- [ ] Registrar los volúmenes de tablas antes de las suites para poder atribuir
+  cualquier fila sintética creada por los propios tests.
 - [ ] Ejecutar la suite TypeScript desde la raíz:
 
 ```bash
@@ -288,7 +291,8 @@ git grep -n -i "gen6" -- apps packages db \
 - Queda registrado el commit exacto y el resultado completo de cada comando.
 - Ningún test saltado se presenta como ejecutado.
 - Cada discrepancia de Fase 2 está asignada a F2-01…F2-10.
-- No se modificaron código, esquema, servicios ni datos.
+- No se modificaron código, esquema, servicios ni datos `source <> 'test'`.
+- Toda fila sintética creada por las suites está enumerada y asignada a F2-05.
 
 **Commit:** No aplica.
 
