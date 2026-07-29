@@ -1,0 +1,78 @@
+[
+[
+">battle-gen6randombattle-397",
+"|init|battle",
+"|title|LudexBot3682 vs. Rival3682",
+"|j|\u2606LudexBot3682",
+""
+],
+[
+">battle-gen6randombattle-397",
+"|request|"
+],
+[
+">battle-gen6randombattle-397",
+"|j|\u2606Rival3682"
+],
+[
+">battle-gen6randombattle-397",
+"|t:|1785186829",
+"|gametype|singles"
+],
+[
+">battle-gen6randombattle-397",
+"|player|p1|LudexBot3682|101|"
+],
+[
+">battle-gen6randombattle-397",
+"|request|{\"active\":[{\"moves\":[{\"move\":\"Nasty Plot\",\"id\":\"nastyplot\",\"pp\":32,\"maxpp\":32,\"target\":\"self\",\"disabled\":false},{\"move\":\"Substitute\",\"id\":\"substitute\",\"pp\":16,\"maxpp\":16,\"target\":\"self\",\"disabled\":false},{\"move\":\"Hidden Power Rock\",\"id\":\"hiddenpower\",\"pp\":24,\"maxpp\":24,\"target\":\"normal\",\"disabled\":false},{\"move\":\"Fire Blast\",\"id\":\"fireblast\",\"pp\":8,\"maxpp\":8,\"target\":\"normal\",\"disabled\":false}]}],\"side\":{\"name\":\"LudexBot3682\",\"id\":\"p1\",\"pokemon\":[{\"ident\":\"p1: Simisear\",\"details\":\"Simisear, L88, F\",\"condition\":\"275/275\",\"active\":true,\"stats\":{\"atk\":177,\"def\":160,\"spa\":223,\"spd\":160,\"spe\":227},\"moves\":[\"nastyplot\",\"substitute\",\"hiddenpowerrock60\",\"fireblast\"],\"baseAbility\":\"blaze\",\"item\":\"leftovers\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Quagsire\",\"details\":\"Quagsire, L88, F\",\"condition\":\"310/310\",\"active\":false,\"stats\":{\"atk\":200,\"def\":200,\"spa\":165,\"spd\":165,\"spe\":112},\"moves\":[\"earthquake\",\"scald\",\"toxic\",\"recover\"],\"baseAbility\":\"unaware\",\"item\":\"leftovers\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Drifblim\",\"details\":\"Drifblim, L83, F\",\"condition\":\"384/384\",\"active\":false,\"stats\":{\"atk\":180,\"def\":121,\"spa\":197,\"spd\":137,\"spe\":180},\"moves\":[\"acrobatics\",\"hex\",\"willowisp\",\"substitute\"],\"baseAbility\":\"unburden\",\"item\":\"sitrusberry\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Dunsparce\",\"details\":\"Dunsparce, L93, M\",\"condition\":\"337/337\",\"active\":false,\"stats\":{\"atk\":183,\"def\":183,\"spa\":174,\"spd\":174,\"spe\":137},\"moves\":[\"coil\",\"earthquake\",\"roost\",\"bodyslam\"],\"baseAbility\":\"serenegrace\",\"item\":\"leftovers\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Tentacruel\",\"details\":\"Tentacruel, L83, F\",\"condition\":\"268/268\",\"active\":false,\"stats\":{\"atk\":121,\"def\":156,\"spa\":180,\"spd\":247,\"spe\":214},\"moves\":[\"haze\",\"sludgebomb\",\"scald\",\"rapidspin\"],\"baseAbility\":\"liquidooze\",\"item\":\"blacksludge\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Virizion\",\"details\":\"Virizion, L81\",\"condition\":\"280/280\",\"active\":false,\"stats\":{\"atk\":192,\"def\":163,\"spa\":192,\"spd\":256,\"spe\":222},\"moves\":[\"leafblade\",\"swordsdance\",\"stoneedge\",\"closecombat\"],\"baseAbility\":\"justified\",\"item\":\"lifeorb\",\"pokeball\":\"pokeball\"}]},\"rqid\":2}"
+],
+[
+">battle-gen6randombattle-397",
+"|player|p2|Rival3682|102|",
+"|teamsize|p1|6",
+"|teamsize|p2|6",
+"|gen|6",
+"|tier|[Gen 6] Random Battle",
+"|rule|Sleep Clause Mod: Limit one foe put to sleep",
+"|rule|HP Percentage Mod: HP is shown in percentages",
+"|rule|Illusion Level Mod: Illusion disguises the Pok\u00e9mon's true level",
+"|",
+"|t:|1785186829",
+"|start",
+"|switch|p1a: Simisear|Simisear, L88, F|275/275",
+"|switch|p2a: Ludicolo|Ludicolo, L88, F|100/100",
+"|turn|1"
+],
+[
+">battle-gen6randombattle-397",
+"|request|{\"active\":[{\"moves\":[{\"move\":\"Haze\",\"id\":\"haze\",\"pp\":48,\"maxpp\":48,\"target\":\"all\",\"disabled\":false},{\"move\":\"Sludge Bomb\",\"id\":\"sludgebomb\",\"pp\":16,\"maxpp\":16,\"target\":\"normal\",\"disabled\":false},{\"move\":\"Scald\",\"id\":\"scald\",\"pp\":24,\"maxpp\":24,\"target\":\"normal\",\"disabled\":false},{\"move\":\"Rapid Spin\",\"id\":\"rapidspin\",\"pp\":64,\"maxpp\":64,\"target\":\"normal\",\"disabled\":false}]}],\"side\":{\"name\":\"LudexBot3682\",\"id\":\"p1\",\"pokemon\":[{\"ident\":\"p1: Tentacruel\",\"details\":\"Tentacruel, L83, F\",\"condition\":\"157/268\",\"active\":true,\"stats\":{\"atk\":121,\"def\":156,\"spa\":180,\"spd\":247,\"spe\":214},\"moves\":[\"haze\",\"sludgebomb\",\"scald\",\"rapidspin\"],\"baseAbility\":\"liquidooze\",\"item\":\"blacksludge\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Quagsire\",\"details\":\"Quagsire, L88, F\",\"condition\":\"310/310\",\"active\":false,\"stats\":{\"atk\":200,\"def\":200,\"spa\":165,\"spd\":165,\"spe\":112},\"moves\":[\"earthquake\",\"scald\",\"toxic\",\"recover\"],\"baseAbility\":\"unaware\",\"item\":\"leftovers\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Drifblim\",\"details\":\"Drifblim, L83, F\",\"condition\":\"384/384\",\"active\":false,\"stats\":{\"atk\":180,\"def\":121,\"spa\":197,\"spd\":137,\"spe\":180},\"moves\":[\"acrobatics\",\"hex\",\"willowisp\",\"substitute\"],\"baseAbility\":\"unburden\",\"item\":\"sitrusberry\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Dunsparce\",\"details\":\"Dunsparce, L93, M\",\"condition\":\"337/337\",\"active\":false,\"stats\":{\"atk\":183,\"def\":183,\"spa\":174,\"spd\":174,\"spe\":137},\"moves\":[\"coil\",\"earthquake\",\"roost\",\"bodyslam\"],\"baseAbility\":\"serenegrace\",\"item\":\"leftovers\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Simisear\",\"details\":\"Simisear, L88, F\",\"condition\":\"275/275\",\"active\":false,\"stats\":{\"atk\":177,\"def\":160,\"spa\":223,\"spd\":160,\"spe\":227},\"moves\":[\"nastyplot\",\"substitute\",\"hiddenpowerrock60\",\"fireblast\"],\"baseAbility\":\"blaze\",\"item\":\"leftovers\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Virizion\",\"details\":\"Virizion, L81\",\"condition\":\"280/280\",\"active\":false,\"stats\":{\"atk\":192,\"def\":163,\"spa\":192,\"spd\":256,\"spe\":222},\"moves\":[\"leafblade\",\"swordsdance\",\"stoneedge\",\"closecombat\"],\"baseAbility\":\"justified\",\"item\":\"lifeorb\",\"pokeball\":\"pokeball\"}]},\"rqid\":4}"
+],
+[
+">battle-gen6randombattle-397",
+"|",
+"|t:|1785186829",
+"|switch|p1a: Tentacruel|Tentacruel, L83, F|268/268",
+"|move|p2a: Ludicolo|Energy Ball|p1a: Tentacruel",
+"|-damage|p1a: Tentacruel|141/268",
+"|",
+"|-heal|p1a: Tentacruel|157/268|[from] item: Black Sludge",
+"|upkeep",
+"|turn|2"
+],
+[
+">battle-gen6randombattle-397",
+"|request|{\"active\":[{\"moves\":[{\"move\":\"Haze\",\"id\":\"haze\",\"pp\":48,\"maxpp\":48,\"target\":\"all\",\"disabled\":false},{\"move\":\"Sludge Bomb\",\"id\":\"sludgebomb\",\"pp\":15,\"maxpp\":16,\"target\":\"normal\",\"disabled\":false},{\"move\":\"Scald\",\"id\":\"scald\",\"pp\":24,\"maxpp\":24,\"target\":\"normal\",\"disabled\":false},{\"move\":\"Rapid Spin\",\"id\":\"rapidspin\",\"pp\":64,\"maxpp\":64,\"target\":\"normal\",\"disabled\":false}]}],\"side\":{\"name\":\"LudexBot3682\",\"id\":\"p1\",\"pokemon\":[{\"ident\":\"p1: Tentacruel\",\"details\":\"Tentacruel, L83, F\",\"condition\":\"173/268\",\"active\":true,\"stats\":{\"atk\":121,\"def\":156,\"spa\":180,\"spd\":247,\"spe\":214},\"moves\":[\"haze\",\"sludgebomb\",\"scald\",\"rapidspin\"],\"baseAbility\":\"liquidooze\",\"item\":\"blacksludge\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Quagsire\",\"details\":\"Quagsire, L88, F\",\"condition\":\"310/310\",\"active\":false,\"stats\":{\"atk\":200,\"def\":200,\"spa\":165,\"spd\":165,\"spe\":112},\"moves\":[\"earthquake\",\"scald\",\"toxic\",\"recover\"],\"baseAbility\":\"unaware\",\"item\":\"leftovers\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Drifblim\",\"details\":\"Drifblim, L83, F\",\"condition\":\"384/384\",\"active\":false,\"stats\":{\"atk\":180,\"def\":121,\"spa\":197,\"spd\":137,\"spe\":180},\"moves\":[\"acrobatics\",\"hex\",\"willowisp\",\"substitute\"],\"baseAbility\":\"unburden\",\"item\":\"sitrusberry\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Dunsparce\",\"details\":\"Dunsparce, L93, M\",\"condition\":\"337/337\",\"active\":false,\"stats\":{\"atk\":183,\"def\":183,\"spa\":174,\"spd\":174,\"spe\":137},\"moves\":[\"coil\",\"earthquake\",\"roost\",\"bodyslam\"],\"baseAbility\":\"serenegrace\",\"item\":\"leftovers\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Simisear\",\"details\":\"Simisear, L88, F\",\"condition\":\"275/275\",\"active\":false,\"stats\":{\"atk\":177,\"def\":160,\"spa\":223,\"spd\":160,\"spe\":227},\"moves\":[\"nastyplot\",\"substitute\",\"hiddenpowerrock60\",\"fireblast\"],\"baseAbility\":\"blaze\",\"item\":\"leftovers\",\"pokeball\":\"pokeball\"},{\"ident\":\"p1: Virizion\",\"details\":\"Virizion, L81\",\"condition\":\"280/280\",\"active\":false,\"stats\":{\"atk\":192,\"def\":163,\"spa\":192,\"spd\":256,\"spe\":222},\"moves\":[\"leafblade\",\"swordsdance\",\"stoneedge\",\"closecombat\"],\"baseAbility\":\"justified\",\"item\":\"lifeorb\",\"pokeball\":\"pokeball\"}]},\"rqid\":6}"
+],
+[
+">battle-gen6randombattle-397",
+"|",
+"|t:|1785186829",
+"|switch|p2a: Latias|Latias, L77, F|100/100",
+"|move|p1a: Tentacruel|Sludge Bomb|p2a: Latias",
+"|-damage|p2a: Latias|76/100",
+"|",
+"|-heal|p1a: Tentacruel|173/268|[from] item: Black Sludge",
+"|upkeep"
+]
+]

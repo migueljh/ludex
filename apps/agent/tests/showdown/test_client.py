@@ -30,6 +30,7 @@ def _player(**kwargs) -> LudexPlayer:
     # servidor local con `|nametaken|` y los tests de integracion erran en
     # bloque — un rojo que no tiene NADA que ver con lo que se esta probando.
     sufijo = random.randint(1000, 9999)
+    kwargs.setdefault("start_listening", False)
     return LudexPlayer(
         account_configuration=AccountConfiguration(f"Foo{sufijo}", None),
         battle_format="gen6randombattle",
@@ -39,6 +40,31 @@ def _player(**kwargs) -> LudexPlayer:
         ),
         **kwargs,
     )
+
+
+def _fake_battle(**overrides) -> SimpleNamespace:
+    """Battle minimo que `serialize_battle` puede recorrer entero.
+
+    Desde D31 `choose_move` serializa en las DOS rutas (antes solo la del
+    grafo lo hacia), asi que un doble sin `format`/`gen`/`weather` ya no
+    alcanza.
+    """
+    base = dict(
+        turn=3, battle_tag="battle-x-1", player_role="p1",
+        format="gen6randombattle", gen=6,
+        weather={}, fields={}, side_conditions={}, opponent_side_conditions={},
+        team={}, opponent_team={},
+        available_moves=[], available_switches=[], can_mega_evolve=False,
+        active_pokemon=None,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _descartar(coro) -> None:
+    """`choose_move` devuelve una coroutine en ambas rutas (D31). Cuando el
+    test solo mira la captura SINCRONICA, se cierra sin ejecutarla."""
+    coro.close()
 
 
 def test_extrae_el_tag_de_la_primera_linea():
@@ -123,22 +149,19 @@ def test_choose_move_captura_legal_actions_y_action_taken_sincronicamente():
     class FakeMove:
         id = "tackle"
 
-    battle = SimpleNamespace(
-        turn=3, battle_tag=tag, player_role="p1",
-        available_moves=[FakeMove()], available_switches=[], can_mega_evolve=False,
-    )
+    battle = _fake_battle(battle_tag=tag, available_moves=[FakeMove()])
 
     with patch.object(
         client_module.RandomPlayer, "choose_move",
         lambda self, b: FakeOrder(mid="tackle"),
     ):
-        player.choose_move(battle)
+        _descartar(player.choose_move(battle))
 
     step = player.steps[tag][0]
     assert step["action_taken"] == {"kind": "move", "id": "tackle"}
     assert step["legal_actions"] == [{"kind": "move", "id": "tackle"}]
     assert step["decision_turn"] == 3
-    assert step["state"] is None  # se completa en _finalize_pending_steps
+    assert step["state"] is None  # lo completa la proyeccion pre-lock
     assert player._sides[tag] == "p1"
 
 
@@ -147,10 +170,7 @@ def test_choose_move_reserva_el_indice_en_orden_de_decision():
     debilitamiento) quedan en el orden en que se DECIDIERON."""
     player = _player()
     tag = "battle-x-1"
-    battle = SimpleNamespace(
-        turn=1, battle_tag=tag, player_role="p1",
-        available_moves=[], available_switches=[], can_mega_evolve=False,
-    )
+    battle = _fake_battle(turn=1, battle_tag=tag)
 
     calls = []
 
@@ -160,12 +180,12 @@ def test_choose_move_reserva_el_indice_en_orden_de_decision():
         return order
 
     with patch.object(client_module.RandomPlayer, "choose_move", fake_super_choose_move):
-        player.choose_move(battle)
-        player.choose_move(battle)
+        _descartar(player.choose_move(battle))
+        _descartar(player.choose_move(battle))
 
     assert len(player.steps[tag]) == 2
     assert [s["state"] for s in player.steps[tag]] == [None, None]
-    assert player._pending_finalize[tag] == [0, 1]
+    assert [s["action_taken"]["id"] for s in player.steps[tag]] == ["move0", "move1"]
 
 
 async def test_grafo_usa_foto_y_mapa_capturados_antes_del_primer_await():
@@ -174,11 +194,7 @@ async def test_grafo_usa_foto_y_mapa_capturados_antes_del_primer_await():
     class FakeMove:
         id = "tackle"
 
-    battle = SimpleNamespace(
-        turn=3, battle_tag=tag, player_role="p1",
-        available_moves=[FakeMove()], available_switches=[],
-        can_mega_evolve=False, active_pokemon=None,
-    )
+    battle = _fake_battle(battle_tag=tag, available_moves=[FakeMove()])
 
     class MutatingGraph:
         async def ainvoke(self, graph_input):
@@ -197,6 +213,9 @@ async def test_grafo_usa_foto_y_mapa_capturados_antes_del_primer_await():
         client_module, "serialize_battle",
         lambda b: {
             "turn": b.turn,
+            "opponent": {"pokemon": []},
+            "field": {"weather": {}, "field_effects": {},
+                      "my_side": {}, "opponent_side": {}},
             "legal_actions": [
                 {"kind": "move", "id": move.id}
                 for move in b.available_moves
@@ -208,13 +227,15 @@ async def test_grafo_usa_foto_y_mapa_capturados_antes_del_primer_await():
         # dentro de ella, esta mutación contaminaría la decisión.
         battle.available_moves = [SimpleNamespace(id="surf")]
         battle.turn = 99
+        await player.frame_inbox.publish(tag, ("|upkeep", "|turn|4"))
         order = await pending
 
     step = player.steps[tag][0]
     assert order.order.id == "tackle"
     assert step["decision_turn"] == 3
     assert step["legal_actions"] == [{"kind": "move", "id": "tackle"}]
-    assert step["state"]["turn"] == 3
+    # El turno sale del `|turn|N` de la narración previa, no de battle.turn.
+    assert step["state"]["turn"] == 4
     assert step["action_taken"] == {"kind": "move", "id": "tackle"}
     assert step["action_path"] == "llm"
 
@@ -222,10 +243,8 @@ async def test_grafo_usa_foto_y_mapa_capturados_antes_del_primer_await():
 async def test_grafo_mapea_variante_mega_a_su_battle_order():
     tag = "battle-graph-mega"
     move = SimpleNamespace(id="meteormash")
-    battle = SimpleNamespace(
-        turn=1, battle_tag=tag, player_role="p1",
-        available_moves=[move], available_switches=[],
-        can_mega_evolve=True, active_pokemon=None,
+    battle = _fake_battle(
+        turn=1, battle_tag=tag, available_moves=[move], can_mega_evolve=True
     )
 
     class MegaGraph:
@@ -238,60 +257,155 @@ async def test_grafo_mapea_variante_mega_a_su_battle_order():
     player = _player(decision_graph=MegaGraph())
     with patch.object(
         client_module, "serialize_battle",
-        lambda b: {"turn": 1, "legal_actions": client_module.legal_actions(b)},
+        lambda b: {
+            "turn": 1, "opponent": {"pokemon": []},
+            "field": {"weather": {}, "field_effects": {},
+                      "my_side": {}, "opponent_side": {}},
+            "legal_actions": client_module.legal_actions(b),
+        },
     ):
-        order = await player.choose_move(battle)
+        pending = player.choose_move(battle)
+        await player.frame_inbox.publish(tag, ("|upkeep",))
+        order = await pending
 
     assert order.mega is True
     assert player.steps[tag][0]["action_path"] == "fallback"
 
 
-def test_finalize_pending_steps_completa_state_con_lo_capturado_en_choose_move(monkeypatch):
-    """`turn` y `legal_actions` del `state` finalizado tienen que quedar
-    exactamente como los capturo `choose_move`, NUNCA como los recalcularia
-    `serialize_battle` en el momento de finalizar (que podria reflejar ya la
-    decision SIGUIENTE si hay mas de un paso pendiente en el mismo lote)."""
-    player = _player()
-    tag = "battle-x-1"
-    player.steps[tag].append({
-        "turn": 3, "decision_turn": 3,
-        "action_taken": {"kind": "move", "id": "tackle"},
-        "legal_actions": [{"kind": "move", "id": "tackle"}],
-        "state": None,
-    })
-    player._pending_finalize[tag] = [0]
-    battle = SimpleNamespace()
-    player.battles[tag] = battle
+async def test_timeout_de_proyeccion_no_deja_ninguna_fila_persistible():
+    """Fallo CERRADO (D31). Si la narracion previa no llega, NO se decide con
+    el snapshot stale ni se persiste una fila degradada: se descarta el paso
+    reservado y el error se propaga.
 
-    monkeypatch.setattr(
-        client_module, "serialize_battle",
-        lambda b: {"turn": 999, "legal_actions": ["lo que sea"], "opponent": {"pokemon": []}},
+    El contador solo no alcanza como aserción: lo que importa es que no
+    quede NADA persistible, porque una fila marcada igual contaminaria el
+    corpus antes de que el auditor pudiera excluirla."""
+    class NeverCalledGraph:
+        async def ainvoke(self, graph_input):  # pragma: no cover
+            raise AssertionError(
+                "el proveedor no puede invocarse con estado stale"
+            )
+
+    player = _player(
+        decision_graph=NeverCalledGraph(), projection_timeout_seconds=0.01
+    )
+    tag = "battle-timeout"
+    battle = _fake_battle(
+        battle_tag=tag, available_moves=[SimpleNamespace(id="tackle")]
     )
 
-    player._finalize_pending_steps(tag)
+    pending = player.choose_move(battle)
+    # Se reservo el paso sincronicamente...
+    assert len(player.steps[tag]) == 1
+    # ...pero nunca llega narracion.
+    with pytest.raises(client_module.ProjectionTimeoutError):
+        await pending
 
-    step = player.steps[tag][0]
-    assert step["state"]["turn"] == 3  # NO 999
-    assert step["state"]["legal_actions"] == [{"kind": "move", "id": "tackle"}]  # NO recalculado
-    assert step["state"]["opponent"] == {"pokemon": []}
-    assert player._pending_finalize[tag] == []
+    assert player.steps[tag] == [], (
+        "el paso reservado tiene que desaparecer: una fila que exista debe "
+        "tener proyeccion valida por construccion"
+    )
+    assert player.projection_timeout_count == 1
 
 
-def test_finalize_pending_steps_sin_pending_no_hace_nada():
+async def test_timeout_consume_el_presupuesto_de_decision():
+    """La espera no puede exceder el presupuesto de la decision."""
+    player = _player(
+        decision_graph=None, projection_timeout_seconds=30,
+        decision_budget_seconds=0.01,
+    )
+    tag = "battle-budget"
+    battle = _fake_battle(battle_tag=tag)
+
+    with patch.object(
+        client_module.RandomPlayer, "choose_move",
+        lambda self, b: FakeOrder(mid="tackle"),
+    ):
+        pending = player.choose_move(battle)
+        with pytest.raises(client_module.ProjectionTimeoutError):
+            await pending
+
+    assert player.steps[tag] == []
+
+
+async def test_reintento_reusa_solo_la_parte_publica_de_la_proyeccion():
+    """Tras una eleccion rechazada no hay resolucion nueva que esperar, asi
+    que el reintento reusa la ultima proyeccion publica. Pero SOLO
+    `opponent`/`field`/`turn`: la mascara pudo cambiar al descubrirse
+    `trapped`, y el snapshot propio del reintento es el nuevo."""
     player = _player()
-    player._finalize_pending_steps("tag-inexistente")  # no debe reventar
+    tag = "battle-retry"
+
+    player._last_projection[tag] = {
+        "turn": 7,
+        "opponent": {"pokemon": [{"species": "latias", "active": True}]},
+        "field": {"weather": {"RAINDANCE": 5}, "field_effects": {},
+                  "my_side": {}, "opponent_side": {}},
+        "legal_actions": [{"kind": "move", "id": "yaviejo"}],
+    }
+    player._retry_pending[tag] = True
+
+    # En el reintento el pokemon resulto atrapado: solo queda un movimiento.
+    battle = _fake_battle(
+        battle_tag=tag, turn=99,
+        available_moves=[SimpleNamespace(id="struggle")],
+    )
+    with patch.object(
+        client_module.RandomPlayer, "choose_move",
+        lambda self, b: FakeOrder(mid="struggle"),
+    ):
+        pending = player.choose_move(battle)
+        await pending
+
+    estado = player.steps[tag][0]["state"]
+    assert estado["opponent"]["pokemon"][0]["species"] == "latias"
+    assert estado["field"]["weather"] == {"RAINDANCE": 5}
+    assert estado["turn"] == 7
+    # La mascara NUEVA, no la de la proyeccion vieja.
+    assert estado["legal_actions"] == [{"kind": "move", "id": "struggle"}]
+    # La marca se consume exactamente una vez.
+    assert player._retry_pending.get(tag) in (None, False)
 
 
-def test_finalize_pending_steps_sin_battle_no_revienta():
+async def test_reintento_sin_proyeccion_previa_falla_ruidosamente():
     player = _player()
-    tag = "battle-x-1"
-    player.steps[tag].append({
-        "turn": 1, "decision_turn": 1, "action_taken": None,
-        "legal_actions": [], "state": None,
-    })
-    player._pending_finalize[tag] = [0]
-    player._finalize_pending_steps(tag)  # sin player.battles[tag]: no revienta
-    assert player.steps[tag][0]["state"] is None  # queda sin finalizar, no crashea
+    tag = "battle-retry-sin-nada"
+    player._retry_pending[tag] = True
+    battle = _fake_battle(battle_tag=tag)
+
+    with patch.object(
+        client_module.RandomPlayer, "choose_move",
+        lambda self, b: FakeOrder(mid="tackle"),
+    ):
+        pending = player.choose_move(battle)
+        with pytest.raises(RuntimeError, match="sin proyeccion publica"):
+            await pending
+
+    assert player.steps[tag] == []
+
+
+async def test_error_de_eleccion_marca_el_proximo_choose_move_como_reintento():
+    """Las DOS rutas de rechazo tienen que quedar marcadas ANTES de que
+    poke-env vuelva a llamar a choose_move: `[Invalid choice]` reintenta
+    dentro del mismo frame, `[Unavailable choice]` en un frame posterior."""
+    for texto in ("[Unavailable choice] Blah", "[Invalid choice] Blah"):
+        player = _player()
+        tag = "battle-gen6randombattle-9"
+        player.steps[tag].append({"turn": 1, "state": {}, "action_taken": None})
+        lote = [[f">{tag}"], _split(f"|error|{texto}")]
+
+        with patch.object(
+            client_module.RandomPlayer, "_handle_battle_message",
+            _noop_async,
+        ):
+            await player._handle_battle_message(lote)
+
+        assert player._retry_pending.get(tag) is True, texto
+        assert player.steps[tag] == [], "la eleccion rechazada se descarta"
+
+
+async def _noop_async(self, split_messages):
+    return None
 
 
 async def test_wait_for_pending_steps_corrige_turnos_sin_ninguna_task():
@@ -800,17 +914,15 @@ def test_choose_move_captura_actor_species():
         species = "Muk"
         base_species = "Muk"
 
-    battle = SimpleNamespace(
-        turn=3, battle_tag=tag, player_role="p1",
-        available_moves=[FakeMove()], available_switches=[], can_mega_evolve=False,
-        active_pokemon=FakeActive(),
+    battle = _fake_battle(
+        battle_tag=tag, available_moves=[FakeMove()], active_pokemon=FakeActive()
     )
 
     with patch.object(
         client_module.RandomPlayer, "choose_move",
         lambda self, b: FakeOrder(mid="brickbreak"),
     ):
-        player.choose_move(battle)
+        _descartar(player.choose_move(battle))
 
     assert player.steps[tag][0]["actor_species"] == "muk"
 
@@ -836,9 +948,8 @@ def test_choose_move_captura_base_species_no_la_forma():
         species = "arceuspoison"  # lo que devuelve poke-env para Arceus-Poison
         base_species = "arceus"   # lo que Showdown usa como identificador
 
-    battle = SimpleNamespace(
-        turn=37, battle_tag=tag, player_role="p1",
-        available_moves=[FakeMove()], available_switches=[], can_mega_evolve=False,
+    battle = _fake_battle(
+        turn=37, battle_tag=tag, available_moves=[FakeMove()],
         active_pokemon=FakeActive(),
     )
 
@@ -846,7 +957,7 @@ def test_choose_move_captura_base_species_no_la_forma():
         client_module.RandomPlayer, "choose_move",
         lambda self, b: FakeOrder(mid="earthpower"),
     ):
-        player.choose_move(battle)
+        _descartar(player.choose_move(battle))
 
     assert player.steps[tag][0]["actor_species"] == "arceus", (
         "tiene que capturar la forma BASE (lo que Showdown narra como "
@@ -979,3 +1090,206 @@ def test_discard_last_step_descarta_el_ultimo_paso():
 async def test_discard_last_step_sin_pasos_no_revienta():
     player = _player()
     player._discard_last_step("tag-vacio")
+
+
+# --- D31 (MON-6): camino pre-lock ------------------------------------------
+#
+# Fixture FIEL: los 11 frames son el protocolo crudo real de
+# `battle-gen6randombattle-397`, tal como los recibio el socket, reconstruidos
+# por sus marcas `>battle-...`. El frame 9 es el `|request|` de una decision y
+# el frame 10 la narracion que el servidor ya habia emitido cuando esa decision
+# se tomo: Latias entra y queda al 76%.
+#
+# Se conducen por `PSClient._handle_message` —una task por frame, igual que
+# `listen()`— y NO inyectados a mano en `_handle_battle_message`: el punto
+# entero del arreglo es que la publicacion ocurra antes del lock.
+
+
+def _frames_reales() -> list[list[str]]:
+    import json
+    from pathlib import Path
+
+    ruta = Path(__file__).parent / "data" / "prelock_frames_397.json"
+    return json.loads(ruta.read_text())
+
+
+def _player_del_fixture(**kwargs) -> LudexPlayer:
+    from poke_env import AccountConfiguration
+
+    kwargs.setdefault("start_listening", False)
+    return LudexPlayer(
+        # Tiene que coincidir con `|player|p1|LudexBot3682|...` del fixture:
+        # es asi como poke-env decide que somos p1.
+        account_configuration=AccountConfiguration("LudexBot3682", None),
+        battle_format="gen6randombattle",
+        log_level=50,
+        server_configuration=local_server_configuration(
+            "ws://localhost:8100/showdown/websocket"
+        ),
+        **kwargs,
+    )
+
+
+async def _correr_fixture(player: LudexPlayer, frames: list[list[str]]) -> None:
+    """Una task por frame, creadas en orden de llegada: la misma topologia que
+    `PSClient.listen()`. Es lo que reproduce la carrera real —la narracion
+    llega mientras la decision anterior tiene el lock— en vez de simularla."""
+    client = player.ps_client
+    tasks = []
+    for frame in frames:
+        tasks.append(asyncio.create_task(client._handle_message("\n".join(frame))))
+        await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=15)
+
+
+async def test_el_grafo_recibe_el_rival_revelado_por_la_narracion_ya_emitida():
+    """LA regresion de F2-01.
+
+    Con el protocolo real: cuando se decide desde el `|request|` del frame 9,
+    poke-env todavia tiene a Ludicolo como activo rival, porque la narracion
+    que mete a Latias esta en el frame 10 y su task quedo encolada detras del
+    lock por batalla. El proveedor tiene que ver a Latias igual, porque esa
+    narracion YA fue emitida por el servidor y no depende de nuestra respuesta.
+    """
+    vistas: list[dict] = []
+    lo_que_ve_pokeenv: list[list[str]] = []
+
+    class CapturingGraph:
+        async def ainvoke(self, graph_input):
+            estado = graph_input["raw_state"]
+            vistas.append(estado)
+            tag = graph_input["turn_id"].split(":")[0]
+            batalla = player.battles[tag]
+            # CANARIO: lo que poke-env tiene aplicado en ESTE instante. Si la
+            # proyeccion no se aplicara, seria identico a `estado` y el test
+            # no probaria nada.
+            lo_que_ve_pokeenv.append(
+                sorted(
+                    m.species
+                    for m in (batalla.opponent_team or {}).values()
+                    if m.active
+                )
+            )
+            return {
+                "action": estado["legal_actions"][0],
+                "action_path": "llm",
+            }
+
+    player = _player_del_fixture(decision_graph=CapturingGraph())
+    enviados: list[str] = []
+
+    async def fake_send(message, room="", message_2=None):
+        enviados.append(message)
+
+    player.ps_client.send_message = fake_send
+    await _correr_fixture(player, _frames_reales())
+
+    assert vistas, "el grafo nunca se invoco: el fixture no ejercio nada"
+    decision = vistas[-1]
+
+    activos = [p for p in decision["opponent"]["pokemon"] if p["active"]]
+    assert len(activos) == 1
+    assert activos[0]["species"] == "latias", (
+        "el proveedor tiene que ver el switch-in que la narracion previa ya "
+        f"revelo, no {activos[0]['species']!r}"
+    )
+    assert activos[0]["hp_fraction"] == 0.76
+
+    # CANARIO: poke-env seguia en Ludicolo cuando decidimos. Sin esta
+    # diferencia el test podria pasar sin que la proyeccion hiciera nada.
+    assert lo_que_ve_pokeenv[-1] == ["ludicolo"], (
+        "si poke-env ya tuviera a Latias aplicada, este fixture no estaria "
+        "ejerciendo el desfase que F2-01 arregla"
+    )
+
+
+async def test_la_proyeccion_no_filtra_informacion_oculta_del_rival():
+    """Latias entra y recibe daño, pero la narracion no revela NINGUN
+    movimiento, item ni habilidad suyos: el Sludge Bomb del frame 10 es
+    NUESTRO. Nada de eso puede aparecer."""
+    vistas: list[dict] = []
+
+    class CapturingGraph:
+        async def ainvoke(self, graph_input):
+            vistas.append(graph_input["raw_state"])
+            return {
+                "action": graph_input["raw_state"]["legal_actions"][0],
+                "action_path": "llm",
+            }
+
+    player = _player_del_fixture(decision_graph=CapturingGraph())
+
+    async def fake_send(message, room="", message_2=None):
+        return None
+
+    player.ps_client.send_message = fake_send
+    await _correr_fixture(player, _frames_reales())
+
+    decision = vistas[-1]
+    latias = next(
+        p for p in decision["opponent"]["pokemon"] if p["species"] == "latias"
+    )
+    assert latias["moves"] == [], "ningun movimiento de Latias fue revelado"
+    assert latias["item"] == "unknown_item"
+    assert latias["ability"] is None
+
+    # Lo que SI estaba revelado se conserva: Ludicolo uso Energy Ball antes.
+    ludicolo = next(
+        p for p in decision["opponent"]["pokemon"] if p["species"] == "ludicolo"
+    )
+    assert [m["id"] for m in ludicolo["moves"]] == ["energyball"]
+    assert ludicolo["active"] is False
+
+
+async def test_snapshot_del_proveedor_y_fila_persistida_son_el_mismo_objeto():
+    """No pueden representar puntos distintos de la batalla: es el mismo dict."""
+    vistas: list[dict] = []
+
+    class CapturingGraph:
+        async def ainvoke(self, graph_input):
+            vistas.append(graph_input["raw_state"])
+            return {
+                "action": graph_input["raw_state"]["legal_actions"][0],
+                "action_path": "llm",
+            }
+
+    player = _player_del_fixture(decision_graph=CapturingGraph())
+
+    async def fake_send(message, room="", message_2=None):
+        return None
+
+    player.ps_client.send_message = fake_send
+    await _correr_fixture(player, _frames_reales())
+
+    tag = "battle-gen6randombattle-397"
+    pasos = [s for s in player.steps[tag] if s["state"] is not None]
+    assert pasos
+    assert pasos[-1]["state"] is vistas[-1]
+
+
+async def test_la_mascara_capturada_no_cambia_por_la_espera():
+    """`legal_actions` sale del `|request|` propio y la espera no la toca."""
+    vistas: list[dict] = []
+
+    class CapturingGraph:
+        async def ainvoke(self, graph_input):
+            vistas.append(graph_input["raw_state"])
+            return {
+                "action": graph_input["raw_state"]["legal_actions"][0],
+                "action_path": "llm",
+            }
+
+    player = _player_del_fixture(decision_graph=CapturingGraph())
+
+    async def fake_send(message, room="", message_2=None):
+        return None
+
+    player.ps_client.send_message = fake_send
+    await _correr_fixture(player, _frames_reales())
+
+    tag = "battle-gen6randombattle-397"
+    for paso in player.steps[tag]:
+        if paso["state"] is None:
+            continue
+        assert paso["state"]["legal_actions"] == paso["legal_actions"]
+        assert paso["action_taken"] in paso["legal_actions"]

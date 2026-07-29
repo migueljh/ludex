@@ -5,4 +5,4 @@ serializer.py, ESTE numero sube. El protocolo crudo persistido permite
 re-derivar el historico a la version nueva.
 """
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2

@@ -419,6 +419,15 @@ con equipos propios.
 
 ## D20 — C1: el desfase de un turno se corrige con materialización diferida, no con una espera antes de responder
 
+> **Superada por [D31](#d31--el-snapshot-de-decisión-se-completa-con-el-frame-público-ya-emitido-antes-del-lock).**
+> El síntoma y la causa raíz de acá siguen siendo correctos, pero la premisa de
+> que la narración llega "en el mismo lote" que el `|request|` es **falsa** (son
+> frames de websocket distintos, cada uno con su task), y por eso la
+> materialización diferida no arreglaba nada: refrescaba al final del lote del
+> request, cuando la narración todavía no había llegado. La medición: 297/762
+> decisiones (39.0%) informaban al proveedor un activo rival equivocado. Leer D31
+> antes de tocar este mecanismo.
+
 **Síntoma medido** (review final de `feat/agent-conexion-estado`, sobre 3123
 filas reales): mi lado del estado queda post-resolución de un turno mientras
 el lado del rival queda un turno atrás, dentro de la misma fila. Causa: en
@@ -552,6 +561,13 @@ Se truncan y se regraban con `agent play`.
 ## D22 — C-1 vuelve a ser síncrona; el cursor de `_correct_step_turns` reconoce
 tres formas de "la acción no se ejecutó" y deja de robarle líneas a la
 decisión siguiente
+
+> **Complementada por [D31](#d31--el-snapshot-de-decisión-se-completa-con-el-frame-público-ya-emitido-antes-del-lock).**
+> Que la captura sea síncrona sigue siendo obligatorio y D31 no lo relaja: la foto
+> del snapshot y la máscara se siguen tomando antes del primer `await`. Lo que
+> agrega D31 es de dónde sale la parte del rival — de una proyección pura sobre el
+> frame público **ya emitido**, esperado en un inbox pre-lock, y nunca releyendo
+> el objeto `battle`. `_finalize_pending_steps` ya no existe.
 
 Dos correcciones de la última puerta antes del merge de
 `feat/agent-conexion-estado` (review-merge.md), sobre el mismo mecanismo:
@@ -963,3 +979,167 @@ turno; si entra, `complete()` duerme ese tramo y reintenta. Dos canarios
 (`tests/graph/test_provider.py`) fijan ambas direcciones: una clave enfriada
 no se reintenta antes de tiempo, y sí vuelve después — revertido el fix,
 los seis tests nuevos fallan.
+
+## D31 — el snapshot de decisión se completa con el frame público ya emitido, antes del lock
+
+**Contexto.** `serialize_battle` corría dentro de `choose_move`, cuando poke-env
+ya había reconstruido *nuestro* lado desde el `|request|` privado pero todavía no
+había parseado la narración pública del turno que ese request resolvió. El
+resultado: un snapshot que mezcla nuestro lado en `t=k` con el rival en `t=k−1`
+— **no corresponde a ningún punto real de la batalla**. Medido sobre el corpus
+real: **297 de 762 decisiones (39.0%)** informaban al proveedor un pokémon activo
+rival **equivocado**, y **270 de esas 297 (90.9%)** mostraban exactamente el
+activo de la decisión anterior.
+
+`_finalize_pending_steps` no lo arreglaba. Se apoyaba en una premisa falsa —
+documentada como hecho en el docstring de `LudexPlayer` — de que la narración
+llegaba "en el MISMO lote" que el request. Son **frames de websocket distintos**,
+cada uno con su propia task.
+
+**Lo que se midió** (sonda causal contra Showdown local, dos variantes de 39 y 76
+decisiones; diseño y traza cruda en
+`docs/superpowers/specs/2026-07-29-f2-01-prelock-snapshot-design.md`):
+
+- `NARR(k)`, la narración que resuelve la decisión **anterior**, llega al socket
+  **0.022–5.557 ms** después del `|request|` y **antes** de que enviemos la
+  elección. Demorar la elección 500 ms **no la mueve** (76/76). No depende de
+  nuestra respuesta.
+- `NARR(k+1)`, la que resuelve la decisión **actual**, sí depende: llega 4–45 ms
+  **después** del envío.
+- Lo que mantiene a `NARR(k)` fuera de `Battle` no es el cable sino el **lock por
+  batalla** de poke-env (`ps_client.py:171-176`): su task ya arrancó pero queda
+  encolada esperando el mismo lock que la decisión mantiene abierto (medido:
+  bloqueada 501 ms con un hold de 500 ms).
+
+**La distinción importa y corrige a `.claude/agent-recording/SKILL.md` y a
+D20/D22:** "esperar la narración es un punto muerto garantizado" vale para
+`NARR(k+1)`, no para `NARR(k)`.
+
+**Decisión.** Un observador envuelve `PSClient._handle_message` —el único punto de
+poke-env 0.15.0 que corre dentro de la task del frame y **antes** del lock— y
+publica el frame crudo en un inbox por `battle_tag`. La decisión espera esa señal
+y aplica una **proyección pura** sobre el snapshot inmutable.
+
+Contrato del snapshot:
+
+- `graph_input["raw_state"]` y `step["state"]` son **el mismo objeto**: no pueden
+  representar puntos distintos de la batalla.
+- Máscara, `action_taken` y mapa acción→`BattleOrder` se siguen capturando
+  **síncronos antes del primer `await`**. La proyección nunca escribe
+  `legal_actions`, `me` ni `player_role`.
+- El proyector vive en `showdown/protocol.py`, que **no importa poke-env**: se
+  testea sin levantar nada. Las traducciones que necesitan el dex o los enums de
+  la librería entran inyectadas (`ObservableVocabulary`), de modo que las
+  inferencias legítimas quedan ancladas al dex y **nunca a una lista a mano**.
+- Nunca se consume una línea `|request|`, ni se relee `Battle` después de decidir.
+- Se espera **únicamente** al inbox. Esperar a `Battle`, al `ProtocolRecorder` o a
+  `_handle_battle_message` desde una decisión que tiene el lock sigue siendo un
+  punto muerto y sigue prohibido.
+- El `ProtocolRecorder` no cambia: se sigue grabando bajo el lock y sigue siendo
+  la fuente de verdad persistida (D17). El inbox es solo el canal de señal.
+- **El chat de batalla nunca entra al prompt.** La completitud de la espera es
+  lista **blanca** (`RESOLUTION_TAGS`): `c`/`c:`, `inactive`, `j`/`l`/`n`, `t:`
+  solo, `request`, `error`, `popup`, `raw`, `html` e `init` no pueden completarla
+  ni llegar al estado. Con lista negra, un `|c:|` habría bastado para decidir sin
+  la narración y el desfase volvía.
+- `|turn|` **no** es requisito de completitud: el frame de un cambio forzado
+  cierra en el `|faint|` y nunca lo trae (medido: 7/76 decisiones con
+  `forceSwitch`, todas con `turn=None`). Exigirlo colgaba cada cambio forzado.
+
+**Fallo cerrado, no fila degradada.** Si la narración no llega dentro del
+presupuesto (`projection_timeout_seconds`, default 1.0 s, acotado además por el
+presupuesto de la decisión): se incrementa `projection_timeout_count`, se lanza
+`ProjectionTimeoutError`, se propaga por `_background_failure` y **se retira el
+paso reservado**. No se invoca al proveedor con estado stale ni se persiste una
+fila marcada. **Si una fila existe, su proyección es válida por construcción** —
+una fila degradada contaminaría el corpus antes de que el auditor pudiera
+excluirla.
+
+**El cursor es un `ContextVar`, no `last_seq`.** poke-env crea una task por frame
+y todas publican al arrancar, pero solo una entra al lock por vez. Bajo carga,
+para cuando la decisión del frame N llega a `choose_move`, los frames N+1, N+2…
+ya están publicados: `last_seq` devolvería uno de **ellos** y la decisión
+esperaría una narración que no es la suya. Cazado por el test de frames reales,
+no teorizado.
+
+**`detailschange` no cambia `species`.** `Pokemon.forme_change()` llama a
+`_update_from_pokedex(..., store_species=False)` (`pokemon.py:431-433`): tras una
+Mega evolución poke-env conserva la forma base. La proyección hace lo mismo —
+cambia los **tipos**, no la especie. Escribir `slowbromega` habría hecho que la
+proyección contradiga al resto del dataset dentro de la misma batalla (medido en
+`battle-gen6randombattle-1896`).
+
+Corolario de medición: la prevalencia oficial del defecto es **297/762 = 39.0%**,
+con firma de retraso-en-uno **270/297 = 90.9%**. Una versión intermedia de la
+consulta contaba `detailschange` como cambio de identidad y daba 309/762 = 40.6%;
+eso sobrecontaba 12 filas por Mega. Toda la documentación de F2-01 cita 39.0%.
+
+**`replace` son dos entradas del equipo, no un renombre.** Renombrar la entrada
+activa —lo primero que se implementó— borraba al imitado del equipo rival, aunque
+su `|switch|` es evidencia pública de que el rival lo tiene, y le regalaba al
+imitador el item, la ability y los movimientos que se le habían atribuido al
+imitado. Paridad exacta con `AbstractBattle._end_illusion_on`
+(`abstract_battle.py:409-427`): el imitador entra con especie, nivel y tipos del
+`details` del `|replace|` y hereda HP, status y `fainted`, porque el que estaba en
+el campo era él; el imitado queda inactivo, con boosts limpios, `status=None` y
+`hp_fraction=0.0` —lo que devuelve `current_hp_fraction` cuando `_current_hp` es
+`None` (`pokemon.py:988-995`)—; item, ability y movimientos no viajan.
+
+**`typechange` y Transform/Imposter también se proyectan**, ancladas a la
+librería y no a listas a mano: `|-start|…|typechange|Water/Flying` vía
+`PokemonType.from_name`, con la forma `[of]` de Reflect Type resuelta igual que
+`abstract_battle.py:802-809`; y `|-transform|…|[from] ability: Imposter`, que copia
+de un pokémon **nuestro** —información que ya tenemos, no fuga— con tipos del dex
+de la especie copiada, boosts, moveset y ability del objetivo y la especie
+intacta, igual que `Pokemon.transform()` (`pokemon.py:625-636`). El PP de un
+movimiento copiado es `min(5, max_pp)` desde gen 5 (`move.py:114`, `move.py:
+477-478`): regla fija de la generación, derivable. Un `switch` posterior borra los
+tipos temporales, igual que `switch_out` limpia `_temporary_types`.
+
+**La exclusión de cambios forzados en la verificación de integración exige firma
+demostrable.** Excluir por `turn_number` repetido a secas era demasiado ancho:
+tapaba cualquier defecto futuro que duplicara el turno por otro motivo, que es la
+misma cobertura silenciosa que costó 265 pasos cuando la PK estaba sobre
+`turn_number` (D21). Se piden dos hechos públicos independientes: la máscara
+persistida sin **ni un** movimiento (un `forceSwitch` llega sin `moves`) y un
+`|faint|{rol}a:` en el protocolo de ese mismo turno. Una decisión que comparte
+turno y no cumple las dos **hace fallar el test**.
+
+**La retención del `RawFrameInbox` está acotada**: `MAX_RETAINED_FRAMES = 128` por
+tag durante la batalla y `close()` la libera al terminarla. El tope no puede
+volverse una respuesta equivocada: si el frame que seguía al cursor se desalojó,
+`wait_for_resolution` falla **cerrado**, porque el primer frame retenido ya no es
+demostrablemente el de esa decisión. El mayor `seq` desalojado se rastrea **por
+tag**, ya que `_seq` es global y los `seq` de un tag no son contiguos.
+
+**Esquema v2.** Un movimiento rival revelado desde `|move|` entra como
+`{"id": ..., "pp": null, "max_pp": null}`: `null` significa **"no derivable de
+esa evidencia pública"**, no cero ni PP faltante por error. Las filas históricas
+v1 no se reescriben ni se les inventa metadata. El invariante global deja de ser
+"una sola versión" y pasa a exigir que columna y JSON coincidan por fila, que
+solo aparezcan versiones soportadas `{1, 2}`, y que las filas nuevas sean v2. No
+hace falta migración: la columna ya versiona el payload.
+
+**Turno.** La proyección fija `turn` desde el `|turn|N` de la narración previa, y
+conserva el `decision_turn` síncrono cuando no lo hay (cambio forzado). Para la
+ruta del grafo, `_correct_step_turns` **verifica** que coincida con la línea que
+resolvió la acción y **falla ruidosamente** si no, en vez de mutar a posteriori el
+dict que ya vio el proveedor. La ruta random conserva su corrección histórica.
+
+**Reintentos por elección rechazada.** F2-01 se ocupa solo de frescura y de no
+trabarse: se marca el próximo `choose_move` como retry **antes** de delegar en
+`super()` —única forma de cubrir las dos rutas, porque `[Invalid choice]`
+reintenta dentro del mismo frame y `[Unavailable choice]` en uno posterior—, se
+salta la espera (no hay turno que resolver) y se reutiliza **solo** `opponent`,
+`field` y `turn` de la última proyección válida sobre el snapshot propio
+**nuevo**. Nunca el dict completo: la máscara pudo cambiar al descubrirse
+`trapped`. Sin proyección previa válida, falla ruidosamente. La identidad canónica
+de la decisión, el descarte del intento rechazado y `decision_index` siguen
+siendo de F2-02.
+
+**Límite conocido.** El seam `_handle_message` es privado y poke-env 0.15.0 no
+expone un hook pre-lock. `tests/showdown/test_pokeenv_contract.py` lo protege; su
+aserción central es que el inbox se puebla **con el lock del tag tomado** mientras
+`_on_battle_message` todavía no fue invocado, así que si poke-env moviera el lock
+más arriba el test cae antes de que el dataset se degrade en silencio. La salida
+de fondo es un hook `on_raw_frame` upstream.
