@@ -8,6 +8,7 @@ from ludex_agent.config import load_settings
 from ludex_agent.cli import play
 from ludex_agent.db.repository import BattleRepository
 from ludex_agent.db.session import make_engine, session_factory
+from ludex_agent.showdown.client import PokeEnvVocabulary
 from ludex_agent.state.schema import STATE_SCHEMA_VERSION
 
 pytestmark = pytest.mark.skipif(
@@ -810,16 +811,260 @@ async def test_no_hay_fuga_de_informacion_del_rival(jugadas):
         await engine.dispose()
 
 
+SCHEMA_VERSIONS_SOPORTADAS = {1, 2}
+
+# Tamaño maximo de un equipo en singles. No es un numero de configuracion: es
+# la regla del juego. Un snapshot con mas rivales que esto es imposible.
+MAX_RIVALES = 6
+
+_VOCABULARIO = PokeEnvVocabulary(6)
+
+
+def _canonica(especie: str) -> str:
+    """Identidad canonica de una especie, con el dex real de gen 6."""
+    return _VOCABULARIO.base_species(especie)
+
+
+def _firma_de_reemplazo_forzado(
+    estado: dict, protocolo: list[tuple[int, str]], turno: int, rol: str | None
+) -> str | None:
+    """¿Esta decision es DEMOSTRABLEMENTE un reemplazo forzado? Devuelve cual
+    de los dos mecanismos lo prueba, o `None`.
+
+    Dos requisitos, los dos obligatorios:
+
+    **1. La mascara persistida no ofrece ni un movimiento.** Un `forceSwitch`
+    llega sin `moves`, asi que `legal_actions` queda con puros cambios; una
+    decision normal de mitad de turno ofreceria movimientos.
+
+    **2. El protocolo nombra la causa** en ese mismo turno. Hay DOS mecanismos
+    que obligan un reemplazo sin avanzar el turno, y los dos dejan rastro:
+
+      - `faint`: nuestro activo se debilito (`|faint|{rol}a:`). Es el de D21.
+      - `self_switch`: un movimiento que cambia al usuario (U-turn, Volt
+        Switch, Baton Pass, Parting Shot). Showdown lo narra en la propia
+        linea que resuelve la decision: `|switch|{rol}a: X|...|[from] U-turn`.
+        Se reconoce por la PRESENCIA del sufijo `[from]`, sin enumerar
+        movimientos a mano.
+
+    El segundo mecanismo lo encontro la corrida de integracion de la segunda
+    ronda: dos decisiones (`battle-gen6randombattle-1919`, indices 33 y 52)
+    compartian turno con `forceSwitch:[true]` y sin ningun `|faint|`. La firma
+    original solo conocia D21 y las marcaba como no explicadas — que es
+    exactamente lo que tenia que hacer en vez de excluirlas en silencio.
+
+    Con (1) sola, cualquier decision atrapada (Encore, trapping) contaria como
+    reemplazo; con (2) sola contaria tambien la decision del turno siguiente.
+    Exigir las dos es lo que hace que la exclusion no pueda tapar un defecto
+    nuevo que duplique `turn_number` por otro motivo.
+    """
+    acciones = estado.get("legal_actions") or []
+    if not acciones or any(a.get("kind") != "switch" for a in acciones):
+        return None
+    if not rol:
+        return None
+    faint = f"|faint|{rol}a:"
+    switch = f"|switch|{rol}a:"
+    for t, linea in protocolo:
+        if t != turno:
+            continue
+        if linea.startswith(faint):
+            return "faint"
+        if linea.startswith(switch) and "|[from] " in linea:
+            return "self_switch"
+    return None
+
+
 async def test_la_version_de_esquema_esta_en_todas_las_filas(jugadas):
-    """Invariante de TODO el dataset (review final): sin filtro de tags."""
+    """Invariante de TODO el dataset (review final): sin filtro de tags.
+
+    D31 subio el esquema a v2 (un movimiento rival revelado desde `|move|`
+    entra con `pp`/`max_pp` en `null`: "no derivable de esta evidencia
+    publica"). Las filas historicas v1 NO se reescriben ni se les inventa
+    metadata, asi que el invariante deja de ser "una sola version" y pasa a
+    ser el que de verdad importa:
+
+      - columna y JSON coinciden en CADA fila;
+      - solo aparecen versiones soportadas;
+      - las filas de esta corrida son la version actual.
+
+    F2-04 implementara los validadores independientes por version.
+    """
     assert jugadas, "la fixture no jugo nada"
     engine = make_engine(load_settings().database_url)
     try:
         async with session_factory(engine)() as s:
-            distintas = (await s.execute(text(
+            desalineadas = (await s.execute(text(
+                "SELECT count(*) FROM trajectory_steps "
+                "WHERE state_schema_version IS DISTINCT FROM "
+                "      (state->>'schema_version')::int"
+            ))).scalar_one()
+            assert desalineadas == 0, (
+                f"{desalineadas} filas donde la columna state_schema_version y "
+                "state->>'schema_version' no coinciden"
+            )
+
+            distintas = set((await s.execute(text(
                 "SELECT DISTINCT state_schema_version FROM trajectory_steps"
-            ))).scalars().all()
-            assert distintas == [STATE_SCHEMA_VERSION]
+            ))).scalars().all())
+            assert distintas <= SCHEMA_VERSIONS_SOPORTADAS, (
+                f"versiones sin validador soportado: "
+                f"{sorted(distintas - SCHEMA_VERSIONS_SOPORTADAS)}"
+            )
+
+            nuevas = set((await s.execute(text(
+                "SELECT DISTINCT ts.state_schema_version "
+                "FROM trajectory_steps ts "
+                "JOIN trajectories tr ON tr.id = ts.trajectory_id "
+                "JOIN battles b ON b.id = tr.battle_id "
+                "WHERE b.battle_tag = ANY(:tags)"
+            ), {"tags": jugadas})).scalars().all())
+            assert nuevas == {STATE_SCHEMA_VERSION}, (
+                f"las filas de esta corrida tienen que ser v{STATE_SCHEMA_VERSION}, "
+                f"no {sorted(nuevas)}"
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_el_rival_persistido_esta_al_dia_con_el_protocolo(jugadas):
+    """Criterio de aceptacion de F2-01 (MON-6), con la MISMA metrica con la
+    que se midio el defecto.
+
+    Antes del camino pre-lock, 297 de 762 decisiones reales (39.0%) tenian un
+    activo rival equivocado en el snapshot, y 270 de esas 297 (90.9%) mostraban
+    exactamente el activo de la decision anterior. Sobre las filas nuevas la
+    unica cifra aceptable es 0.
+
+    La referencia se construye con las TRES lineas que cambian que especie esta
+    activa: `switch`, `drag` y `replace` (Illusion). `detailschange` y
+    `-formechange` quedan afuera a proposito porque NO cambian `species` en
+    poke-env (`forme_change` usa `store_species=False`), y contarlos
+    sobrecontaba 12 filas por Mega. La comparacion se hace por identidad
+    canonica (`base_species`), asi que una Mega no cuenta como otro pokemon.
+    """
+    assert jugadas, "la fixture no jugo nada"
+    engine = make_engine(load_settings().database_url)
+    # `detailschange` y `-formechange` NO cambian la especie: poke-env llama a
+    # `_update_from_pokedex(..., store_species=False)` en `forme_change`
+    # (`pokemon.py:431-433`), asi que tras una Mega `mon.species` sigue siendo
+    # la forma base. Medido en `battle-gen6randombattle-1896`: llega
+    # `|detailschange|p2a: Slowbro|Slowbro-Mega, L81, M` y las filas siguen
+    # diciendo `slowbro`. Incluirlos aca marcaba como desfase 2 decisiones que
+    # estaban bien.
+    cambia_identidad = ("switch", "drag", "replace")
+    try:
+        async with session_factory(engine)() as s:
+            protocolo: dict[str, list[tuple[int, str]]] = {}
+            for tag, turno, lineas in (await s.execute(text(
+                "SELECT b.battle_tag, bt.turn_number, bt.protocol_lines "
+                "FROM battle_turns bt JOIN battles b ON b.id = bt.battle_id "
+                "WHERE b.battle_tag = ANY(:tags) ORDER BY b.battle_tag, bt.turn_number"
+            ), {"tags": jugadas})).all():
+                protocolo.setdefault(tag, []).extend(
+                    (turno, linea) for linea in lineas
+                )
+
+            filas = (await s.execute(text(
+                "SELECT b.battle_tag, ts.decision_index, ts.turn_number, ts.state "
+                "FROM trajectory_steps ts "
+                "JOIN trajectories tr ON tr.id = ts.trajectory_id "
+                "JOIN battles b ON b.id = tr.battle_id "
+                "WHERE b.battle_tag = ANY(:tags) "
+                "ORDER BY b.battle_tag, ts.decision_index"
+            ), {"tags": jugadas})).all()
+
+            comparadas = 0
+            excluidas_mitad_de_turno = 0
+            sin_referencia = 0
+            desfasadas = []
+            sin_firma = []
+            por_mecanismo: dict[str, int] = {}
+            turno_previo: dict[str, int] = {}
+            for tag, indice, turno, estado in filas:
+                previo = turno_previo.get(tag)
+                turno_previo[tag] = turno
+                rol = estado.get("player_role")
+                if previo == turno:
+                    # Cambio forzado tras un debilitamiento: no avanza el turno
+                    # (D21), asi que hay DOS decisiones con el mismo
+                    # `turn_number` y el punto observable de la segunda cae a
+                    # mitad de turno. "Estado al inicio del turno de
+                    # resolucion" no es la referencia correcta para esas.
+                    #
+                    # La exclusion exige FIRMA DEMOSTRABLE, no basta con
+                    # compartir turno: una exclusion por `previo == turno` sola
+                    # taparia cualquier defecto futuro que duplique el
+                    # `turn_number` por otro motivo (justo la clase de
+                    # cobertura silenciosa que ya nos costo 265 pasos perdidos
+                    # cuando la PK estaba sobre `turn_number`). Sin firma, la
+                    # decision se reporta como fallo.
+                    firma = _firma_de_reemplazo_forzado(
+                        estado, protocolo.get(tag, []), turno, rol
+                    )
+                    if firma is None:
+                        sin_firma.append((tag, indice, turno))
+                    else:
+                        excluidas_mitad_de_turno += 1
+                        por_mecanismo[firma] = por_mecanismo.get(firma, 0) + 1
+                    continue
+                opp = "p2" if rol == "p1" else "p1"
+                real = None
+                for t, linea in protocolo.get(tag, []):
+                    if t >= turno:
+                        break
+                    partes = linea.split("|")
+                    if len(partes) < 4 or partes[1] not in cambia_identidad:
+                        continue
+                    if not partes[2].startswith(f"{opp}a:"):
+                        continue
+                    real = _normalizar(partes[3].split(",", 1)[0])
+                activos = [
+                    p for p in estado["opponent"]["pokemon"] if p.get("active")
+                ]
+                if real is None or not activos:
+                    sin_referencia += 1
+                    continue
+                comparadas += 1
+                # Por identidad canonica: `camerupt` y `cameruptmega` son el
+                # MISMO pokemon (`base_species`), y cual de las dos formas
+                # nombra cada lado depende de si la ultima linea fue un
+                # `switch` (escribe la especie) o un `detailschange` (no).
+                visto = _canonica(_normalizar(activos[0]["species"]))
+                if visto != _canonica(real):
+                    desfasadas.append((tag, indice, turno, visto, real))
+
+            print(
+                f"\n[F2-01] decisiones={len(filas)} comparadas={comparadas} "
+                f"excluidas_mitad_de_turno={excluidas_mitad_de_turno} "
+                f"por_mecanismo={por_mecanismo} sin_referencia={sin_referencia} "
+                f"sin_firma={len(sin_firma)} desfasadas={len(desfasadas)}"
+            )
+            # Canario: sin un piso de decisiones comparadas este test podria
+            # pasar habiendo excluido todo.
+            assert comparadas >= 50, (
+                f"solo {comparadas} decisiones comparables (excluidas a mitad "
+                f"de turno: {excluidas_mitad_de_turno}, sin referencia: "
+                f"{sin_referencia}): el test no ejercio lo suficiente"
+            )
+            # Pedido explicito del tech lead: afirmar que se ejercio al menos
+            # un caso excluido. Sin esto, "0 sin firma" podria significar que
+            # ninguna decision compartio turno y la firma nunca se evaluo.
+            assert excluidas_mitad_de_turno >= 1, (
+                "ninguna decision compartio `turn_number`: la firma de "
+                "reemplazo forzado no se ejercio en esta corrida"
+            )
+            assert sin_firma == [], (
+                f"{len(sin_firma)} decisiones comparten `turn_number` con la "
+                f"anterior SIN firma publica de reemplazo forzado (mascara solo "
+                f"de cambios + `|faint|` propio en ese turno): no son "
+                f"excluibles y hay que explicarlas, no taparlas: {sin_firma[:5]}"
+            )
+            assert desfasadas == [], (
+                f"{len(desfasadas)}/{comparadas} decisiones con el activo rival "
+                f"desfasado respecto del protocolo (baseline del defecto: "
+                f"297/762 = 39.0%): {desfasadas[:5]}"
+            )
     finally:
         await engine.dispose()
 
@@ -1070,5 +1315,84 @@ async def test_la_accion_tomada_esta_dentro_de_su_propia_mascara(jugadas):
             f"{len(filas)} fila(s) con action_taken fuera de su propia "
             f"legal_actions: {filas}"
         )
+    finally:
+        await engine.dispose()
+
+
+async def test_ningun_snapshot_tiene_un_equipo_rival_imposible(jugadas):
+    """Canario de la propiedad que la integracion de `6af10da` violo.
+
+    Esa corrida produjo un snapshot con SIETE rivales
+    (`battle-gen6randombattle-1917`, decision 32, turno 28): la proyeccion
+    contaba `camerupt` y `cameruptmega` como dos miembros distintos porque
+    resolvia la identidad por igualdad exacta de `species` en vez de por
+    `base_species`. Camerupt mega-evoluciono en T25, salio, y volvio en T27.
+
+    Son dos aserciones, no una:
+
+      - **tamaño**: seis es la regla del juego, no un parametro;
+      - **identidad canonica duplicada**: es la causa, y se puede violar sin
+        pasar de seis (con un equipo rival de cuatro revelados, duplicar uno
+        da cinco y el tope no se entera).
+
+    Se mide sobre TODAS las filas de la corrida, no solo las de la decision
+    que falle, y se reporta el maximo observado para que el numero quede en el
+    log incluso en verde.
+    """
+    assert jugadas, "la fixture no jugo nada"
+    engine = make_engine(load_settings().database_url)
+    try:
+        async with session_factory(engine)() as s:
+            filas = (await s.execute(text(
+                "SELECT b.battle_tag, ts.decision_index, ts.turn_number, ts.state "
+                "FROM trajectory_steps ts "
+                "JOIN trajectories tr ON tr.id = ts.trajectory_id "
+                "JOIN battles b ON b.id = tr.battle_id "
+                "WHERE b.battle_tag = ANY(:tags) "
+                "ORDER BY b.battle_tag, ts.decision_index"
+            ), {"tags": jugadas})).all()
+
+            assert filas, "no hay filas nuevas que auditar"
+            excedidos = []
+            duplicados = []
+            maximo = 0
+            for tag, indice, turno, estado in filas:
+                equipo = estado["opponent"]["pokemon"]
+                maximo = max(maximo, len(equipo))
+                if len(equipo) > MAX_RIVALES:
+                    excedidos.append(
+                        (tag, indice, turno, len(equipo),
+                         [p["species"] for p in equipo])
+                    )
+                canonicas = [
+                    _canonica(_normalizar(p["species"])) for p in equipo
+                ]
+                repetidas = {c for c in canonicas if canonicas.count(c) > 1}
+                if repetidas:
+                    duplicados.append(
+                        (tag, indice, turno, sorted(repetidas),
+                         [p["species"] for p in equipo])
+                    )
+
+            print(
+                f"\n[canario equipo rival] filas={len(filas)} "
+                f"max_rivales={maximo} excedidos={len(excedidos)} "
+                f"duplicados={len(duplicados)}"
+            )
+            assert excedidos == [], (
+                f"{len(excedidos)} snapshots con mas de {MAX_RIVALES} rivales: "
+                f"{excedidos[:3]}"
+            )
+            assert duplicados == [], (
+                f"{len(duplicados)} snapshots con la misma identidad canonica "
+                f"dos veces (una forma alternativa contada como otro pokemon): "
+                f"{duplicados[:3]}"
+            )
+            # Canario del canario: si la corrida nunca revelo mas de un rival,
+            # ninguna de las dos aserciones de arriba ejercio nada.
+            assert maximo >= 3, (
+                f"solo {maximo} rivales revelados como maximo: el test no "
+                "ejercio lo suficiente"
+            )
     finally:
         await engine.dispose()

@@ -43,7 +43,7 @@ def _battle(**kw):
 
 def test_incluye_version_turno_y_metadatos():
     s = serialize_battle(_battle())
-    assert s["schema_version"] == 1
+    assert s["schema_version"] == 2
     assert s["turn"] == 3
     assert s["player_role"] == "p1"
     assert s["format"] == "gen6randombattle"

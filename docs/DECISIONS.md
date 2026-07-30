@@ -419,6 +419,15 @@ con equipos propios.
 
 ## D20 — C1: el desfase de un turno se corrige con materialización diferida, no con una espera antes de responder
 
+> **Superada por [D31](#d31--el-snapshot-de-decisión-se-completa-con-el-frame-público-ya-emitido-antes-del-lock).**
+> El síntoma y la causa raíz de acá siguen siendo correctos, pero la premisa de
+> que la narración llega "en el mismo lote" que el `|request|` es **falsa** (son
+> frames de websocket distintos, cada uno con su task), y por eso la
+> materialización diferida no arreglaba nada: refrescaba al final del lote del
+> request, cuando la narración todavía no había llegado. La medición: 297/762
+> decisiones (39.0%) informaban al proveedor un activo rival equivocado. Leer D31
+> antes de tocar este mecanismo.
+
 **Síntoma medido** (review final de `feat/agent-conexion-estado`, sobre 3123
 filas reales): mi lado del estado queda post-resolución de un turno mientras
 el lado del rival queda un turno atrás, dentro de la misma fila. Causa: en
@@ -552,6 +561,13 @@ Se truncan y se regraban con `agent play`.
 ## D22 — C-1 vuelve a ser síncrona; el cursor de `_correct_step_turns` reconoce
 tres formas de "la acción no se ejecutó" y deja de robarle líneas a la
 decisión siguiente
+
+> **Complementada por [D31](#d31--el-snapshot-de-decisión-se-completa-con-el-frame-público-ya-emitido-antes-del-lock).**
+> Que la captura sea síncrona sigue siendo obligatorio y D31 no lo relaja: la foto
+> del snapshot y la máscara se siguen tomando antes del primer `await`. Lo que
+> agrega D31 es de dónde sale la parte del rival — de una proyección pura sobre el
+> frame público **ya emitido**, esperado en un inbox pre-lock, y nunca releyendo
+> el objeto `battle`. `_finalize_pending_steps` ya no existe.
 
 Dos correcciones de la última puerta antes del merge de
 `feat/agent-conexion-estado` (review-merge.md), sobre el mismo mecanismo:
@@ -963,3 +979,299 @@ turno; si entra, `complete()` duerme ese tramo y reintenta. Dos canarios
 (`tests/graph/test_provider.py`) fijan ambas direcciones: una clave enfriada
 no se reintenta antes de tiempo, y sí vuelve después — revertido el fix,
 los seis tests nuevos fallan.
+
+## D31 — el snapshot de decisión se completa con el frame público ya emitido, antes del lock
+
+**Contexto.** `serialize_battle` corría dentro de `choose_move`, cuando poke-env
+ya había reconstruido *nuestro* lado desde el `|request|` privado pero todavía no
+había parseado la narración pública del turno que ese request resolvió. El
+resultado: un snapshot que mezcla nuestro lado en `t=k` con el rival en `t=k−1`
+— **no corresponde a ningún punto real de la batalla**. Medido sobre el corpus
+real: **297 de 762 decisiones (39.0%)** informaban al proveedor un pokémon activo
+rival **equivocado**, y **270 de esas 297 (90.9%)** mostraban exactamente el
+activo de la decisión anterior.
+
+`_finalize_pending_steps` no lo arreglaba. Se apoyaba en una premisa falsa —
+documentada como hecho en el docstring de `LudexPlayer` — de que la narración
+llegaba "en el MISMO lote" que el request. Son **frames de websocket distintos**,
+cada uno con su propia task.
+
+**Lo que se midió** (sonda causal contra Showdown local, dos variantes de 39 y 76
+decisiones; diseño y traza cruda en
+`docs/superpowers/specs/2026-07-29-f2-01-prelock-snapshot-design.md`):
+
+- `NARR(k)`, la narración que resuelve la decisión **anterior**, llega al socket
+  **0.022–5.557 ms** después del `|request|` y **antes** de que enviemos la
+  elección. Demorar la elección 500 ms **no la mueve** (76/76). No depende de
+  nuestra respuesta.
+- `NARR(k+1)`, la que resuelve la decisión **actual**, sí depende: llega 4–45 ms
+  **después** del envío.
+- Lo que mantiene a `NARR(k)` fuera de `Battle` no es el cable sino el **lock por
+  batalla** de poke-env (`ps_client.py:171-176`): su task ya arrancó pero queda
+  encolada esperando el mismo lock que la decisión mantiene abierto (medido:
+  bloqueada 501 ms con un hold de 500 ms).
+
+**La distinción importa y corrige a `.claude/agent-recording/SKILL.md` y a
+D20/D22:** "esperar la narración es un punto muerto garantizado" vale para
+`NARR(k+1)`, no para `NARR(k)`.
+
+**Decisión.** Un observador envuelve `PSClient._handle_message` —el único punto de
+poke-env 0.15.0 que corre dentro de la task del frame y **antes** del lock— y
+publica el frame crudo en un inbox por `battle_tag`. La decisión espera esa señal
+y aplica una **proyección pura** sobre el snapshot inmutable.
+
+Contrato del snapshot:
+
+- `graph_input["raw_state"]` y `step["state"]` son **el mismo objeto**: no pueden
+  representar puntos distintos de la batalla.
+- Máscara, `action_taken` y mapa acción→`BattleOrder` se siguen capturando
+  **síncronos antes del primer `await`**. La proyección nunca escribe
+  `legal_actions`, `me` ni `player_role`.
+- El proyector vive en `showdown/protocol.py`, que **no importa poke-env**: se
+  testea sin levantar nada. Las traducciones que necesitan el dex o los enums de
+  la librería entran inyectadas (`ObservableVocabulary`), de modo que las
+  inferencias legítimas quedan ancladas al dex y **nunca a una lista a mano**.
+- Nunca se consume una línea `|request|`, ni se relee `Battle` después de decidir.
+- Se espera **únicamente** al inbox. Esperar a `Battle`, al `ProtocolRecorder` o a
+  `_handle_battle_message` desde una decisión que tiene el lock sigue siendo un
+  punto muerto y sigue prohibido.
+- El `ProtocolRecorder` no cambia: se sigue grabando bajo el lock y sigue siendo
+  la fuente de verdad persistida (D17). El inbox es solo el canal de señal.
+- **El chat de batalla nunca entra al prompt.** La completitud de la espera es
+  lista **blanca** (`RESOLUTION_TAGS`): `c`/`c:`, `inactive`, `j`/`l`/`n`, `t:`
+  solo, `request`, `error`, `popup`, `raw`, `html` e `init` no pueden completarla
+  ni llegar al estado. Con lista negra, un `|c:|` habría bastado para decidir sin
+  la narración y el desfase volvía.
+- `|turn|` **no** es requisito de completitud: el frame de un cambio forzado
+  cierra en el `|faint|` y nunca lo trae (medido: 7/76 decisiones con
+  `forceSwitch`, todas con `turn=None`). Exigirlo colgaba cada cambio forzado.
+
+**Fallo cerrado, no fila degradada.** Si la narración no llega dentro del
+presupuesto (`projection_timeout_seconds`, default 1.0 s, acotado además por el
+presupuesto de la decisión): se incrementa `projection_timeout_count`, se lanza
+`ProjectionTimeoutError`, se propaga por `_background_failure` y **se retira el
+paso reservado**. No se invoca al proveedor con estado stale ni se persiste una
+fila marcada. **Si una fila existe, su proyección es válida por construcción** —
+una fila degradada contaminaría el corpus antes de que el auditor pudiera
+excluirla.
+
+**El cursor es un `ContextVar`, no `last_seq`.** poke-env crea una task por frame
+y todas publican al arrancar, pero solo una entra al lock por vez. Bajo carga,
+para cuando la decisión del frame N llega a `choose_move`, los frames N+1, N+2…
+ya están publicados: `last_seq` devolvería uno de **ellos** y la decisión
+esperaría una narración que no es la suya. Cazado por el test de frames reales,
+no teorizado.
+
+**`detailschange` no cambia `species`.** `Pokemon.forme_change()` llama a
+`_update_from_pokedex(..., store_species=False)` (`pokemon.py:431-433`): tras una
+Mega evolución poke-env conserva la forma base. La proyección hace lo mismo —
+cambia los **tipos**, no la especie. Escribir `slowbromega` habría hecho que la
+proyección contradiga al resto del dataset dentro de la misma batalla (medido en
+`battle-gen6randombattle-1896`).
+
+Corolario de medición: la prevalencia oficial del defecto es **297/762 = 39.0%**,
+con firma de retraso-en-uno **270/297 = 90.9%**. Una versión intermedia de la
+consulta contaba `detailschange` como cambio de identidad y daba 309/762 = 40.6%;
+eso sobrecontaba 12 filas por Mega. Toda la documentación de F2-01 cita 39.0%.
+
+**La identidad de un miembro del equipo es su `base_species`, no su `species`.**
+Es el criterio de `Pokemon.identifies_as` (`pokemon.py:435-438`). Comparar
+`species` a secas contaba `camerupt` y `cameruptmega` como dos miembros: una Mega
+que sale del campo y vuelve producía un **equipo rival de siete**, imposible por
+las reglas del juego (medido en `battle-gen6randombattle-1917`, decisión 32).
+Cuál de las dos formas nombra cada lado depende de la línea: `switch` escribe la
+especie (`store_species=True`), `detailschange` no.
+
+**`replace` son dos entradas del equipo, no un renombre.** Renombrar la entrada
+activa —lo primero que se implementó— borraba al imitado del equipo rival, aunque
+su `|switch|` es evidencia pública de que el rival lo tiene, y le regalaba al
+imitador el item, la ability y los movimientos que se le habían atribuido al
+imitado. Paridad con `AbstractBattle._end_illusion_on`
+(`abstract_battle.py:409-427`): el imitador entra con especie, nivel y tipos del
+`details` del `|replace|` y hereda HP, status y `fainted`, porque el que estaba en
+el campo era él; el imitado queda inactivo, con boosts limpios, `status=None` y
+`hp_fraction=0.0` —lo que devuelve `current_hp_fraction` cuando `_current_hp` es
+`None` (`pokemon.py:988-995`)—; item y movimientos no viajan.
+
+**La ability sale del dex cuando el dex la determina.** Si una especie tiene
+exactamente una ability posible, saberla no es información oculta: Zoroark solo
+puede tener Illusion, Weezing solo Levitate. Es la misma inferencia que hace
+`_update_from_pokedex` (`pokemon.py:658-661`), con el mismo corte de `gen >= 3`, y
+resuelve el `illusion` público sin ninguna lista de especies a mano; Camerupt tiene
+tres abilities y queda en `None`. Una forma Mega/Primal reporta la suya, porque
+poke-env la guarda en `forme_change_ability` y la property la prefiere
+(`pokemon.py:650-655`, `861-871`). `|-end|{side}a: X|Illusion` se procesa además
+por sí misma, para cubrir la ventana de frames que arranca después del `|replace|`.
+
+**Todo el estado temporal de Transform se limpia al salir del campo.** `switch_out`
+borra en poke-env `_temporary_types`, `temporary_ability`, `_transform_moves` y los
+boosts (`pokemon.py:600-612`). Lo persistente sobrevive: la ability que reveló
+Imposter y el movimiento `transform` que poke-env agrega al moveset base, con PP
+completo. El proyector guarda el estado base **antes** de que Transform lo tape, en
+un registro por identidad canónica dentro de la propia proyección, en vez de
+intentar adivinarlo después.
+
+**La rama `move` no puede inventar pertenencia ni PP.** Tratar toda línea `|move|`
+como "este movimiento es del actor" era falso: el corpus tiene 39 líneas `|move|`
+con `[from] ability:`, casi todas **Magic Bounce**, donde el movimiento reflejado
+era del rival de ese actor. Se reproducen las excepciones que poke-env ya codifica
+(`abstract_battle.py:582-700`), ancladas a los sufijos públicos: Magic Bounce,
+Magic Coat, Mirror Move, `lockedmove` y Sky Attack no revelan; Copycat, Metronome,
+Nature Power y Round no revelan el eco; Sleep Talk sí, porque llama movimientos
+propios, y con PP completo porque el PP lo paga Sleep Talk; Dancer descarta la línea
+entera. El PP se **descuenta** desde el valor que ya trae el snapshot, y va en
+`null` cuando no es derivable con exactitud —`max_pp` desconocido, o Pressure de
+nuestro lado, que descuenta 2 con una regla dependiente del objetivo—. Conservar el
+número anterior afirmaba un PP stale.
+
+**`typechange` y Transform/Imposter también se proyectan**, ancladas a la
+librería y no a listas a mano: `|-start|…|typechange|Water/Flying` vía
+`PokemonType.from_name`, con la forma `[of]` de Reflect Type resuelta igual que
+`abstract_battle.py:802-809`; y `|-transform|…|[from] ability: Imposter`, que copia
+de un pokémon **nuestro** —información que ya tenemos, no fuga— con tipos del dex
+de la especie copiada, boosts, moveset y ability del objetivo y la especie
+intacta, igual que `Pokemon.transform()` (`pokemon.py:625-636`). El PP de un
+movimiento copiado es `min(5, max_pp)` desde gen 5 (`move.py:114`, `move.py:
+477-478`): regla fija de la generación, derivable. Un `switch` posterior borra los
+tipos temporales, igual que `switch_out` limpia `_temporary_types`.
+
+**La exclusión de cambios forzados en la verificación de integración exige firma
+demostrable.** Excluir por `turn_number` repetido a secas era demasiado ancho:
+tapaba cualquier defecto futuro que duplicara el turno por otro motivo, que es la
+misma cobertura silenciosa que costó 265 pasos cuando la PK estaba sobre
+`turn_number` (D21). Se piden dos hechos públicos independientes: la máscara
+persistida sin **ni un** movimiento (un `forceSwitch` llega sin `moves`) y un
+`|faint|{rol}a:` en el protocolo de ese mismo turno. Una decisión que comparte
+turno y no cumple las dos **hace fallar el test**.
+
+**La retención del `RawFrameInbox` está acotada**: `MAX_RETAINED_FRAMES = 128` por
+tag durante la batalla y `close()` la libera al terminarla. El tope no puede
+volverse una respuesta equivocada: si el frame que seguía al cursor se desalojó,
+`wait_for_resolution` falla **cerrado**, porque el primer frame retenido ya no es
+demostrablemente el de esa decisión. El mayor `seq` desalojado se rastrea **por
+tag**, ya que `_seq` es global y los `seq` de un tag no son contiguos.
+
+**Esquema v2.** Un movimiento rival revelado desde `|move|` entra como
+`{"id": ..., "pp": null, "max_pp": null}`: `null` significa **"no derivable de
+esa evidencia pública"**, no cero ni PP faltante por error. Las filas históricas
+v1 no se reescriben ni se les inventa metadata. El invariante global deja de ser
+"una sola versión" y pasa a exigir que columna y JSON coincidan por fila, que
+solo aparezcan versiones soportadas `{1, 2}`, y que las filas nuevas sean v2. No
+hace falta migración: la columna ya versiona el payload.
+
+**Turno.** La proyección fija `turn` desde el `|turn|N` de la narración previa, y
+conserva el `decision_turn` síncrono cuando no lo hay (cambio forzado). Para la
+ruta del grafo, `_correct_step_turns` **verifica** que coincida con la línea que
+resolvió la acción y **falla ruidosamente** si no, en vez de mutar a posteriori el
+dict que ya vio el proveedor. La ruta random conserva su corrección histórica.
+
+**Reintentos por elección rechazada.** F2-01 se ocupa solo de frescura y de no
+trabarse: se marca el próximo `choose_move` como retry **antes** de delegar en
+`super()` —única forma de cubrir las dos rutas, porque `[Invalid choice]`
+reintenta dentro del mismo frame y `[Unavailable choice]` en uno posterior—, se
+salta la espera (no hay turno que resolver) y se reutiliza **solo** `opponent`,
+`field` y `turn` de la última proyección válida sobre el snapshot propio
+**nuevo**. Nunca el dict completo: la máscara pudo cambiar al descubrirse
+`trapped`. Sin proyección previa válida, falla ruidosamente. La identidad canónica
+de la decisión, el descarte del intento rechazado y `decision_index` siguen
+siendo de F2-02.
+
+**Memoria pública entre decisiones, por tag e identidad canónica.**
+`project_observable_state` se llama UNA VEZ por decisión, siempre con un
+snapshot fresco de `serialize_battle(battle)`. Confundir "tapado
+temporalmente" con "hay que recalcular del dex" —lo que hacía la versión
+anterior— perdía los tipos de una Mega o el ability/moveset propios de un
+Transform tan pronto la decisión que los aplicó terminaba: `switch_out`
+(`pokemon.py:600-612`) en poke-env **nunca** resetea `_type_1`/`_type_2`, solo
+limpia `_temporary_types`/`temporary_ability`/`_transform_moves`, que son
+campos DISTINTOS. La corrección agrega un parámetro explícito
+`persistent_state: dict[str, dict]` (mutado in-place, no un caché oculto): un
+typechange o un Transform siembran ahí, con `setdefault` (nunca pisan un
+registro ya sembrado), el valor de tipos/ability/moves de ANTES del override;
+`switch_out` restaura desde ahí si hay registro, y si NO lo hay **no toca
+nada** —ni tipos, ni ability, ni moves—, porque ya son los persistentes
+correctos. `client.py` le pasa a cada decisión el mismo dict por `battle_tag`,
+vivo mientras dura la batalla y liberado en `win`/`tie`.
+
+**Item y ability revelados por el sufijo de un `-damage`/`-heal`.** Se
+reproducen los cuatro helpers de poke-env (`abstract_battle.py:333-403`): daño
+por item/ability propios (sin `[of]`), daño por item/ability ajenos (`[of] X`,
+donde X puede ser CUALQUIERA de los dos lados), heal por item propio (con el
+guard de poke-env: no reescribe si el item ya es `None` —consumido— o si el
+nombre es una berry/herb), y heal por ability propia (el `[of]` de esa línea es
+engañoso y NO indica el dueño, salvo el caso especial Hospitality). Se procesa
+**antes** del filtro por `ident` de la línea, porque el mon dañado puede ser
+nuestro propio activo mientras el item/ability revelado es del rival vía
+`[of]`: filtrar por ident perdería esa revelación entera.
+
+**`-clearallboost` no trae `ident`.** Limpia los dos activos a la vez
+(`abstract_battle.py:901-902`); el guard genérico `len(parts) < 3` lo volvía
+inalcanzable (94 líneas reales en el corpus de test, cero ejercidas). Se
+procesa antes de ese guard. `-clearnegativeboost`/`-clearpositiveboost`/
+`-invertboost`/`-copyboost` sí se proyectan (el objetivo de `-copyboost` puede
+ser el rival aunque la fuente seamos nosotros). **`-swapboost` falla CERRADO**
+(`ProjectionAmbiguityError`, ver más abajo): documentarlo como límite y
+conservar el boost stale del rival —lo que hacía la ronda anterior— quedó
+rechazado explícitamente. Sigue en `RESOLUTION_TAGS` para no colgar la espera,
+pero la decisión entera se aborta antes que persistir un boost del rival
+sabidamente incorrecto.
+
+**Dancer revela su propia ability, no el movimiento.** Orden exacto de
+poke-env (`abstract_battle.py:650-656`): la ability se asigna PRIMERO,
+incondicionalmente, y recién después viene el `return` que omite
+`register_move`. La versión anterior invertía el orden y dejaba `ability=None`.
+
+**La fuente propia se resuelve por el NOMBRE del evento, no por "quien está
+activo ahora".** `snapshot["me"]` viene fresco del `|request|` propio, ya
+post-resolución de TODO el turno. Si un evento (Transform, Reflect Type,
+`-copyboost`) nombra a un pokémon propio que DESPUÉS salió del campo dentro de
+la MISMA narración, "el activo ahora" es el que entró después, no el nombrado
+— medido en `battle-gen6randombattle-1929`: un `-transform` que copiaba a
+Spinda terminaba copiando a Tentacruel. `own_mon_named()` resuelve por
+identidad canónica (`base_species`, igual que D22) contra el equipo COMPLETO
+en `snapshot["me"]["pokemon"]` (poke-env conoce los seis desde el team
+preview), y **falla cerrado** (`ProjectionAmbiguityError`) si el nombre no
+corresponde a ningún miembro conocido, en vez de sustituir por el activo
+"por las dudas" — que sería repetir el mismo bug. `own_active()` queda
+restringido a lo que de verdad depende de "ahora mismo" (Pressure sobre un
+movimiento rival).
+
+**La ability tiene una base persistente y un override temporal, igual que el
+setter de poke-env.** `Pokemon.ability` (setter, `pokemon.py:873-878`): si
+`_ability` es `None`, el valor se vuelve persistente; si no, es un override
+temporal. La versión anterior conflacionaba las dos en un solo campo. Ahora
+`reveal_ability()` implementa la misma regla (usada por `-ability`, Magic
+Bounce/Dancer y la ability copiada por Transform): la primera revelación es
+persistente y no siembra nada; una revelación posterior es temporal y siembra,
+con `setdefault`, el valor anterior en `persistent_state[canon]["ability"]`.
+`switch_out` restaura desde ahí — y a diferencia de `types`/`moves` (que se
+consumen, `pop`, porque un Transform es puntual), **la ability NO se
+descarta**: sobrevive para el próximo override, igual que `_ability` nunca se
+olvida en poke-env aunque el pokémon salga del campo. Trace es el caso
+especial (`abstract_battle.py:781-792`, "correcting for bad PS ordering of
+logs"): borra la base anterior y fija `"trace"` como la nueva, ANTES de
+aplicar el override con la ability copiada — 170 líneas reales en el corpus.
+`-endability` restaura ya, sin esperar un switch, y solo si hay un override
+activo (si no, es un no-op, igual que en poke-env).
+
+**Hallazgo incidental, fuera de los cuatro pedidos: `_find_action_line` matcheaba
+de más contra un sufijo `[from] move: X`.** No es parte de la proyección del
+rival —es la atribución de turno de NUESTRAS propias decisiones (D20/D22/D23)—,
+pero la verificación de integración estrechada de esta ronda lo destapó: Sleep
+Talk llamando a Rest se narra `|move|p1a: Spiritomb|Rest||[from] move: Sleep
+Talk|[still]`, y buscar `"sleeptalk" in _normalize(line)` sobre la línea
+**entera** matcheaba esa línea de Rest aunque la decisión elegida fuera un
+**segundo** Sleep Talk real, más adelante. Medido en
+`battle-gen6randombattle-1925`: la decisión 32 se apropiaba de la línea que ya
+había resuelto la decisión 31 y quedaba con `turn_number` equivocado. El match
+ahora se ancla a `parts[3]` (el token del movimiento o la especie), no a la
+línea completa. Cambio mínimo, con su propio test (`test_find_action_line_no_
+matchea_un_sufijo_from_move_de_otro_movimiento`) y su propia rotura deliberada;
+no toca el camino pre-lock ni ninguno de los cuatro findings de esta ronda.
+
+**Límite conocido.** El seam `_handle_message` es privado y poke-env 0.15.0 no
+expone un hook pre-lock. `tests/showdown/test_pokeenv_contract.py` lo protege; su
+aserción central es que el inbox se puebla **con el lock del tag tomado** mientras
+`_on_battle_message` todavía no fue invocado, así que si poke-env moviera el lock
+más arriba el test cae antes de que el dataset se degrade en silencio. La salida
+de fondo es un hook `on_raw_frame` upstream.

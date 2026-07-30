@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import json
 import logging
 import re
@@ -16,11 +17,24 @@ from collections import defaultdict
 from typing import Any
 
 from poke_env import ServerConfiguration
+from poke_env.battle.field import Field
+from poke_env.battle.pokemon_type import PokemonType
+from poke_env.battle.side_condition import STACKABLE_CONDITIONS, SideCondition
+from poke_env.battle.weather import Weather
+from poke_env.data import GenData
 from poke_env.player import RandomPlayer
 
 from ..state.actions import action_from_order, legal_actions
 from ..state.serializer import serialize_battle
-from .protocol import ProtocolRecorder
+from .protocol import (
+    CURRENT_FRAME_SEQ,
+    ProjectionTimeoutError,
+    ProjectionAmbiguityError,
+    ProtocolRecorder,
+    RawFrameInbox,
+    normalize_id,
+    project_observable_state,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -48,6 +62,127 @@ def local_server_configuration(ws_url: str) -> ServerConfiguration:
 
 def _normalize(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+class PokeEnvVocabulary:
+    """Traduce nombres del protocolo usando el dex y los enums de poke-env.
+
+    Vive de este lado a proposito: `showdown/protocol.py` no importa poke-env,
+    y asi el proyector se testea sin levantar nada. Ademas mantiene las
+    inferencias legitimas ancladas al dex y a los enums de la libreria, nunca
+    a una lista a mano (ver .claude/agent-recording/SKILL.md).
+
+    La generacion es siempre un parametro: se instancia una por `battle.gen`.
+    """
+
+    def __init__(self, gen: int) -> None:
+        data = GenData.from_gen(gen)
+        self._gen = gen
+        self._pokedex = data.pokedex
+        self._moves = data.moves
+
+    def species_types(self, species_id: str) -> list[str]:
+        entry = self._pokedex.get(species_id) or {}
+        # El serializador persiste los enums de poke-env por NOMBRE
+        # (`PokemonType.DARK` -> "DARK"); el dex los trae capitalizados.
+        return [str(t).upper() for t in entry.get("types", [])]
+
+    def base_species(self, species_id: str) -> str:
+        """Identidad canonica: la especie base del dex.
+
+        Es el criterio de `Pokemon.identifies_as` (`pokemon.py:435-438`), que
+        es como poke-env decide si dos nombres son el MISMO miembro del equipo.
+        `baseSpecies` viene capitalizado para las formas alternativas
+        ("Camerupt" para `cameruptmega`), asi que hay que normalizarlo.
+        """
+        entry = self._pokedex.get(species_id) or {}
+        base = entry.get("baseSpecies")
+        return normalize_id(str(base)) if base else species_id
+
+    def _is_forme_change_forme(self, entry: dict) -> bool:
+        """Mismo predicado que `_update_from_pokedex` (`pokemon.py:650-655`)."""
+        forme = entry.get("forme")
+        if not forme:
+            return False
+        forme = str(forme)
+        return (
+            forme.startswith("Mega")
+            or forme in ("Primal", "Stellar", "Terastal")
+            or forme.endswith("-Tera")
+        )
+
+    def forme_change_ability(self, species_id: str) -> str | None:
+        """La ability de una forma Mega/Primal, que la property `ability` de
+        poke-env prefiere sobre la revelada (`pokemon.py:861-871`)."""
+        entry = self._pokedex.get(species_id) or {}
+        if not self._is_forme_change_forme(entry):
+            return None
+        abilities = entry.get("abilities") or {}
+        raw = abilities.get("0")
+        return normalize_id(str(raw)) if raw else None
+
+    def unique_ability(self, species_id: str) -> str | None:
+        """La ability cuando el dex lista EXACTAMENTE una posible.
+
+        Inferencia legitima y anclada al dex: si Zoroark solo puede tener
+        Illusion, saberlo no es informacion oculta. poke-env hace lo mismo en
+        `_update_from_pokedex` (`pokemon.py:658-661`), con el mismo corte de
+        `gen >= 3`.
+        """
+        if self._gen < 3:
+            return None
+        entry = self._pokedex.get(species_id) or {}
+        if self._is_forme_change_forme(entry):
+            return None
+        abilities = list((entry.get("abilities") or {}).values())
+        if len(abilities) != 1:
+            return None
+        return normalize_id(str(abilities[0]))
+
+    def move_max_pp(self, move_id: str) -> int | None:
+        """PP maximo, con la misma cuenta que `Move.max_pp` (`move.py:476`)."""
+        entry = self._moves.get(move_id) or {}
+        pp = entry.get("pp")
+        if not isinstance(pp, int):
+            return None
+        return pp * 8 // 5
+
+    def type_name(self, raw: str) -> str | None:
+        """Nombre de tipo narrado ("Water", "Flying") -> nombre del enum.
+
+        Anclado a `PokemonType.from_name`, que es lo que usa poke-env para
+        `typechange` (`pokemon.py:567-570`), y no a una tabla a mano.
+        """
+        try:
+            return PokemonType.from_name(raw.strip()).name
+        except (KeyError, ValueError, AttributeError):
+            return None
+
+    def weather_name(self, raw: str) -> str | None:
+        if not raw or raw.lower() == "none":
+            return None
+        try:
+            return Weather.from_showdown_message(raw).name
+        except (KeyError, ValueError, AttributeError):
+            return None
+
+    def field_name(self, raw: str) -> str | None:
+        try:
+            return Field.from_showdown_message(raw).name
+        except (KeyError, ValueError, AttributeError):
+            return None
+
+    def side_condition_name(self, raw: str) -> str | None:
+        try:
+            return SideCondition.from_showdown_message(raw).name
+        except (KeyError, ValueError, AttributeError):
+            return None
+
+    def side_condition_is_stackable(self, raw: str) -> bool:
+        try:
+            return SideCondition.from_showdown_message(raw) in STACKABLE_CONDITIONS
+        except (KeyError, ValueError, AttributeError):
+            return False
 
 
 # Margen de turnos mas alla de `decision_turn` (battle.turn capturado
@@ -317,7 +452,19 @@ def _find_action_line(
             # esa linea disponible para que la decision siguiente la robe.
             request_activo_turn = turn
         elif line.startswith(prefix_move) or line.startswith(prefix_switch):
-            if clave in _normalize(line):
+            # Ancla el match al TOKEN del movimiento/especie (`parts[3]`), no
+            # a la linea entera. Hallazgo nuevo (F2-01, segunda ronda):
+            # `clave in _normalize(line)` matcheaba de mas cuando el nombre
+            # elegido aparecia dentro de un sufijo `[from] move: X` de OTRO
+            # movimiento -- Sleep Talk llamando a Rest se narra
+            # `|move|p1a: Spiritomb|Rest||[from] move: Sleep Talk|[still]`, y
+            # buscar "sleeptalk" en esa linea entera matcheaba aunque la linea
+            # es la resolucion de REST, no de un segundo Sleep Talk. Medido:
+            # `battle-gen6randombattle-1925`, decision 32 se apropiaba de esa
+            # linea (la misma que ya habia consumido la decision 31) y quedaba
+            # con `turn_number=28` en vez de su turno real.
+            move_parts = line.split("|")
+            if len(move_parts) > 3 and clave in _normalize(move_parts[3]):
                 return turn, from_index + offset + 1
             if line.startswith(prefix_move):
                 se_movio_en.add(turn)
@@ -450,29 +597,52 @@ class LudexPlayer(RandomPlayer):
     que `parse_request` ya proceso antes de que poke-env llame a
     `choose_move` (ver `player.py:289-294` en poke-env).
 
-    Lo que SI hacia falta esperar es el lado del rival (D20 original: mi
-    equipo llega fresco por el `|request|`, pero Showdown narra "lo que paso
-    en el turno" —incluida la revelacion del rival— DESPUES del `|request|`,
-    en el MISMO lote). La clave (ver `_handle_battle_message`): ese lote
-    COMPLETO ya esta grabado en `self.recorders[tag]` ANTES de que
-    `super()._handle_battle_message()` procese una sola linea (el recorder
-    graba de una sola vez, no incrementalmente), y para cuando esa llamada a
-    `super()` REGRESA, poke-env ya proceso el lote entero —incluida la
-    narracion que estaba pendiente cuando `choose_move` corrio a mitad de
-    camino— y actualizo `battle.opponent_team` en consecuencia. Por eso
-    `_finalize_pending_steps` corre ENTRE que `super()._handle_battle_message`
-    regresa y que nuestro propio `_handle_battle_message` regresa: sigue
-    siendo parte de la MISMA llamada sincronica que proceso el lote, nunca una
-    task planificada aparte, asi que NINGUNA decision futura puede
-    "adelantarsele": la unica forma de que se procese el lote de la decision
-    N+1 es que esta llamada retorne primero, y para entonces la decision N ya
-    quedo finalizada.
+    ## D31 (MON-6) — CORRECCION: la narracion NO viene en el mismo lote
 
-    `legal_actions` y `turn` de cada paso SIEMPRE se sobreescriben con el
-    valor capturado en `choose_move` (nunca con lo que `serialize_battle`
-    recalcularia en el momento de finalizar): eso es lo que hace que
-    `action_taken in legal_actions` valga por CONSTRUCCION, no por
-    casualidad de timing.
+    La version anterior de este docstring afirmaba que Showdown narra el turno
+    "DESPUES del `|request|`, en el MISMO lote", y sobre esa premisa se
+    construyo `_finalize_pending_steps`. **Es falso, y medido**: son frames de
+    websocket DISTINTOS, cada uno con su propia task
+    (`asyncio.create_task` por frame en `ps_client.listen`).
+
+    Por eso `_finalize_pending_steps` no arreglaba nada: corria al final del
+    lote del `|request|`, cuando la narracion todavia no habia llegado. El
+    resultado medido sobre el corpus real: en 297 de 762 decisiones (39.0%)
+    el snapshot le informaba al proveedor un pokemon activo rival
+    EQUIVOCADO, y 270 de esas 297 (90.9%) mostraban exactamente el activo de
+    la decision anterior.
+
+    Lo que si es cierto, y lo que sostiene el diseño actual (sonda causal en
+    `docs/superpowers/specs/2026-07-29-f2-01-prelock-snapshot-design.md`):
+
+    - `NARR(k)`, la narracion que resuelve la decision ANTERIOR, llega al
+      socket 0.022-5.557 ms despues del `|request|` y **antes** de que
+      enviemos nuestra eleccion. Demorar la eleccion 500 ms no la mueve
+      (76/76 decisiones). **No depende de nuestra respuesta.**
+    - `NARR(k+1)`, la que resuelve la decision ACTUAL, si depende: llega
+      recien 4-45 ms DESPUES del envio. Esperar esa es el punto muerto que
+      documenta `.claude/agent-recording/SKILL.md`, y sigue prohibido.
+    - Lo que mantiene a `NARR(k)` fuera de `Battle` no es el cable sino el
+      lock por batalla de poke-env (`ps_client.py:171-176`): su task ya
+      arranco, pero queda encolada esperando el mismo lock que esta decision
+      mantiene abierto (medido: bloqueada 501 ms con un hold de 500 ms).
+
+    De ahi el camino pre-lock: un observador envuelve
+    `PSClient._handle_message` y publica el frame CRUDO en `frame_inbox`
+    ANTES de que el original intente adquirir el lock. La decision espera esa
+    señal —nunca a `Battle` ni al recorder, que solo avanzan bajo el lock— y
+    aplica una proyeccion pura sobre el snapshot inmutable.
+
+    ## Lo que D20/D22 dejaron bien y se conserva
+
+    `choose_move` captura TODO lo que define la decision (`legal_actions`,
+    `action_taken`, `decision_turn`, mapa accion->`BattleOrder`) en el mismo
+    instante sincronico, antes del primer `await`. `action_taken in
+    legal_actions` vale por CONSTRUCCION porque las dos salen de la misma
+    linea de codigo. Y nada que deba ser consistente con la decision se relee
+    de `battle` despues: la proyeccion sale del protocolo crudo (D17), nunca
+    del objeto mutable. Eso no cambia; lo que se corrige es la premisa de
+    DISPONIBILIDAD, no la disciplina.
     """
 
     def __init__(
@@ -480,17 +650,53 @@ class LudexPlayer(RandomPlayer):
         *args: Any,
         decision_graph: Any = None,
         decision_budget_seconds: float = 240,
+        projection_timeout_seconds: float = 1.0,
         **kwargs: Any,
     ) -> None:
-        super().__init__(*args, **kwargs)
+        # El listener se arranca DESPUES de instalar el observador pre-lock:
+        # si poke-env lo arrancara desde su propio __init__, el primer frame
+        # podria entrar sin observar. Se preserva lo que pidio el caller: si
+        # pidio False, no se arranca nada.
+        caller_wants_listening = kwargs.pop("start_listening", True)
+        super().__init__(*args, start_listening=False, **kwargs)
         self.decision_graph = decision_graph
         self.decision_budget_seconds = decision_budget_seconds
+        self.projection_timeout_seconds = projection_timeout_seconds
         self.recorders: dict[str, ProtocolRecorder] = defaultdict(ProtocolRecorder)
         self.steps: dict[str, list[dict | None]] = defaultdict(list)
-        # Indices de self.steps[tag] cuyo "state" todavia es None: se llenan
-        # sincronicamente en _finalize_pending_steps, nunca en una task de
-        # fondo (ver docstring de la clase).
-        self._pending_finalize: dict[str, list[int]] = defaultdict(list)
+        # Frames crudos publicados ANTES del lock por batalla. Es lo unico
+        # que una decision puede esperar sin trabarse (ver docstring).
+        self.frame_inbox = RawFrameInbox()
+        # Ultima proyeccion publica valida por tag. La reusa un reintento
+        # tras una eleccion rechazada, donde no hay resolucion nueva que
+        # esperar.
+        self._last_projection: dict[str, dict] = {}
+        # Memoria PUBLICA entre decisiones, por tag e identidad canonica:
+        # tipos/ability/moves persistentes que un typechange o un Transform
+        # tapan temporalmente. `switch_out` (`pokemon.py:600-612`) en
+        # poke-env nunca resetea `_type_1`/`_type_2`, solo los overrides
+        # temporales -- sin esta memoria vivendo MAS ALLA de una sola
+        # proyeccion, la version anterior perdia los tipos de una Mega o el
+        # moveset/ability propios de un Transform en cuanto la decision que
+        # los aplico terminaba (finding 1, TECH LEAD REVIEW sobre `b784bcc`).
+        self._temporary_state: dict[str, dict[str, dict]] = {}
+        # Marca explicita de "el proximo choose_move de este tag es un
+        # reintento". Se pone al ver el `|error|` y se consume UNA sola vez.
+        self._retry_pending: dict[str, bool] = {}
+        self._vocabularies: dict[int, PokeEnvVocabulary] = {}
+        # Contador consultable: cuantas decisiones fallaron cerrado porque la
+        # narracion previa no llego a tiempo. Distinto de cero es fallo, no
+        # warning.
+        self.projection_timeout_count: int = 0
+        # Contador consultable, mismo espiritu que el anterior: cuantas
+        # decisiones fallaron cerrado porque un evento nombraba a un pokemon
+        # propio que ya no era el activo del snapshot (Transform/Reflect
+        # Type/-copyboost con nickname ambiguo o no resoluble).
+        self.projection_ambiguity_count: int = 0
+        self._listener_started = False
+        self._install_prelock_observer()
+        if caller_wants_listening:
+            self.start_listening()
         # player_role no cambia en el curso de una batalla: capturarlo UNA
         # vez en choose_move deja a _correct_step_turns sin necesidad de
         # tocar `self.battles`/`battle` para nada.
@@ -520,6 +726,54 @@ class LudexPlayer(RandomPlayer):
         return await asyncio.shield(
             asyncio.wrap_future(self._background_failure)
         )
+
+    def _install_prelock_observer(self) -> None:
+        """Envuelve `PSClient._handle_message` para publicar el frame crudo
+        ANTES de que el original intente adquirir `_battle_locks[tag]`.
+
+        Es el unico punto de poke-env 0.15.0 que corre dentro de la task del
+        frame y antes del lock (`ps_client.py:156-176`). Se ENVUELVE, no se
+        reemplaza: el original se sigue llamando con el mismo mensaje, sin
+        consumir, filtrar ni reordenar nada. `listen()` no se copia ni se
+        toca.
+
+        `tests/showdown/test_pokeenv_contract.py` falla ruidosamente si
+        poke-env mueve el lock o cambia esta firma.
+        """
+        client = self.ps_client
+        original = client._handle_message
+        inbox = self.frame_inbox
+
+        async def observed(message: str) -> Any:
+            if message.startswith(">battle"):
+                lines = tuple(message.split("\n"))
+                tag = lines[0][1:].strip()
+                if tag:
+                    frame = await inbox.publish(tag, lines)
+                    # Cada frame corre en su propia task, con su propia copia
+                    # del contexto: asi `choose_move` sabe cual es SU frame
+                    # aunque haya varios encolados detras del lock.
+                    CURRENT_FRAME_SEQ.set(frame.seq)
+            return await original(message)
+
+        client._handle_message = observed
+
+    def start_listening(self) -> None:
+        """Arranca el listener que `__init__` difirio. Idempotente."""
+        if self._listener_started:
+            return
+        self._listener_started = True
+        client = self.ps_client
+        client._listening_coroutine = asyncio.run_coroutine_threadsafe(
+            client.listen(), client.loop
+        )
+
+    def _vocabulary(self, gen: int) -> PokeEnvVocabulary:
+        vocabulary = self._vocabularies.get(gen)
+        if vocabulary is None:
+            vocabulary = PokeEnvVocabulary(gen)
+            self._vocabularies[gen] = vocabulary
+        return vocabulary
 
     async def _handle_battle_message(self, split_messages: list[list[str]]) -> Any:
         tag = battle_tag_from(split_messages)
@@ -566,6 +820,20 @@ class LudexPlayer(RandomPlayer):
                 )
             ):
                 self._discard_last_step(tag)
+                # D31: marcar el reintento ANTES de delegar en super(), que
+                # es lo unico que funciona para las DOS rutas de rechazo:
+                #
+                #   [Invalid choice]     -> poke-env vuelve a llamar a
+                #     `choose_move` DENTRO del manejo de este mismo frame
+                #     (`player.py:322`), sin request nuevo.
+                #   [Unavailable choice] -> solo marca `_trying_again` y el
+                #     request nuevo llega en un frame POSTERIOR.
+                #
+                # Un reintento no puede esperar narracion: no hay turno que
+                # resolver y la espera venceria siempre. Por eso hace falta
+                # una marca explicita y no alcanza con mirar "el frame
+                # anterior al request".
+                self._retry_pending[tag] = True
                 break
 
         try:
@@ -574,13 +842,13 @@ class LudexPlayer(RandomPlayer):
             if not self._background_failure.done():
                 self._background_failure.set_result(exc)
             raise
-        # SIGUE siendo la misma llamada sincronica: ninguna otra invocacion de
-        # _handle_battle_message para este tag puede haber corrido entre
-        # medio. Si `choose_move` reservo un paso en algun punto de este
-        # mismo lote (typicamente cero o uno; en cadenas de cambio forzado,
-        # mas de uno), se finaliza AHORA, con `battle` ya al dia con TODA la
-        # narracion de este lote.
-        self._finalize_pending_steps(tag)
+        if any(
+            len(parts) > 1 and parts[1] in ("win", "tie") for parts in split_messages
+        ):
+            # Despierta a cualquier decision que siguiera esperando: la
+            # batalla termino y no va a llegar mas narracion.
+            await self.frame_inbox.close(tag)
+            self._temporary_state.pop(tag, None)
         return result
 
     def _discard_last_step(self, tag: str) -> None:
@@ -596,12 +864,32 @@ class LudexPlayer(RandomPlayer):
             self.steps[tag].pop()
 
     def choose_move(self, battle: Any) -> Any:
-        if self.decision_graph is not None:
-            return self._choose_move_with_graph(battle)
-        order = super().choose_move(battle)
+        """Captura TODO lo que define la decision, sincronicamente, y devuelve
+        una coroutine que primero espera la narracion previa —ya emitida por
+        el servidor, independiente de nuestra respuesta— y recien despues
+        decide.
+
+        Las dos rutas (random y grafo) son asincronas y comparten la MISMA
+        proyeccion: `graph_input["raw_state"]` y `step["state"]` son el mismo
+        objeto, asi que no pueden contradecirse.
+        """
         tag = battle.battle_tag
         self._sides.setdefault(tag, battle.player_role)
-        action_taken = action_from_order(order)
+        # Se consume UNA sola vez (D31, reintento por eleccion rechazada).
+        retry = self._retry_pending.pop(tag, False)
+        # Cursor ANTES de cualquier await: el `seq` del frame que trajo ESTE
+        # `|request|`, no el ultimo publicado. Bajo carga hay varios frames
+        # encolados detras del lock y `last_seq` devolveria uno posterior;
+        # con el ContextVar cada decision espera exactamente la narracion que
+        # sigue a SU request, y dos decisiones nunca consumen el mismo frame.
+        cursor = CURRENT_FRAME_SEQ.get()
+        if cursor is None:
+            cursor = self.frame_inbox.last_seq(tag)
+        captured_legal = legal_actions(battle)
+        snapshot = {**serialize_battle(battle), "legal_actions": captured_legal}
+        opponent_side = "p2" if battle.player_role == "p1" else "p1"
+        vocabulary = self._vocabulary(battle.gen)
+        deadline = time.monotonic() + self.decision_budget_seconds
         # Todo esto se lee AHORA, sincronicamente, y nunca se vuelve a leer
         # de `battle`: `available_moves`/`available_switches` ya reflejan el
         # `|request|` que acaba de procesar `parse_request` (poke-env llama a
@@ -634,27 +922,53 @@ class LudexPlayer(RandomPlayer):
             _normalize(getattr(actor, "base_species", "") or actor.species)
             if actor is not None else None
         )
-        step = {
-            "turn": battle.turn,
-            "decision_turn": battle.turn,
-            "action_taken": action_taken,
-            "legal_actions": legal_actions(battle),
-            "actor_species": actor_species,
-            "state": None,  # se completa en _finalize_pending_steps
-        }
-        index = len(self.steps[tag])
-        self.steps[tag].append(step)
-        self._pending_finalize[tag].append(index)
-        return order
 
-    def _choose_move_with_graph(self, battle: Any) -> Any:
-        """Captura fotografía y órdenes antes de devolver una coroutine."""
-        tag = battle.battle_tag
-        self._sides.setdefault(tag, battle.player_role)
-        snapshot = serialize_battle(battle)
-        captured_legal = legal_actions(battle)
-        snapshot = {**snapshot, "legal_actions": captured_legal}
+        if self.decision_graph is None:
+            order = super().choose_move(battle)
+            step = {
+                "turn": battle.turn,
+                "decision_turn": battle.turn,
+                "action_taken": action_from_order(order),
+                "legal_actions": captured_legal,
+                "actor_species": actor_species,
+                "decision_path": "random",
+                "state": None,
+            }
+            self.steps[tag].append(step)
 
+            async def run_random() -> Any:
+                step["state"] = await self._resolve_state(
+                    tag, snapshot, step=step, cursor=cursor, retry=retry,
+                    opponent_side=opponent_side, vocabulary=vocabulary,
+                    deadline=deadline,
+                )
+                return order
+
+            return run_random()
+
+        return self._choose_move_with_graph(
+            battle, tag=tag, snapshot=snapshot, captured_legal=captured_legal,
+            actor_species=actor_species, cursor=cursor, retry=retry,
+            opponent_side=opponent_side, vocabulary=vocabulary,
+            deadline=deadline,
+        )
+
+    def _choose_move_with_graph(
+        self,
+        battle: Any,
+        *,
+        tag: str,
+        snapshot: dict,
+        captured_legal: list[dict],
+        actor_species: str | None,
+        cursor: int,
+        retry: bool,
+        opponent_side: str,
+        vocabulary: PokeEnvVocabulary,
+        deadline: float,
+    ) -> Any:
+        """Construye el mapa accion->`BattleOrder` ANTES de devolver la
+        coroutine: ni la espera ni el grafo pueden cambiarlo."""
         action_orders: dict[tuple[tuple[str, Any], ...], Any] = {}
         for move in battle.available_moves:
             action = {"kind": "move", "id": move.id}
@@ -668,11 +982,6 @@ class LudexPlayer(RandomPlayer):
             action = {"kind": "switch", "species": mon.species}
             action_orders[tuple(sorted(action.items()))] = self.create_order(mon)
 
-        actor = getattr(battle, "active_pokemon", None)
-        actor_species = (
-            _normalize(getattr(actor, "base_species", "") or actor.species)
-            if actor is not None else None
-        )
         index = len(self.steps[tag])
         step = {
             "turn": battle.turn,
@@ -681,16 +990,25 @@ class LudexPlayer(RandomPlayer):
             "action_path": None,
             "legal_actions": captured_legal,
             "actor_species": actor_species,
-            "state": snapshot,
+            "decision_path": "graph",
+            "state": None,
         }
         self.steps[tag].append(step)
-        graph_input = {
-            "raw_state": snapshot,
-            "turn_id": f"{tag}:{index}",
-            "deadline": time.monotonic() + self.decision_budget_seconds,
-        }
 
         async def run_graph() -> Any:
+            projected = await self._resolve_state(
+                tag, snapshot, step=step, cursor=cursor, retry=retry,
+                opponent_side=opponent_side, vocabulary=vocabulary,
+                deadline=deadline,
+            )
+            # MISMA referencia para el proveedor y para la fila: por
+            # construccion no pueden representar puntos distintos.
+            step["state"] = projected
+            graph_input = {
+                "raw_state": projected,
+                "turn_id": f"{tag}:{index}",
+                "deadline": deadline,
+            }
             result = await self.decision_graph.ainvoke(graph_input)
             action = result["action"]
             order = action_orders.get(tuple(sorted(action.items())))
@@ -704,41 +1022,89 @@ class LudexPlayer(RandomPlayer):
 
         return run_graph()
 
-    def _finalize_pending_steps(self, tag: str) -> None:
-        """Completa `state` (mi lado + el del rival + el resto del estado)
-        para cada paso reservado durante ESTE MISMO lote de protocolo.
+    async def _resolve_state(
+        self,
+        tag: str,
+        snapshot: dict,
+        *,
+        step: dict,
+        cursor: int,
+        retry: bool,
+        opponent_side: str,
+        vocabulary: PokeEnvVocabulary,
+        deadline: float,
+    ) -> dict:
+        """Estado observable con el que se decide y que se persiste.
 
-        Sincronico, nunca una task: se llama desde `_handle_battle_message`,
-        justo despues de que `super()._handle_battle_message()` termino de
-        procesar el lote completo (incluida la narracion que quedaba
-        pendiente cuando `choose_move` corrio a mitad de camino). No hay
-        forma de que otra decision se cuele entre medio: la unica manera de
-        que se procese el lote de la decision SIGUIENTE es que esta misma
-        llamada retorne primero.
-
-        `turn` y `legal_actions` se sobreescriben con lo capturado en
-        `choose_move` (nunca con lo que `serialize_battle` calcularia ahora):
-        eso es lo que preserva el invariante `action_taken in legal_actions`
-        aunque haya mas de un paso pendiente en el mismo lote (p.ej. un
-        cambio forzado tras un debilitamiento).
+        Espera la narracion previa —publicada pre-lock, ya emitida por el
+        servidor y ajena a nuestra respuesta— y le aplica una proyeccion pura
+        al snapshot inmutable. Nunca relee `Battle`.
         """
-        pending = self._pending_finalize.get(tag)
-        if not pending:
-            return
-        battle = self.battles.get(tag)
-        if battle is None:
-            return
-        fresh_state = serialize_battle(battle)
-        for index in pending:
-            step = self.steps[tag][index]
-            if step is None:
-                continue
-            step["state"] = {
-                **fresh_state,
-                "turn": step["decision_turn"],
-                "legal_actions": step["legal_actions"],
+        if retry:
+            # Un reintento no tiene resolucion nueva que esperar: el turno no
+            # avanzo. Esperar aca venceria siempre.
+            previous = self._last_projection.get(tag)
+            if previous is None:
+                self._drop_step(tag, step)
+                raise RuntimeError(
+                    f"reintento de eleccion en {tag} sin proyeccion publica "
+                    "previa valida: no hay estado observable con el que decidir"
+                )
+            # Se reusa SOLO la parte publica, nunca el dict entero: la
+            # mascara pudo cambiar al descubrirse `trapped`, y el snapshot
+            # propio de este reintento es el nuevo.
+            return {
+                **snapshot,
+                "turn": previous.get("turn", snapshot.get("turn")),
+                "opponent": copy.deepcopy(previous["opponent"]),
+                "field": copy.deepcopy(previous["field"]),
             }
-        self._pending_finalize[tag] = []
+        budget = max(0.0, deadline - time.monotonic())
+        try:
+            frame = await self.frame_inbox.wait_for_resolution(
+                tag,
+                after_seq=cursor,
+                timeout=min(self.projection_timeout_seconds, budget),
+            )
+        except ProjectionTimeoutError:
+            # Fallo CERRADO: ni se invoca al proveedor con estado stale ni
+            # queda un paso persistible. Si una fila existe, su proyeccion es
+            # valida por construccion.
+            self.projection_timeout_count += 1
+            self._drop_step(tag, step)
+            raise
+        try:
+            projected = project_observable_state(
+                snapshot,
+                frame.lines,
+                opponent_side=opponent_side,
+                vocabulary=vocabulary,
+                # Mismo dict, por tag, a traves de TODA la batalla: es lo
+                # unico que le permite a un Transform o una Mega aplicado en
+                # ESTA decision seguir siendo correcto varias decisiones
+                # despues, cuando recien ahi llegue su switch-out.
+                persistent_state=self._temporary_state.setdefault(tag, {}),
+            )
+        except ProjectionAmbiguityError:
+            # Mismo fallo CERRADO que el timeout: la alternativa era copiar
+            # silenciosamente del activo post-resolucion equivocado (el bug
+            # medido de Transform/Reflect Type/-copyboost). Ni proveedor con
+            # estado ambiguo ni fila persistida.
+            self.projection_ambiguity_count += 1
+            self._drop_step(tag, step)
+            raise
+        self._last_projection[tag] = projected
+        return projected
+
+    def _drop_step(self, tag: str, step: dict) -> None:
+        """Retira el paso reservado por una decision que fallo cerrado.
+
+        Las decisiones son estrictamente secuenciales, asi que el paso de
+        ESTA decision es siempre el ultimo del tag.
+        """
+        steps = self.steps.get(tag)
+        if steps and steps[-1] is step:
+            steps.pop()
 
     async def wait_for_pending_steps(self, tag: str) -> None:
         """Corrige la etiqueta de turno de cada paso contra el protocolo.
@@ -791,10 +1157,25 @@ class LudexPlayer(RandomPlayer):
             )
             if found is not None:
                 step["turn"], cursor = found
-                # El `turn` DENTRO del estado serializado tiene que quedar
-                # coherente con la etiqueta de la fila (review final: "state
-                #['turn'] sale de battle.turn, que va un turno atras del
-                # protocolo"). Si no se corrigiera aca tambien, la columna
-                # `turn_number` y el campo `state->>'turn'` podrian
-                # divergir dentro de la MISMA fila.
-                step["state"]["turn"] = step["turn"]
+                estado = step.get("state")
+                if estado is None:
+                    continue
+                if step.get("decision_path") == "graph":
+                    # D31: este dict es el MISMO que vio el proveedor. Mutarlo
+                    # aca reescribiria a posteriori la evidencia de la
+                    # decision, asi que se VERIFICA en vez de corregir. La
+                    # proyeccion ya fijo `turn` desde el `|turn|N` de la
+                    # narracion previa; si no coincide con la linea que
+                    # resolvio la accion, hay algo que no entendemos y tiene
+                    # que hacer ruido, no quedar tapado.
+                    if estado.get("turn") != step["turn"]:
+                        raise RuntimeError(
+                            f"{tag} decision {estado.get('turn')!r}: el turno "
+                            f"proyectado desde la narracion previa no coincide "
+                            f"con el turno {step['turn']} donde la accion se "
+                            f"resolvio en el protocolo"
+                        )
+                else:
+                    # Ruta random: conserva la correccion historica (D20/C1).
+                    # No hay proveedor que haya visto este dict.
+                    estado["turn"] = step["turn"]

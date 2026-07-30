@@ -19,10 +19,35 @@ del turno.** Refleja el estado posterior a la resolución. poke-env rehace
 `battle.team` entero desde ese JSON, mientras `opponent_team` solo avanza
 parseando la narración. Por eso el lado propio puede ir "adelante" del rival.
 
-**La narración es la RESPUESTA del servidor a que ambos jugadores eligieron**,
-no datos que ya venían en camino. Medido causalmente: retrasar la respuesta
-500 ms retrasa la narración exactamente 500 ms. **Corolario: esperar la
-narración antes de responder es un punto muerto garantizado.** No lo intentes.
+**Hay DOS narraciones y confundirlas cuesta el 39% del dataset.** Llamalas
+`NARR(k)` —la que resuelve la decisión ANTERIOR— y `NARR(k+1)` —la que resuelve
+la que estás tomando ahora.
+
+`NARR(k+1)` **es la respuesta del servidor a que ambos jugadores eligieron**.
+Medido causalmente: retrasar la respuesta 500 ms la retrasa exactamente 500 ms.
+Esperarla antes de responder es un punto muerto garantizado. No lo intentes.
+
+`NARR(k)` **ya fue emitida y no depende de vos**. Llega al socket 0.022–5.557 ms
+después del `|request|` y antes de que mandes la elección (76/76 decisiones);
+demorar la elección 500 ms **no la mueve**. Lo que la mantiene fuera de `Battle`
+no es el cable: es el **lock por batalla** de poke-env
+(`ps_client.py:171-176`), que la deja encolada mientras tu decisión lo tiene
+tomado (medido: bloqueada 501 ms con un hold de 500 ms).
+
+Durante meses el docstring de `LudexPlayer` afirmó que la narración llegaba "en
+el MISMO lote" que el request. **Es falso**: son frames de websocket distintos,
+cada uno con su propia task. Sobre esa premisa se construyó
+`_finalize_pending_steps`, que por eso no arreglaba nada — refrescaba al final
+del lote del request, cuando la narración todavía no había llegado. Resultado
+medido: 297 de 762 decisiones (39.0%) le informaban al proveedor un activo rival
+**equivocado**, y 270 de esas 297 (90.9%) mostraban exactamente el activo de la
+decisión anterior.
+
+**Cómo se obtiene `NARR(k)` sin trabarse (D31):** un observador envuelve
+`PSClient._handle_message` y publica el frame crudo **antes** del lock; la
+decisión espera ese inbox y aplica una proyección pura. Esperar a `Battle`, al
+`ProtocolRecorder` o a `_handle_battle_message` sigue siendo un punto muerto:
+los tres avanzan solo dentro del lock.
 
 **poke-env llama a `choose_move` apenas parsea el `|request|`**, dentro del
 `elif split_message[1] == "request"` de `_handle_battle_message`. Y despacha
@@ -103,6 +128,44 @@ copiando un pokémon propio, y el nivel 100 que Showdown omite.
 Showdown narra solo `Hidden Power`. Sin recortar a `hiddenpower`, la búsqueda
 no matchea nunca. Recorte específico, no una regla genérica de prefijos: hay 17
 Hidden Power que comparten el id base.
+
+**Illusion son DOS entradas, no un renombre**: en un `|replace|`, el imitado
+**sigue** en el equipo (su `|switch|` es evidencia pública de que el rival lo
+tiene) y sale del campo; el imitador entra con su nivel y tipos del `details` y
+hereda el HP y el status que recibió disfrazado. Renombrar la entrada activa
+borra un miembro del equipo rival y le regala al imitador el item y la ability
+del imitado.
+
+**Un cambio de forma NO cambia `species`**: `Pokemon.forme_change()` usa
+`store_species=False`, así que tras una Mega poke-env sigue diciendo la forma
+base. Cambian los tipos y la ability, no la especie. Contarlo como cambio de
+identidad sobrecontaba 12 filas de la métrica del defecto.
+
+**Pero un `|switch|` SÍ la cambia**, y de ahí sale la trampa que produjo un
+equipo rival de **siete**: la identidad de un miembro es su `base_species`
+(`Pokemon.identifies_as`), no su `species`. Con igualdad exacta, una Mega que
+sale del campo y vuelve entra como miembro nuevo. Seis es la regla del juego:
+tiene que haber un canario, y no alcanza con el tope —duplicar un miembro de un
+equipo de cuatro revelados da cinco y el tope no se entera—.
+
+**Una línea `|move|` no prueba que el movimiento sea del actor.** Magic Bounce
+narra el movimiento reflejado en boca de quien lo refleja (39 líneas en el
+corpus). Copycat, Metronome, Nature Power y Round narran un eco ajeno; Sleep
+Talk sí llama movimientos propios, pero sin gastarles PP. Las excepciones están
+en `abstract_battle.py` bajo la rama `move`: leerlas de ahí, no reinventarlas.
+Y un movimiento repetido **descuenta** PP: dejar el número anterior es afirmar
+un dato stale, que es peor que `null`.
+
+**Lo que el dex determina no es información oculta.** Si una especie tiene
+exactamente una ability posible, decirla no es fuga: Zoroark solo puede tener
+Illusion. Es lo que hace poke-env, y es la forma correcta de registrar la
+ability pública de una Illusion sin mantener una lista de especies.
+
+**Ante una diferencia con poke-env, gana poke-env.** Las filas de una misma
+batalla se llenan desde dos fuentes (el serializador de `Battle` y la proyección
+del protocolo): una proyección "más correcta" que la librería hace que el dataset
+se contradiga dentro de la misma batalla. Se puede **omitir** (`null` = "no
+derivable de esa evidencia"), no afirmar otra cosa.
 
 **Formas alternativas**: compará por `base_species`, no por `species`.
 Comparar por `species` rompe todo pokémon con forma alternativa (Arceus-Poison,
