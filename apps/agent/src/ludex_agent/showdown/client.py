@@ -14,6 +14,7 @@ import logging
 import re
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any
 
 from poke_env import ServerConfiguration
@@ -38,6 +39,53 @@ from .protocol import (
 
 
 logger = logging.getLogger(__name__)
+
+
+class ChoiceProtocolError(RuntimeError):
+    """El protocolo de choices perdio una correlacion que Ludex necesita."""
+
+
+@dataclass
+class OutboundCommand:
+    sequence: int
+    message: str
+    message_2: str | None
+    phase: str
+
+    @property
+    def effective_message(self) -> str:
+        return self.message_2 or self.message
+
+
+@dataclass
+class PendingChoice:
+    decision_index: int
+    attempt_index: int
+    phase: str
+    request_rqid: int | None
+    request_frame_seq: int
+    step_index: int
+    step: dict | None
+    outbound_seq: int | None = None
+    outbound_message: str | None = None
+    outbound_phase: str | None = None
+
+
+_AUXILIARY_UNDO_ERRORS = {
+    "[Invalid choice] There's nothing to cancel",
+    (
+        "[Invalid choice] Sorry, too late to cancel; "
+        "the next turn has already started"
+    ),
+}
+
+_FATAL_ROOM_CHOICE_ERRORS = {
+    "[Invalid choice] There's nothing to choose",
+    (
+        "[Invalid choice] Sorry, too late to make a different move; "
+        "the next turn has already started"
+    ),
+}
 
 
 def battle_tag_from(split_messages: list[list[str]]) -> str | None:
@@ -645,6 +693,10 @@ class LudexPlayer(RandomPlayer):
     DISPONIBILIDAD, no la disciplina.
     """
 
+    # Un retry de Ludex siempre vuelve a pasar por `choose_move`: el default
+    # aleatorio de poke-env (0.1%) enviaria una orden sin snapshot ni slot.
+    DEFAULT_CHOICE_CHANCE = 0.0
+
     def __init__(
         self,
         *args: Any,
@@ -683,6 +735,16 @@ class LudexPlayer(RandomPlayer):
         # Marca explicita de "el proximo choose_move de este tag es un
         # reintento". Se pone al ver el `|error|` y se consume UNA sola vez.
         self._retry_pending: dict[str, bool] = {}
+        # F2-02: una decision canonica puede tener varios intentos, pero solo
+        # existe un slot final. La identidad vive fuera del dict persistible.
+        self._pending_choices: dict[str, PendingChoice] = {}
+        self._request_heads: dict[str, tuple[int | None, int]] = {}
+        self._outbound_sequences: dict[str, int] = defaultdict(int)
+        self._last_outbound: dict[str, OutboundCommand] = {}
+        self._terminal_failures: dict[str, ChoiceProtocolError] = {}
+        self.rejected_choice_count: int = 0
+        self.auxiliary_command_error_count: int = 0
+        self.fatal_choice_error_count: int = 0
         self._vocabularies: dict[int, PokeEnvVocabulary] = {}
         # Contador consultable: cuantas decisiones fallaron cerrado porque la
         # narracion previa no llego a tiempo. Distinto de cero es fallo, no
@@ -694,6 +756,7 @@ class LudexPlayer(RandomPlayer):
         # Type/-copyboost con nickname ambiguo o no resoluble).
         self.projection_ambiguity_count: int = 0
         self._listener_started = False
+        self._install_outbound_observer()
         self._install_prelock_observer()
         if caller_wants_listening:
             self.start_listening()
@@ -704,12 +767,12 @@ class LudexPlayer(RandomPlayer):
         # I3 (review de merge): contador consultable de pasos perdidos, para
         # que "no hay huecos hoy" (0 huecos de decision_index medidos sobre
         # toda la base) deje de depender solo de que nadie mire. Se
-        # incrementa en `cli._persist_one`, en el momento en que un paso se
-        # descarta sin persistir (`step is None` o `step["state"] is None`):
-        # ese es el UNICO lugar donde un paso se pierde de verdad del
-        # dataset, asi que es el unico que cuenta (evita contar dos veces el
-        # mismo paso: `wait_for_pending_steps`, mas abajo, detecta el mismo
-        # caso ANTES pero solo loguea, no incrementa). Es el mismo rol que
+        # incrementa en el gate de `cli._persist_one`, despues de corregir
+        # turnos pero ANTES del primer `save_step`: un slot `None`, un estado
+        # incompleto o una choice que no llego a `resolved` invalida TODA la
+        # trayectoria y no puede dejar escrituras parciales ni reward. Ese es
+        # el unico lugar que cuenta para no inflar dos veces la misma perdida.
+        # Es el mismo rol que
         # cumpliria un `turn_alignment_timeouts`: un numero que un runner
         # desatendido (miles de batallas, `agent play -n grande`) puede
         # loguear o alertar sin tener que grepear el log linea por linea.
@@ -726,6 +789,75 @@ class LudexPlayer(RandomPlayer):
         return await asyncio.shield(
             asyncio.wrap_future(self._background_failure)
         )
+
+    def _publish_background_failure(self, exc: Exception) -> None:
+        if not self._background_failure.done():
+            self._background_failure.set_result(exc)
+
+    def _install_outbound_observer(self) -> None:
+        """Correlaciona cada comando de batalla antes del primer `await`.
+
+        El original se invoca exactamente una vez. Un fallo de websocket
+        deja la fase `failed`, nunca un intento ficticiamente `sent`.
+        """
+        client = self.ps_client
+        self._send_message_original = client.send_message
+
+        async def observed_send(
+            message: str, room: str = "", message_2: str | None = None
+        ) -> Any:
+            tag = room if room.startswith("battle-") else None
+            outbound: OutboundCommand | None = None
+            pending: PendingChoice | None = None
+            if tag is not None:
+                sequence = self._outbound_sequences[tag] + 1
+                self._outbound_sequences[tag] = sequence
+                outbound = OutboundCommand(
+                    sequence=sequence,
+                    message=message,
+                    message_2=message_2,
+                    phase="sending",
+                )
+                self._last_outbound[tag] = outbound
+                if outbound.effective_message.startswith("/choose"):
+                    pending = self._pending_choices.get(tag)
+                    if pending is None or pending.phase not in ("reserved", "retried"):
+                        exc = ChoiceProtocolError(
+                            f"{tag}: /choose outbound sin decision reservada "
+                            f"correlacionable (phase={getattr(pending, 'phase', None)!r})"
+                        )
+                        self.fatal_choice_error_count += 1
+                        self._publish_background_failure(exc)
+                        raise exc
+                    if pending.outbound_seq is not None:
+                        exc = ChoiceProtocolError(
+                            f"{tag}: decision {pending.decision_index} intento "
+                            f"{pending.attempt_index} envio mas de un /choose"
+                        )
+                        self.fatal_choice_error_count += 1
+                        self._publish_background_failure(exc)
+                        raise exc
+                    pending.outbound_seq = sequence
+                    pending.outbound_message = outbound.effective_message
+                    pending.outbound_phase = "sending"
+            try:
+                result = await self._send_message_original(message, room, message_2)
+            except Exception as exc:
+                if outbound is not None:
+                    outbound.phase = "failed"
+                if pending is not None and outbound is not None:
+                    if pending.outbound_seq == outbound.sequence:
+                        pending.outbound_phase = "failed"
+                self._publish_background_failure(exc)
+                raise
+            if outbound is not None:
+                outbound.phase = "sent"
+            if pending is not None and outbound is not None:
+                if pending.outbound_seq == outbound.sequence:
+                    pending.outbound_phase = "sent"
+            return result
+
+        client.send_message = observed_send
 
     def _install_prelock_observer(self) -> None:
         """Envuelve `PSClient._handle_message` para publicar el frame crudo
@@ -796,72 +928,236 @@ class LudexPlayer(RandomPlayer):
         # _correct_step_turns (que solo lee el recorder, nunca `battle`)
         # jamas quede corriendo por detras de lo que ya se grabo.
         self.recorders[tag].record(split_messages)
-
-        # Hallazgo nuevo (descubierto al implementar D21/C2, no estaba en el
-        # brief): si el servidor rechaza la eleccion anterior
-        # (`[Unavailable choice]`: el pokemon resulto estar atrapado /
-        # `[Invalid choice]`), poke-env vuelve a llamar a `choose_move` para
-        # la MISMA decision (rqid nuevo, pero es una correccion, no una
-        # decision de juego nueva). Sin esto, la eleccion rechazada —que
-        # nunca se ejecuto— quedaba grabada como un paso fantasma. Con la
-        # clave vieja (turn_number) muchas veces se pisaba sola por
-        # casualidad; con decision_index (D21) queda expuesta: se detecto
-        # asi, comparando el conteo de switches grabados contra el
-        # protocolo (mas grabados que `|switch|` reales). Se descarta el
-        # ULTIMO paso de este tag: la eleccion rechazada es siempre la mas
-        # reciente, porque las decisiones son estrictamente secuenciales.
-        for parts in split_messages:
-            if (
-                len(parts) > 2
-                and parts[1] == "error"
-                and (
-                    parts[2].startswith("[Unavailable choice]")
-                    or parts[2].startswith("[Invalid choice]")
-                )
-            ):
-                self._discard_last_step(tag)
-                # D31: marcar el reintento ANTES de delegar en super(), que
-                # es lo unico que funciona para las DOS rutas de rechazo:
-                #
-                #   [Invalid choice]     -> poke-env vuelve a llamar a
-                #     `choose_move` DENTRO del manejo de este mismo frame
-                #     (`player.py:322`), sin request nuevo.
-                #   [Unavailable choice] -> solo marca `_trying_again` y el
-                #     request nuevo llega en un frame POSTERIOR.
-                #
-                # Un reintento no puede esperar narracion: no hay turno que
-                # resolver y la espera venceria siempre. Por eso hace falta
-                # una marca explicita y no alcanza con mirar "el frame
-                # anterior al request".
-                self._retry_pending[tag] = True
-                break
-
+        terminal = any(
+            len(parts) > 1 and parts[1] in ("win", "tie")
+            for parts in split_messages
+        )
+        deinit = any(
+            len(parts) > 1 and parts[1] == "deinit" for parts in split_messages
+        )
         try:
-            result = await super()._handle_battle_message(split_messages)
+            delegated: list[list[str]] = []
+            for parts in split_messages:
+                if len(parts) > 2 and parts[1] == "request" and parts[2]:
+                    self._observe_request(tag, parts[2])
+                if len(parts) > 2 and parts[1] == "error":
+                    classification = self._classify_choice_error(tag, parts[2])
+                    if classification == "rejection":
+                        self._reject_pending_choice(tag)
+                    elif classification == "auxiliary":
+                        self.auxiliary_command_error_count += 1
+                        last = self._last_outbound[tag]
+                        logger.warning(
+                            "choice_auxiliary_error battle_tag=%s command=%s "
+                            "outbound_seq=%d error=%r count=%d",
+                            tag,
+                            last.effective_message,
+                            last.sequence,
+                            parts[2],
+                            self.auxiliary_command_error_count,
+                        )
+                        # El recorder ya conserva el frame integro. Esta unica
+                        # linea no atraviesa el retry demasiado amplio de
+                        # poke-env; las demas se delegan sin cambio.
+                        continue
+                    elif classification == "fatal":
+                        raise self._fatal_choice_error(tag, parts[2])
+                if len(parts) > 1 and parts[1] in ("win", "tie"):
+                    self._resolve_terminal_choice(tag, parts[1])
+                if len(parts) > 1 and parts[1] == "deinit":
+                    pending = self._pending_choices.get(tag)
+                    if pending is not None:
+                        raise self._fatal_choice_error(
+                            tag,
+                            "deinit con decision pendiente "
+                            f"index={pending.decision_index} phase={pending.phase}",
+                        )
+                delegated.append(parts)
+
+            result = await super()._handle_battle_message(delegated)
         except Exception as exc:
-            if not self._background_failure.done():
-                self._background_failure.set_result(exc)
+            self._publish_background_failure(exc)
+            if deinit:
+                if isinstance(exc, ChoiceProtocolError):
+                    self._terminal_failures[tag] = exc
+                await self.frame_inbox.close(tag)
+                self._cleanup_choice_tracking(tag)
             raise
-        if any(
-            len(parts) > 1 and parts[1] in ("win", "tie") for parts in split_messages
-        ):
+        if terminal or deinit:
             # Despierta a cualquier decision que siguiera esperando: la
             # batalla termino y no va a llegar mas narracion.
             await self.frame_inbox.close(tag)
-            self._temporary_state.pop(tag, None)
+            self._cleanup_choice_tracking(tag)
         return result
 
-    def _discard_last_step(self, tag: str) -> None:
-        """Descarta el ultimo paso grabado: su eleccion fue rechazada por el
-        servidor y nunca se ejecuto.
+    def _current_frame_seq(self, tag: str) -> int:
+        return CURRENT_FRAME_SEQ.get() or self.frame_inbox.last_seq(tag)
 
-        Siempre llega ya finalizado (con `state` real, no `None`): el lote
-        que trae el rechazo es, por construccion, POSTERIOR al lote donde se
-        tomo esa decision, y ese lote anterior ya paso por
-        `_finalize_pending_steps` antes de que este pudiera empezar a
-        procesarse (ver `_handle_battle_message`)."""
-        if self.steps[tag]:
-            self.steps[tag].pop()
+    def _observe_request(self, tag: str, raw_request: str) -> None:
+        try:
+            request = json.loads(raw_request)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ChoiceProtocolError(f"{tag}: request invalido: {exc}") from exc
+        rqid = request.get("rqid")
+        identity = (rqid if isinstance(rqid, int) else None, self._current_frame_seq(tag))
+        pending = self._pending_choices.get(tag)
+        if pending is not None:
+            if pending.phase == "rejected":
+                if not self._retry_pending.get(tag):
+                    raise ChoiceProtocolError(
+                        f"{tag}: request con decision rechazada sin retry pendiente"
+                    )
+                # Unavailable revela informacion y trae el request del retry.
+                # No prueba que el intento rechazado se haya resuelto.
+            elif pending.phase in ("reserved", "retried"):
+                if pending.outbound_phase not in ("sending", "sent"):
+                    raise ChoiceProtocolError(
+                        f"{tag}: request nuevo antes de enviar decision "
+                        f"{pending.decision_index} (phase={pending.outbound_phase!r})"
+                    )
+                self._resolve_pending_choice(tag)
+            else:
+                raise ChoiceProtocolError(
+                    f"{tag}: request con pending phase={pending.phase!r}"
+                )
+        self._request_heads[tag] = identity
+
+    def _classify_choice_error(self, tag: str, text: str) -> str | None:
+        is_choice_error = text.startswith("[Unavailable choice]") or text.startswith(
+            "[Invalid choice]"
+        )
+        if "The battle crashed" in text or text in _FATAL_ROOM_CHOICE_ERRORS:
+            return "fatal"
+        last = self._last_outbound.get(tag)
+        if text in _AUXILIARY_UNDO_ERRORS:
+            if (
+                last is not None
+                and last.effective_message == "/undo"
+                and last.phase in ("sending", "sent")
+            ):
+                return "auxiliary"
+            return "fatal"
+        if not is_choice_error:
+            return None
+        pending = self._pending_choices.get(tag)
+        correlated = (
+            pending is not None
+            and pending.phase in ("reserved", "retried")
+            and pending.outbound_seq is not None
+            and pending.outbound_seq == getattr(last, "sequence", None)
+            and pending.outbound_message == getattr(last, "effective_message", None)
+            and pending.outbound_message is not None
+            and pending.outbound_message.startswith("/choose")
+            and pending.outbound_phase in ("sending", "sent")
+            and self._request_heads.get(tag)
+            == (pending.request_rqid, pending.request_frame_seq)
+        )
+        return "rejection" if correlated else "fatal"
+
+    def _reject_pending_choice(self, tag: str) -> None:
+        pending = self._pending_choices[tag]
+        pending.phase = "rejected"
+        pending.step = None
+        self.steps[tag][pending.step_index] = None
+        self._retry_pending[tag] = True
+        self.rejected_choice_count += 1
+
+    def _resolve_pending_choice(self, tag: str) -> None:
+        pending = self._pending_choices[tag]
+        pending.phase = "resolved"
+        self._pending_choices.pop(tag, None)
+        self._retry_pending.pop(tag, None)
+
+    def _resolve_terminal_choice(self, tag: str, event: str) -> None:
+        pending = self._pending_choices.get(tag)
+        if pending is None:
+            return
+        if (
+            pending.phase not in ("reserved", "retried")
+            or pending.outbound_phase not in ("sending", "sent")
+        ):
+            raise self._fatal_choice_error(
+                tag,
+                f"{event} con decision index={pending.decision_index} "
+                f"phase={pending.phase} outbound_phase={pending.outbound_phase}",
+            )
+        self._resolve_pending_choice(tag)
+
+    def _fatal_choice_error(self, tag: str, detail: str) -> ChoiceProtocolError:
+        self.fatal_choice_error_count += 1
+        return ChoiceProtocolError(f"{tag}: choice protocol fatal: {detail}")
+
+    def _cleanup_choice_tracking(self, tag: str) -> None:
+        self._pending_choices.pop(tag, None)
+        self._retry_pending.pop(tag, None)
+        self._request_heads.pop(tag, None)
+        self._last_outbound.pop(tag, None)
+        self._outbound_sequences.pop(tag, None)
+        self._last_projection.pop(tag, None)
+        self._temporary_state.pop(tag, None)
+
+    def trajectory_blocker(self, tag: str) -> tuple[int, str] | None:
+        terminal = self._terminal_failures.get(tag)
+        if terminal is not None:
+            return (-1, f"terminal_failure:{terminal}")
+        pending = self._pending_choices.get(tag)
+        if pending is not None:
+            return (pending.decision_index, pending.phase)
+        for index, step in enumerate(self.steps.get(tag, [])):
+            if step is None:
+                return (index, "missing")
+            if step.get("state") is None:
+                return (index, "incomplete")
+            if step.get("action_taken") is None:
+                return (index, "action_missing")
+        return None
+
+    def _reserve_step(
+        self,
+        tag: str,
+        step: dict,
+        *,
+        retry: bool,
+        request_rqid: int | None,
+        request_frame_seq: int,
+    ) -> int:
+        if retry:
+            pending = self._pending_choices.get(tag)
+            if pending is None or pending.phase != "rejected":
+                raise ChoiceProtocolError(
+                    f"{tag}: retry sin decision rechazada correlacionada"
+                )
+            identity = self._request_heads.get(
+                tag, (pending.request_rqid, pending.request_frame_seq)
+            )
+            pending.attempt_index += 1
+            pending.phase = "retried"
+            pending.request_rqid, pending.request_frame_seq = identity
+            pending.step = step
+            pending.outbound_seq = None
+            pending.outbound_message = None
+            pending.outbound_phase = None
+            self.steps[tag][pending.step_index] = step
+            return pending.decision_index
+        if tag in self._pending_choices:
+            pending = self._pending_choices[tag]
+            raise ChoiceProtocolError(
+                f"{tag}: nueva decision antes de resolver index="
+                f"{pending.decision_index} phase={pending.phase}"
+            )
+        index = len(self.steps[tag])
+        self.steps[tag].append(step)
+        self._pending_choices[tag] = PendingChoice(
+            decision_index=index,
+            attempt_index=0,
+            phase="reserved",
+            request_rqid=request_rqid,
+            request_frame_seq=request_frame_seq,
+            step_index=index,
+            step=step,
+        )
+        self._request_heads.setdefault(tag, (request_rqid, request_frame_seq))
+        return index
 
     def choose_move(self, battle: Any) -> Any:
         """Captura TODO lo que define la decision, sincronicamente, y devuelve
@@ -922,6 +1218,9 @@ class LudexPlayer(RandomPlayer):
             _normalize(getattr(actor, "base_species", "") or actor.species)
             if actor is not None else None
         )
+        last_request = getattr(battle, "last_request", {}) or {}
+        raw_rqid = last_request.get("rqid") if isinstance(last_request, dict) else None
+        request_rqid = raw_rqid if isinstance(raw_rqid, int) else None
 
         if self.decision_graph is None:
             order = super().choose_move(battle)
@@ -934,7 +1233,13 @@ class LudexPlayer(RandomPlayer):
                 "decision_path": "random",
                 "state": None,
             }
-            self.steps[tag].append(step)
+            self._reserve_step(
+                tag,
+                step,
+                retry=retry,
+                request_rqid=request_rqid,
+                request_frame_seq=cursor,
+            )
 
             async def run_random() -> Any:
                 step["state"] = await self._resolve_state(
@@ -949,6 +1254,7 @@ class LudexPlayer(RandomPlayer):
         return self._choose_move_with_graph(
             battle, tag=tag, snapshot=snapshot, captured_legal=captured_legal,
             actor_species=actor_species, cursor=cursor, retry=retry,
+            request_rqid=request_rqid,
             opponent_side=opponent_side, vocabulary=vocabulary,
             deadline=deadline,
         )
@@ -963,6 +1269,7 @@ class LudexPlayer(RandomPlayer):
         actor_species: str | None,
         cursor: int,
         retry: bool,
+        request_rqid: int | None,
         opponent_side: str,
         vocabulary: PokeEnvVocabulary,
         deadline: float,
@@ -982,7 +1289,6 @@ class LudexPlayer(RandomPlayer):
             action = {"kind": "switch", "species": mon.species}
             action_orders[tuple(sorted(action.items()))] = self.create_order(mon)
 
-        index = len(self.steps[tag])
         step = {
             "turn": battle.turn,
             "decision_turn": battle.turn,
@@ -993,7 +1299,13 @@ class LudexPlayer(RandomPlayer):
             "decision_path": "graph",
             "state": None,
         }
-        self.steps[tag].append(step)
+        index = self._reserve_step(
+            tag,
+            step,
+            retry=retry,
+            request_rqid=request_rqid,
+            request_frame_seq=cursor,
+        )
 
         async def run_graph() -> Any:
             projected = await self._resolve_state(
@@ -1018,6 +1330,7 @@ class LudexPlayer(RandomPlayer):
                 )
             step["action_taken"] = action
             step["action_path"] = result["action_path"]
+            step["reasoning"] = result.get("reasoning")
             return order
 
         return run_graph()
@@ -1103,8 +1416,14 @@ class LudexPlayer(RandomPlayer):
         ESTA decision es siempre el ultimo del tag.
         """
         steps = self.steps.get(tag)
-        if steps and steps[-1] is step:
-            steps.pop()
+        pending = self._pending_choices.get(tag)
+        if pending is not None and pending.step is step:
+            if steps and pending.step_index == len(steps) - 1:
+                steps.pop()
+            elif steps and pending.step_index < len(steps):
+                steps[pending.step_index] = None
+            self._pending_choices.pop(tag, None)
+            self._retry_pending.pop(tag, None)
 
     async def wait_for_pending_steps(self, tag: str) -> None:
         """Corrige la etiqueta de turno de cada paso contra el protocolo.
@@ -1116,12 +1435,10 @@ class LudexPlayer(RandomPlayer):
 
         Guarda defensiva (I-3 de la review de merge): si algun paso quedara
         sin finalizar —no deberia pasar nunca, dado como esta escrito
-        `_handle_battle_message`— loguea en vez de persistir un `None` en
-        silencio. El conteo consultable (`lost_step_count`) se lleva en un
-        unico lugar, `cli._persist_one` (que es donde el paso efectivamente
-        se descarta del dataset): este metodo solo corre ANTES de leer
-        `self.steps[tag]` para persistir, asi que contar aca tambien
-        duplicaria el mismo paso perdido dos veces.
+        `_handle_battle_message`— deja el diagnostico en el log. El gate
+        atomico de `cli._persist_one`, que corre inmediatamente despues,
+        incrementa `lost_step_count` y lanza el error tipado antes de escribir
+        ningun step. Contar tambien aca duplicaria la misma perdida.
         """
         sin_finalizar = [
             i for i, s in enumerate(self.steps.get(tag, [])) if s is not None and s["state"] is None

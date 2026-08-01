@@ -7,17 +7,20 @@ demostrarse: I6 (empate) e I3 (perdida silenciosa de pasos).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from ludex_agent import cli as cli_module
 from ludex_agent.benchmark import BenchmarkResult
 from ludex_agent.graph.provider import FatalProviderError
 from typer.testing import CliRunner
 
 from ludex_agent.cli import (
+    IncompleteTrajectoryError,
     _battle_outcome,
     _benchmark_provider,
     _persist_one,
@@ -25,7 +28,11 @@ from ludex_agent.cli import (
     app,
 )
 from ludex_agent.graph.provider import DecisionMetrics
-from ludex_agent.showdown.client import LudexPlayer, local_server_configuration
+from ludex_agent.showdown.client import (
+    LudexPlayer,
+    PendingChoice,
+    local_server_configuration,
+)
 
 
 def _player() -> LudexPlayer:
@@ -298,10 +305,8 @@ async def test_persist_one_graba_el_empate_sin_ganador_ni_reward_negativo():
 # --- I3: un paso perdido tiene que dejar rastro, no perderse en silencio ---
 
 
-async def test_persist_one_loguea_y_cuenta_un_paso_none(caplog):
-    """Un paso `None` en `agent.steps[tag]` (hoy inalcanzable, guarda
-    defensiva) ya no se descarta en silencio: se loguea en WARNING y se
-    cuenta en `agent.lost_step_count`."""
+async def test_persist_one_falla_antes_de_escribir_si_hay_un_slot_none():
+    """Un slot perdido invalida la trayectoria completa antes de save_step."""
     player = _player()
     tag = "battle-x-1"
     battle = SimpleNamespace(
@@ -313,19 +318,15 @@ async def test_persist_one_loguea_y_cuenta_un_paso_none(caplog):
     player.steps[tag] = [None]
 
     repo = _FakeRepo()
-    with caplog.at_level(logging.WARNING):
+    with pytest.raises(RuntimeError, match=rf"{tag}.*0"):
         await _persist_one(player, repo, tag, "gen6randombattle", "test")
 
     assert player.lost_step_count == 1
     assert repo.saved_steps == []
-    assert any("se pierde del dataset" in r.message for r in caplog.records)
+    assert repo.finalized is None
 
 
-async def test_persist_one_loguea_y_cuenta_un_paso_sin_materializar(caplog):
-    """Mismo camino para el otro caso posible: el paso no es `None` pero su
-    `state` quedo en `None` (guarda de `wait_for_pending_steps`). Antes de
-    este chequeo, esto revienta con un TypeError al leer
-    `step["state"]["legal_actions"]` en vez de dejar rastro."""
+async def test_persist_one_falla_antes_de_escribir_si_el_estado_es_none():
     player = _player()
     tag = "battle-x-2"
     battle = SimpleNamespace(
@@ -340,38 +341,74 @@ async def test_persist_one_loguea_y_cuenta_un_paso_sin_materializar(caplog):
     }]
 
     repo = _FakeRepo()
-    with caplog.at_level(logging.WARNING):
+    with pytest.raises(RuntimeError, match=rf"{tag}.*0"):
         await _persist_one(player, repo, tag, "gen6randombattle", "test")
 
     assert player.lost_step_count == 1
     assert repo.saved_steps == []
+    assert repo.finalized is None
 
 
-async def test_persist_one_no_pierde_pasos_validos_junto_a_uno_perdido():
-    """El contador no debe inflar por pasos que SI se guardan: solo el que
-    se pierde incrementa `lost_step_count`, y el valido se persiste igual."""
+async def test_persist_one_no_escribe_parcialmente_antes_de_un_slot_perdido():
     player = _player()
     tag = "battle-x-3"
     battle = SimpleNamespace(
         battle_tag=tag, player_role="p1",
         player_username="Bot", opponent_username="Rival",
-        finished=False, won=None, gen=6,
+        finished=True, won=True, gen=6,
     )
     player.battles[tag] = battle
     player.steps[tag] = [
-        None,
         {
             "turn": 1, "decision_turn": 1,
             "state": {"legal_actions": [{"kind": "move", "id": "tackle"}]},
             "action_taken": {"kind": "move", "id": "tackle"},
         },
+        None,
     ]
 
     repo = _FakeRepo()
-    await _persist_one(player, repo, tag, "gen6randombattle", "test")
+    with pytest.raises(RuntimeError, match=rf"{tag}.*1"):
+        await _persist_one(player, repo, tag, "gen6randombattle", "test")
 
     assert player.lost_step_count == 1
-    assert len(repo.saved_steps) == 1
+    assert repo.saved_steps == []
+    assert repo.finalized is None
+
+
+async def test_persist_one_reporta_indice_y_fase_de_un_rechazo_pendiente():
+    player = _player()
+    tag = "battle-rejected-pending"
+    player.battles[tag] = SimpleNamespace(
+        battle_tag=tag,
+        player_role="p1",
+        player_username="Bot",
+        opponent_username="Rival",
+        finished=True,
+        won=True,
+        gen=6,
+    )
+    player.steps[tag] = [None]
+    player._pending_choices[tag] = PendingChoice(
+        decision_index=0,
+        attempt_index=1,
+        phase="rejected",
+        request_rqid=6,
+        request_frame_seq=20,
+        step_index=0,
+        step=None,
+    )
+    repo = _FakeRepo()
+
+    with pytest.raises(
+        IncompleteTrajectoryError,
+        match=rf"{tag}.*decision_index=0.*phase=rejected",
+    ):
+        await _persist_one(player, repo, tag, "gen6randombattle", "test")
+
+    assert player.lost_step_count == 1
+    assert repo.saved_steps == []
+    assert repo.finalized is None
 
 
 async def test_persist_one_separa_action_path_de_action_source():
@@ -393,3 +430,51 @@ async def test_persist_one_separa_action_path_de_action_source():
 
     assert repo.saved_steps[0][-1] == "agent"
     assert repo.saved_step_kwargs[0] == {"action_path": "llm_retry"}
+
+
+async def test_play_propaga_el_fallo_background_sin_esperar_timeout(monkeypatch):
+    failure = RuntimeError("choice protocol fatal")
+
+    class FakeAgent:
+        def __init__(self, **kwargs) -> None:
+            self.battles = {}
+
+        async def battle_against(self, rival, n_battles=1):
+            await asyncio.Event().wait()
+
+        async def wait_for_background_failure(self):
+            return failure
+
+    class FakeRival:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+    class FakeEngine:
+        async def dispose(self):
+            pass
+
+    async def reachable(url):
+        pass
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_settings",
+        lambda: SimpleNamespace(
+            showdown_ws_url="ws://localhost:8100/showdown/websocket",
+            bot_username="Bot",
+            database_url="postgresql+asyncpg://x:x@localhost:15432/x",
+        ),
+    )
+    monkeypatch.setattr(cli_module, "_check_showdown_reachable", reachable)
+    monkeypatch.setattr(cli_module, "LudexPlayer", FakeAgent)
+    monkeypatch.setattr(cli_module, "RandomPlayer", FakeRival)
+    monkeypatch.setattr(cli_module, "make_engine", lambda url: FakeEngine())
+    monkeypatch.setattr(cli_module, "BattleRepository", lambda factory: object())
+    monkeypatch.setattr(cli_module, "session_factory", lambda engine: object())
+
+    with pytest.raises(RuntimeError, match="choice protocol fatal") as caught:
+        await asyncio.wait_for(
+            cli_module.play(1, "gen6randombattle", source="test"), timeout=0.2
+        )
+
+    assert caught.value is failure
