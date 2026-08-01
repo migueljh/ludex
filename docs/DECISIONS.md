@@ -1275,3 +1275,147 @@ aserción central es que el inbox se puebla **con el lock del tag tomado** mient
 `_on_battle_message` todavía no fue invocado, así que si poke-env moviera el lock
 más arriba el test cae antes de que el dataset se degrade en silencio. La salida
 de fondo es un hook `on_raw_frame` upstream.
+
+## D32 — retrieve_context: contextorico y prompt compacto, generation-scoped, sin fuga
+
+**Contexto.** El grafo de decisión (`parse_state → retrieve_context →
+calc_damage → decide`) no consultaba datos de juego: el proveedor decidía con el
+estado observable únicamente. F2-06 introduce el nodo `retrieve_context`, que
+lee especies, movimientos y learnsets de la base local de Postgres y produce
+**dos** contextos: uno **rico** (`GraphState.context`) para
+`calc_damage`/F2-07 y consumidores deterministas, y uno **compacto**
+(`GraphState.prompt_context`) que es lo único que recibe `decide`/provider.
+
+**Fuente: exclusivamente game data local, generation-scoped.** No hay internet,
+no hay fetch runtime de Pokémon Showdown, no hay perfiles, embeddings,
+playbooks, round availability ni tablas futuras. Toda consulta resuelve
+`gen_number → gen_id` y filtra pokémon y movimientos por `gen_id`; los
+learnsets respetan la generación del pokémon y del movimiento. Nunca se fija
+Gen 6 directamente en producción (`grep -ri "gen6" src/` no devuelve nada fuera
+de configuración y fixtures). La frontera Gen 6/Gen 9 se verifica con hechos
+del juego: `gholdengo` existe en 9 y no en 6, y `tackle` baja de poder 50
+(gen 6) a 40 (gen 9).
+
+**ContextRepository obligatorio y fallo ruidoso.** `build_decision_graph` no
+admite `repository=None`: el parámetro es posicional required, no opcional. No
+existe fallback de contexto vacío. CLI, tests y todos los callers inyectan un
+repositorio explícito. Los errores del repositorio se **propagan**; no se
+ocultan. Un `ContextRepository` omitido produce `TypeError` en la
+construcción del grafo (`test_grafo_exige_context_repository`).
+
+**El engine vive en el loop del listener (corrección posterior a la
+integración con MON-6).** poke-env ejecuta `choose_move` (y por ende el
+grafo) en el loop del listener, que puede ser otro hilo distinto del loop
+que orquesta la batalla o el test. Un `AsyncEngine` creado por el caller
+bindea su pool de asyncpg a ESE loop y al usarlo desde el listener cruza
+loops ("Future attached to a different loop"). `PostgresContextRepository`
+recibe una `database_url: str` y crea su engine **perezosamente** en el
+primer `await`, garantizando que el pool se bindea al loop correcto; `aclose()`
+lo dispone. Esto no acopla al `BattleRepository` (que persiste en el loop
+principal) y repara el defecto latente que Galileo dejó tanto en el CLI de
+producción como en el test de integración.
+
+**Lookup de movimientos observados, independiente del learnset.** Los
+movimientos propios conocidos y rivales revelados se resuelven directamente
+por `(gen_id, showdown_id)`, sin requerir que pertenezcan al learnset de la
+especie visible. Es obligatorio para Illusion, Transform y Mimic: un movimiento
+observado puede venir de una especie que el snapshot no muestra como tal. Un
+ID observado inexistente produce `LookupError` (**fallo ruidoso**, no
+descriptor silencioso). Un tuple vacío evita queries inválidas y devuelve
+catálogo vacío.
+
+**Especies rivales limitadas a evidencia pública.** Las especies rivales
+consultadas son **exclusivamente** las reveladas en `battle_state`
+(allowlisted). Nunca se consulta `raw_state`, equipos privados ni especies
+hipotéticas. `extract_species_ids` lee solo `battle_state.me` y
+`battle_state.opponent`, deduplica en orden de aparición y descarta entradas
+inválidas. El test `test_retrieve_context_excluye_rival_no_revelado`
+verifica que `raw_state.opponent.pokemon` (con mewtwo) no se consulta
+mientras `battle_state.opponent` (con garchomp) sí.
+
+**`possible_moves` expresa posibilidades, no información real oculta.** Para
+el rival, `possible_moves` es el learnset **completo** de la especie visible,
+presentado claramente como posibilidades del learnset, no como el moveset
+real. Un movimiento observado prevalece sobre `possible-only` para el mismo
+ID: el catálogo de movimientos del `prompt_context` está deduplicado por
+`showdown_id`. **Ursaring/Sludge Bomb** es el caso testigo: solo se consulta
+`ursaring`, no aparece ni se consulta `zoroark`, `sludgebomb` no entra en
+`possible_moves` de Ursaring (no está en su learnset), sí entra como
+`observed_move` con descriptor enriquecido en `prompt_context`.
+
+**Preservación de `learn_methods`/`sourceSpecies` en el contexto rico.** El
+contexto rico conserva por movimiento: `learn_methods` (lista de métodos con
+`gen`, `method`, `level` y `sourceSpecies`), `flags`, `description`,
+`accuracy`/`never_misses`, `power_kind` y la información completa necesaria
+para F2-07 (`calc_damage`). El test `test_learn_methods_conserva_source_species_
+y_campos` verifica Charizard-Mega-X: `flamethrower` hereda de `charizard`
+(machine), `charmeleon` (level 43) y `charmander` (level 37).
+
+**Semántica de `accuracy NULL` y `power_kind`.** `moves.accuracy IS NULL`
+significa **"nunca falla"** (D15), no "desconocida": el repositorio lo
+expone como `never_misses: true`. El test lo verifica con `swift` sobre
+pikachu. `power_kind` distingue: `status` (movimiento de estado, p.ej.
+`splash`), `variable` (poder variable, p.ej. `gyroball`), `fixed_damage`
+(daño fijo, p.ej. `seismictoss`), `special` y `standard`. En el
+`prompt_context`, `accuracy` se proyecta como `"never_misses"` (string)
+cuando es `NULL`, y como el valor numérico en caso contrario.
+
+**Proyección compacta (`prompt_context`).** `project_prompt_context` produce:
+- `own`: solo movimientos **realmente conocidos** en `battle_state`
+  (`known_moves`), no el learnset propio completo.
+- `opponent`: solo especies **reveladas**; `revealed_moves` con igualdad
+  exacta con evidencia pública; `possible_moves` = learnset completo de la
+  especie visible.
+- `moves`: catálogo deduplicado por `showdown_id`. Movimientos
+  conocidos/revelados: descriptor base **+** `description` **+** `flags`.
+  Movimientos únicamente posibles: descriptor **base compacto** (sin
+  `description` ni `flags`).
+- Una observación prevalece sobre `possible-only` para el mismo ID.
+- No existe truncado runtime.
+
+**El provider recibe únicamente `prompt_context`.** `decide_node` construye un
+`decision_state` donde `battle_state.context` = `state["prompt_context"]`, no
+el contexto rico. Los tests usan sentinels exclusivos del objeto rico
+(`"rich-only-sentinel-source-species"`, `"learn_methods"`, `"sourceSpecies"`,
+`"observed_moves"`) para probar que **no llegan** al prompt. `battle_state`,
+`context` y `prompt_context` no se mutan durante `decide` (verificado con
+`deepcopy` antes/después en `test_prompt_context_separa_observados_
+enriquecidos_de_posibles_compactos`).
+
+**`calc_damage`/F2-07 recibe el contexto rico.** El test
+`test_calc_damage_recibe_contexto_rico_no_prompt_context` confirma que
+`calc_damage` ve `state["context"]` (con `learn_methods` y sentinels ricos),
+no `prompt_context`.
+
+**Presupuesto.** Baseline histórico aceptado, recalculado desde el código
+final contra `battle-gen6randombattle-397` (decisiones 1 y 25):
+
+| caso | prompt_context (bytes) | bajo 64 KiB |
+|------|-----------------------:|:-----------:|
+| 6+1  | 19,846                 | ✓           |
+| 6+6  | 44,740                 | ✓           |
+
+Son mediciones reproducibles (`len(json.dumps(..., separators=(",",":")).
+encode())`), no golden exacto eterno. El techo de 64 KiB (65,536 bytes)
+funciona como **canario**, no como límite operacional: los canarios de
+completitud (`own_known`, `opponent_candidates`, `catalog`,
+`learn_methods`) comprueban que el límite no se cumple eliminando
+candidatos o semántica. Nunca se cortan datos silenciosamente para cumplir
+el techo.
+
+**Casos vinculantes verificados.** Frontera Gen 6/Gen 9 para especies
+(`gholdengo`) y en `load_moves` (`tackle`); `accuracy NULL` → `never_misses`;
+`power_kind` distingue `status`/`variable`/`fixed_damage`/`special`/
+`standard`; Ursaring/Sludge Bomb (sin inferir zoroark); ID observado ausente
+→ `LookupError`; IDs vacíos → resultado vacío sin query inválida;
+`ContextRepository` omitido → `TypeError`; error del repositorio →
+propagación; F2-07 recibe contexto rico; provider recibe solo
+`prompt_context`; `battle_state` y ambos contextos inmutables; no entran
+especies rivales no reveladas.
+
+**Exclusiones diferidas.** Quedan explícitamente fuera de F2-06: round
+availability (la ronda activa se agrega en una rebanada posterior), perfiles
+del rival, lecciones de análisis previos, playbook activo, retrieval por
+pgvector (embeddings) e internet. El grafo actual no depende de ninguna de
+estas fuentes; cualquier referencia futura las introducirá como capas
+adicionales, no reemplazando la game data local.
