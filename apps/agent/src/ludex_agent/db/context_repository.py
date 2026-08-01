@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+
+
+def _showdown_id(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
 _GENERATION = text("""
@@ -87,6 +92,60 @@ def _standalone_move(row: Any) -> dict[str, object]:
     }
 
 
+class SpeciesVocabulary(Protocol):
+    """Resuelve formas cosmeticas a su especie base sin heuristica de prefijo.
+
+    Las formas cosmeticas (Vivillon-Tundra, Sawsbuck-Summer, Unown-O,
+    Florges-Yellow/Orange) comparten stats y learnset con la especie base:
+    solo cambia el sprite. Una forma con stats propios (Mega, floetteeternal)
+    NO es cosmetica y debe LookupError ruidosamente. La generacion es siempre
+    un parametro (ver .claude/showdown-data/SKILL.md y AGENTS.md).
+    """
+
+    def cosmetic_base_species(
+        self, visible_id: str, gen_number: int
+    ) -> str | None: ...
+
+
+class PokeEnvSpeciesVocabulary:
+    """Impl con ``GenData`` de poke-env, generation-scoped y cacheado por gen.
+
+    La fuente es exclusivamente local (el paquete empaquetado), sin internet.
+    """
+
+    def __init__(self) -> None:
+        self._data_by_gen: dict[int, Any] = {}
+
+    def _data(self, gen_number: int) -> Any:
+        from poke_env.data import GenData
+
+        if gen_number not in self._data_by_gen:
+            self._data_by_gen[gen_number] = GenData.from_gen(gen_number)
+        return self._data_by_gen[gen_number]
+
+    def cosmetic_base_species(
+        self, visible_id: str, gen_number: int
+    ) -> str | None:
+        pokedex = self._data(gen_number).pokedex
+        entry = pokedex.get(visible_id)
+        if entry is None:
+            return None
+        base = entry.get("baseSpecies")
+        if not isinstance(base, str) or not base:
+            return None
+        base_id = _showdown_id(base)
+        if base_id == visible_id:
+            return None
+        base_entry = pokedex.get(base_id)
+        if base_entry is None:
+            return None
+        # Una forma es cosmetica solo si sus stats son identicos a los de la
+        # base. Mega y floetteeternal tienen stats propios: no degradan.
+        if entry.get("baseStats") != base_entry.get("baseStats"):
+            return None
+        return base_id
+
+
 class PostgresContextRepository:
     """El engine vive dentro del loop donde corre ``retrieve_context``.
 
@@ -99,10 +158,17 @@ class PostgresContextRepository:
     sin acoplar al ``BattleRepository`` (que persiste en el loop principal).
     """
 
-    def __init__(self, database_url: str) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        vocabulary: SpeciesVocabulary | None = None,
+    ) -> None:
         self._database_url = database_url
         self._engine = None
         self._factory = None
+        self._vocabulary = (
+            vocabulary if vocabulary is not None else PokeEnvSpeciesVocabulary()
+        )
 
     def _ensure_factory(self) -> Any:
         if self._factory is None:
@@ -141,6 +207,26 @@ class PostgresContextRepository:
         opponent_species: tuple[str, ...],
     ) -> dict[str, object]:
         requested = tuple(dict.fromkeys(own_species + opponent_species))
+        # Resolver alias cosmeticos antes de tocar la base: las formas
+        # cosmeticas (vivillontundra, florgesyellow, ...) no tienen fila en
+        # `pokemon`, asi que se consultan por su especie base (vivillon,
+        # florges...). El showdown_id VISIBLE se conserva en el resultado
+        # para que la proyeccion correlacione por especie revelada. Una forma
+        # ausente que no sea cosmética (floetteeternal: stats propios) no
+        # degrada: LookupError ruidoso, nunca descarte silencioso.
+        visible_to_db_id: dict[str, str] = {}
+        query_ids: list[str] = []
+        for visible_id in requested:
+            if visible_id in visible_to_db_id:
+                continue
+            base = self._vocabulary.cosmetic_base_species(
+                visible_id, gen_number
+            )
+            db_id = base if base is not None else visible_id
+            visible_to_db_id[visible_id] = db_id
+            if db_id not in query_ids:
+                query_ids.append(db_id)
+
         factory = self._ensure_factory()
         async with factory() as session:
             generation = (
@@ -153,21 +239,21 @@ class PostgresContextRepository:
                 raise LookupError(f"generación no seedeada: {gen_number}")
 
             rows = []
-            if requested:
+            if query_ids:
                 rows = (
                     await session.execute(
                         _SPECIES_CONTEXT,
                         {
                             "gen_id": generation["id"],
-                            "species_ids": list(requested),
+                            "species_ids": query_ids,
                         },
                     )
                 ).mappings().all()
 
-        by_id: dict[str, dict[str, object]] = {}
+        by_db_id: dict[str, dict[str, object]] = {}
         for row in rows:
             pokemon_id = row["pokemon_showdown_id"]
-            pokemon = by_id.setdefault(
+            pokemon = by_db_id.setdefault(
                 pokemon_id,
                 {
                     "showdown_id": pokemon_id,
@@ -199,20 +285,32 @@ class PostgresContextRepository:
                 "learn_methods": list(row["learn_methods"]),
             })
 
+        by_visible_id: dict[str, dict[str, object]] = {}
+        for visible_id in requested:
+            db_id = visible_to_db_id[visible_id]
+            if db_id not in by_db_id:
+                raise LookupError(
+                    f"especie visible no seedeada ni forma cosmética: "
+                    f"{visible_id}"
+                )
+            labeled = deepcopy(by_db_id[db_id])
+            labeled["showdown_id"] = visible_id
+            by_visible_id[visible_id] = labeled
+
         return {
             "generation": {
                 "gen_number": gen_number,
                 "label": generation["label"],
             },
             "own": [
-                deepcopy(by_id[showdown_id])
+                deepcopy(by_visible_id[showdown_id])
                 for showdown_id in own_species
-                if showdown_id in by_id
+                if showdown_id in by_visible_id
             ],
             "opponent": [
-                deepcopy(by_id[showdown_id])
+                deepcopy(by_visible_id[showdown_id])
                 for showdown_id in opponent_species
-                if showdown_id in by_id
+                if showdown_id in by_visible_id
             ],
         }
 

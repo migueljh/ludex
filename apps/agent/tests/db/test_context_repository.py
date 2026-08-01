@@ -67,18 +67,18 @@ async def test_lookup_usa_gen_id_y_showdown_id():
 @pytest.mark.asyncio
 async def test_frontera_real_gholdengo_existe_en_gen9_pero_no_en_gen6():
     async with _repository() as repository:
-        gen6 = await repository.load_battle_context(
-            gen_number=6,
-            own_species=("gholdengo",),
-            opponent_species=(),
-        )
+        with pytest.raises(LookupError, match="gholdengo"):
+            await repository.load_battle_context(
+                gen_number=6,
+                own_species=("gholdengo",),
+                opponent_species=(),
+            )
         gen9 = await repository.load_battle_context(
             gen_number=9,
             own_species=("gholdengo",),
             opponent_species=(),
         )
 
-    assert gen6["own"] == []
     assert [
         pokemon["showdown_id"] for pokemon in gen9["own"]
     ] == ["gholdengo"]
@@ -349,3 +349,91 @@ async def test_batalla_real_preserva_completitud_bajo_techo_compacto():
     finally:
         await repository.aclose()
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_vivillontundra_resuelve_a_vivillon_y_permanece_visible():
+    async with _repository() as repository:
+        base = await repository.load_battle_context(
+            gen_number=6,
+            own_species=("vivillon",),
+            opponent_species=(),
+        )
+        cosmetica = await repository.load_battle_context(
+            gen_number=6,
+            own_species=("vivillontundra",),
+            opponent_species=(),
+        )
+
+    mon_base = _species(base, "own", "vivillon")
+    mon_cosmetica = _species(cosmetica, "own", "vivillontundra")
+
+    assert mon_cosmetica["showdown_id"] == "vivillontundra"
+    assert mon_cosmetica["types"] == mon_base["types"]
+    assert mon_cosmetica["base_stats"] == mon_base["base_stats"]
+    assert mon_cosmetica["abilities"] == mon_base["abilities"]
+    assert {m["showdown_id"] for m in mon_cosmetica["moves"]} == {
+        m["showdown_id"] for m in mon_base["moves"]
+    }
+
+
+@pytest.mark.asyncio
+async def test_charizardmegax_usa_fila_directa_no_charizard():
+    async with _repository() as repository:
+        charizard = await repository.load_battle_context(
+            gen_number=6,
+            own_species=("charizard",),
+            opponent_species=(),
+        )
+        megax = await repository.load_battle_context(
+            gen_number=6,
+            own_species=("charizardmegax",),
+            opponent_species=(),
+        )
+
+    mon_charizard = _species(charizard, "own", "charizard")
+    mon_megax = _species(megax, "own", "charizardmegax")
+
+    assert mon_megax["showdown_id"] == "charizardmegax"
+    assert mon_megax["base_stats"] == {
+        "hp": 78, "atk": 130, "def": 111,
+        "spa": 130, "spd": 85, "spe": 100,
+    }
+    assert mon_charizard["base_stats"]["atk"] == 84
+    assert mon_megax["base_stats"]["atk"] != 84
+
+
+@pytest.mark.asyncio
+async def test_floetteeternal_no_es_cosmetica_y_falla_ruidosamente():
+    async with _repository() as repository:
+        with pytest.raises(LookupError, match="floetteeternal"):
+            await repository.load_battle_context(
+                gen_number=6,
+                own_species=("floetteeternal",),
+                opponent_species=(),
+            )
+
+
+@pytest.mark.asyncio
+async def test_rival_cosmetico_no_desaparece_de_prompt_context():
+    from ludex_agent.graph.context import retrieve_context
+
+    state = {
+        "battle_state": {
+            "gen": 6,
+            "me": {"pokemon": [{"species": "charmander"}]},
+            "opponent": {"pokemon": [{"species": "vivillontundra"}]},
+        },
+    }
+    async with _repository() as repository:
+        result = await retrieve_context(state, repository)
+
+    rich = result["context"]
+    projected = result["prompt_context"]
+
+    assert [p["showdown_id"] for p in rich["opponent"]] == ["vivillontundra"]
+    assert [p["species"] for p in projected["opponent"]] == ["vivillontundra"]
+    assert projected["opponent"][0]["base_types"] == rich["opponent"][0]["types"]
+    assert projected["opponent"][0]["possible_moves"] == [
+        m["showdown_id"] for m in rich["opponent"][0]["moves"]
+    ]
