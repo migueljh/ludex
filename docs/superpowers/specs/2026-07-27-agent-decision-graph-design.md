@@ -376,10 +376,11 @@ comando y en el reporte final.
   movimientos rivales revelados o ningún cálculo utilizable.
 - Calc usa únicamente información observable. Los movimientos no revelados y
   sets desconocidos no se inventan ni se obtienen de data oculta.
-- Una orden puede ser rechazada por Showdown (`[Unavailable choice]` o
-  `[Invalid choice]`). Existe `_discard_last_step`, pero hoy busca líneas
-  `|error|` dentro del canal de mensajes de batalla y se observó que esos
-  errores no llegan por ese canal. La fila puede quedar grabada como si la
-  acción hubiera ocurrido. Resolver y medir ese canal queda fuera de esta
-  rebanada; el riesgo puede aumentar cuando el LLM elija acciones
-  condicionadas con más frecuencia que RandomPlayer.
+- **Corrección F2-02 / D34:** la afirmación anterior de que esos errores no
+  llegaban por el canal de batalla era falsa. Se reprodujeron ambos en frames
+  reales y el corpus ya contenía `[Unavailable choice]` en `battle_turns`.
+  `_discard_last_step` fue retirado: una máquina de estados correlaciona el
+  `|error|` con `battle_tag`, request/frame y `/choose` outbound; los retries
+  reemplazan el mismo slot y sólo la acción resuelta entra al dataset. Los
+  errores auxiliares de room, como `/undo` → `nothing to cancel`, conservan el
+  pending sin retry, y los casos desconocidos fallan cerrado.
