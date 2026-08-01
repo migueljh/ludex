@@ -373,9 +373,7 @@ async def _benchmark_command(
         os.environ.get("CALC_BASE_URL", "http://127.0.0.1:8200"),
         timeout_seconds=settings.llm_request_timeout_seconds,
     )
-    engine = make_engine(settings.database_url)
-    factory = session_factory(engine)
-    context_repository = PostgresContextRepository(factory)
+    context_repository = PostgresContextRepository(settings.database_url)
     graph = build_decision_graph(
         calculator, selected, metrics, context_repository
     )
@@ -403,6 +401,8 @@ async def _benchmark_command(
         account_configuration=AccountConfiguration(f"Opp{suffix}", None),
         **common,
     )
+    engine = make_engine(settings.database_url)
+    factory = session_factory(engine)
     repo = BattleRepository(factory) if persist else None
 
     async def persist_tag(tag: str) -> None:
@@ -436,6 +436,7 @@ async def _benchmark_command(
             )
     finally:
         await calculator.aclose()
+        await context_repository.aclose()
         await engine.dispose()
     return result, metrics.snapshot()
 

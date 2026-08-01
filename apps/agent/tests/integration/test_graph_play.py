@@ -100,11 +100,12 @@ async def test_respuesta_ilegal_dos_veces_juega_y_persiste_fallback():
     engine = make_engine(settings.database_url)
     factory = session_factory(engine)
     calculator = CalcClient("http://127.0.0.1:8200", timeout_seconds=3)
+    context_repository = PostgresContextRepository(settings.database_url)
     graph = build_decision_graph(
         calculator,
         AlwaysIllegalProvider(),
         DecisionMetrics(),
-        PostgresContextRepository(factory),
+        context_repository,
     )
     common = {
         "server_configuration": server,
@@ -165,4 +166,5 @@ async def test_respuesta_ilegal_dos_veces_juega_y_persiste_fallback():
                 ), {"tags": tags})
                 await session.commit()
         await calculator.aclose()
+        await context_repository.aclose()
         await engine.dispose()

@@ -6,7 +6,6 @@ import pytest
 from sqlalchemy import text
 
 from ludex_agent.config import load_settings
-from ludex_agent.db.session import make_engine, session_factory
 
 
 pytestmark = pytest.mark.skipif(
@@ -18,12 +17,11 @@ pytestmark = pytest.mark.skipif(
 async def _repository():
     from ludex_agent.db.context_repository import PostgresContextRepository
 
-    engine = make_engine(load_settings().database_url)
-    repo = PostgresContextRepository(session_factory(engine))
+    repo = PostgresContextRepository(load_settings().database_url)
     try:
         yield repo
     finally:
-        await engine.dispose()
+        await repo.aclose()
 
 
 def _species(context, side, showdown_id):
@@ -266,6 +264,8 @@ def _learn_method_count(context):
 
 @pytest.mark.asyncio
 async def test_batalla_real_preserva_completitud_bajo_techo_compacto():
+    from ludex_agent.db.session import make_engine, session_factory
+
     engine = make_engine(load_settings().database_url)
     factory = session_factory(engine)
     try:
@@ -289,7 +289,7 @@ async def test_batalla_real_preserva_completitud_bajo_techo_compacto():
         from ludex_agent.graph.context import retrieve_context
         from ludex_agent.graph.state import allowlisted_state
 
-        repository = PostgresContextRepository(factory)
+        repository = PostgresContextRepository(load_settings().database_url)
         # Proveniencia de los conteos: seed pokemon-showdown@0.11.10 sobre
         # 20260725000002_game_data.sql y
         # 20260726000001_base_species_id_y_power_kind.sql.
@@ -347,4 +347,5 @@ async def test_batalla_real_preserva_completitud_bajo_techo_compacto():
             assert _compact_bytes(projected) <= 65_536
             assert _compact_bytes(projected) <= _compact_bytes(rich) * 0.10
     finally:
+        await repository.aclose()
         await engine.dispose()

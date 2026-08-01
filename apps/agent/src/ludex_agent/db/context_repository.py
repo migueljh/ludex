@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 
 _GENERATION = text("""
@@ -87,8 +88,50 @@ def _standalone_move(row: Any) -> dict[str, object]:
 
 
 class PostgresContextRepository:
-    def __init__(self, factory: Any) -> None:
-        self.factory = factory
+    """El engine vive dentro del loop donde corre ``retrieve_context``.
+
+    poke-env ejecuta ``choose_move`` (y por ende el grafo) en el loop del
+    listener, que puede ser otro hilo distinto del loop que orquesta la
+    batalla. Un ``AsyncEngine`` creado por el caller bindea su pool de
+    asyncpg a ESE loop, y usarlo desde el listener cruza loops ("Future
+    attached to a different loop"). Creando el engine perezosamente en el
+    primer ``await`` garantizamos que el pool se bindea al loop correcto,
+    sin acoplar al ``BattleRepository`` (que persiste en el loop principal).
+    """
+
+    def __init__(self, database_url: str) -> None:
+        self._database_url = database_url
+        self._engine = None
+        self._factory = None
+
+    def _ensure_factory(self) -> Any:
+        if self._factory is None:
+            # NullPool: el repositorio corre en el loop del listener de
+            # poke-env, que puede ser otro hilo distinto del loop que lo
+            # dispone. Un pool que retiene conexiones (QueuePool) bindea sus
+            # conexiones asyncpg al loop donde se crearon, y dispose() desde
+            # otro loop cruza ("Future attached to a different loop"). NullPool
+            # no retiene conexiones entre sesiones: cada checkout abre una
+            # nueva y la devuelve cerrada, asi que dispose es trivial y no
+            # necesita cerrar Futures en loop ajeno. El overhead de abrir una
+            # conexion por query es despreciable para dos lecturas por
+            # decision.
+            from sqlalchemy.pool import NullPool
+
+            self._engine = create_async_engine(
+                self._database_url, poolclass=NullPool,
+            )
+            self._factory = async_sessionmaker(
+                self._engine, expire_on_commit=False,
+            )
+        return self._factory
+
+    async def aclose(self) -> None:
+        engine = self._engine
+        self._engine = None
+        self._factory = None
+        if engine is not None:
+            await engine.dispose()
 
     async def load_battle_context(
         self,
@@ -98,7 +141,8 @@ class PostgresContextRepository:
         opponent_species: tuple[str, ...],
     ) -> dict[str, object]:
         requested = tuple(dict.fromkeys(own_species + opponent_species))
-        async with self.factory() as session:
+        factory = self._ensure_factory()
+        async with factory() as session:
             generation = (
                 await session.execute(
                     _GENERATION,
@@ -182,7 +226,8 @@ class PostgresContextRepository:
         if not requested:
             return {}
 
-        async with self.factory() as session:
+        factory = self._ensure_factory()
+        async with factory() as session:
             generation = (
                 await session.execute(
                     _GENERATION,
