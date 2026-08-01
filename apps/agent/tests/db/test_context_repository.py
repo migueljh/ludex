@@ -437,3 +437,87 @@ async def test_rival_cosmetico_no_desaparece_de_prompt_context():
     assert projected["opponent"][0]["possible_moves"] == [
         m["showdown_id"] for m in rich["opponent"][0]["moves"]
     ]
+
+
+# --- Cambios Requested: fila directa siempre gana, cosmeticFormes explícito ---
+
+
+@pytest.mark.asyncio
+async def test_arceuspoison_gen6_conserva_tipo_poison_por_fila_directa():
+    async with _repository() as repository:
+        context = await repository.load_battle_context(
+            gen_number=6, own_species=("arceuspoison",), opponent_species=(),
+        )
+    mon = _species(context, "own", "arceuspoison")
+    assert mon["showdown_id"] == "arceuspoison"
+    assert mon["types"] == ["Poison"], (
+        "tiene fila directa con tipo Poison; no debe degradar a Arceus Normal"
+    )
+
+
+@pytest.mark.asyncio
+async def test_castformsunny_gen6_conserva_tipo_fire_por_fila_directa():
+    async with _repository() as repository:
+        context = await repository.load_battle_context(
+            gen_number=6, own_species=("castformsunny",), opponent_species=(),
+        )
+    mon = _species(context, "own", "castformsunny")
+    assert mon["showdown_id"] == "castformsunny"
+    assert mon["types"] == ["Fire"], (
+        "tiene fila directa con tipo Fire; no debe degradar a Castform Normal"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pikachucosplay_gen6_conserva_fila_directa_y_ability():
+    async with _repository() as repository:
+        context = await repository.load_battle_context(
+            gen_number=6, own_species=("pikachucosplay",), opponent_species=(),
+        )
+    mon = _species(context, "own", "pikachucosplay")
+    assert mon["showdown_id"] == "pikachucosplay"
+    assert mon["abilities"]["0"] == "Lightning Rod", (
+        "pikachucosplay tiene su propia ability, no la de pikachu"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ogerponwellspring_gen9_conserva_tipos_y_ability():
+    async with _repository() as repository:
+        context = await repository.load_battle_context(
+            gen_number=9, own_species=("ogerponwellspring",), opponent_species=(),
+        )
+    mon = _species(context, "own", "ogerponwellspring")
+    assert mon["showdown_id"] == "ogerponwellspring"
+    assert mon["types"] == ["Grass", "Water"]
+    assert mon["abilities"]["0"] == "Water Absorb"
+
+
+@pytest.mark.asyncio
+async def test_pikachupartner_gen6_no_disponible_falla_ruidosamente():
+    async with _repository() as repository:
+        with pytest.raises(LookupError, match="pikachupartner"):
+            await repository.load_battle_context(
+                gen_number=6, own_species=("pikachupartner",),
+                opponent_species=(),
+            )
+
+
+@pytest.mark.asyncio
+async def test_pikachuworld_gen6_no_disponible_falla_ruidosamente():
+    async with _repository() as repository:
+        with pytest.raises(LookupError, match="pikachuworld"):
+            await repository.load_battle_context(
+                gen_number=6, own_species=("pikachuworld",),
+                opponent_species=(),
+            )
+
+
+@pytest.mark.asyncio
+async def test_charizardgmax_gen6_no_disponible_falla_ruidosamente():
+    async with _repository() as repository:
+        with pytest.raises(LookupError, match="charizardgmax"):
+            await repository.load_battle_context(
+                gen_number=6, own_species=("charizardgmax",),
+                opponent_species=(),
+            )

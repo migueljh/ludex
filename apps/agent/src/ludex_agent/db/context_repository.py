@@ -126,22 +126,33 @@ class PokeEnvSpeciesVocabulary:
     def cosmetic_base_species(
         self, visible_id: str, gen_number: int
     ) -> str | None:
+        """Resuelve un alias cosmético a su especie base usando ``cosmeticFormes``
+        explícito del dex, NO por igualdad de stats ni prefijo.
+
+        Una forma es cosmética sólo si el dex la marca con
+        ``cosmeticFormes`` (lista no vacía) y su ``baseSpecies`` difiere del
+        propio. Las formas mecánicas (Arceus tipos, Castform climas, Mega,
+        Gmax, ogerponwellspring) tienen ``cosmeticFormes=None`` y NO se
+        resuelven: se espera una fila directa o ``LookupError``.
+
+        IMPORTANTE: ``GenData.from_gen(N).pokedex`` contiene formas de
+        generaciones futuras sin filtrar (ver SKILL.md). Estar en el dex no
+        significa estar disponible: ``Postgres`` decide disponibilidad. Esta
+        función sólo identifica aliases cosméticos para consultar la base; la
+        fila directa siempre gana.
+        """
         pokedex = self._data(gen_number).pokedex
         entry = pokedex.get(visible_id)
         if entry is None:
+            return None
+        cosmetic = entry.get("cosmeticFormes")
+        if not isinstance(cosmetic, list) or not cosmetic:
             return None
         base = entry.get("baseSpecies")
         if not isinstance(base, str) or not base:
             return None
         base_id = _showdown_id(base)
         if base_id == visible_id:
-            return None
-        base_entry = pokedex.get(base_id)
-        if base_entry is None:
-            return None
-        # Una forma es cosmetica solo si sus stats son identicos a los de la
-        # base. Mega y floetteeternal tienen stats propios: no degradan.
-        if entry.get("baseStats") != base_entry.get("baseStats"):
             return None
         return base_id
 
@@ -207,25 +218,22 @@ class PostgresContextRepository:
         opponent_species: tuple[str, ...],
     ) -> dict[str, object]:
         requested = tuple(dict.fromkeys(own_species + opponent_species))
-        # Resolver alias cosmeticos antes de tocar la base: las formas
-        # cosmeticas (vivillontundra, florgesyellow, ...) no tienen fila en
-        # `pokemon`, asi que se consultan por su especie base (vivillon,
-        # florges...). El showdown_id VISIBLE se conserva en el resultado
-        # para que la proyeccion correlacione por especie revelada. Una forma
-        # ausente que no sea cosmética (floetteeternal: stats propios) no
-        # degrada: LookupError ruidoso, nunca descarte silencioso.
-        visible_to_db_id: dict[str, str] = {}
+        # Pre-computar candidatos cosméticos para construir la query union.
+        # La fila directa SIEMPRE gana: se incluyen visible_ids Y base_ids
+        # candidatas en una sola query, sin N+1. Postgres decide disponibilidad;
+        # GenData sólo identifica aliases cosméticos vía cosmeticFormes.
+        cosmetic_bases: dict[str, str] = {}
         query_ids: list[str] = []
         for visible_id in requested:
-            if visible_id in visible_to_db_id:
+            if visible_id in query_ids:
                 continue
+            query_ids.append(visible_id)
             base = self._vocabulary.cosmetic_base_species(
                 visible_id, gen_number
             )
-            db_id = base if base is not None else visible_id
-            visible_to_db_id[visible_id] = db_id
-            if db_id not in query_ids:
-                query_ids.append(db_id)
+            if base is not None and base not in query_ids:
+                cosmetic_bases[visible_id] = base
+                query_ids.append(base)
 
         factory = self._ensure_factory()
         async with factory() as session:
@@ -287,14 +295,23 @@ class PostgresContextRepository:
 
         by_visible_id: dict[str, dict[str, object]] = {}
         for visible_id in requested:
-            db_id = visible_to_db_id[visible_id]
-            if db_id not in by_db_id:
+            if visible_id in by_db_id:
+                labeled = deepcopy(by_db_id[visible_id])
+                labeled["showdown_id"] = visible_id
+            elif visible_id in cosmetic_bases:
+                base_id = cosmetic_bases[visible_id]
+                if base_id not in by_db_id:
+                    raise LookupError(
+                        f"base cosmética no seedeada: {base_id} "
+                        f"para {visible_id}"
+                    )
+                labeled = deepcopy(by_db_id[base_id])
+                labeled["showdown_id"] = visible_id
+            else:
                 raise LookupError(
                     f"especie visible no seedeada ni forma cosmética: "
                     f"{visible_id}"
                 )
-            labeled = deepcopy(by_db_id[db_id])
-            labeled["showdown_id"] = visible_id
             by_visible_id[visible_id] = labeled
 
         return {
