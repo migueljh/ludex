@@ -231,9 +231,10 @@ class PostgresContextRepository:
             base = self._vocabulary.cosmetic_base_species(
                 visible_id, gen_number
             )
-            if base is not None and base not in query_ids:
+            if base is not None:
                 cosmetic_bases[visible_id] = base
-                query_ids.append(base)
+                if base not in query_ids:
+                    query_ids.append(base)
 
         factory = self._ensure_factory()
         async with factory() as session:

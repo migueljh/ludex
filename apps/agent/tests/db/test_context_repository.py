@@ -521,3 +521,45 @@ async def test_charizardgmax_gen6_no_disponible_falla_ruidosamente():
                 gen_number=6, own_species=("charizardgmax",),
                 opponent_species=(),
             )
+
+
+# --- Bug acoplado: la base ya en query_ids descarta el alias ---
+
+
+@pytest.mark.asyncio
+async def test_vivillon_y_vivillontundra_devuelven_ambos_en_orden():
+    async with _repository() as repository:
+        context = await repository.load_battle_context(
+            gen_number=6,
+            own_species=("vivillon", "vivillontundra"),
+            opponent_species=(),
+        )
+    ids = [p["showdown_id"] for p in context["own"]]
+    assert ids == ["vivillon", "vivillontundra"]
+
+
+@pytest.mark.asyncio
+async def test_vivillontundra_y_vivillon_devuelven_ambos():
+    async with _repository() as repository:
+        context = await repository.load_battle_context(
+            gen_number=6,
+            own_species=("vivillontundra", "vivillon"),
+            opponent_species=(),
+        )
+    ids = [p["showdown_id"] for p in context["own"]]
+    assert ids == ["vivillontundra", "vivillon"]
+
+
+@pytest.mark.asyncio
+async def test_florgesyellow_y_florgesorange_resuelven_ambos_aliases():
+    async with _repository() as repository:
+        context = await repository.load_battle_context(
+            gen_number=6,
+            own_species=("florgesyellow", "florgesorange"),
+            opponent_species=(),
+        )
+    ids = [p["showdown_id"] for p in context["own"]]
+    assert ids == ["florgesyellow", "florgesorange"]
+    for mon in context["own"]:
+        assert mon["types"] == ["Fairy"]
+        assert mon["base_stats"]["hp"] == 78
