@@ -1,37 +1,63 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { createReadOnlyPool, loadDataset } from "./db.js";
+import { createReadOnlyPool, EXPECTED_QUERY_COUNT, loadDataset, type Queryable } from "./db.js";
 import { auditDataset } from "./invariants.js";
 import { renderBattle } from "./render.js";
-import type { Violation } from "./types.js";
+import { parseScope, SCOPE_RULES } from "./scope.js";
+import type { Scope, Violation } from "./types.js";
+import { SCOPES } from "./types.js";
 
 const envPath = fileURLToPath(new URL("../../../.env", import.meta.url));
 if (existsSync(envPath)) process.loadEnvFile(envPath);
 
+/** Cuántos ejemplos se imprimen por invariante. El TOTAL siempre se informa
+ * completo: esto acota la salida, no la evidencia. */
+const EXAMPLES_PER_INVARIANT = 20;
+
 function usage(): string {
   return [
     "Uso:",
-    "  dataset-audit audit [--gen N]",
-    "  dataset-audit battle <battle-tag|id> [--gen N]",
+    `  dataset-audit audit [--scope ${SCOPES.join("|")}] [--gen N]`,
+    "  dataset-audit battle <battle-tag|id> [--scope ...] [--gen N]",
+    "",
+    "Scopes:",
+    ...SCOPES.flatMap((scope) => [
+      `  ${scope}`,
+      ...SCOPE_RULES[scope].map((rule) => `    - ${rule}`),
+    ]),
   ].join("\n");
 }
 
-function parseGen(args: string[]): { gen?: number; rest: string[] } {
+interface ParsedArgs {
+  scope: Scope;
+  gen?: number;
+  rest: string[];
+}
+
+function parseArgs(args: string[]): ParsedArgs {
   const rest: string[] = [];
   let gen: number | undefined;
+  let scope: string | undefined;
   for (let index = 0; index < args.length; index += 1) {
-    if (args[index] !== "--gen") {
-      rest.push(args[index]);
+    const arg = args[index];
+    if (arg === "--gen") {
+      const raw = args[index + 1];
+      if (raw === undefined || !/^\d+$/.test(raw)) {
+        throw new Error("--gen requiere un entero positivo");
+      }
+      gen = Number(raw);
+      index += 1;
       continue;
     }
-    const raw = args[index + 1];
-    if (raw === undefined || !/^\d+$/.test(raw)) {
-      throw new Error("--gen requiere un entero positivo");
+    if (arg === "--scope") {
+      scope = args[index + 1];
+      if (scope === undefined) throw new Error(`--scope requiere un valor (${SCOPES.join(", ")})`);
+      index += 1;
+      continue;
     }
-    gen = Number(raw);
-    index += 1;
+    rest.push(arg);
   }
-  return { gen, rest };
+  return { scope: parseScope(scope), gen, rest };
 }
 
 function violationLine(violation: Violation): string {
@@ -41,7 +67,10 @@ function violationLine(violation: Violation): string {
     violation.turnNumber === undefined ? undefined : `turno ${violation.turnNumber}`,
     violation.decisionIndex === undefined ? undefined : `decisión ${violation.decisionIndex}`,
   ].filter((part) => part !== undefined).join(" · ");
-  return `  - ${violation.invariant}${location ? ` · ${location}` : ""}: ${violation.detail}`;
+  const name = violation.field === undefined
+    ? violation.invariant
+    : `${violation.invariant}/${violation.field}`;
+  return `  - ${name}${location ? ` · ${location}` : ""}: ${violation.detail}`;
 }
 
 async function main(): Promise<void> {
@@ -49,10 +78,20 @@ async function main(): Promise<void> {
   if (command !== "audit" && command !== "battle") {
     throw new Error(usage());
   }
-  const { gen, rest } = parseGen(rawArgs);
+  const { scope, gen, rest } = parseArgs(rawArgs);
   const pool = createReadOnlyPool();
+  // El auditor es read-only por diseño; el contador existe para poder
+  // publicar la medición junto al resultado, no para cambiar el resultado.
+  let queries = 0;
+  const counting: Queryable = {
+    query: async (text: string, values?: unknown[]) => {
+      queries += 1;
+      return await pool.query(text, values as unknown[]);
+    },
+  };
+  const startedAt = Date.now();
   try {
-    const dataset = await loadDataset(pool, gen);
+    const dataset = await loadDataset(counting, { scope, gen });
     if (command === "battle") {
       if (rest.length !== 1) throw new Error(usage());
       const rawSelector = rest[0];
@@ -64,14 +103,43 @@ async function main(): Promise<void> {
 
     const result = auditDataset(dataset);
     console.log(
-      `Dataset: ${dataset.battles.length} batallas · ${dataset.trajectories.length} trayectorias · ${dataset.steps.length} pasos${gen === undefined ? "" : ` · gen ${gen}`}`,
+      `Dataset: ${dataset.battles.length} batallas · ${dataset.trajectories.length} trayectorias · ${dataset.steps.length} pasos · scope ${scope}${gen === undefined ? "" : ` · gen ${gen}`}`,
     );
     for (const check of result.checks) {
       console.log(`${check.violations === 0 ? "PASS" : "FAIL"} ${check.name}: ${check.violations}`);
+      if (check.name !== "hidden_information") continue;
+      for (const field of result.opponentFields) {
+        console.log(
+          `  ${field.violations === 0 ? "PASS" : "FAIL"} hidden_information/${field.name}: ${field.violations}`,
+        );
+      }
     }
+    console.log(
+      `\nQueries: ${queries} (esperadas ${EXPECTED_QUERY_COUNT}) · líneas de protocolo indexadas: ${result.stats.protocolLinesScanned} · pasos auditados: ${result.stats.stepsAudited} · entradas rivales: ${result.stats.opponentEntriesAudited} · chequeos de campo: ${result.stats.opponentFieldChecksRun} · ${((Date.now() - startedAt) / 1000).toFixed(1)} s`,
+    );
+
+    // Un auditor que no recorrió ningún paso no puede afirmar nada: falla
+    // ruidoso en vez de reportar todo en PASS.
+    if (dataset.steps.length > 0 && result.stats.stepsAudited === 0) {
+      throw new Error("el auditor no visitó ningún paso pese a que el dataset tiene filas");
+    }
+
     if (result.violations.length > 0) {
-      console.log("\nViolaciones:");
-      console.log(result.violations.map(violationLine).join("\n"));
+      console.log(`\nViolaciones (${result.violations.length}):`);
+      const shown = new Map<string, number>();
+      for (const violation of result.violations) {
+        const key = violation.field === undefined
+          ? violation.invariant
+          : `${violation.invariant}/${violation.field}`;
+        const count = shown.get(key) ?? 0;
+        if (count < EXAMPLES_PER_INVARIANT) console.log(violationLine(violation));
+        shown.set(key, count + 1);
+      }
+      for (const [key, count] of shown) {
+        if (count > EXAMPLES_PER_INVARIANT) {
+          console.log(`  … ${key}: ${count - EXAMPLES_PER_INVARIANT} violaciones más`);
+        }
+      }
       process.exitCode = 1;
     }
   } finally {
