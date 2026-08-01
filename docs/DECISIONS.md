@@ -1416,24 +1416,46 @@ especies rivales no reveladas.
 **Formas cosméticas y frontera ruidosa (corrección de Changes Requested).**
 El repositorio no podía silenciosamente descartar especies visibles sin fila
 directa en `pokemon`: las formas cosméticas (Vivillon-Tundra,
-Florges-Yellow/Orange, Sawsbuck-Summer, Unown-O) son specias con `baseSpecies`
-distinto al propio e `baseStats` idénticos a la base; aparecen en el protocolo
-con su showdown_id visible, no se seedean por separado, y antes quedaban fuera
-del catálogo y del prompt sin ruido. La corrección inyecta un
-`SpeciesVocabulary` (protocolo) con impl `PokeEnvSpeciesVocabulary` (poke-env
-`GenData`, generation-scoped, cacheado por gen, sin internet). Antes de la
-consulta SQL se resuelve cada species_id visible: si es cosmético se reemplaza
-por su especie base en la query, conservando el `showdown_id` VISIBLE en el
-resultado, así la proyección correlaciona por especie revelada. Una forma con
-stats propios (Mega, `floetteeternal` — stats 74/65/67/125/128/92 vs
-floette 54/45/47/75/98/52) **no es cosmética** y llueve `LookupError`
-ruidoso: jamás degrada a la base. `charizardmegax` tiene fila directa en
-`pokemon` y sigue usándola. La frontera de generación misma es ruidosa:
-`gholdengo` en gen6 (no existe en pokedex de gen6) también raise `LookupError`,
-no devuelve `[]` silenciosamente. Medido: 332 apariciones afectadas (276
-propias + 56 rivales) bajo `state_schema_version=2`; las 5 formas cosméticas se
-resuelven a su base con stats idénticos; `floetteeternal` (38 apariciones)
-queda como canario del fallo ruidoso.
+Florges-Yellow/Orange, Sawsbuck-Summer, Unown-O) son especies que aparecen
+en el protocolo con su showdown_id visible, no se seedean por separado, y
+antes quedaban fuera del catálogo y del prompt sin ruido.
+
+La primera corrección usó igualdad de `baseStats` para clasificar cosméticas,
+pero era incorrecta: Arceus-Poison (120/120/120/120/120/120 idénticos a
+Arceus Normal) y Castform-Sunny se degradaban a su base perdiendo tipo;
+Pikachu-World/Partner (gen 8/7) se aceptaban en gen 6 porque
+`GenData.from_gen(6).pokedex` contiene formas de generaciones futuras sin
+filtrar (ver `.claude/showdown-data/SKILL.md`: "los mods NO filtran por
+generación").
+
+La corrección final:
+
+- **Una fila directa `(gen_id, visible_showdown_id)` SIEMPRE gana.** Se
+  consulta la unión de IDs visibles y bases candidatas en una sola query
+  (sin N+1). Para cada visible_id: si hay fila directa se usa; si no, se
+  busca entre las bases candidatas.
+- **`cosmeticFormes` explícito del dex es el único criterio.** Una forma es
+  cosmética sólo si su entrada en el dex tiene `cosmeticFormes` (lista no
+  vacía) y `baseSpecies` distinto al propio. Las formas mecánicas (Arceus
+  tipos, Castform climas, Mega, Gmax, Ogerpon te, Pikachu Cosplay/World/
+  Partner) tienen `cosmeticFormes=None` y NO se resuelven.
+- **Postgres decide disponibilidad, no GenData.** Estar en el pokedex no
+  significa estar disponible en la generación. La query es generation-scoped
+  (`WHERE p.gen_id = :gen_id`): una forma de generación posterior sin fila
+  en `pokemon` no produce resultado y se raises `LookupError`.
+- **Fallo ruidoso, nunca descarte silencioso.** Si no hay fila directa y la
+  forma no es miembro explícito de `cosmeticFormes`, se lanza `LookupError`.
+  Canarios: `floetteeternal` gen6, `pikachupartner` gen6, `pikachuworld`
+  gen6, `charizardgmax` gen6, `gholdengo` gen6.
+- **El `showdown_id` visible se conserva** sólo tras una resolución
+  cosmética válida, para que la proyección correlacione por especie
+  revelada.
+
+Medido: 332 apariciones afectadas (276 propias + 56 rivales) bajo
+`state_schema_version=2`. Las 5 formas cosméticas (vivillontundra,
+florgesyellow, florgesorange, sawsbucksummer, unowno) se resuelven a su base
+vía `cosmeticFormes`. `floetteeternal` (38 apariciones) y las formas de gen
+posterior quedan como canarios del fallo ruidoso.
 
 **Exclusiones diferidas.** Quedan explícitamente fuera de F2-06: round
 availability (la ronda activa se agrega en una rebanada posterior), perfiles
