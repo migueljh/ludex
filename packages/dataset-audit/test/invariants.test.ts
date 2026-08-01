@@ -89,7 +89,7 @@ describe("action_turn", () => {
 
   it("rechaza un state.turn POSTERIOR a turn_number: sería un techo falso", () => {
     const dataset = baseDataset();
-    auditedStep(dataset).state.turn = 2;
+    auditedStep(dataset).state.turn = 3;
     expect(invariantsViolated(dataset)).toEqual(["action_turn"]);
   });
 
@@ -142,7 +142,7 @@ describe("decision_index", () => {
 describe("state_rederivable", () => {
   it("rechaza un paso sin protocol_lines para su battle/side/turn", () => {
     const dataset = baseDataset();
-    dataset.turns = dataset.turns.filter((turn) => turn.turnNumber !== 1);
+    dataset.turns = dataset.turns.filter((turn) => turn.turnNumber !== 2);
     const violations = auditDataset(dataset).violations
       .filter((violation) => violation.invariant === "state_rederivable");
     expect(violations.length).toBeGreaterThan(0);
@@ -150,7 +150,7 @@ describe("state_rederivable", () => {
 
   it("rechaza protocol_lines vacías", () => {
     const dataset = baseDataset();
-    dataset.turns[1].protocolLines = [];
+    dataset.turns[2].protocolLines = [];
     expect(invariantsViolated(dataset)).toContain("state_rederivable");
   });
 

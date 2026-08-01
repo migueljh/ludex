@@ -55,14 +55,17 @@ export function dexMoves(): DexMove[] {
   ];
 }
 
+// `|turn|N` ABRE el bloque del turno N (`ProtocolRecorder.record`), así que
+// cada bloque arranca con su propia línea de turno y contiene la narración de
+// lo que pasó DURANTE ese turno.
 export const PROTOCOL_TURN_0 = [
   "|rule|HP Percentage Mod: HP is shown in percentages",
   "|switch|p1a: Gengar|Gengar, L80, M|280/280",
   "|switch|p2a: Furfrou|Furfrou-Pharaoh, L85, F|100/100",
-  "|turn|1",
 ];
 
 export const PROTOCOL_TURN_1 = [
+  "|turn|1",
   "|switch|p2a: Mimien|Mr. Mime, L82, M|100/100",
   "|-ability|p2a: Mimien|Soundproof",
   "|move|p2a: Mimien|Psychic|p1a: Gengar",
@@ -71,7 +74,15 @@ export const PROTOCOL_TURN_1 = [
   "|-boost|p2a: Mimien|atk|1",
   "|-damage|p2a: Mimien|55/100 par",
   "|-heal|p2a: Mimien|55/100 par|[from] item: Leftovers",
+];
+
+// El paso auditado vive en el turno 2, DESPUÉS de que el turno 1 dejó todo
+// resuelto: así "quién está activo" y "qué status tiene" tienen una única
+// respuesta admisible y una mutación no puede escudarse en el estado
+// intermedio de su propio turno.
+export const PROTOCOL_TURN_2 = [
   "|turn|2",
+  "|upkeep",
 ];
 
 /** La entrada que auditan los tests de los 11 campos. Todo lo que afirma está
@@ -93,6 +104,26 @@ export function auditedOpponent(): OpponentPokemonState {
       { id: "hiddenpowerice", pp: 24, max_pp: 24 },
     ],
   };
+}
+
+/** Nuestro propio lado. No es fuga —ya lo tenemos— y es exactamente lo que un
+ * Transform copia, así que el auditor lo necesita para poder exigir que un
+ * Transform sólo acepte los datos que realmente copió. */
+export function ownTeam(): OpponentPokemonState[] {
+  return [{
+    species: "gengar",
+    hp_fraction: 1,
+    active: true,
+    fainted: false,
+    status: null,
+    level: 80,
+    item: "lifeorb",
+    ability: "levitate",
+    types: ["GHOST", "POISON"],
+    boosts: { accuracy: 0, atk: 0, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0 },
+    moves: [{ id: "shadowball", pp: 24, max_pp: 24 }],
+    stats: { atk: 120, def: 130, spa: 240, spd: 150, spe: 220 },
+  }];
 }
 
 /** Segunda entrada: forma COSMÉTICA (ausente del dex local) con la ability
@@ -136,6 +167,7 @@ function step(
       format: "gen6randombattle",
       player_role: "p1",
       legal_actions: LEGAL_ACTIONS,
+      me: { pokemon: ownTeam() },
       opponent: { pokemon: opponent },
     },
     stateSchemaVersion: 2,
@@ -162,6 +194,7 @@ export function baseDataset(): Dataset {
     turns: [
       { battleId: BATTLE_ID, playerSide: "p1", turnNumber: 0, protocolLines: [...PROTOCOL_TURN_0] },
       { battleId: BATTLE_ID, playerSide: "p1", turnNumber: 1, protocolLines: [...PROTOCOL_TURN_1] },
+      { battleId: BATTLE_ID, playerSide: "p1", turnNumber: 2, protocolLines: [...PROTOCOL_TURN_2] },
     ],
     trajectories: [{
       id: TRAJECTORY_ID,
@@ -173,7 +206,7 @@ export function baseDataset(): Dataset {
     }],
     steps: [
       step(0, 0, [{ ...benchedOpponent(), active: true }]),
-      step(1, 1, [auditedOpponent(), benchedOpponent()]),
+      step(1, 2, [auditedOpponent(), benchedOpponent()]),
     ],
     dexPokemon: dexPokemon(),
     dexMoves: dexMoves(),
@@ -185,6 +218,34 @@ export function auditedStep(dataset: Dataset): TrajectoryStepRecord {
   const found = dataset.steps.find((candidate) => candidate.decisionIndex === 1);
   if (found === undefined) throw new Error("el fixture perdió su paso auditado");
   return found;
+}
+
+/** El rival auditado, dentro del dataset dado. */
+export function auditedOpponentOf(dataset: Dataset): OpponentPokemonState {
+  const opponent = auditedStep(dataset).state.opponent?.pokemon;
+  if (opponent === undefined) throw new Error("el fixture perdió su rival");
+  return opponent[0];
+}
+
+/** Añade una línea al protocolo del turno 1: lo que pasa ahí ya está resuelto
+ * cuando el paso auditado (turno 2) toma su snapshot. */
+export function withProtocolLine(dataset: Dataset, line: string, turnNumber = 1): Dataset {
+  const turn = dataset.turns.find((candidate) => candidate.turnNumber === turnNumber);
+  if (turn === undefined) throw new Error(`el fixture perdió su turno ${turnNumber}`);
+  turn.protocolLines.push(line);
+  return dataset;
+}
+
+/** El rival auditado, debilitado con su `|faint|` público. Positivo por
+ * defecto: `fainted` en `true` es lo que el protocolo dice. */
+export function faintedFixture(fainted: boolean): Dataset {
+  const dataset = withProtocolLine(baseDataset(), "|faint|p2a: Mimien");
+  const audited = auditedOpponentOf(dataset);
+  audited.fainted = fainted;
+  audited.hp_fraction = 0;
+  audited.status = "FNT";
+  audited.active = false;
+  return dataset;
 }
 
 /** Devuelve un dataset con UN campo del rival auditado cambiado. */

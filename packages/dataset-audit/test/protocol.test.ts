@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { auditDataset } from "../src/invariants.js";
 import {
   buildProtocolIndex,
-  buildSpeciesResolver,
+  buildSpeciesIndex,
   identityKeys,
   moveEvidenceKeys,
   normalizeProtocolText,
@@ -14,13 +14,14 @@ import {
 import type { BattleTurnRecord, Dataset } from "../src/types.js";
 import { auditedStep, baseDataset, dexPokemon } from "./fixtures.js";
 
-const resolve = buildSpeciesResolver(dexPokemon());
+const speciesIndex = buildSpeciesIndex(dexPokemon());
+const resolve = speciesIndex.resolve;
 
 function indexOf(lines: string[]): ReturnType<typeof buildProtocolIndex> {
   const turns: BattleTurnRecord[] = [
     { battleId: 1, playerSide: "p1", turnNumber: 0, protocolLines: lines },
   ];
-  return buildProtocolIndex(turns, resolve);
+  return buildProtocolIndex(turns, speciesIndex);
 }
 
 describe("normalización", () => {
@@ -42,7 +43,10 @@ describe("parseo de ident y details", () => {
 
   it("extrae especie y nivel del details, y acepta que Showdown omita L100", () => {
     expect(parseDetails("Yanmega, L82, F")).toEqual({ species: "yanmega", level: 82 });
-    expect(parseDetails("Mew")).toEqual({ species: "mew", level: undefined });
+    // Showdown OMITE el nivel cuando es 100, y el recorder lo interpreta así
+    // (`_level_from_details`). Devolver 100 explícito es lo que permite exigir
+    // el nivel sin dejar un comodín que un valor falso pueda aprovechar.
+    expect(parseDetails("Mew")).toEqual({ species: "mew", level: 100 });
   });
 
   it("el lado observado es siempre el otro", () => {
@@ -85,7 +89,7 @@ describe("evidencia por TOKEN, no por substring de la línea", () => {
       "|switch|p1a: Gengar|Gengar, L80, M|280/280",
       "|move|p1a: Gengar|Shadow Ball|p2a: Mr. Mime",
     ]);
-    const evidence = index.get(1, "p1", "p2")!;
+    const evidence = index.get(1, "p1", "p2")!.evidence;
     // La línea NOMBRA a Mr. Mime, pero como objetivo: no es un `|switch|`.
     expect(revealedBy(evidence.species, ["mrmime"], 0)).toBe(false);
     expect(revealedBy(evidence.move, ["mrmime|shadowball"], 0)).toBe(false);
@@ -93,16 +97,16 @@ describe("evidencia por TOKEN, no por substring de la línea", () => {
 
   it("un `|switch|` sí lo revela", () => {
     const index = indexOf(["|switch|p2a: Mimien|Mr. Mime, L82, M|100/100"]);
-    expect(revealedBy(index.get(1, "p1", "p2")!.species, ["mrmime"], 0)).toBe(true);
+    expect(revealedBy(index.get(1, "p1", "p2")!.evidence.species, ["mrmime"], 0)).toBe(true);
   });
 });
 
 describe("pertenencia de item y ability por sufijo", () => {
   function abilityOf(lines: string[], key: string, side = "p2"): boolean {
-    return revealedBy(indexOf(lines).get(1, "p1", side)!.ability, [key], 0);
+    return revealedBy(indexOf(lines).get(1, "p1", side)!.evidence.ability, [key], 0);
   }
   function itemOf(lines: string[], key: string, side = "p2"): boolean {
-    return revealedBy(indexOf(lines).get(1, "p1", side)!.item, [key], 0);
+    return revealedBy(indexOf(lines).get(1, "p1", side)!.evidence.item, [key], 0);
   }
 
   const SWITCH_OPP = "|switch|p2a: Lapras|Lapras, L80, F|100/100";
@@ -173,7 +177,7 @@ describe("el índice se arma línea por línea, nunca sobre el protocolo concate
       "|switch|p2a: Char|Charizard, L80, M|100/100",
       "|-message|izard-Mega-X",
     ]);
-    const evidence = index.get(1, "p1", "p2")!;
+    const evidence = index.get(1, "p1", "p2")!.evidence;
     expect(revealedBy(evidence.species, ["charizard"], 0)).toBe(true);
     expect(revealedBy(evidence.species, ["charizardmegax"], 0)).toBe(false);
   });
@@ -200,6 +204,11 @@ describe("Transform: inferencia legítima, no fuga", () => {
     dataset.turns[1].protocolLines.push(
       "|-transform|p2a: Mimien|p1a: Gengar|[from] ability: Imposter",
     );
+    // Con el Transform vigente, el moveset copiado topea su PP en 5.
+    auditedStep(dataset).state.opponent!.pokemon![0].moves = [
+      { id: "shadowball", pp: 5, max_pp: 5 },
+    ];
+    auditedStep(dataset).state.opponent!.pokemon![0].ability = "levitate";
     expect(auditDataset(dataset).violations).toEqual([]);
   });
 });

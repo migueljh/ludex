@@ -81,6 +81,11 @@ export interface OpponentPokemonState {
 export interface StepState {
   turn?: unknown;
   schema_version?: unknown;
+  /** Nuestro propio lado. No es fuga: es lo que un Transform puede copiar. */
+  me?: {
+    pokemon?: OpponentPokemonState[];
+    [key: string]: unknown;
+  };
   opponent?: {
     pokemon?: OpponentPokemonState[];
     [key: string]: unknown;

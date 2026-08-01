@@ -45,7 +45,7 @@ describe("el costo de leer el protocolo no crece con trajectory_steps", () => {
     // Relación conceptual: el protocolo se lee una vez, no una por paso.
     expect(large.stats.protocolLinesScanned).toBe(small.stats.protocolLinesScanned);
     // Valor exacto: cualquier deriva en cómo se recorre el corpus se nota.
-    expect(large.stats.protocolLinesScanned).toBe(13);
+    expect(large.stats.protocolLinesScanned).toBe(14);
   });
 
   it("el trabajo POR PASO sí crece: si no, el dataset grande no se auditó", () => {

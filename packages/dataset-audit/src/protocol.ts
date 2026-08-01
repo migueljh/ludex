@@ -1,26 +1,36 @@
-/** Índice acumulativo del protocolo crudo.
+/** Lectura del protocolo crudo: evidencia de revelación + línea de tiempo.
  *
- * El protocolo es la fuente de verdad del estado (D17). Este módulo lo lee
- * UNA sola vez por corrida y deja, para cada `(battle_id, player_side)`, el
- * PRIMER turno en que cada hecho público quedó revelado. Preguntar "¿esto era
- * público en el turno T?" pasa a ser `primerTurno <= T`, O(1), en vez de
- * rebobinar el prefijo de protocolo una vez por paso.
+ * El protocolo es la fuente de verdad del estado (D17). Este módulo lo lee UNA
+ * sola vez por corrida y produce dos cosas distintas, porque responden
+ * preguntas distintas:
+ *
+ *  - `SideEvidence` — "¿esto fue público alguna vez, hasta el turno T?".
+ *    Sirve para lo que el protocolo revela pero no vuelve a mencionar: item,
+ *    ability, especie, existencia de un movimiento.
+ *  - `SideTimeline` — "¿cuál era el VALOR en el turno T?". Sirve para todo lo
+ *    que tiene ciclo de vida: HP, activo, status, debilitado, boosts, PP,
+ *    Transform. Sin esto, "revelado alguna vez" deja pasar un valor falso.
  *
  * Reglas del SKILL que este módulo respeta a propósito:
  *
- *  - Se compara LÍNEA POR LÍNEA, nunca sobre el protocolo concatenado: en un
- *    blob un nombre puede "aparecer" a caballo entre dos tokens sin relación
- *    y una fuga real pasaría como revelada.
- *  - Se compara por TOKEN, no por substring de la línea entera: sin eso,
- *    `|move|p1a: Gengar|Shadow Ball|p2a: Mr. Mime` "revelaría" a Mr. Mime como
- *    especie sólo por ser el objetivo.
- *  - La identidad de un miembro es su `base_species` (`Pokemon.identifies_as`),
- *    no su `species`: una Mega que sale del campo y vuelve NO es un miembro
- *    nuevo.
- *  - La normalización saca TODA la puntuación y los diacríticos: "Mr. Mime"
- *    tiene un punto y "Farfetch'd" un apóstrofo.
+ *  - Se compara LÍNEA POR LÍNEA, nunca sobre el protocolo concatenado.
+ *  - Se compara por TOKEN, no por substring de la línea entera.
+ *  - La identidad de un miembro es su `base_species` (`Pokemon.identifies_as`).
+ *  - La normalización saca TODA la puntuación y los diacríticos.
  */
 
+import {
+  blankBoosts,
+  emptyLog,
+  emptySideTimeline,
+  monOf,
+  record,
+  UNKNOWN,
+  type Boosts,
+  type EventLog,
+  type SideTimeline,
+  type Unknown,
+} from "./timeline.js";
 import type { BattleTurnRecord, DexPokemon } from "./types.js";
 
 export function normalizeProtocolText(value: string): string {
@@ -55,77 +65,95 @@ export function parseIdent(raw: string | undefined): ProtocolIdent | undefined {
   return name.length === 0 ? undefined : { side: match[1].toLowerCase(), name };
 }
 
-/** `Yanmega, L82, F` -> especie normalizada y nivel narrado (Showdown omite
- * `L100`, por eso `level` puede venir `undefined` legítimamente). */
+/** `Yanmega, L82, F` -> especie y nivel.
+ *
+ * El nivel NUNCA queda indefinido para un `details` no vacío: Showdown omite
+ * `L100` y `_level_from_details` del recorder devuelve 100 en ese caso. Por
+ * eso el auditor puede exigir que `level` sea uno de los niveles narrados, sin
+ * ninguna excepción "implícita" que un valor falso pueda aprovechar.
+ */
 export function parseDetails(raw: string | undefined): {
   species: string;
-  level?: number;
+  level: number;
 } | undefined {
   if (raw === undefined) return undefined;
   const parts = raw.split(",").map((part) => part.trim());
   const species = normalizeProtocolText(parts[0] ?? "");
   if (species.length === 0) return undefined;
-  let level: number | undefined;
   for (const part of parts.slice(1)) {
     const match = /^L(\d+)$/i.exec(part);
-    if (match) level = Number(match[1]);
+    if (match) return { species, level: Number(match[1]) };
   }
-  return { species, level };
+  return { species, level: 100 };
+}
+
+/** `55/100 par`, `0 fnt`, `100/100`. */
+export function parseHpToken(raw: string | undefined): {
+  fraction: number;
+  status: string | null;
+  fainted: boolean;
+} | undefined {
+  if (raw === undefined) return undefined;
+  const token = raw.trim();
+  const match = /^(\d+)(?:\/(\d+))?(?:\s+([a-z]+))?/i.exec(token);
+  if (!match) return undefined;
+  const current = Number(match[1]);
+  const total = match[2] === undefined ? undefined : Number(match[2]);
+  if (total !== undefined && total === 0) return undefined;
+  const fraction = total === undefined ? (current === 0 ? 0 : 1) : current / total;
+  const rawStatus = match[3]?.toLowerCase() ?? null;
+  const fainted = rawStatus === "fnt" || current === 0;
+  return { fraction, status: fainted ? "fnt" : rawStatus, fainted };
 }
 
 const REVEAL_TAGS = new Set(["switch", "drag", "replace", "detailschange"]);
+/** Sólo estas ENTRAN al campo. `detailschange` es un cambio de forma sobre el
+ * pokémon que ya está adentro (una Mega): no limpia boosts ni termina un
+ * Transform, y confundirlo con una entrada borraba boosts públicos reales
+ * (medido: 32 filas v2, todas Mega). `replace` (Illusion) revela quién estaba
+ * realmente en el campo y hereda su HP y su status, así que tampoco reinicia
+ * los boosts de la posición. */
+const SWITCH_IN_TAGS = new Set(["switch", "drag"]);
+const HP_TAGS = new Set(["-damage", "-heal", "-sethp"]);
 /** Etiquetas que cambian UN stat nombrado en `parts[3]`. */
 const BOOST_TAGS_WITH_STAT = new Set(["-boost", "-unboost", "-setboost"]);
-/** Etiquetas que cambian VARIOS stats sin nombrarlos: se registran con el
- * comodín `*`, porque cualquiera de los siete pudo moverse. */
-const BOOST_TAGS_ANY_STAT = new Set([
-  "-swapboost", "-copyboost", "-clearboost",
-  "-clearnegativeboost", "-clearpositiveboost", "-invertboost",
-]);
-/** Comodín de stat para los boosts que el protocolo no desglosa. */
-export const ANY_BOOST_STAT = "*";
 const TYPE_CHANGE_TAGS = new Set(["-transform", "detailschange", "-formechange", "replace"]);
 
-/** Evidencia pública acumulada de UN lado de UNA batalla. Cada mapa guarda el
- * PRIMER turno en que el hecho quedó revelado. */
+/** Evidencia de revelación: primer turno en que cada hecho se hizo público. */
 export interface SideEvidence {
+  /** Especie narrada VERBATIM en un `details`. */
+  speciesExact: Map<string, number>;
+  /** Especie o su base, para la identidad canónica. */
   species: Map<string, number>;
-  level: Map<string, number>;
   move: Map<string, number>;
   item: Map<string, number>;
   ability: Map<string, number>;
   status: Map<string, number>;
-  faint: Map<string, number>;
-  boost: Map<string, number>;
   typeChange: Map<string, number>;
-  /** Transform/Imposter: a partir de acá el moveset, los tipos y la ability
-   * son copia de otro pokémon y no se pueden contrastar contra el dex. */
-  transform: Map<string, number>;
-  /** `|rule|HP Percentage Mod`: con la regla activa el HP rival se narra en
-   * centésimos, así que `hp_fraction` tiene que caer en la grilla de 1/100. */
+  /** `|rule|HP Percentage Mod`: el HP rival se narra en centésimos. */
   hpPercentageMod: boolean;
-  /** Turnos con al menos una línea de protocolo grabada. */
   turnsWithLines: Set<number>;
 }
 
+export interface SideView {
+  evidence: SideEvidence;
+  timeline: SideTimeline;
+}
+
 export interface ProtocolIndex {
-  /** Clave `${battleId}:${playerSide}:${opponentSide}`. */
-  get(battleId: number, playerSide: string, opponentSide: string): SideEvidence | undefined;
+  get(battleId: number, playerSide: string, opponentSide: string): SideView | undefined;
   linesScanned: number;
 }
 
 function emptyEvidence(): SideEvidence {
   return {
+    speciesExact: new Map(),
     species: new Map(),
-    level: new Map(),
     move: new Map(),
     item: new Map(),
     ability: new Map(),
     status: new Map(),
-    faint: new Map(),
-    boost: new Map(),
     typeChange: new Map(),
-    transform: new Map(),
     hpPercentageMod: false,
     turnsWithLines: new Set(),
   };
@@ -158,60 +186,70 @@ export type SpeciesResolver = (speciesId: string) => DexPokemon | undefined;
  * *cosméticas* de Showdown (Furfrou-Pharaoh, Florges-Blue, Sawsbuck-Autumn,
  * Gastrodon-East, las 28 Unown), que en el dex oficial comparten la entrada de
  * su especie base. poke-env sí las resuelve, así que el estado grabado las
- * nombra y una búsqueda exacta las deja sin dex: 492 falsos positivos de
- * `ability` sobre el corpus real, todos Furfrou.
+ * nombra y una búsqueda exacta las deja sin dex.
  *
  * La resolución de respaldo es el prefijo MÁS LARGO del dex que sea prefijo
  * del id buscado, que es exactamente cómo Showdown forma el id de una forma
  * cosmética (`furfrou` + `pharaoh`). Sigue anclada al dex: no hay ninguna
  * lista de especies escrita a mano.
+ *
+ * Es resolución, NO validación: `resolvedExactly` distingue las dos, porque un
+ * sufijo inventado (`furfroubanana`) también resuelve a `furfrou`. Quien
+ * valide una especie tiene que exigir, además, que el protocolo la haya
+ * narrado verbatim.
  */
-export function buildSpeciesResolver(entries: Iterable<DexPokemon>): SpeciesResolver {
+export interface SpeciesIndex {
+  resolve: SpeciesResolver;
+  /** ¿El dex conoce este id exactamente, sin caer al prefijo? */
+  resolvedExactly: (speciesId: string) => boolean;
+}
+
+export function buildSpeciesIndex(entries: Iterable<DexPokemon>): SpeciesIndex {
   const exact = new Map<string, DexPokemon>();
   for (const entry of entries) exact.set(normalizeProtocolText(entry.showdownId), entry);
   const byLengthDesc = [...exact.keys()].sort((a, b) => b.length - a.length);
   const cache = new Map<string, DexPokemon | undefined>();
-  return (speciesId: string) => {
-    const normalized = normalizeProtocolText(speciesId);
-    const hit = exact.get(normalized);
-    if (hit !== undefined) return hit;
-    if (cache.has(normalized)) return cache.get(normalized);
-    let resolved: DexPokemon | undefined;
-    for (const candidate of byLengthDesc) {
-      if (candidate.length < normalized.length && normalized.startsWith(candidate)) {
-        resolved = exact.get(candidate);
-        break;
+  return {
+    resolve: (speciesId: string) => {
+      const normalized = normalizeProtocolText(speciesId);
+      const hit = exact.get(normalized);
+      if (hit !== undefined) return hit;
+      if (cache.has(normalized)) return cache.get(normalized);
+      let resolved: DexPokemon | undefined;
+      for (const candidate of byLengthDesc) {
+        if (candidate.length < normalized.length && normalized.startsWith(candidate)) {
+          resolved = exact.get(candidate);
+          break;
+        }
       }
-    }
-    cache.set(normalized, resolved);
-    return resolved;
+      cache.set(normalized, resolved);
+      return resolved;
+    },
+    resolvedExactly: (speciesId: string) => exact.has(normalizeProtocolText(speciesId)),
   };
 }
 
-/** Identidad canónica de una especie según el dex local: su `base_species`.
+export function buildSpeciesResolver(entries: Iterable<DexPokemon>): SpeciesResolver {
+  return buildSpeciesIndex(entries).resolve;
+}
+
+/** Identidad canónica de una especie: su `base_species` según el dex local.
  * Es el criterio de `Pokemon.identifies_as`, no una comparación por `species`
  * (que rompe con toda forma alternativa: Arceus-Poison, Rotom-Wash). */
-export function identityKeys(species: string, resolve: SpeciesResolver): string[] {
+export function canonicalIdentity(species: string, resolve: SpeciesResolver): string {
   const normalized = normalizeProtocolText(species);
   const entry = resolve(normalized);
-  const base = entry ? normalizeProtocolText(entry.baseSpecies) : normalized;
+  return entry ? normalizeProtocolText(entry.baseSpecies) : normalized;
+}
+
+/** Claves con las que buscar evidencia de revelación: la especie tal cual y su
+ * identidad canónica. */
+export function identityKeys(species: string, resolve: SpeciesResolver): string[] {
+  const normalized = normalizeProtocolText(species);
+  const base = canonicalIdentity(normalized, resolve);
   return base === normalized ? [normalized] : [normalized, base];
 }
 
-/** Un evento sobre `ident` se atribuye a TODAS las identidades que ese ident
- * nombró hasta ahora (el apodo del protocolo puede ser la forma base mientras
- * `species` es una forma alternativa: `p2a: Rotom` para `Rotom-Wash`). */
-function identityAliases(
-  ident: ProtocolIdent,
-  identSpecies: Map<string, Set<string>>,
-): string[] {
-  const aliases = new Set<string>([ident.name]);
-  for (const species of identSpecies.get(ident.name) ?? []) aliases.add(species);
-  return [...aliases];
-}
-
-// El sufijo aparece con y sin `[from]`: `|-immune|p2a: X|[from] ability: Levitate`
-// pero `|-activate|p2a: X|ability: Sturdy`.
 const SUFFIX_ITEM = /(?:\[from\]\s*)?item:\s*([^|]+)/i;
 const SUFFIX_ABILITY = /(?:\[from\]\s*)?ability:\s*([^|]+)/i;
 const SUFFIX_OF = /\[of\]\s*(p[1-9][a-z]?:[^|]+)/i;
@@ -221,18 +259,8 @@ const SWAP_CAUSE = /(?:move:\s*(?:Trick|Switcheroo|Thief|Covet)|ability:\s*(?:Ma
 /** Quién es el dueño real del item/ability que revela un sufijo.
  *
  * Reproduce la semántica del `[of]` que poke-env 0.15.0 codifica en sus cuatro
- * helpers de `-damage`/`-heal` (`abstract_battle.py:333-403`), que el proyector
- * del recorder ya replica en `apply_damage_or_heal_ownership`:
- *
- *  - `-damage` con `[of] Y`: el item/ability es de Y (Rocky Helmet, Rough Skin).
- *  - `-heal`: el `[of]` es ENGAÑOSO y el dueño es el ident de la línea
- *    (Water Absorb cura a quien la tiene y nombra a quien lanzó el agua);
- *    la única excepción es Hospitality, que sí viene de otro.
- *  - `-ability`: el `[of]` es la FUENTE copiada (Trace), no el dueño.
- *  - el resto de las etiquetas: el ident de la línea.
- *
- * Atribuirle el dato al `[of]` en los dos primeros casos dejaba al dueño real
- * sin evidencia: 1655 falsos positivos de `ability` sobre el corpus real.
+ * helpers de `-damage`/`-heal` (`abstract_battle.py:333-403`) y en su rama
+ * `-item` (`:949-989`), que el proyector del recorder ya replica.
  */
 function suffixOwner(
   tag: string,
@@ -248,25 +276,25 @@ function suffixOwner(
   // `-heal` por ability: el `[of]` nombra a quien lanzó el ataque absorbido,
   // no a quien tiene la ability. Hospitality es la única que sí viene de otro.
   if (tag === "-heal" && kind === "ability") return value === "hospitality" ? of : ident;
-  // `-item`: poke-env (`abstract_battle.py:949-989`) distingue tres causas.
-  // Frisk la tiene el `[of]` (el que espía); Pickpocket y Magician las tiene
-  // el ident (el que roba). Darle Pickpocket al `[of]` dejaba al ladrón sin
-  // evidencia: 14 falsos positivos sobre el corpus real.
+  // `-item`: Frisk la tiene el `[of]` (el que espía); Pickpocket y Magician,
+  // el ident (el que roba).
   if (tag === "-item" && kind === "ability") {
     return value === "pickpocket" || value === "magician" ? ident : of;
   }
   // Resto: el `[of]` es la CAUSA, y la causa es quien tiene el item/ability.
-  // `|-item|p1a: Nuestro|Leftovers|[from] ability: Frisk|[of] p2a: Rival` es
-  // prueba pública de que el Frisk es del rival.
   return of;
 }
 
-/** Construye el índice. Recorre el corpus UNA vez: el costo es proporcional a
- * las líneas de protocolo, no a la cantidad de pasos. */
+function currentBoosts(log: EventLog<Boosts | Unknown>): Boosts | Unknown {
+  return log.values.length === 0 ? blankBoosts() : log.values[log.values.length - 1];
+}
+
+/** Construye evidencia y línea de tiempo en UNA pasada sobre el corpus. */
 export function buildProtocolIndex(
   turns: readonly BattleTurnRecord[],
-  resolve: SpeciesResolver,
+  species: SpeciesIndex | SpeciesResolver,
 ): ProtocolIndex {
+  const resolve: SpeciesResolver = typeof species === "function" ? species : species.resolve;
   const byBattleSide = new Map<string, BattleTurnRecord[]>();
   for (const turn of turns) {
     const key = `${turn.battleId}:${turn.playerSide}`;
@@ -275,34 +303,36 @@ export function buildProtocolIndex(
     else bucket.push(turn);
   }
 
-  const evidences = new Map<string, SideEvidence>();
+  const views = new Map<string, SideView>();
   let linesScanned = 0;
 
   for (const [key, bucket] of byBattleSide) {
     bucket.sort((a, b) => a.turnNumber - b.turnNumber);
-    // Una evidencia por lado observado. `player_side` es el dueño del stream;
-    // el lado auditado es el otro, pero el índice se arma para los dos por si
-    // una trayectoria futura audita p2.
-    const perSide = new Map<string, SideEvidence>();
-    const identSpecies = new Map<string, Map<string, Set<string>>>();
-    const ensure = (side: string): SideEvidence => {
-      let evidence = perSide.get(side);
-      if (evidence === undefined) {
-        evidence = emptyEvidence();
-        perSide.set(side, evidence);
-        identSpecies.set(side, new Map());
+    const perSide = new Map<string, SideView>();
+    /** ident del protocolo -> identidad canónica conocida hasta ahora. */
+    const identCanon = new Map<string, Map<string, string>>();
+    const ensure = (side: string): SideView => {
+      let view = perSide.get(side);
+      if (view === undefined) {
+        view = { evidence: emptyEvidence(), timeline: emptySideTimeline() };
+        perSide.set(side, view);
+        identCanon.set(side, new Map());
       }
-      return evidence;
+      return view;
     };
-    // Los dos lados existen desde el arranque: crearlos perezosamente dejaba
-    // sin `turnsWithLines` los turnos anteriores a la primera línea con ident.
     for (const side of ["p1", "p2"]) ensure(side);
 
+    /** La identidad canónica que este ident nombra hoy. En random battles el
+     * apodo ES el nombre base, así que el fallback coincide. */
+    const canonOf = (ident: ProtocolIdent): string =>
+      identCanon.get(ident.side)?.get(ident.name) ?? ident.name;
+
     let lastSwap: [ProtocolIdent, ProtocolIdent] | undefined;
+
     for (const turn of bucket) {
       const turnNumber = turn.turnNumber;
       if (turn.protocolLines.length > 0) {
-        for (const evidence of perSide.values()) evidence.turnsWithLines.add(turnNumber);
+        for (const view of perSide.values()) view.evidence.turnsWithLines.add(turnNumber);
       }
       for (const line of turn.protocolLines) {
         linesScanned += 1;
@@ -311,23 +341,17 @@ export function buildProtocolIndex(
         const tag = parts[1] ?? "";
 
         if (tag === "rule") {
-          const rule = parts[2] ?? "";
-          if (/^HP Percentage Mod\b/i.test(rule)) {
-            for (const side of ["p1", "p2"]) ensure(side).hpPercentageMod = true;
+          if (/^HP Percentage Mod\b/i.test(parts[2] ?? "")) {
+            for (const side of ["p1", "p2"]) ensure(side).evidence.hpPercentageMod = true;
           }
           continue;
         }
         // `-clearallboost` no lleva ident: afecta a los dos lados. Va antes
         // del filtro por ident, que si no lo descartaría en silencio.
         if (tag === "-clearallboost") {
-          for (const [side, evidence] of perSide) {
-            for (const alias of identSpecies.get(side)?.keys() ?? []) {
-              remember(evidence.boost, `${alias}|${ANY_BOOST_STAT}`, turnNumber);
-            }
-            for (const aliases of identSpecies.get(side)?.values() ?? []) {
-              for (const alias of aliases) {
-                remember(evidence.boost, `${alias}|${ANY_BOOST_STAT}`, turnNumber);
-              }
+          for (const view of perSide.values()) {
+            for (const mon of view.timeline.mons.values()) {
+              record(mon.boosts, turnNumber, blankBoosts());
             }
           }
           continue;
@@ -335,65 +359,149 @@ export function buildProtocolIndex(
 
         const ident = parseIdent(parts[2]);
         if (ident === undefined) continue;
-        const evidence = ensure(ident.side);
-        const aliasesBySide = identSpecies.get(ident.side)!;
+        const view = ensure(ident.side);
+        const { evidence, timeline } = view;
+        const canonBySide = identCanon.get(ident.side)!;
 
         if (REVEAL_TAGS.has(tag) || tag === "-formechange") {
           // `-formechange` trae sólo la especie donde los otros traen el
-          // `details` completo; `parseDetails` cubre las dos formas porque
-          // toma el token anterior a la primera coma.
+          // `details` completo; `parseDetails` cubre las dos formas.
           const details = parseDetails(parts[3]);
           if (details !== undefined) {
-            for (const identityKey of identityKeys(details.species, resolve)) {
-              remember(evidence.species, identityKey, turnNumber);
-              const bucketAliases = aliasesBySide.get(ident.name) ?? new Set<string>();
-              bucketAliases.add(identityKey);
-              aliasesBySide.set(ident.name, bucketAliases);
-              if (details.level !== undefined) {
-                remember(evidence.level, `${identityKey}|${details.level}`, turnNumber);
+            const identity = canonicalIdentity(details.species, resolve);
+            canonBySide.set(ident.name, identity);
+            remember(evidence.speciesExact, details.species, turnNumber);
+            remember(evidence.species, details.species, turnNumber);
+            remember(evidence.species, identity, turnNumber);
+            const mon = monOf(timeline, identity);
+            mon.levels.add(details.level);
+
+            if (tag === "replace") record(timeline.active, turnNumber, identity);
+            if (SWITCH_IN_TAGS.has(tag)) {
+              // Entra al campo: el anterior sale, y salir del campo LIMPIA
+              // boosts y termina el Transform (`Pokemon.switch_out`).
+              const previous = timeline.active.values[timeline.active.values.length - 1];
+              if (previous !== undefined && previous !== identity) {
+                const leaving = monOf(timeline, previous);
+                record(leaving.boosts, turnNumber, blankBoosts());
+                record(leaving.transform, turnNumber, null);
               }
+              record(timeline.active, turnNumber, identity);
+              record(mon.boosts, turnNumber, blankBoosts());
+              record(mon.transform, turnNumber, null);
             }
-            if (details.level !== undefined) {
-              remember(evidence.level, `${ident.name}|${details.level}`, turnNumber);
-            }
-          }
-          // El token de HP puede traer el estado: `100/100 par`, `0 fnt`.
-          const hpToken = parts[4] ?? "";
-          const statusInHp = /\b(brn|par|slp|frz|psn|tox|fnt)\b/i.exec(hpToken);
-          if (statusInHp) {
-            for (const alias of identityAliases(ident, aliasesBySide)) {
-              remember(evidence.status, `${alias}|${statusInHp[1].toLowerCase()}`, turnNumber);
+            const hp = parseHpToken(parts[4]);
+            if (hp !== undefined) {
+              record(mon.hp, turnNumber, hp.fraction);
+              record(mon.status, turnNumber, hp.status);
+              if (hp.status !== null) {
+                remember(evidence.status, `${identity}|${hp.status}`, turnNumber);
+              }
+              if (hp.fainted) mon.faintTurn ??= turnNumber;
             }
           }
         }
 
-        const aliases = identityAliases(ident, aliasesBySide);
+        const identity = canonOf(ident);
+        const mon = monOf(timeline, identity);
 
-        if (TYPE_CHANGE_TAGS.has(tag)) {
-          for (const alias of aliases) remember(evidence.typeChange, alias, turnNumber);
-        }
+        if (TYPE_CHANGE_TAGS.has(tag)) remember(evidence.typeChange, identity, turnNumber);
         if (tag === "-start" && /^typechange$/i.test(parts[3] ?? "")) {
-          for (const alias of aliases) remember(evidence.typeChange, alias, turnNumber);
+          remember(evidence.typeChange, identity, turnNumber);
         }
+
+        if (HP_TAGS.has(tag)) {
+          const hp = parseHpToken(parts[3]);
+          if (hp !== undefined) {
+            record(mon.hp, turnNumber, hp.fraction);
+            record(mon.status, turnNumber, hp.status);
+            if (hp.status !== null) {
+              remember(evidence.status, `${identity}|${hp.status}`, turnNumber);
+            }
+            if (hp.fainted) mon.faintTurn ??= turnNumber;
+          }
+        }
+        if (tag === "faint") {
+          mon.faintTurn ??= turnNumber;
+          record(mon.hp, turnNumber, 0);
+          record(mon.status, turnNumber, "fnt");
+          remember(evidence.status, `${identity}|fnt`, turnNumber);
+        }
+        if (tag === "-status") {
+          const status = normalizeProtocolText(parts[3] ?? "");
+          if (status.length > 0) {
+            record(mon.status, turnNumber, status);
+            remember(evidence.status, `${identity}|${status}`, turnNumber);
+          }
+        }
+        if (tag === "-curestatus") {
+          record(mon.status, turnNumber, null);
+        }
+        if (tag === "-cureteam") {
+          for (const teammate of timeline.mons.values()) {
+            if (teammate.faintTurn === undefined) record(teammate.status, turnNumber, null);
+          }
+        }
+
+        if (BOOST_TAGS_WITH_STAT.has(tag)) {
+          const stat = normalizeProtocolText(parts[3] ?? "");
+          const amount = Number(parts[4]);
+          const current = currentBoosts(mon.boosts);
+          if (stat.length > 0 && Number.isFinite(amount) && current !== UNKNOWN) {
+            const next = { ...current };
+            if (tag === "-setboost") next[stat] = amount;
+            else {
+              const delta = tag === "-boost" ? amount : -amount;
+              next[stat] = Math.max(-6, Math.min(6, (next[stat] ?? 0) + delta));
+            }
+            record(mon.boosts, turnNumber, next);
+          }
+        }
+        if (tag === "-clearboost") record(mon.boosts, turnNumber, blankBoosts());
+        if (tag === "-clearnegativeboost" || tag === "-clearpositiveboost" || tag === "-invertboost") {
+          const current = currentBoosts(mon.boosts);
+          if (current !== UNKNOWN) {
+            const next = { ...current };
+            for (const [stat, value] of Object.entries(next)) {
+              if (tag === "-invertboost") next[stat] = -value;
+              else if (tag === "-clearnegativeboost" && value < 0) next[stat] = 0;
+              else if (tag === "-clearpositiveboost" && value > 0) next[stat] = 0;
+            }
+            record(mon.boosts, turnNumber, next);
+          }
+        }
+        if (tag === "-copyboost" || tag === "-swapboost") {
+          // Necesitan los boosts del OTRO lado, que esta proyección no tiene.
+          // Marcar DESCONOCIDO y abstenerse es lo correcto: el recorder mismo
+          // falla cerrado en `-swapboost`.
+          record(mon.boosts, turnNumber, UNKNOWN);
+        }
+
         if (tag === "move") {
           for (const moveKey of moveEvidenceKeys(parts[3] ?? "")) {
-            for (const alias of aliases) remember(evidence.move, `${alias}|${moveKey}`, turnNumber);
+            remember(evidence.move, `${identity}|${moveKey}`, turnNumber);
+            let uses = mon.moveUses.get(moveKey);
+            if (uses === undefined) {
+              uses = emptyLog<number>();
+              mon.moveUses.set(moveKey, uses);
+            }
+            const previous = uses.values.length === 0 ? 0 : uses.values[uses.values.length - 1];
+            record(uses, turnNumber, previous + 1);
           }
         }
-        // Trick/Switcheroo/Thief/Covet/Magician/Pickpocket INTERCAMBIAN el
-        // item: la línea `|-activate|A|move: Trick|[of] B` nombra a los dos
-        // socios y el `|-item|` que sigue narra el item que cambió de dueño.
-        // Ese item es público para AMBOS —uno lo tenía, el otro lo tiene—, y
-        // acreditárselo sólo al ident dejaba al socio sin evidencia (medido:
-        // 70 falsos positivos de `item` sobre filas v2).
-        if (tag === "-activate" && SWAP_CAUSE.test(parts[3] ?? "")) {
-          const other = parseIdent(SUFFIX_OF.exec(line)?.[1]);
-          lastSwap = other === undefined ? undefined : [ident, other];
+
+        if (tag === "-transform") {
+          const target = parseIdent(parts[3]);
+          record(mon.transform, turnNumber, target === undefined ? "" : `${target.side}:${target.name}`);
         }
+
         if (tag === "-item" || tag === "-enditem") {
           const item = normalizeProtocolText(parts[3] ?? "");
           if (item.length > 0) {
-            for (const alias of aliases) remember(evidence.item, `${alias}|${item}`, turnNumber);
+            remember(evidence.item, `${identity}|${item}`, turnNumber);
+            // Trick/Switcheroo/Thief/Covet/Magician/Pickpocket INTERCAMBIAN el
+            // item: es público para AMBOS socios, uno lo tenía y el otro lo
+            // tiene.
             const swapped = SWAP_CAUSE.test(line);
             const partners: ProtocolIdent[] = [];
             if (swapped && lastSwap !== undefined) {
@@ -406,69 +514,38 @@ export function buildProtocolIndex(
             const ofIdent = swapped ? parseIdent(SUFFIX_OF.exec(line)?.[1]) : undefined;
             if (ofIdent !== undefined) partners.push(ofIdent);
             for (const partner of partners) {
-              const partnerEvidence = ensure(partner.side);
-              for (const alias of identityAliases(
-                partner, identSpecies.get(partner.side)!,
-              )) {
-                remember(partnerEvidence.item, `${alias}|${item}`, turnNumber);
-              }
+              const partnerView = ensure(partner.side);
+              remember(
+                partnerView.evidence.item,
+                `${identCanon.get(partner.side)?.get(partner.name) ?? partner.name}|${item}`,
+                turnNumber,
+              );
             }
           }
+        }
+        if (tag === "-activate" && SWAP_CAUSE.test(parts[3] ?? "")) {
+          const other = parseIdent(SUFFIX_OF.exec(line)?.[1]);
+          lastSwap = other === undefined ? undefined : [ident, other];
         }
         if (tag === "-ability") {
           const ability = normalizeProtocolText(parts[3] ?? "");
           if (ability.length > 0) {
-            for (const alias of aliases) {
-              remember(evidence.ability, `${alias}|${ability}`, turnNumber);
-            }
-            // Trace: `|-ability|p1a: Gardevoir|Intimidate|[from] ability: Trace|
-            // [of] p2a: Luxray` dice que Gardevoir tiene Trace y que copió
-            // Intimidate DE Luxray. poke-env sólo escribe sobre el ident
-            // (`abstract_battle.py:781-793`), pero la línea es prueba PÚBLICA
-            // de que Luxray tiene esa ability: el auditor pregunta "¿esto era
-            // público?", no "¿poke-env lo anotó?".
+            remember(evidence.ability, `${identity}|${ability}`, turnNumber);
+            // Trace: la línea es prueba PÚBLICA de que el pokémon TRAZADO
+            // (`[of]`) tiene esa ability, aunque poke-env sólo escriba sobre
+            // el ident (`abstract_battle.py:781-793`).
             if (/\[from\]\s*ability:\s*Trace/i.test(line)) {
               const traced = parseIdent(SUFFIX_OF.exec(line)?.[1]);
               if (traced !== undefined) {
-                const tracedEvidence = ensure(traced.side);
-                for (const alias of identityAliases(
-                  traced, identSpecies.get(traced.side)!,
-                )) {
-                  remember(tracedEvidence.ability, `${alias}|${ability}`, turnNumber);
-                }
+                const tracedView = ensure(traced.side);
+                remember(
+                  tracedView.evidence.ability,
+                  `${identCanon.get(traced.side)?.get(traced.name) ?? traced.name}|${ability}`,
+                  turnNumber,
+                );
               }
             }
           }
-        }
-        if (tag === "-status") {
-          const status = normalizeProtocolText(parts[3] ?? "");
-          if (status.length > 0) {
-            for (const alias of aliases) remember(evidence.status, `${alias}|${status}`, turnNumber);
-          }
-        }
-        if (tag === "faint") {
-          for (const alias of aliases) {
-            remember(evidence.faint, alias, turnNumber);
-            remember(evidence.status, `${alias}|fnt`, turnNumber);
-          }
-        }
-        if (BOOST_TAGS_WITH_STAT.has(tag)) {
-          const stat = normalizeProtocolText(parts[3] ?? "");
-          if (stat.length > 0) {
-            for (const alias of aliases) remember(evidence.boost, `${alias}|${stat}`, turnNumber);
-          }
-        }
-        if (BOOST_TAGS_ANY_STAT.has(tag)) {
-          for (const alias of aliases) {
-            remember(evidence.boost, `${alias}|${ANY_BOOST_STAT}`, turnNumber);
-          }
-        }
-
-        // Un Transform copia el moveset, los tipos y la ability de OTRO
-        // pokémon —normalmente uno nuestro— y eso es una inferencia legítima,
-        // no una fuga: los datos copiados salen de nuestro propio lado.
-        if (tag === "-transform" || /\[from\]\s*ability:\s*Imposter/i.test(line)) {
-          for (const alias of aliases) remember(evidence.transform, alias, turnNumber);
         }
 
         const itemSuffix = SUFFIX_ITEM.exec(line);
@@ -476,10 +553,11 @@ export function buildProtocolIndex(
           const item = normalizeProtocolText(itemSuffix[1]);
           if (item.length > 0) {
             const owner = suffixOwner(tag, ident, line, "item", item);
-            const ownerEvidence = ensure(owner.side);
-            for (const alias of identityAliases(owner, identSpecies.get(owner.side)!)) {
-              remember(ownerEvidence.item, `${alias}|${item}`, turnNumber);
-            }
+            remember(
+              ensure(owner.side).evidence.item,
+              `${identCanon.get(owner.side)?.get(owner.name) ?? owner.name}|${item}`,
+              turnNumber,
+            );
           }
         }
         const abilitySuffix = SUFFIX_ABILITY.exec(line);
@@ -487,21 +565,22 @@ export function buildProtocolIndex(
           const ability = normalizeProtocolText(abilitySuffix[1]);
           if (ability.length > 0) {
             const owner = suffixOwner(tag, ident, line, "ability", ability);
-            const ownerEvidence = ensure(owner.side);
-            for (const alias of identityAliases(owner, identSpecies.get(owner.side)!)) {
-              remember(ownerEvidence.ability, `${alias}|${ability}`, turnNumber);
-            }
+            remember(
+              ensure(owner.side).evidence.ability,
+              `${identCanon.get(owner.side)?.get(owner.name) ?? owner.name}|${ability}`,
+              turnNumber,
+            );
           }
         }
       }
     }
 
-    for (const [side, evidence] of perSide) evidences.set(`${key}:${side}`, evidence);
+    for (const [side, view] of perSide) views.set(`${key}:${side}`, view);
   }
 
   return {
     get: (battleId, playerSide, opponentSide) =>
-      evidences.get(`${battleId}:${playerSide}:${opponentSide}`),
+      views.get(`${battleId}:${playerSide}:${opponentSide}`),
     linesScanned,
   };
 }

@@ -9,7 +9,7 @@
 import { buildDexIndex, auditOpponentPokemon, type DexIndex } from "./opponent.js";
 import {
   buildProtocolIndex,
-  buildSpeciesResolver,
+  buildSpeciesIndex,
   normalizeProtocolText,
   opponentSideOf,
 } from "./protocol.js";
@@ -89,26 +89,24 @@ export function auditDataset(dataset: Dataset): AuditResult {
     dataset.trajectories.map((trajectory) => [trajectory.id, trajectory]),
   );
 
+  // `base_species` es lo único que el índice de protocolo necesita del dex, y
+  // es estable entre generaciones: un solo resolvedor fusionado alcanza para
+  // un corpus multi-gen sin volver a recorrer el protocolo por generación.
+  const speciesIndex = buildSpeciesIndex(dataset.dexPokemon);
   const dexIndexByGen = new Map<number, DexIndex>();
   const dexFor = (gen: number): DexIndex => {
     let index = dexIndexByGen.get(gen);
     if (index === undefined) {
-      index = buildDexIndex(dataset.dexPokemon, dataset.dexMoves, gen);
+      index = buildDexIndex(dataset.dexPokemon, dataset.dexMoves, gen, speciesIndex);
       dexIndexByGen.set(gen, index);
     }
     return index;
   };
 
-  // `base_species` es lo único que el índice necesita del dex, y es estable
-  // entre generaciones: un solo mapa fusionado alcanza para un corpus
-  // multi-gen sin volver a recorrer el protocolo por generación.
   // El protocolo se recorre UNA vez, acá. Nada dentro del loop de pasos vuelve
   // a tocar `dataset.turns`: ése era el N+1 (92 277 173 normalizaciones sobre
   // un corpus de 447 428 líneas).
-  const protocolIndex = buildProtocolIndex(
-    dataset.turns,
-    buildSpeciesResolver(dataset.dexPokemon),
-  );
+  const protocolIndex = buildProtocolIndex(dataset.turns, speciesIndex);
 
   const stats = {
     stepsAudited: 0,
@@ -140,16 +138,21 @@ export function auditDataset(dataset: Dataset): AuditResult {
     if (!Array.isArray(opponent)) {
       at("hidden_information", "state.opponent.pokemon ausente o no es una lista");
     } else {
-      const evidence = protocolIndex.get(
+      const view = protocolIndex.get(
         trajectory.battleId,
         trajectory.playerSide,
         opponentSideOf(trajectory.playerSide),
       );
+      const ownTeam = step.state.me?.pokemon;
       const context = {
-        evidence,
+        evidence: view?.evidence,
+        timeline: view?.timeline,
         dex: dexFor(trajectory.gen),
         gen: trajectory.gen,
         turn: step.turnNumber,
+        stateTurn: step.state.turn,
+        ownTeam: Array.isArray(ownTeam) ? ownTeam : [],
+        playerSide: trajectory.playerSide,
       };
       let actives = 0;
       for (const pokemon of opponent) {
@@ -202,12 +205,12 @@ export function auditDataset(dataset: Dataset): AuditResult {
     }
 
     // --- 5. rederivabilidad: protocolo crudo + fila autoconsistente -------
-    const evidence = protocolIndex.get(
+    const sideView = protocolIndex.get(
       trajectory.battleId,
       trajectory.playerSide,
       opponentSideOf(trajectory.playerSide),
     );
-    if (evidence === undefined || !evidence.turnsWithLines.has(step.turnNumber)) {
+    if (sideView === undefined || !sideView.evidence.turnsWithLines.has(step.turnNumber)) {
       at("state_rederivable", "el paso no tiene protocol_lines crudas para su battle/player_side/turn");
     }
     if (stableKey(step.state.legal_actions) !== stableKey(step.legalActions)) {

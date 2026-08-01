@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 import { auditDataset } from "../src/invariants.js";
 import { OPPONENT_FIELDS, type Dataset, type OpponentField } from "../src/types.js";
-import { auditedStep, baseDataset, withOpponentField } from "./fixtures.js";
+import { auditedStep, baseDataset, faintedFixture, withOpponentField } from "./fixtures.js";
 
 function fieldsViolated(dataset: Dataset): OpponentField[] {
   return [...new Set(
@@ -14,11 +14,11 @@ function fieldsViolated(dataset: Dataset): OpponentField[] {
   )].sort();
 }
 
+/** El negativo de `fainted` es el del review: un `|faint|` público y una fila
+ * que insiste en que el pokémon sigue en pie. Aísla el campo sin arrastrar a
+ * `hp_fraction`, que en ese fixture ya vale 0 como corresponde. */
 function faintedWithoutProof(): Dataset {
-  const dataset = withOpponentField("fainted", true);
-  const audited = auditedStep(dataset).state.opponent!.pokemon![0];
-  audited.hp_fraction = 0;
-  return dataset;
+  return faintedFixture(false);
 }
 
 function otherInvariants(dataset: Dataset): string[] {
@@ -94,11 +94,6 @@ describe("inferencias legítimas: no son fuga", () => {
     expect(auditDataset(dataset).violations).toEqual([]);
   });
 
-  it("acepta el nivel 100 que Showdown omite del details", () => {
-    const dataset = withOpponentField("level", 100);
-    expect(fieldsViolated(dataset)).toEqual([]);
-  });
-
   it("acepta `unknown_item` y `null`: son centinelas de poke-env, no una afirmación", () => {
     expect(fieldsViolated(withOpponentField("item", "unknown_item"))).toEqual([]);
     expect(fieldsViolated(withOpponentField("item", null))).toEqual([]);
@@ -154,7 +149,7 @@ describe("chequeos estructurales del rival", () => {
       { id: "psychic", pp: 10, max_pp: 32 },
     ]))).toEqual(["moves"]);
     expect(fieldsViolated(withOpponentField("moves", [
-      { id: "psychic", pp: 10, max_pp: 16 },
+      { id: "psychic", pp: 15, max_pp: 16 },
     ]))).toEqual([]);
   });
 
@@ -162,6 +157,9 @@ describe("chequeos estructurales del rival", () => {
     expect(fieldsViolated(withOpponentField("moves", [
       { id: "psychic", pp: 17, max_pp: 16 },
     ]))).toEqual(["moves"]);
+    expect(fieldsViolated(withOpponentField("moves", [
+      { id: "psychic", pp: 16, max_pp: 16 },
+    ]))).toEqual([]);
     expect(fieldsViolated(withOpponentField("moves", [
       { id: "psychic", pp: null, max_pp: null },
     ]))).toEqual([]);
@@ -179,21 +177,27 @@ describe("chequeos estructurales del rival", () => {
     expect(fieldsViolated(withOpponentField("hp_fraction", 0.5537))).toEqual(["hp_fraction"]);
   });
 
-  it("no exige la grilla de centésimos si el protocolo no declara la regla", () => {
+  it("la grilla de centésimos sólo se exige si el protocolo declara la regla", () => {
+    const conRegla = auditDataset(withOpponentField("hp_fraction", 0.5537)).violations;
+    expect(conRegla[0].detail).toContain("centésimo");
+
     const dataset = withOpponentField("hp_fraction", 0.5537);
     const turn0 = dataset.turns.find((turn) => turn.turnNumber === 0)!;
     turn0.protocolLines = turn0.protocolLines.filter(
       (line) => !line.startsWith("|rule|HP Percentage Mod"),
     );
-    expect(fieldsViolated(dataset)).toEqual([]);
+    // Sin la regla, el reproche ya no es la grilla: es que el protocolo nunca
+    // narró ese HP. El valor sigue sin pasar, por el motivo correcto.
+    const sinRegla = auditDataset(dataset).violations;
+    expect(sinRegla[0].detail).toContain("narró");
+    expect(sinRegla[0].detail).not.toContain("centésimo");
   });
 
-  it("rechaza fainted=true sin |faint| público y lo acepta con él", () => {
-    expect(fieldsViolated(faintedWithoutProof())).toEqual(["fainted"]);
-    const dataset = faintedWithoutProof();
-    auditedStep(dataset).state.opponent!.pokemon![0].status = "FNT";
-    dataset.turns[1].protocolLines.push("|faint|p2a: Mimien");
-    expect(fieldsViolated(dataset)).toEqual([]);
+  it("exige que fainted coincida con el |faint| público, en los dos sentidos", () => {
+    expect(fieldsViolated(faintedFixture(false))).toEqual(["fainted"]);
+    expect(fieldsViolated(faintedFixture(true))).toEqual([]);
+    // Y sin ningún `|faint|`, declararse debilitado tampoco pasa.
+    expect(fieldsViolated(withOpponentField("fainted", true))).toContain("fainted");
   });
 
   it("exige que el boost sea del MISMO stat que narró el protocolo", () => {
@@ -206,12 +210,25 @@ describe("chequeos estructurales del rival", () => {
     }))).toEqual(["boosts"]);
   });
 
-  it("acepta cualquier stat después de un boost que el protocolo no desglosa", () => {
+  it("proyecta los boosts que el protocolo no desglosa por stat", () => {
+    // `|-invertboost|` invierte el +1 atk público: el valor esperado pasa a
+    // ser -1, y sólo ése.
     const dataset = withOpponentField("boosts", {
-      accuracy: 0, atk: 0, def: -1, evasion: 0, spa: 0, spd: 0, spe: 0,
+      accuracy: 0, atk: -1, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0,
     });
     expect(fieldsViolated(dataset)).toEqual(["boosts"]);
     dataset.turns[1].protocolLines.push("|-invertboost|p2a: Mimien");
+    expect(fieldsViolated(dataset)).toEqual([]);
+  });
+
+  it("se abstiene cuando el protocolo no permite derivar el boost", () => {
+    // `-copyboost` necesita los boosts del OTRO lado, que esta proyección no
+    // tiene: marcar DESCONOCIDO y no afirmar nada es lo correcto.
+    const dataset = withOpponentField("boosts", {
+      accuracy: 0, atk: 4, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0,
+    });
+    expect(fieldsViolated(dataset)).toEqual(["boosts"]);
+    dataset.turns[1].protocolLines.push("|-copyboost|p2a: Mimien|p1a: Gengar");
     expect(fieldsViolated(dataset)).toEqual([]);
   });
 });
