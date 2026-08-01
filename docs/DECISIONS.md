@@ -1276,7 +1276,7 @@ aserción central es que el inbox se puebla **con el lock del tag tomado** mient
 más arriba el test cae antes de que el dataset se degrade en silencio. La salida
 de fondo es un hook `on_raw_frame` upstream.
 
-## D32 — retrieve_context: contextorico y prompt compacto, generation-scoped, sin fuga
+## D32 — retrieve_context: contexto rico y prompt compacto, generation-scoped, sin fuga
 
 **Contexto.** El grafo de decisión (`parse_state → retrieve_context →
 calc_damage → decide`) no consultaba datos de juego: el proveedor decidía con el
@@ -1412,6 +1412,28 @@ el techo.
 propagación; F2-07 recibe contexto rico; provider recibe solo
 `prompt_context`; `battle_state` y ambos contextos inmutables; no entran
 especies rivales no reveladas.
+
+**Formas cosméticas y frontera ruidosa (corrección de Changes Requested).**
+El repositorio no podía silenciosamente descartar especies visibles sin fila
+directa en `pokemon`: las formas cosméticas (Vivillon-Tundra,
+Florges-Yellow/Orange, Sawsbuck-Summer, Unown-O) son specias con `baseSpecies`
+distinto al propio e `baseStats` idénticos a la base; aparecen en el protocolo
+con su showdown_id visible, no se seedean por separado, y antes quedaban fuera
+del catálogo y del prompt sin ruido. La corrección inyecta un
+`SpeciesVocabulary` (protocolo) con impl `PokeEnvSpeciesVocabulary` (poke-env
+`GenData`, generation-scoped, cacheado por gen, sin internet). Antes de la
+consulta SQL se resuelve cada species_id visible: si es cosmético se reemplaza
+por su especie base en la query, conservando el `showdown_id` VISIBLE en el
+resultado, así la proyección correlaciona por especie revelada. Una forma con
+stats propios (Mega, `floetteeternal` — stats 74/65/67/125/128/92 vs
+floette 54/45/47/75/98/52) **no es cosmética** y llueve `LookupError`
+ruidoso: jamás degrada a la base. `charizardmegax` tiene fila directa en
+`pokemon` y sigue usándola. La frontera de generación misma es ruidosa:
+`gholdengo` en gen6 (no existe en pokedex de gen6) también raise `LookupError`,
+no devuelve `[]` silenciosamente. Medido: 332 apariciones afectadas (276
+propias + 56 rivales) bajo `state_schema_version=2`; las 5 formas cosméticas se
+resuelven a su base con stats idénticos; `floetteeternal` (38 apariciones)
+queda como canario del fallo ruidoso.
 
 **Exclusiones diferidas.** Quedan explícitamente fuera de F2-06: round
 availability (la ronda activa se agrega en una rebanada posterior), perfiles
