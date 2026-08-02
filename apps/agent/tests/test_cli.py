@@ -21,6 +21,7 @@ from typer.testing import CliRunner
 
 from ludex_agent.cli import (
     IncompleteTrajectoryError,
+    _battle_against_or_failure,
     _battle_outcome,
     _benchmark_provider,
     _persist_one,
@@ -221,6 +222,7 @@ class _FakeRepo:
     def __init__(self) -> None:
         self.saved_steps: list[tuple] = []
         self.saved_step_kwargs: list[dict] = []
+        self.saved_trajectories: list[tuple[tuple, dict]] = []
         self.finalized: tuple | None = None
         self.saved_battle_kwargs: dict | None = None
 
@@ -232,6 +234,7 @@ class _FakeRepo:
         pass
 
     async def save_trajectory(self, *args, **kwargs) -> int:
+        self.saved_trajectories.append((args, kwargs))
         return 1
 
     async def save_step(self, *args, **kwargs) -> None:
@@ -322,6 +325,7 @@ async def test_persist_one_falla_antes_de_escribir_si_hay_un_slot_none():
         await _persist_one(player, repo, tag, "gen6randombattle", "test")
 
     assert player.lost_step_count == 1
+    assert repo.saved_trajectories == []
     assert repo.saved_steps == []
     assert repo.finalized is None
 
@@ -345,6 +349,7 @@ async def test_persist_one_falla_antes_de_escribir_si_el_estado_es_none():
         await _persist_one(player, repo, tag, "gen6randombattle", "test")
 
     assert player.lost_step_count == 1
+    assert repo.saved_trajectories == []
     assert repo.saved_steps == []
     assert repo.finalized is None
 
@@ -372,6 +377,7 @@ async def test_persist_one_no_escribe_parcialmente_antes_de_un_slot_perdido():
         await _persist_one(player, repo, tag, "gen6randombattle", "test")
 
     assert player.lost_step_count == 1
+    assert repo.saved_trajectories == []
     assert repo.saved_steps == []
     assert repo.finalized is None
 
@@ -407,6 +413,7 @@ async def test_persist_one_reporta_indice_y_fase_de_un_rechazo_pendiente():
         await _persist_one(player, repo, tag, "gen6randombattle", "test")
 
     assert player.lost_step_count == 1
+    assert repo.saved_trajectories == []
     assert repo.saved_steps == []
     assert repo.finalized is None
 
@@ -432,18 +439,8 @@ async def test_persist_one_separa_action_path_de_action_source():
     assert repo.saved_step_kwargs[0] == {"action_path": "llm_retry"}
 
 
-async def test_play_propaga_el_fallo_background_sin_esperar_timeout(monkeypatch):
-    failure = RuntimeError("choice protocol fatal")
-
-    class FakeAgent:
-        def __init__(self, **kwargs) -> None:
-            self.battles = {}
-
-        async def battle_against(self, rival, n_battles=1):
-            await asyncio.Event().wait()
-
-        async def wait_for_background_failure(self):
-            return failure
+def _patch_play_dependencies(monkeypatch, agent_type) -> None:
+    """Aísla `play` de red y Postgres sin reemplazar su control de tareas."""
 
     class FakeRival:
         def __init__(self, **kwargs) -> None:
@@ -466,11 +463,27 @@ async def test_play_propaga_el_fallo_background_sin_esperar_timeout(monkeypatch)
         ),
     )
     monkeypatch.setattr(cli_module, "_check_showdown_reachable", reachable)
-    monkeypatch.setattr(cli_module, "LudexPlayer", FakeAgent)
+    monkeypatch.setattr(cli_module, "LudexPlayer", agent_type)
     monkeypatch.setattr(cli_module, "RandomPlayer", FakeRival)
     monkeypatch.setattr(cli_module, "make_engine", lambda url: FakeEngine())
     monkeypatch.setattr(cli_module, "BattleRepository", lambda factory: object())
     monkeypatch.setattr(cli_module, "session_factory", lambda engine: object())
+
+
+async def test_play_propaga_el_fallo_background_sin_esperar_timeout(monkeypatch):
+    failure = RuntimeError("choice protocol fatal")
+
+    class FakeAgent:
+        def __init__(self, **kwargs) -> None:
+            self.battles = {}
+
+        async def battle_against(self, rival, n_battles=1):
+            await asyncio.Event().wait()
+
+        async def wait_for_background_failure(self):
+            return failure
+
+    _patch_play_dependencies(monkeypatch, FakeAgent)
 
     with pytest.raises(RuntimeError, match="choice protocol fatal") as caught:
         await asyncio.wait_for(
@@ -478,3 +491,115 @@ async def test_play_propaga_el_fallo_background_sin_esperar_timeout(monkeypatch)
         )
 
     assert caught.value is failure
+
+
+async def test_battle_helper_cancela_hijas_ante_timeout_externo():
+    """Rompe si el helper sale sin cancelar y esperar ambas tareas hijas."""
+    child_tasks: list[asyncio.Task] = []
+    battle_cancelled = asyncio.Event()
+    failure_cancelled = asyncio.Event()
+
+    class FakeAgent:
+        async def battle_against(self, rival, n_battles=1):
+            child_tasks.append(asyncio.current_task())
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                battle_cancelled.set()
+                raise
+
+        async def wait_for_background_failure(self):
+            child_tasks.append(asyncio.current_task())
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                failure_cancelled.set()
+                raise
+
+    try:
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.01):
+                await _battle_against_or_failure(FakeAgent(), object())
+        await asyncio.sleep(0)
+
+        assert battle_cancelled.is_set()
+        assert failure_cancelled.is_set()
+        assert len(child_tasks) == 2
+        assert all(task.done() for task in child_tasks)
+        assert not any(task in asyncio.all_tasks() for task in child_tasks)
+    finally:
+        for task in child_tasks:
+            task.cancel()
+        await asyncio.gather(*child_tasks, return_exceptions=True)
+
+
+async def test_play_propaga_timeouterror_del_canal_background(monkeypatch):
+    """Un timeout del websocket no es el deadline silencioso de la batalla."""
+    failure = TimeoutError("websocket send timed out")
+    child_tasks: list[asyncio.Task] = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs) -> None:
+            self.battles = {}
+
+        async def battle_against(self, rival, n_battles=1):
+            child_tasks.append(asyncio.current_task())
+            await asyncio.Event().wait()
+
+        async def wait_for_background_failure(self):
+            return failure
+
+    _patch_play_dependencies(monkeypatch, FakeAgent)
+
+    with pytest.raises(TimeoutError, match="websocket send timed out") as caught:
+        await cli_module.play(1, "gen6randombattle", source="test")
+
+    assert caught.value is failure
+    assert all(task.done() for task in child_tasks)
+
+
+async def test_play_deadline_real_retorna_vacio_y_limpia_hijas(monkeypatch):
+    """El deadline propio conserva el contrato [] sin dejar coroutines vivas."""
+    child_tasks: list[asyncio.Task] = []
+    battle_cancelled = asyncio.Event()
+    failure_cancelled = asyncio.Event()
+
+    class FakeAgent:
+        def __init__(self, **kwargs) -> None:
+            self.battles = {}
+
+        async def battle_against(self, rival, n_battles=1):
+            child_tasks.append(asyncio.current_task())
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                battle_cancelled.set()
+                raise
+
+        async def wait_for_background_failure(self):
+            child_tasks.append(asyncio.current_task())
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                failure_cancelled.set()
+                raise
+
+    _patch_play_dependencies(monkeypatch, FakeAgent)
+    monkeypatch.setattr(cli_module, "BATTLE_TIMEOUT_SECONDS", 0.01)
+
+    try:
+        tags = await asyncio.wait_for(
+            cli_module.play(1, "gen6randombattle", source="test"), timeout=0.2
+        )
+        await asyncio.sleep(0)
+
+        assert tags == []
+        assert battle_cancelled.is_set()
+        assert failure_cancelled.is_set()
+        assert len(child_tasks) == 2
+        assert all(task.done() for task in child_tasks)
+        assert not any(task in asyncio.all_tasks() for task in child_tasks)
+    finally:
+        for task in child_tasks:
+            task.cancel()
+        await asyncio.gather(*child_tasks, return_exceptions=True)

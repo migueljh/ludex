@@ -127,17 +127,18 @@ async def _battle_against_or_failure(agent: Any, rival: Any) -> None:
         return
     battle_task = asyncio.create_task(agent.battle_against(rival, n_battles=1))
     failure_task = asyncio.create_task(wait_for_failure())
-    await asyncio.wait(
-        {battle_task, failure_task}, return_when=asyncio.FIRST_COMPLETED
-    )
-    if failure_task.done():
-        failure = failure_task.result()
-        battle_task.cancel()
-        await asyncio.gather(battle_task, return_exceptions=True)
-        raise failure
-    failure_task.cancel()
-    await asyncio.gather(failure_task, return_exceptions=True)
-    await battle_task
+    try:
+        await asyncio.wait(
+            {battle_task, failure_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if failure_task.done():
+            raise failure_task.result()
+        await battle_task
+    finally:
+        for task in (battle_task, failure_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(battle_task, failure_task, return_exceptions=True)
 
 
 async def play(n: int, fmt: str, *, source: str = "local") -> list[str]:
@@ -175,10 +176,13 @@ async def play(n: int, fmt: str, *, source: str = "local") -> list[str]:
             # lote, y la batalla se persiste apenas termina, no despues de
             # jugar las n. Un cuelgue en la batalla 5 de 5 ya no tira a la
             # basura las 4 anteriores, que quedaron commiteadas.
+            battle_timeout = asyncio.timeout(BATTLE_TIMEOUT_SECONDS)
             try:
-                async with asyncio.timeout(BATTLE_TIMEOUT_SECONDS):
+                async with battle_timeout:
                     await _battle_against_or_failure(agent, rival)
             except TimeoutError:
+                if not battle_timeout.expired():
+                    raise
                 break
             nuevas = [t for t in agent.battles if t not in antes]
             for tag in nuevas:
@@ -241,12 +245,11 @@ async def _persist_one(
     for turn in recorder.turns():
         await repo.save_turn(battle_id, side, turn, recorder.lines_for_turn(turn))
 
-    traj = await repo.save_trajectory(
-        battle_id, gen_number=battle.gen, fmt=fmt, player_side=side
-    )
     # C1/D22: la materializacion del estado es sincronica, dentro del manejo
     # de mensajes; esto corrige la etiqueta de turno contra el protocolo antes
-    # de validar el conjunto completo de slots.
+    # de validar el conjunto completo de slots. El preflight ocurre antes de
+    # crear la trayectoria: una batalla incompleta conserva protocolo crudo,
+    # pero no deja una fila vacia dentro del dataset de politica.
     await agent.wait_for_pending_steps(tag)
     blocker = agent.trajectory_blocker(tag)
     if blocker is not None:
@@ -256,6 +259,9 @@ async def _persist_one(
             f"{tag}: trajectory_step incompleto decision_index={decision_index} "
             f"phase={phase} (lost_step_count={agent.lost_step_count})"
         )
+    traj = await repo.save_trajectory(
+        battle_id, gen_number=battle.gen, fmt=fmt, player_side=side
+    )
     # D21/F2-02: decision_index cuenta decisiones canonicas resueltas. Los
     # retries rechazados reemplazan el mismo slot y no producen filas.
     for decision_index, step in enumerate(agent.steps[tag]):
