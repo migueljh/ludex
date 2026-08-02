@@ -65,6 +65,14 @@ export interface MoveState {
   ppMin: number | undefined;
   ppMax: number | undefined;
   fromTransform: boolean;
+  /** El PP de este movimiento quedó INDETERMINADO para el recorder.
+   *
+   * D31: `register_move` escribe `pp: null` cuando `pressure_on_us()` —o sea
+   * cuando NUESTRO activo tiene Pressure—, porque el descuento pudo ser de uno
+   * o de dos y la regla exacta depende de la categoría de objetivo. Una vez
+   * en `null`, la cuenta no vuelve sola: `pp - 1 if isinstance(pp, int)` deja
+   * `None` para siempre. Por eso esto es PEGAJOSO. */
+  indeterminate: boolean;
 }
 
 export interface MonState {
@@ -72,10 +80,15 @@ export interface MonState {
   /** `Pokemon._species`. NO cambia con `detailschange`/`-formechange`
    * (`forme_change` usa `store_species=False`, `pokemon.py:431-433`). */
   species: string;
-  /** La forma vigente, que es lo que manda en tipos y ability de forma. */
+  /** La forma vigente, que es lo que manda en tipos y ability de forma. El id
+   * VISIBLE se conserva aunque haya caído a una base cosmética (D32). */
   formeId: string;
-  /** El dex local no conoce `formeId` (formas cosméticas). */
-  formeUnknown: boolean;
+  /** La entrada del dex de esta generación para `formeId`. */
+  dexEntry: DexPokemon | undefined;
+  /** El dex de ESTA generación no conoce la especie ni por fila directa ni
+   * como alias cosmético real. La fila no es auditable y el gate falla
+   * CERRADO: no se abstiene de nada, se reporta. */
+  dexUnknown: boolean;
   level: number;
   active: boolean;
   hp: number | undefined;
@@ -107,7 +120,6 @@ export interface MonState {
 /** Lo que la proyección necesita del dex local. Nunca se consulta internet. */
 export interface DexView {
   gen: number;
-  forme(speciesId: string): DexPokemon | undefined;
   /** `Move.max_pp` = `pp * 8 // 5` (`move.py:471-478`). */
   maxPp(moveId: string): number | undefined;
   knowsMove(moveId: string): boolean;
@@ -122,7 +134,6 @@ const PRESSURE_TARGETS = new Set([
 ]);
 
 export function buildDexView(
-  pokemon: readonly DexPokemon[],
   moves: readonly DexMove[],
   gen: number,
 ): DexView {
@@ -131,14 +142,8 @@ export function buildDexView(
     if (move.gen !== gen) continue;
     moveIndex.set(normalizeProtocolText(move.showdownId), move);
   }
-  const byId = new Map<string, DexPokemon>();
-  for (const entry of pokemon) {
-    if (entry.gen !== gen) continue;
-    byId.set(normalizeProtocolText(entry.showdownId), entry);
-  }
   return {
     gen,
-    forme: (speciesId) => byId.get(normalizeProtocolText(speciesId)),
     maxPp: (moveId) => {
       const entry = moveIndex.get(retrieveMoveId(moveId));
       return entry?.pp === null || entry?.pp === undefined
@@ -175,10 +180,11 @@ export function abilityOf(mon: MonState): string | null {
 }
 
 /** `Pokemon.types` (`pokemon.py:1396-1408`). `undefined` = no derivable. */
-export function typesOf(mon: MonState, dex: DexView): string[] | undefined {
+export function typesOf(mon: MonState): string[] | undefined {
   if (mon.temporaryTypes !== undefined) return mon.temporaryTypes;
-  const entry = dex.forme(mon.formeId);
-  return entry === undefined ? undefined : entry.types.map((type) => type.toUpperCase());
+  return mon.dexEntry === undefined
+    ? undefined
+    : mon.dexEntry.types.map((type) => type.toUpperCase());
 }
 
 /** `MoveSet.moves` (`move.py:998-1013`): el Transform tapa el moveset base y
@@ -265,7 +271,8 @@ export class BattleProjection {
         ident,
         species: "",
         formeId: "",
-        formeUnknown: true,
+        dexEntry: undefined,
+        dexUnknown: false,
         level: 100,
         active: false,
         hp: undefined,
@@ -299,14 +306,12 @@ export class BattleProjection {
     const normalized = normalizeProtocolText(speciesId);
     if (storeSpecies) mon.species = normalized;
     mon.formeId = normalized;
-    const entry = this.dex.forme(normalized);
-    mon.formeUnknown = entry === undefined;
+    // D32: la fila directa de esta generación gana; sólo un miembro real de
+    // `cosmeticFormes` cae a su base. Todo lo demás es desconocido.
+    const entry = this.species.resolve(normalized);
+    mon.dexEntry = entry;
+    mon.dexUnknown = entry === undefined;
     if (entry === undefined) {
-      // Sin entrada de dex no hay tipos ni abilities derivables para esta
-      // forma. Es un límite del dex local, no una licencia para aceptar todo:
-      // sólo estos dos campos quedan sin afirmar.
-      mon.unresolved.add("types");
-      mon.unresolved.add("ability");
       this.touch();
       return;
     }
@@ -456,6 +461,7 @@ export class BattleProjection {
       ppMin: maxPp,
       ppMax: maxPp,
       fromTransform,
+      indeterminate: false,
     };
     target.set(id, move);
     this.touch();
@@ -480,7 +486,18 @@ export class BattleProjection {
     options: { use: boolean; reveal: boolean; pressure: boolean | undefined },
   ): void {
     const move = options.reveal ? this.addMove(mon, rawId) : undefined;
-    if (options.use && move !== undefined) this.useMove(move, options.pressure);
+    if (options.use && move !== undefined) {
+      this.useMove(move, options.pressure);
+      if (this.recorderCannotCount(mon)) move.indeterminate = true;
+    }
+  }
+
+  /** `pressure_on_us()` del proyector del recorder: NUESTRO activo con
+   * Pressure. Es la única causa pública por la que D31 admite `pp: null`. */
+  private recorderCannotCount(attacker: MonState): boolean {
+    if (this.own === undefined || attacker.ident.side === this.own.side) return false;
+    const defender = this.activeOf(this.own.side);
+    return defender !== undefined && abilityOf(defender) === "pressure";
   }
 
   /** `_pressure_on` (`battle.py:1196-1221`).
@@ -708,13 +725,26 @@ export class BattleProjection {
   private applyMega(mon: MonState, tag: string, stone: string | undefined): void {
     const suffix = tag === "-mega" ? "mega" : "primal";
     const base = normalizeProtocolText(mon.species);
-    let candidate = base.endsWith(suffix) ? base : `${base}${suffix}`;
-    mon.temporaryAbility = null;
-    if (this.dex.forme(candidate) === undefined && tag === "-mega" && stone !== undefined) {
-      const letter = stone.trim().slice(-1).toLowerCase();
-      if (letter === "x" || letter === "y") candidate = `${candidate}${letter}`;
+    const candidate = base.endsWith(suffix) ? base : `${base}${suffix}`;
+    // `mega_evolve` limpia el override temporal ANTES de mirar el pokédex.
+    if (tag === "-mega") mon.temporaryAbility = null;
+    if (this.species.row(candidate) !== undefined) {
+      this.updateFromPokedex(mon, candidate, false);
+      return;
     }
-    this.updateFromPokedex(mon, candidate, false);
+    // `|-mega|p2a: Charizard|Charizard|Charizardite Y`: poke-env lee `event[3]`
+    // como la piedra, y ahí viene la ESPECIE, no la piedra. Con `charizardmega`
+    // fuera del pokédex y una "piedra" que no termina en X/Y, la librería no
+    // cambia nada y deja que el `|detailschange|` que sigue haga el trabajo.
+    // Forzar la forma acá marcaba al pokémon como fuera del dex y, con el gate
+    // cerrado, convertía a Charizard entero en una violación.
+    if (tag !== "-mega" || stone === undefined) return;
+    const letter = stone.trim().slice(-1).toLowerCase();
+    if (letter !== "x" && letter !== "y") return;
+    const withLetter = `${candidate}${letter}`;
+    if (this.species.row(withLetter) !== undefined) {
+      this.updateFromPokedex(mon, withLetter, false);
+    }
   }
 
   /** `-start` (`abstract_battle.py:798-826`). */
@@ -725,7 +755,7 @@ export class BattleProjection {
       if (of !== undefined) {
         // Reflect Type: los tipos son los del pokémon citado.
         const source = this.mons.get(identKey(of));
-        const types = source === undefined ? undefined : typesOf(source, this.dex);
+        const types = source === undefined ? undefined : typesOf(source);
         if (types === undefined) mon.unresolved.add("types");
         else {
           mon.temporaryTypes = [...types];
@@ -748,7 +778,10 @@ export class BattleProjection {
       const copied = retrieveMoveId(parts[4] ?? "");
       if (copied.length > 0) {
         const dexMax = this.dex.maxPp(copied);
-        mon.mimicMove = { id: copied, maxPp: dexMax, ppMin: dexMax, ppMax: dexMax, fromTransform: false };
+        mon.mimicMove = {
+          id: copied, maxPp: dexMax, ppMin: dexMax, ppMax: dexMax,
+          fromTransform: false, indeterminate: false,
+        };
         this.touch();
       }
     }
@@ -832,7 +865,10 @@ export class BattleProjection {
       const copied = retrieveMoveId(parts[4] ?? "");
       if (copied.length > 0) {
         const dexMax = this.dex.maxPp(copied);
-        mon.mimicMove = { id: copied, maxPp: dexMax, ppMin: dexMax, ppMax: dexMax, fromTransform: false };
+        mon.mimicMove = {
+          id: copied, maxPp: dexMax, ppMin: dexMax, ppMax: dexMax,
+          fromTransform: false, indeterminate: false,
+        };
         this.touch();
       }
       return;
@@ -980,10 +1016,10 @@ export class BattleProjection {
     }
     mon.transformTarget = target;
     mon.transformMoves = new Map();
-    const entry = this.dex.forme(source.species);
+    const entry = source.dexEntry;
     if (entry === undefined) mon.unresolved.add("types");
     else {
-      mon.temporaryTypes = entry.types.map((type) => type.toUpperCase());
+      mon.temporaryTypes = entry.types.map((type: string) => type.toUpperCase());
       mon.unresolved.delete("types");
     }
     mon.boosts = { ...source.boosts };
@@ -1002,6 +1038,7 @@ export class BattleProjection {
         ppMin: capped,
         ppMax: capped,
         fromTransform: true,
+        indeterminate: move.indeterminate,
       });
     }
     mon.unresolved.add("moves");
@@ -1096,6 +1133,6 @@ export class BattleProjection {
 
   /** Identidad canónica de un miembro proyectado, para cruzarlo con la fila. */
   identityOf(mon: MonState): string {
-    return canonicalIdentity(mon.species, this.species.resolve);
+    return canonicalIdentity(mon.species, this.species);
   }
 }

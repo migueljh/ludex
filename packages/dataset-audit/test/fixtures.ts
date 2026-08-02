@@ -8,6 +8,7 @@
  */
 
 import type {
+  CosmeticAliasRecord,
   Dataset,
   DexMove,
   DexPokemon,
@@ -57,6 +58,16 @@ export function dexPokemon(): DexPokemon[] {
       gen: 6, showdownId: "dusknoir", baseSpecies: "dusknoir", forme: null,
       types: ["Ghost"], abilities: ["Pressure"],
     },
+  ];
+}
+
+/** Los alias cosméticos REALES de gen 6, con el mismo criterio que D32: sólo
+ * los que el dex de Showdown lista en `cosmeticFormes`. `furfroubanana` no
+ * está y no puede estar: ésa es justamente la frontera. */
+export function cosmeticFormes(): CosmeticAliasRecord[] {
+  return [
+    { gen: 6, aliasId: "furfroupharaoh", baseId: "furfrou" },
+    { gen: 6, aliasId: "furfroudandy", baseId: "furfrou" },
   ];
 }
 
@@ -239,6 +250,7 @@ export function baseDataset(): Dataset {
     ],
     dexPokemon: dexPokemon(),
     dexMoves: dexMoves(),
+    cosmeticFormes: cosmeticFormes(),
   };
 }
 

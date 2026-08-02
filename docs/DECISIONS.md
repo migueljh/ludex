@@ -1463,3 +1463,85 @@ del rival, lecciones de análisis previos, playbook activo, retrieval por
 pgvector (embeddings) e internet. El grafo actual no depende de ninguna de
 estas fuentes; cualquier referencia futura las introducirá como capas
 adicionales, no reemplazando la game data local.
+
+## D33 — el auditor de dataset es la compuerta del corpus: un instante coherente, frontera cerrada y `pp: null` con dueño
+
+**Contexto.** `packages/dataset-audit` tenía que pasar de sonda a compuerta.
+Tres rondas de revisión mostraron que el problema no era la cobertura sino la
+*pregunta*: primero preguntaba "¿esto fue público alguna vez?", después "¿este
+valor fue público en algún momento de la ventana?". Las dos son preguntas **por
+campo**, y con cualquiera de ellas un snapshot podía tomar el HP del turno 3, el
+status del turno 4 y los boosts del turno 5 y pasar, aunque esos valores nunca
+hubieran coexistido.
+
+**Una fila vale si ALGÚN instante la explica entera.** El auditor reproduce el
+protocolo crudo (D17) sobre un modelo con el mismo ciclo de vida que `Pokemon`
+de poke-env 0.15.0 y compara el equipo rival **completo** contra un único
+cursor dentro de `[state.turn, turn_number]`. Ningún campo elige su propio
+instante. La ventana es esa y no otra porque `state.turn` es el `battle.turn`
+capturado dentro de `choose_move` y `_correct_step_turns` sólo puede subir el
+turno (D20/D22/D23).
+
+**El oráculo es poke-env, no el recorder.** El auditor no reimplementa al
+proyector de D31: reimplementa a la librería, que es lo que el recorder debía
+producir. Por eso replica sus rarezas en vez de "arreglarlas" —`switch_out` no
+restaura los tipos de una Mega, `_update_from_details` corta temprano si el
+`details` repite, `faint()` no libera la ranura, `-clearallboost` alcanza sólo a
+los dos activos, `-copyboost|FUENTE|OBJETIVO` escribe en el segundo— y por eso
+un `|-mega|` cuyo `event[3]` trae la especie en vez de la piedra **no cambia
+nada**, igual que en `mega_evolve`.
+
+**Pertenencia de movimientos con la lista de la librería.** Magic Bounce, Magic
+Coat y Mirror Move no atribuyen el movimiento rebotado; Dancer descarta el
+evento entero; `lockedmove` y Sky Attack no revelan ni descuentan; Copycat,
+Metronome, Nature Power y Round llaman a un movimiento que **no** es del actor;
+Sleep Talk sí revela, porque sólo puede llamar a uno propio.
+
+**La frontera del dex falla CERRADA, generation-scoped y con el criterio de
+D32.** La fila directa de esa generación gana; si no hay fila, sólo un miembro
+real de `cosmeticFormes` cae a su base, y sólo si la base tiene fila en esa
+generación. Todo lo demás es especie desconocida y **se reporta**: no se
+"resuelve por prefijo" ni se degradan `types`/`ability` a no auditables. Sin
+esto, una fila con `Furfrou-Banana`, tipos DRAGON y Wonder Guard —narrada por un
+protocolo igual de falso— pasaba con cero violaciones, y un `gholdengo` de gen 9
+resolvía dentro de una batalla de gen 6. Medido sobre el corpus: el único id que
+cae por esta frontera es `floetteeternal` (393 filas, todas v1), que es
+exactamente el canario de fallo ruidoso que fija D32.
+
+**`pp: null` es "no derivable con exactitud" (D31), no "omitido".** El proyector
+del recorder escribe `null` cuando `pressure_on_us()` —nuestro activo con
+Pressure—, porque el descuento pudo ser de uno o de dos y la regla exacta
+depende de la categoría de objetivo; y una vez en `null` la cuenta no vuelve
+sola. El replay del auditor modela ese ciclo de vida: acepta `null` **sólo**
+sobre un movimiento con esa indeterminación vigente o heredada, y lo rechaza
+cuando el valor sí era derivable. Fuera de ese caso el PP es **exacto**, no un
+piso: la tabla `moves` trae `target` y `flags`, que son las dos condiciones que
+`_pressure_on` evalúa además de la ability del defensor.
+
+**Lo propio no es fuga.** La ability y el item de nuestro equipo salen de
+`state.me` de la misma fila: poke-env los conoce por el `|request|` privado, que
+el protocolo no contiene. Sin ellos no se puede decidir Pressure ni saber qué
+item recibe el rival en un Trick. Un Transform sólo acepta lo efectivamente
+copiado —tipos del dex de la especie copiada, ability copiada, moveset con el PP
+en `min(5, max_pp)`— y si su objetivo no es resoluble no excusa nada.
+
+**Scopes y versiones.** `--scope all` no excluye nada, incluidas las filas
+`source='test'`; `--scope training` excluye `battles.source='test'` y
+`trajectories.final_result IS NULL`; `--gen N` es el mismo contrato filtrado.
+Los dos son read-only (`default_transaction_read_only=on`) y salen con código 1
+ante cualquier violación. `state_schema_version` 1 y 2 conviven porque comparten
+forma; una versión fuera del conjunto se rechaza. `win→1`, `loss→-1`, `tie→0`, y
+`final_result IS NULL ⇒ reward IS NULL`: `NULL` no es empate, es "no terminó".
+
+**Costo, escrito como es.** Seis `SELECT` parametrizados, siempre, con scope y
+generación dentro del SQL; el protocolo se recorre una vez por `(batalla, lado)`
+y no hay N+1. La tabla de alias cosméticos **no** es una query: sale del mismo
+dex local empaquetado que usa `PokeEnvSpeciesVocabulary`, sin internet. La
+complejidad real es `O(L + Σ_filas C_ventana · E · F)` —líneas del corpus, más
+cursores de la ventana por entradas rivales por campos—, **no** `O(L + pasos)`.
+Lo constante es el conteo de queries, y eso es lo que el canario mide.
+
+**La cita a D19 de la migración es incorrecta.** `20260727000007_battle_source_test.sql`
+remite a "D19" para el contrato `source <> 'test'`, pero D19 es *"se juega
+`gen6randombattle`, no `gen6ou`"*. La migración histórica **no se edita**; esta
+decisión es la canónica del scope y deja constancia del error de referencia.

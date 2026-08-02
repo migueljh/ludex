@@ -17,10 +17,10 @@ import {
   UNKNOWN_ITEM,
   type MonState,
 } from "../src/projection.js";
-import { dexMoves, dexPokemon } from "./fixtures.js";
+import { cosmeticFormes, dexMoves, dexPokemon } from "./fixtures.js";
 
-const dex = buildDexView(dexPokemon(), dexMoves(), 6);
-const species = buildSpeciesIndex(dexPokemon());
+const dex = buildDexView(dexMoves(), 6);
+const species = buildSpeciesIndex(dexPokemon(), 6, cosmeticFormes());
 
 const SWITCH_MINE = "|switch|p1a: Gengar|Gengar, L80, M|280/280";
 const SWITCH_OPP = "|switch|p2a: Lapras|Lapras, L80, F|100/100";
@@ -55,14 +55,14 @@ describe("identidad y forma", () => {
     const charizard = mon(projection, "p2:charizard");
     expect(charizard.species).toBe("charizard");
     // Los TIPOS y la ability de forma sí cambian.
-    expect(typesOf(charizard, dex)).toEqual(["FIRE", "DRAGON"]);
+    expect(typesOf(charizard)).toEqual(["FIRE", "DRAGON"]);
     expect(abilityOf(charizard)).toBe("toughclaws");
   });
 
   it("antes del detailschange, los tipos y la ability son los de la forma base", () => {
     const projection = project(["|switch|p2a: Charizard|Charizard, L79, M|100/100"]);
     const charizard = mon(projection, "p2:charizard");
-    expect(typesOf(charizard, dex)).toEqual(["FIRE", "FLYING"]);
+    expect(typesOf(charizard)).toEqual(["FIRE", "FLYING"]);
     // Charizard tiene dos abilities posibles: el dex no determina ninguna.
     expect(abilityOf(charizard)).toBeNull();
   });
@@ -324,9 +324,9 @@ describe("boosts", () => {
 describe("typechange y Transform", () => {
   it("un typechange fija los tipos narrados y termina al salir del campo", () => {
     const lines = [SWITCH_OPP, "|-start|p2a: Lapras|typechange|Fire"];
-    expect(typesOf(mon(project(lines), "p2:lapras"), dex)).toEqual(["FIRE"]);
+    expect(typesOf(mon(project(lines), "p2:lapras"))).toEqual(["FIRE"]);
     const out = project([...lines, "|switch|p2a: Ditto|Ditto, L80|100/100"]);
-    expect(typesOf(mon(out, "p2:lapras"), dex)).toEqual(["WATER", "ICE"]);
+    expect(typesOf(mon(out, "p2:lapras"))).toEqual(["WATER", "ICE"]);
   });
 
   it("un `-end|typechange` también lo revierte", () => {
@@ -335,7 +335,7 @@ describe("typechange y Transform", () => {
       "|-start|p2a: Lapras|typechange|Fire",
       "|-end|p2a: Lapras|typechange",
     ]);
-    expect(typesOf(mon(projection, "p2:lapras"), dex)).toEqual(["WATER", "ICE"]);
+    expect(typesOf(mon(projection, "p2:lapras"))).toEqual(["WATER", "ICE"]);
   });
 
   it("Reflect Type copia los tipos del pokémon citado en el `[of]`", () => {
@@ -343,7 +343,7 @@ describe("typechange y Transform", () => {
       SWITCH_MINE, SWITCH_OPP,
       "|-start|p2a: Lapras|typechange|[from] move: Reflect Type|[of] p1a: Gengar",
     ]);
-    expect(typesOf(mon(projection, "p2:lapras"), dex)).toEqual(["GHOST", "POISON"]);
+    expect(typesOf(mon(projection, "p2:lapras"))).toEqual(["GHOST", "POISON"]);
   });
 
   it("Transform copia tipos del DEX, boosts y moveset, y NO agrega `transform`", () => {
@@ -355,7 +355,7 @@ describe("typechange y Transform", () => {
       "|-transform|p2a: Ditto|p1a: Gengar|[from] ability: Imposter",
     ]);
     const ditto = mon(projection, "p2:ditto");
-    expect(typesOf(ditto, dex)).toEqual(["GHOST", "POISON"]);
+    expect(typesOf(ditto)).toEqual(["GHOST", "POISON"]);
     expect(ditto.boosts.spa).toBe(2);
     // `_transform_moves` TAPA el moveset base: `transform` queda debajo.
     expect([...movesOf(ditto).keys()]).toEqual(["shadowball"]);
@@ -372,7 +372,7 @@ describe("typechange y Transform", () => {
       "|switch|p2a: Lapras|Lapras, L80, F|100/100",
     ]);
     const ditto = mon(projection, "p2:ditto");
-    expect(typesOf(ditto, dex)).toEqual(["NORMAL"]);
+    expect(typesOf(ditto)).toEqual(["NORMAL"]);
     expect([...movesOf(ditto).keys()]).toEqual([]);
   });
 });

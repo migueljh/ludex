@@ -242,7 +242,7 @@ function compareMon(
   if (!Array.isArray(types) || types.some((type) => typeof type !== "string")) {
     if (push("types", () => `types=${JSON.stringify(types)} no es una lista de textos`)) return true;
   } else if (!mon.unresolved.has("types")) {
-    const expected = typesOf(mon, context.dex);
+    const expected = typesOf(mon);
     if (expected !== undefined && typeKey(types as string[]) !== typeKey(expected)) {
       if (push(
         "types",
@@ -354,7 +354,20 @@ function compareMon(
       return false;
     }
     const pp = move.pp;
-    if (expected.ppMin !== undefined && expected.ppMax !== undefined) {
+    if (pp === null || pp === undefined) {
+      // D31: `pp: null` significa "no derivable con exactitud", no "omitido".
+      // El recorder lo escribe cuando NUESTRO activo tiene Pressure —ahí no
+      // puede decidir si el descuento fue de uno o de dos— y ese estado
+      // persiste después. Se acepta ahí y sólo ahí.
+      if (!expected.indeterminate) {
+        if (push(
+          "moves",
+          () => `pp=null de '${id}' pero el valor era derivable: ${describeMove(expected)}`
+            + " (ninguna línea pública dejó el PP indeterminado)",
+        )) return true;
+        return false;
+      }
+    } else if (expected.ppMin !== undefined && expected.ppMax !== undefined) {
       if (typeof pp !== "number" || pp < expected.ppMin || pp > expected.ppMax) {
         if (push(
           "moves",
@@ -432,7 +445,7 @@ export function matchOpponentTeam(
         "species",
         () => `'${raw}' no es ninguna especie que el protocolo haya revelado para ${context.opponentSide}`
         + (known.length > 0 ? ` (reveladas: ${known.join(", ")})` : "")
-        + (canonicalIdentity(normalized, context.species.resolve) !== normalized
+        + (canonicalIdentity(normalized, context.species) !== normalized
           ? "; una Mega conserva la especie base (`store_species=False`)"
           : ""),
         IDENTITY_WEIGHT,
@@ -444,6 +457,20 @@ export function matchOpponentTeam(
       continue;
     }
     claimed.add(normalized);
+    if (mon.dexUnknown) {
+      // Fallo CERRADO. Antes esto marcaba `types` y `ability` como no
+      // derivables y el comparador dejaba de auditarlos: una fila con
+      // `Furfrou-Banana`, tipos DRAGON y Wonder Guard pasaba con cero
+      // violaciones porque el prefijo la "resolvía".
+      if (push(
+        "species",
+        () => `'${raw}' no existe en el dex de gen ${context.gen}: no tiene fila propia`
+          + " y no es miembro de ningún `cosmeticFormes` (D32), así que ni sus tipos"
+          + " ni su ability son auditables",
+        IDENTITY_WEIGHT,
+      )) return result();
+      continue;
+    }
     if (compareMon(entry, mon, context, push)) return result();
   }
 
@@ -452,12 +479,12 @@ export function matchOpponentTeam(
   // especie inventada), no dos.
   const canonicalClaims = new Set(
     entries.map((entry) => typeof entry.species === "string"
-      ? canonicalIdentity(entry.species, context.species.resolve)
+      ? canonicalIdentity(entry.species, context.species)
       : ""),
   );
   for (const [species, mon] of projected) {
     if (claimed.has(species)) continue;
-    if (canonicalClaims.has(canonicalIdentity(species, context.species.resolve))) continue;
+    if (canonicalClaims.has(canonicalIdentity(species, context.species))) continue;
     if (push(
       "species",
       () => `el protocolo ya reveló a '${species}'${mon.active ? " (y está en el campo)" : ""} y la fila no lo trae`,

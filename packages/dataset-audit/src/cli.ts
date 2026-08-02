@@ -114,8 +114,17 @@ async function main(): Promise<void> {
         );
       }
     }
+    // La tabla de alias cosméticos NO es una query: es el dex local de
+    // Showdown (D32). Si no se pudo leer, el auditor falla cerrado sobre TODA
+    // forma cosmética y hay que verlo, no deducirlo.
     console.log(
-      `\nQueries: ${queries} (esperadas ${EXPECTED_QUERY_COUNT}) · líneas de protocolo indexadas: ${result.stats.protocolLinesScanned} · pasos auditados: ${result.stats.stepsAudited} · entradas rivales: ${result.stats.opponentEntriesAudited} · chequeos de campo: ${result.stats.opponentFieldChecksRun} · ${((Date.now() - startedAt) / 1000).toFixed(1)} s`,
+      dataset.cosmeticSource === undefined
+        ? "\nAlias cosméticos: NINGUNO — no se encontró el dex local de Showdown;"
+          + " toda forma cosmética se reporta como especie desconocida"
+        : `\nAlias cosméticos: ${dataset.cosmeticFormes.length} desde ${dataset.cosmeticSource}`,
+    );
+    console.log(
+      `Queries: ${queries} (esperadas ${EXPECTED_QUERY_COUNT}) · líneas de protocolo indexadas: ${result.stats.protocolLinesScanned} · pasos auditados: ${result.stats.stepsAudited} · entradas rivales: ${result.stats.opponentEntriesAudited} · chequeos de campo: ${result.stats.opponentFieldChecksRun} · ${((Date.now() - startedAt) / 1000).toFixed(1)} s`,
     );
 
     // Un auditor que no recorrió ningún paso no puede afirmar nada: falla

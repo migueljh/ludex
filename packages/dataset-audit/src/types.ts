@@ -126,6 +126,12 @@ export interface DexMove {
   flags: string[];
 }
 
+export interface CosmeticAliasRecord {
+  gen: number;
+  aliasId: string;
+  baseId: string;
+}
+
 export interface Dataset {
   battles: BattleRecord[];
   turns: BattleTurnRecord[];
@@ -133,6 +139,13 @@ export interface Dataset {
   steps: TrajectoryStepRecord[];
   dexPokemon: DexPokemon[];
   dexMoves: DexMove[];
+  /** Alias cosméticos del dex de Showdown, por generación (D32). NO sale de
+   * Postgres —la tabla `pokemon` no los seedea— sino del mismo dex local
+   * empaquetado que usa el agente. Vacío significa fallo cerrado, nunca
+   * resolución permisiva. */
+  cosmeticFormes: CosmeticAliasRecord[];
+  /** De dónde salieron los alias, para poder informarlo. */
+  cosmeticSource?: string;
 }
 
 export type InvariantName =

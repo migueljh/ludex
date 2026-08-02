@@ -312,6 +312,124 @@ describe("Ronda 2 · un único cursor coherente para toda la fila", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Ronda 3 — la frontera del dex falla CERRADA, y `pp: null` tiene dueño
+// ---------------------------------------------------------------------------
+
+describe("Ronda 3 · la frontera del dex y la semántica D31 de pp null", () => {
+  const LAPRAS = "|switch|p2a: Lapras|Lapras, L80, F|100/100";
+
+  it("furfrou_banana_narrated_and_claimed", () => {
+    // El protocolo Y la fila coinciden en la especie inventada: la evidencia
+    // pública no alcanza, tiene que gatearla el dex.
+    const dataset = soloFixture(
+      ["|switch|p2a: Furfrou|Furfrou-Banana, L85, F|100/100"],
+      {
+        ...freshOpponent("furfroubanana", 85, ["DRAGON"]),
+        ability: "wonderguard",
+      },
+    );
+    expect(fields(dataset)).toEqual(["species"]);
+    // Positivo: la forma cosmética REAL sí resuelve, y con los tipos y la
+    // ability de su base.
+    const real = soloFixture(
+      ["|switch|p2a: Furfrou|Furfrou-Pharaoh, L85, F|100/100"],
+      { ...freshOpponent("furfroupharaoh", 85, ["NORMAL"]), ability: "furcoat" },
+    );
+    expect(fields(real)).toEqual([]);
+    // Y sobre la forma real, un tipo inventado ya NO se excusa.
+    const wrongTypes = soloFixture(
+      ["|switch|p2a: Furfrou|Furfrou-Pharaoh, L85, F|100/100"],
+      { ...freshOpponent("furfroupharaoh", 85, ["DRAGON"]), ability: "furcoat" },
+    );
+    expect(fields(wrongTypes)).toEqual(["types"]);
+  });
+
+  it("gholdengo_gen6_narrated_and_claimed", () => {
+    // Gholdengo existe en el dex, pero en gen 9. Una batalla de gen 6 no
+    // puede resolverlo: el índice es generation-scoped.
+    const dataset = soloFixture(
+      ["|switch|p2a: Gholdengo|Gholdengo, L80|100/100"],
+      { ...freshOpponent("gholdengo", 80, ["STEEL", "GHOST"]), ability: "goodasgold" },
+    );
+    dataset.dexPokemon.push({
+      gen: 9, showdownId: "gholdengo", baseSpecies: "gholdengo", forme: null,
+      types: ["Steel", "Ghost"], abilities: ["Good as Gold"],
+    });
+    expect(fields(dataset)).toEqual(["species"]);
+    // Positivo: la misma especie en SU generación no es una violación.
+    const gen9 = soloFixture(
+      ["|switch|p2a: Gholdengo|Gholdengo, L80|100/100"],
+      { ...freshOpponent("gholdengo", 80, ["STEEL", "GHOST"]), ability: "goodasgold" },
+    );
+    gen9.dexPokemon.push({
+      gen: 9, showdownId: "gholdengo", baseSpecies: "gholdengo", forme: null,
+      types: ["Steel", "Ghost"], abilities: ["Good as Gold"],
+    });
+    gen9.trajectories[0].gen = 9;
+    gen9.steps[0].state.gen = 9;
+    gen9.cosmeticFormes = [];
+    expect(fields(gen9)).toEqual([]);
+  });
+
+  it("pp_null_under_pressure_is_legitimate", () => {
+    // `pressure_on_us()`: con NUESTRO activo con Pressure, el recorder no
+    // puede decidir si el descuento fue de uno o de dos y escribe null.
+    const dataset = soloFixture(
+      [
+        "|switch|p1a: Dusknoir|Dusknoir, L80, M|100/100",
+        LAPRAS,
+        "|move|p2a: Lapras|Shadow Ball|p1a: Dusknoir",
+      ],
+      {
+        ...freshOpponent("lapras", 80, ["WATER", "ICE"]),
+        moves: [{ id: "shadowball", pp: null, max_pp: 24 }],
+      },
+    );
+    expect(fields(dataset)).toEqual([]);
+  });
+
+  it("pp_null_persists_after_losing_pressure", () => {
+    // Una vez en null, `pp - 1 if isinstance(pp, int)` deja null para siempre.
+    const dataset = soloFixture(
+      [
+        "|switch|p1a: Dusknoir|Dusknoir, L80, M|100/100",
+        LAPRAS,
+        "|move|p2a: Lapras|Shadow Ball|p1a: Dusknoir",
+        "|switch|p1a: Gengar|Gengar, L80, M|280/280",
+        "|move|p2a: Lapras|Shadow Ball|p1a: Gengar",
+      ],
+      {
+        ...freshOpponent("lapras", 80, ["WATER", "ICE"]),
+        moves: [{ id: "shadowball", pp: null, max_pp: 24 }],
+      },
+    );
+    expect(fields(dataset)).toEqual([]);
+  });
+
+  it("pp_null_without_public_cause_is_rejected", () => {
+    // Sin Pressure enfrente el PP es exacto: un null ahí es una omisión que
+    // el contrato de D31 no habilita.
+    const dataset = soloFixture(
+      [LAPRAS, "|move|p2a: Lapras|Shadow Ball|p1a: Gengar"],
+      {
+        ...freshOpponent("lapras", 80, ["WATER", "ICE"]),
+        moves: [{ id: "shadowball", pp: null, max_pp: 24 }],
+      },
+    );
+    expect(fields(dataset)).toEqual(["moves"]);
+    // Positivo: el mismo movimiento con su PP exacto pasa.
+    const exact = soloFixture(
+      [LAPRAS, "|move|p2a: Lapras|Shadow Ball|p1a: Gengar"],
+      {
+        ...freshOpponent("lapras", 80, ["WATER", "ICE"]),
+        moves: [{ id: "shadowball", pp: 23, max_pp: 24 }],
+      },
+    );
+    expect(fields(exact)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Otras protecciones que el rediseño no puede perder
 // ---------------------------------------------------------------------------
 
@@ -387,13 +505,22 @@ describe("canario · las reproducciones de los dos reviews están todas cubierta
     "formechange_read_as_details_adds_level_100",
   ];
 
+  const ROUND_THREE = [
+    "furfrou_banana_narrated_and_claimed",
+    "gholdengo_gen6_narrated_and_claimed",
+    "pp_null_under_pressure_is_legitimate",
+    "pp_null_persists_after_losing_pressure",
+    "pp_null_without_public_cause_is_rejected",
+  ];
+
   it("hay un test con el nombre exacto de cada reproducción reportada", async () => {
     const source = await import("node:fs/promises")
       .then((fs) => fs.readFile(new URL("./lifecycle.test.ts", import.meta.url), "utf8"));
-    for (const mutation of [...ROUND_ONE, ...ROUND_TWO]) {
+    for (const mutation of [...ROUND_ONE, ...ROUND_TWO, ...ROUND_THREE]) {
       expect(source, `falta el canario de ${mutation}`).toContain(`it("${mutation}"`);
     }
     expect(ROUND_ONE).toHaveLength(11);
     expect(ROUND_TWO).toHaveLength(12);
+    expect(ROUND_THREE).toHaveLength(5);
   });
 });

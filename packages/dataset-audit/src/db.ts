@@ -7,6 +7,7 @@
  */
 
 import pg from "pg";
+import { loadCosmeticAliases } from "./cosmetic.js";
 import type { Pool } from "pg";
 import type {
   BattleRecord,
@@ -241,5 +242,14 @@ export async function loadDataset(
     flags: Object.keys(row.flags ?? {}),
   }));
 
-  return { battles, turns, trajectories, steps, dexPokemon, dexMoves };
+  // Los alias cosméticos NO son una query: salen del dex local empaquetado
+  // (D32). El conteo de queries no cambia.
+  const gens = new Set(trajectories.map((trajectory) => trajectory.gen));
+  const cosmetic = loadCosmeticAliases(gens);
+
+  return {
+    battles, turns, trajectories, steps, dexPokemon, dexMoves,
+    cosmeticFormes: cosmetic.aliases,
+    ...(cosmetic.directory === undefined ? {} : { cosmeticSource: cosmetic.directory }),
+  };
 }

@@ -11,6 +11,7 @@ import {
   buildSpeciesIndex,
   normalizeProtocolText,
   opponentSideOf,
+  type SpeciesIndex,
 } from "./protocol.js";
 import { BattleProjection, buildDexView, type DexView } from "./projection.js";
 import type {
@@ -95,12 +96,22 @@ export function auditDataset(dataset: Dataset): AuditResult {
   // `base_species` es lo único que el índice de especies necesita del dex, y
   // es estable entre generaciones: un solo resolvedor fusionado alcanza para
   // un corpus multi-gen sin volver a recorrer el protocolo por generación.
-  const speciesIndex = buildSpeciesIndex(dataset.dexPokemon);
+  // Un índice POR GENERACIÓN: el dex de gen 9 no puede resolver una especie
+  // dentro de una batalla de gen 6, y `gholdengo` es justamente ese caso.
+  const speciesByGen = new Map<number, SpeciesIndex>();
+  const speciesFor = (gen: number): SpeciesIndex => {
+    let index = speciesByGen.get(gen);
+    if (index === undefined) {
+      index = buildSpeciesIndex(dataset.dexPokemon, gen, dataset.cosmeticFormes ?? []);
+      speciesByGen.set(gen, index);
+    }
+    return index;
+  };
   const dexViewByGen = new Map<number, DexView>();
   const dexFor = (gen: number): DexView => {
     let view = dexViewByGen.get(gen);
     if (view === undefined) {
-      view = buildDexView(dataset.dexPokemon, dataset.dexMoves, gen);
+      view = buildDexView(dataset.dexMoves, gen);
       dexViewByGen.set(gen, view);
     }
     return view;
@@ -343,13 +354,13 @@ export function auditDataset(dataset: Dataset): AuditResult {
     }
     const projection = new BattleProjection(
       dexFor(rows[0].trajectory.gen),
-      speciesIndex,
+      speciesFor(rows[0].trajectory.gen),
       { side: playerSide, abilities: ownAbilities, items: ownItems },
     );
     const contextOf = (row: PendingRow): OpponentContext => ({
       projection,
       dex: dexFor(row.trajectory.gen),
-      species: speciesIndex,
+      species: speciesFor(row.trajectory.gen),
       gen: row.trajectory.gen,
       opponentSide,
       playerSide: row.trajectory.playerSide,

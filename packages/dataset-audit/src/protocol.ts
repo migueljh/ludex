@@ -116,66 +116,81 @@ export function parseHpToken(raw: string | undefined): {
   };
 }
 
-/** Resuelve un id de especie contra el dex local. */
-export type SpeciesResolver = (speciesId: string) => DexPokemon | undefined;
-
-/** Construye el resolvedor.
+/** El dex local de UNA generación, con la resolución cosmética de D32.
  *
- * LÍMITE MEDIDO del dex local: la tabla `pokemon` no trae las formas
- * *cosméticas* de Showdown (Furfrou-Pharaoh, Florges-Blue, Sawsbuck-Autumn,
- * Gastrodon-East, las 28 Unown), que en el dex oficial comparten la entrada de
- * su especie base. poke-env sí las resuelve, así que el estado grabado las
- * nombra y una búsqueda exacta las deja sin dex.
+ * Antes esto resolvía por el prefijo más largo y sobre el dex de TODAS las
+ * generaciones a la vez. Fallaba abierto por partida doble: `furfroubanana`
+ * resolvía a `furfrou` igual que `furfroupharaoh`, y un `gholdengo` (que sólo
+ * existe en gen 9) resolvía dentro de una batalla de gen 6. Con la especie
+ * "resuelta", la proyección marcaba `types` y `ability` como no derivables y
+ * el comparador dejaba de auditarlos: cero violaciones sobre una fila
+ * inventada.
  *
- * La resolución de respaldo es el prefijo MÁS LARGO del dex que sea prefijo
- * del id buscado, que es exactamente cómo Showdown forma el id de una forma
- * cosmética (`furfrou` + `pharaoh`). Sigue anclada al dex: no hay ninguna
- * lista de especies escrita a mano.
+ * El orden ahora es el de D32, y no admite terceras vías:
  *
- * Es resolución, NO validación: `resolvedExactly` distingue las dos, porque un
- * sufijo inventado (`furfroubanana`) también resuelve a `furfrou`.
+ *  1. **La fila directa de ESTA generación gana.** Es lo que dice Postgres, y
+ *     Postgres es quien decide disponibilidad.
+ *  2. Si no hay fila, sólo un miembro REAL de `cosmeticFormes` cae a su base,
+ *     y sólo si esa base tiene fila en esta generación. El id visible se
+ *     conserva (D32) para poder correlacionar por especie revelada.
+ *  3. Cualquier otra cosa es **desconocida** y el auditor falla cerrado.
  */
 export interface SpeciesIndex {
-  resolve: SpeciesResolver;
-  /** ¿El dex conoce este id exactamente, sin caer al prefijo? */
-  resolvedExactly: (speciesId: string) => boolean;
+  gen: number;
+  /** La fila directa de esta generación, si existe. */
+  row(speciesId: string): DexPokemon | undefined;
+  /** La base de un alias cosmético REAL, si lo es. */
+  cosmeticBase(speciesId: string): string | undefined;
+  /** La entrada efectiva: fila directa, o la base de un alias cosmético. */
+  resolve(speciesId: string): DexPokemon | undefined;
+  /** ¿El dex de esta generación conoce esta especie? `false` = fallo cerrado. */
+  knows(speciesId: string): boolean;
 }
 
-export function buildSpeciesIndex(entries: Iterable<DexPokemon>): SpeciesIndex {
-  const exact = new Map<string, DexPokemon>();
-  for (const entry of entries) exact.set(normalizeProtocolText(entry.showdownId), entry);
-  const byLengthDesc = [...exact.keys()].sort((a, b) => b.length - a.length);
-  const cache = new Map<string, DexPokemon | undefined>();
-  return {
-    resolve: (speciesId: string) => {
-      const normalized = normalizeProtocolText(speciesId);
-      const hit = exact.get(normalized);
-      if (hit !== undefined) return hit;
-      if (cache.has(normalized)) return cache.get(normalized);
-      let resolved: DexPokemon | undefined;
-      for (const candidate of byLengthDesc) {
-        if (candidate.length < normalized.length && normalized.startsWith(candidate)) {
-          resolved = exact.get(candidate);
-          break;
-        }
-      }
-      cache.set(normalized, resolved);
-      return resolved;
-    },
-    resolvedExactly: (speciesId: string) => exact.has(normalizeProtocolText(speciesId)),
+export function buildSpeciesIndex(
+  entries: Iterable<DexPokemon>,
+  gen: number,
+  cosmeticAliases: Iterable<{ gen: number; aliasId: string; baseId: string }> = [],
+): SpeciesIndex {
+  const rows = new Map<string, DexPokemon>();
+  for (const entry of entries) {
+    if (entry.gen !== gen) continue;
+    rows.set(normalizeProtocolText(entry.showdownId), entry);
+  }
+  const cosmetic = new Map<string, string>();
+  for (const alias of cosmeticAliases) {
+    if (alias.gen !== gen) continue;
+    cosmetic.set(alias.aliasId, alias.baseId);
+  }
+  const row = (speciesId: string): DexPokemon | undefined =>
+    rows.get(normalizeProtocolText(speciesId));
+  const cosmeticBase = (speciesId: string): string | undefined => {
+    const normalized = normalizeProtocolText(speciesId);
+    if (rows.has(normalized)) return undefined;
+    const base = cosmetic.get(normalized);
+    return base !== undefined && rows.has(base) ? base : undefined;
   };
-}
-
-export function buildSpeciesResolver(entries: Iterable<DexPokemon>): SpeciesResolver {
-  return buildSpeciesIndex(entries).resolve;
+  const resolve = (speciesId: string): DexPokemon | undefined => {
+    const direct = row(speciesId);
+    if (direct !== undefined) return direct;
+    const base = cosmeticBase(speciesId);
+    return base === undefined ? undefined : rows.get(base);
+  };
+  return {
+    gen,
+    row,
+    cosmeticBase,
+    resolve,
+    knows: (speciesId) => resolve(speciesId) !== undefined,
+  };
 }
 
 /** Identidad canónica de una especie: su `base_species` según el dex local.
  * Es el criterio de `Pokemon.identifies_as`, no una comparación por `species`
  * (que rompe con toda forma alternativa: Arceus-Poison, Rotom-Wash). */
-export function canonicalIdentity(species: string, resolve: SpeciesResolver): string {
+export function canonicalIdentity(species: string, index: SpeciesIndex): string {
   const normalized = normalizeProtocolText(species);
-  const entry = resolve(normalized);
+  const entry = index.resolve(normalized);
   return entry ? normalizeProtocolText(entry.baseSpecies) : normalized;
 }
 

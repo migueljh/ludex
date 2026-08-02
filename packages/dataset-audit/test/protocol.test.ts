@@ -12,9 +12,9 @@ import {
   parseIdent,
   retrieveMoveId,
 } from "../src/protocol.js";
-import { dexPokemon } from "./fixtures.js";
+import { cosmeticFormes, dexPokemon } from "./fixtures.js";
 
-const speciesIndex = buildSpeciesIndex(dexPokemon());
+const speciesIndex = buildSpeciesIndex(dexPokemon(), 6, cosmeticFormes());
 const resolve = speciesIndex.resolve;
 
 describe("normalización", () => {
@@ -56,23 +56,42 @@ describe("parseo de ident y details", () => {
 
 describe("identidad canónica", () => {
   it("resuelve una forma alternativa a su especie base", () => {
-    expect(canonicalIdentity("charizardmegax", resolve)).toBe("charizard");
-    expect(canonicalIdentity("gengar", resolve)).toBe("gengar");
+    expect(canonicalIdentity("charizardmegax", speciesIndex)).toBe("charizard");
+    expect(canonicalIdentity("gengar", speciesIndex)).toBe("gengar");
   });
 
-  it("resuelve una forma COSMÉTICA ausente del dex local por su prefijo más largo", () => {
-    // `Furfrou-Pharaoh` comparte la entrada de Furfrou en el dex de Showdown y
-    // la tabla `pokemon` no la trae.
+  it("sólo un miembro REAL de `cosmeticFormes` cae a su base (D32)", () => {
     expect(resolve("furfroupharaoh")?.showdownId).toBe("furfrou");
-    // Resolver NO es validar: un sufijo inventado resuelve igual.
-    expect(resolve("furfroubanana")?.showdownId).toBe("furfrou");
-    expect(speciesIndex.resolvedExactly("furfroubanana")).toBe(false);
-    expect(speciesIndex.resolvedExactly("furfrou")).toBe(true);
+    expect(speciesIndex.cosmeticBase("furfroupharaoh")).toBe("furfrou");
+    expect(speciesIndex.knows("furfroupharaoh")).toBe(true);
+    // Un sufijo inventado sobre una especie real ya NO resuelve.
+    expect(resolve("furfroubanana")).toBeUndefined();
+    expect(speciesIndex.cosmeticBase("furfroubanana")).toBeUndefined();
+    expect(speciesIndex.knows("furfroubanana")).toBe(false);
   });
 
-  it("no inventa una base cuando el dex no conoce ni el prefijo", () => {
+  it("la fila directa de la generación siempre gana sobre el alias", () => {
+    // `furfrou` tiene fila propia: no se lo trata como alias de nadie.
+    expect(speciesIndex.row("furfrou")?.showdownId).toBe("furfrou");
+    expect(speciesIndex.cosmeticBase("furfrou")).toBeUndefined();
+  });
+
+  it("una especie de OTRA generación no existe en ésta", () => {
+    const gen9Only = buildSpeciesIndex(
+      [...dexPokemon(), {
+        gen: 9, showdownId: "gholdengo", baseSpecies: "gholdengo", forme: null,
+        types: ["Steel", "Ghost"], abilities: ["Good as Gold"],
+      }],
+      6,
+      cosmeticFormes(),
+    );
+    expect(gen9Only.knows("gholdengo")).toBe(false);
+    expect(gen9Only.gen).toBe(6);
+  });
+
+  it("no inventa una base cuando el dex no conoce la especie", () => {
     expect(resolve("pokemoninexistente")).toBeUndefined();
-    expect(canonicalIdentity("pokemoninexistente", resolve)).toBe("pokemoninexistente");
+    expect(canonicalIdentity("pokemoninexistente", speciesIndex)).toBe("pokemoninexistente");
   });
 });
 
