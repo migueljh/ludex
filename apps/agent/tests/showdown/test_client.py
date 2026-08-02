@@ -16,7 +16,7 @@ from ludex_agent.showdown.client import (
     battle_tag_from,
     local_server_configuration,
 )
-from ludex_agent.showdown.protocol import ProtocolRecorder
+from ludex_agent.showdown.protocol import CURRENT_FRAME_SEQ, ProtocolRecorder
 
 
 def _split(raw: str) -> list[str]:
@@ -182,6 +182,10 @@ def test_choose_move_reserva_el_indice_en_orden_de_decision():
 
     with patch.object(client_module.RandomPlayer, "choose_move", fake_super_choose_move):
         _descartar(player.choose_move(battle))
+        # La decision siguiente solo puede reservarse despues de que el
+        # servidor resolvio la anterior. Este test aisla la numeracion; los
+        # tests contractuales de request/win cubren la señal de resolucion.
+        player._resolve_pending_choice(tag)
         _descartar(player.choose_move(battle))
 
     assert len(player.steps[tag]) == 2
@@ -386,11 +390,24 @@ async def test_reintento_reusa_solo_la_parte_publica_de_la_proyeccion():
                   "my_side": {}, "opponent_side": {}},
         "legal_actions": [{"kind": "move", "id": "yaviejo"}],
     }
-    player._retry_pending[tag] = True
+    websocket = _RecordingWebsocket()
+    player.ps_client.websocket = websocket
+    _reservar_choice(player, tag, rqid=4)
+    await _enviar(player, tag, "/choose move tackle")
+    with patch.object(client_module.RandomPlayer, "_handle_battle_message", _sin_super):
+        await player._handle_battle_message([
+            [f">{tag}"],
+            _split("|error|[Unavailable choice] Move disabled"),
+        ])
+        await player._handle_battle_message([
+            [f">{tag}"],
+            _split('|request|{"rqid":6}'),
+        ])
 
     # En el reintento el pokemon resulto atrapado: solo queda un movimiento.
     battle = _fake_battle(
         battle_tag=tag, turn=99,
+        last_request={"rqid": 6},
         available_moves=[SimpleNamespace(id="struggle")],
     )
     with patch.object(
@@ -413,8 +430,20 @@ async def test_reintento_reusa_solo_la_parte_publica_de_la_proyeccion():
 async def test_reintento_sin_proyeccion_previa_falla_ruidosamente():
     player = _player()
     tag = "battle-retry-sin-nada"
-    player._retry_pending[tag] = True
-    battle = _fake_battle(battle_tag=tag)
+    websocket = _RecordingWebsocket()
+    player.ps_client.websocket = websocket
+    _reservar_choice(player, tag, rqid=4)
+    await _enviar(player, tag, "/choose move tackle")
+    with patch.object(client_module.RandomPlayer, "_handle_battle_message", _sin_super):
+        await player._handle_battle_message([
+            [f">{tag}"],
+            _split("|error|[Unavailable choice] Move disabled"),
+        ])
+        await player._handle_battle_message([
+            [f">{tag}"],
+            _split('|request|{"rqid":6}'),
+        ])
+    battle = _fake_battle(battle_tag=tag, last_request={"rqid": 6})
 
     with patch.object(
         client_module.RandomPlayer, "choose_move",
@@ -425,26 +454,6 @@ async def test_reintento_sin_proyeccion_previa_falla_ruidosamente():
             await pending
 
     assert player.steps[tag] == []
-
-
-async def test_error_de_eleccion_marca_el_proximo_choose_move_como_reintento():
-    """Las DOS rutas de rechazo tienen que quedar marcadas ANTES de que
-    poke-env vuelva a llamar a choose_move: `[Invalid choice]` reintenta
-    dentro del mismo frame, `[Unavailable choice]` en un frame posterior."""
-    for texto in ("[Unavailable choice] Blah", "[Invalid choice] Blah"):
-        player = _player()
-        tag = "battle-gen6randombattle-9"
-        player.steps[tag].append({"turn": 1, "state": {}, "action_taken": None})
-        lote = [[f">{tag}"], _split(f"|error|{texto}")]
-
-        with patch.object(
-            client_module.RandomPlayer, "_handle_battle_message",
-            _noop_async,
-        ):
-            await player._handle_battle_message(lote)
-
-        assert player._retry_pending.get(tag) is True, texto
-        assert player.steps[tag] == [], "la eleccion rechazada se descarta"
 
 
 async def _noop_async(self, split_messages):
@@ -1067,11 +1076,60 @@ async def _sin_super(*a, **kw):
     return None
 
 
-async def test_un_error_de_eleccion_no_disponible_descarta_el_ultimo_paso():
+class _RecordingWebsocket:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+
+def _reservar_choice(
+    player: LudexPlayer,
+    tag: str,
+    *,
+    rqid: int = 4,
+    frame_seq: int = 10,
+    move_id: str = "tackle",
+) -> dict:
+    """Reserva una decision por el camino publico de `choose_move`.
+
+    La coroutine se cierra porque estos tests ejercen la reconciliacion que
+    ocurre antes de decidir de nuevo; no necesitan esperar otra narracion.
+    """
+
+    class FakeMove:
+        id = move_id
+
+    battle = _fake_battle(
+        battle_tag=tag,
+        last_request={"rqid": rqid},
+        available_moves=[FakeMove()],
+    )
+    token = CURRENT_FRAME_SEQ.set(frame_seq)
+    try:
+        with patch.object(
+            client_module.RandomPlayer,
+            "choose_move",
+            lambda self, b: FakeOrder(mid=move_id),
+        ):
+            _descartar(player.choose_move(battle))
+    finally:
+        CURRENT_FRAME_SEQ.reset(token)
+    return player.steps[tag][0]
+
+
+async def _enviar(player: LudexPlayer, tag: str, message: str) -> None:
+    await player.ps_client.send_message(message, tag)
+
+
+async def test_unavailable_correlacionado_invalida_sin_eliminar_el_slot():
     player = _player()
     tag = "battle-x-1"
-    player.steps[tag].append({"action_taken": {"kind": "switch", "species": "regice"}})
-    player.recorders[tag]  # crea el recorder por defaultdict
+    websocket = _RecordingWebsocket()
+    player.ps_client.websocket = websocket
+    rechazado = _reservar_choice(player, tag)
+    await _enviar(player, tag, "/choose move tackle")
 
     lote = [_split(">battle-x-1"), _split(
         "|error|[Unavailable choice] Can't switch: The active Pokémon is trapped"
@@ -1079,31 +1137,431 @@ async def test_un_error_de_eleccion_no_disponible_descarta_el_ultimo_paso():
     with patch.object(client_module.RandomPlayer, "_handle_battle_message", _sin_super):
         await player._handle_battle_message(lote)
 
-    assert player.steps[tag] == []
+    assert len(player.steps[tag]) == 1, "el slot canonico no se elimina"
+    assert player.steps[tag][0] is None, "un intento rechazado no es persistible"
+    assert rechazado not in player.steps[tag]
+    assert getattr(player, "rejected_choice_count", 0) == 1
+    assert player._retry_pending.get(tag) is True
+    assert websocket.sent == [f"{tag}|/choose move tackle"]
 
 
-async def test_un_error_de_eleccion_invalida_tambien_descarta_el_ultimo_paso():
+async def test_undo_real_preserva_el_choice_pendiente_y_no_reintenta(caplog):
     player = _player()
     tag = "battle-x-1"
-    player.steps[tag].append({"action_taken": {"kind": "move", "id": "tackle"}})
+    websocket = _RecordingWebsocket()
+    player.ps_client.websocket = websocket
+    reservado = _reservar_choice(player, tag)
+    await _enviar(player, tag, "/choose move tackle")
+    await _enviar(player, tag, "/undo")
 
-    lote = [_split(">battle-x-1"), _split("|error|[Invalid choice] Move disabled")]
-    with patch.object(client_module.RandomPlayer, "_handle_battle_message", _sin_super):
+    lote = [
+        _split(">battle-x-1"),
+        _split("|error|[Invalid choice] There's nothing to cancel"),
+    ]
+    with caplog.at_level(logging.WARNING), patch.object(
+        client_module.RandomPlayer, "_handle_battle_message", _sin_super
+    ):
         await player._handle_battle_message(lote)
 
-    assert player.steps[tag] == []
+    assert player.steps[tag] == [reservado]
+    assert player._retry_pending.get(tag) in (None, False)
+    assert getattr(player, "auxiliary_command_error_count", 0) == 1
+    assert getattr(player, "rejected_choice_count", 0) == 0
+    assert any(
+        f"battle_tag={tag}" in record.message and "command=/undo" in record.message
+        for record in caplog.records
+    ), "el error auxiliar debe dejar un log estructurado y consultable"
+    assert websocket.sent == [
+        f"{tag}|/choose move tackle",
+        f"{tag}|/undo",
+    ]
 
 
-async def test_un_error_no_relacionado_no_descarta_nada():
+@pytest.mark.parametrize(
+    "error",
+    [
+        "[Invalid choice] There's nothing to choose",
+        (
+            "[Invalid choice] Sorry, too late to make a different move; "
+            "the next turn has already started"
+        ),
+        "[Invalid choice] The battle crashed",
+    ],
+)
+async def test_room_level_stale_choose_y_battle_crashed_fallan_cerrado(error):
     player = _player()
     tag = "battle-x-1"
-    player.steps[tag].append({"action_taken": {"kind": "move", "id": "tackle"}})
+    websocket = _RecordingWebsocket()
+    player.ps_client.websocket = websocket
+    reservado = _reservar_choice(player, tag)
+    await _enviar(player, tag, "/choose move tackle")
 
-    lote = [_split(">battle-x-1"), _split("|error|[Something else] no importa")]
+    lote = [_split(">battle-x-1"), _split(f"|error|{error}")]
     with patch.object(client_module.RandomPlayer, "_handle_battle_message", _sin_super):
-        await player._handle_battle_message(lote)
+        with pytest.raises(RuntimeError, match=tag):
+            await player._handle_battle_message(lote)
 
+    assert player.steps[tag] == [reservado]
+    assert player._retry_pending.get(tag) in (None, False)
+    assert getattr(player, "rejected_choice_count", 0) == 0
+    failure = await player.wait_for_background_failure()
+    assert tag in str(failure)
+
+
+async def test_invalid_correlaciona_aunque_responda_durante_sending():
+    """La observacion outbound debe existir antes del primer await del send."""
+    player = _player()
+    tag = "battle-race-1"
+    _reservar_choice(player, tag)
+    original_calls = 0
+
+    async def immediate_response(message, room="", message_2=None):
+        nonlocal original_calls
+        original_calls += 1
+        pending = player._pending_choices[tag]
+        assert pending.outbound_phase == "sending", (
+            "CANARIO: la respuesta se inyecta antes de que send pueda marcar sent"
+        )
+        with patch.object(
+            client_module.RandomPlayer, "_handle_battle_message", _sin_super
+        ):
+            await player._handle_battle_message([
+                [f">{tag}"],
+                _split("|error|[Invalid choice] Move disabled"),
+            ])
+
+    player._send_message_original = immediate_response
+    await _enviar(player, tag, "/choose move tackle")
+
+    assert original_calls == 1, "el wrapper delega exactamente una vez"
+    assert player.rejected_choice_count == 1
+    assert player.steps[tag] == [None]
+    assert player._pending_choices[tag].phase == "rejected"
+    assert player._pending_choices[tag].outbound_phase == "sent"
+
+
+async def test_fallo_de_send_no_deja_un_intento_ficticiamente_enviado():
+    player = _player()
+    tag = "battle-send-failed"
+    _reservar_choice(player, tag)
+    original_calls = 0
+
+    async def failing_send(message, room="", message_2=None):
+        nonlocal original_calls
+        original_calls += 1
+        raise OSError("socket closed")
+
+    player._send_message_original = failing_send
+    with pytest.raises(OSError, match="socket closed"):
+        await _enviar(player, tag, "/choose move tackle")
+
+    assert original_calls == 1
+    pending = player._pending_choices[tag]
+    assert pending.outbound_phase == "failed"
+    assert player._last_outbound[tag].phase == "failed"
+    assert player.rejected_choice_count == 0
+
+
+async def test_invalid_reintenta_dentro_del_handler_y_reemplaza_el_slot_random():
+    player = _player()
+    tag = "battle-invalid-inline"
+    websocket = _RecordingWebsocket()
+    player.ps_client.websocket = websocket
+    rechazado = _reservar_choice(player, tag, rqid=4, move_id="tackle")
+    await _enviar(player, tag, "/choose move tackle")
+    player._last_projection[tag] = {
+        "turn": 7,
+        "opponent": {"pokemon": [{"species": "latias", "active": True}]},
+        "field": {"weather": {}, "field_effects": {},
+                  "my_side": {}, "opponent_side": {}},
+    }
+    retry_battle = _fake_battle(
+        battle_tag=tag,
+        turn=7,
+        last_request={"rqid": 4},
+        available_moves=[SimpleNamespace(id="struggle")],
+    )
+    retries_inside_handler = 0
+
+    async def vendor_invalid_retry(self, split_messages):
+        nonlocal retries_inside_handler
+        retries_inside_handler += 1
+        with patch.object(
+            client_module.RandomPlayer,
+            "choose_move",
+            lambda owner, battle: FakeOrder(mid="struggle"),
+        ):
+            order = await self.choose_move(retry_battle)
+        assert order.order.id == "struggle"
+        await self.ps_client.send_message("/choose move struggle", tag)
+
+    with patch.object(
+        client_module.RandomPlayer,
+        "_handle_battle_message",
+        vendor_invalid_retry,
+    ):
+        await player._handle_battle_message([
+            [f">{tag}"],
+            _split("|error|[Invalid choice] Move disabled"),
+        ])
+
+    assert retries_inside_handler == 1, "CANARIO: el retry ocurrio en el handler"
+    assert player.rejected_choice_count == 1
     assert len(player.steps[tag]) == 1
+    final = player.steps[tag][0]
+    assert final is not rechazado
+    assert final["action_taken"] == {"kind": "move", "id": "struggle"}
+    assert final["state"]["legal_actions"] == [
+        {"kind": "move", "id": "struggle"}
+    ]
+    pending = player._pending_choices[tag]
+    assert pending.decision_index == 0
+    assert pending.attempt_index == 1
+    assert pending.phase == "retried"
+    assert websocket.sent == [
+        f"{tag}|/choose move tackle",
+        f"{tag}|/choose move struggle",
+    ]
+
+
+async def test_multiples_rechazos_comparten_indice_y_wait_resuelve_el_final():
+    player = _player()
+    tag = "battle-multiple-rejections"
+    websocket = _RecordingWebsocket()
+    player.ps_client.websocket = websocket
+    _reservar_choice(player, tag, rqid=4, move_id="tackle")
+    await _enviar(player, tag, "/choose move tackle")
+    player._last_projection[tag] = {
+        "turn": 5,
+        "opponent": {"pokemon": []},
+        "field": {"weather": {}, "field_effects": {},
+                  "my_side": {}, "opponent_side": {}},
+    }
+
+    async def reject_and_request(rqid: int) -> None:
+        with patch.object(
+            client_module.RandomPlayer, "_handle_battle_message", _sin_super
+        ):
+            await player._handle_battle_message([
+                [f">{tag}"],
+                _split("|error|[Unavailable choice] Move disabled"),
+            ])
+            await player._handle_battle_message([
+                [f">{tag}"],
+                _split(f'|request|{{"rqid":{rqid}}}'),
+            ])
+
+    async def retry(move_id: str, rqid: int) -> None:
+        battle = _fake_battle(
+            battle_tag=tag,
+            turn=5,
+            last_request={"rqid": rqid},
+            available_moves=[SimpleNamespace(id=move_id)],
+        )
+        with patch.object(
+            client_module.RandomPlayer,
+            "choose_move",
+            lambda owner, b: FakeOrder(mid=move_id),
+        ):
+            await player.choose_move(battle)
+        await _enviar(player, tag, f"/choose move {move_id}")
+
+    await reject_and_request(6)
+    await retry("struggle", 6)
+    await reject_and_request(8)
+    await retry("scratch", 8)
+
+    # wait:true no llama choose_move en poke-env, pero confirma que el ultimo
+    # intento fue aceptado. El canario exacto demuestra dos rechazos reales.
+    with patch.object(client_module.RandomPlayer, "_handle_battle_message", _sin_super):
+        await player._handle_battle_message([
+            [f">{tag}"],
+            _split('|request|{"rqid":10,"wait":true}'),
+        ])
+
+    assert player.rejected_choice_count == 2
+    assert len(player.steps[tag]) == 1
+    assert player.steps[tag][0]["action_taken"] == {
+        "kind": "move", "id": "scratch"
+    }
+    assert player._pending_choices.get(tag) is None
+    assert player.trajectory_blocker(tag) is None
+
+
+@pytest.mark.parametrize(
+    ("request_extra", "label"),
+    [
+        ("", "ordinario"),
+        (',"forceSwitch":[true]', "forceSwitch"),
+    ],
+)
+async def test_request_siguiente_resuelve_y_reserva_el_indice_siguiente(
+    request_extra, label
+):
+    """Un request nuevo resuelve la accion previa, incluso en el mismo turno."""
+    player = _player()
+    tag = f"battle-next-{label}"
+    websocket = _RecordingWebsocket()
+    player.ps_client.websocket = websocket
+    first = _reservar_choice(player, tag, rqid=4, move_id="tackle")
+    await _enviar(player, tag, "/choose move tackle")
+
+    with patch.object(client_module.RandomPlayer, "_handle_battle_message", _sin_super):
+        await player._handle_battle_message([
+            [f">{tag}"],
+            _split(f'|request|{{"rqid":6{request_extra}}}'),
+        ])
+
+    assert player._pending_choices.get(tag) is None, (
+        f"CANARIO: el request {label} no confirmo la decision anterior"
+    )
+    second_battle = _fake_battle(
+        battle_tag=tag,
+        turn=3,
+        last_request={"rqid": 6},
+        available_moves=[SimpleNamespace(id="scratch")],
+    )
+    with patch.object(
+        client_module.RandomPlayer,
+        "choose_move",
+        lambda owner, battle: FakeOrder(mid="scratch"),
+    ):
+        _descartar(player.choose_move(second_battle))
+
+    assert player.steps[tag][0] is first
+    assert len(player.steps[tag]) == 2
+    assert player._pending_choices[tag].decision_index == 1
+    assert player._pending_choices[tag].attempt_index == 0
+
+
+async def test_retry_graph_reemplaza_accion_path_y_reasoning_del_rechazado():
+    player = _player()
+    tag = "battle-graph-retry"
+    websocket = _RecordingWebsocket()
+    player.ps_client.websocket = websocket
+    rechazado = _reservar_choice(player, tag, rqid=4, move_id="tackle")
+    rechazado["action_path"] = "REJECTED_PATH"
+    rechazado["reasoning"] = "REJECTED_REASONING"
+    await _enviar(player, tag, "/choose move tackle")
+    player._last_projection[tag] = {
+        "turn": 3,
+        "opponent": {"pokemon": []},
+        "field": {"weather": {}, "field_effects": {},
+                  "my_side": {}, "opponent_side": {}},
+    }
+    with patch.object(client_module.RandomPlayer, "_handle_battle_message", _sin_super):
+        await player._handle_battle_message([
+            [f">{tag}"],
+            _split("|error|[Unavailable choice] Move disabled"),
+        ])
+        await player._handle_battle_message([
+            [f">{tag}"],
+            _split('|request|{"rqid":6}'),
+        ])
+
+    class RetryGraph:
+        async def ainvoke(self, graph_input):
+            assert graph_input["turn_id"] == f"{tag}:0"
+            return {
+                "action": {"kind": "move", "id": "struggle"},
+                "action_path": "fallback",
+                "reasoning": "FRESH_REASONING",
+            }
+
+    player.decision_graph = RetryGraph()
+    battle = _fake_battle(
+        battle_tag=tag,
+        last_request={"rqid": 6},
+        available_moves=[SimpleNamespace(id="struggle")],
+    )
+    await player.choose_move(battle)
+
+    final = player.steps[tag][0]
+    assert final is not rechazado
+    assert final["action_path"] == "fallback"
+    assert final["reasoning"] == "FRESH_REASONING"
+    assert "REJECTED_PATH" not in repr(final)
+    assert "REJECTED_REASONING" not in repr(final)
+    assert player.rejected_choice_count == 1
+
+
+@pytest.mark.parametrize("terminal", ["win", "tie"])
+async def test_win_y_tie_resuelven_y_limpian_un_intento_aceptado(terminal):
+    player = _player()
+    tag = f"battle-{terminal}-cleanup"
+    websocket = _RecordingWebsocket()
+    player.ps_client.websocket = websocket
+    step = _reservar_choice(player, tag)
+    step["state"] = {"legal_actions": step["legal_actions"]}
+    await _enviar(player, tag, "/choose move tackle")
+    await player.frame_inbox.publish(tag, ("|upkeep",))
+
+    with patch.object(client_module.RandomPlayer, "_handle_battle_message", _sin_super):
+        await player._handle_battle_message([
+            [f">{tag}"], _split(f"|{terminal}|Bot")
+        ])
+
+    assert player._pending_choices.get(tag) is None
+    assert tag not in player._last_outbound
+    assert tag not in player._request_heads
+    assert tag not in player._outbound_sequences
+    assert player.frame_inbox.retained(tag) == 0
+    assert player.trajectory_blocker(tag) is None
+
+
+async def test_win_con_intento_rechazado_falla_cerrado():
+    player = _player()
+    tag = "battle-win-rejected"
+    websocket = _RecordingWebsocket()
+    player.ps_client.websocket = websocket
+    _reservar_choice(player, tag)
+    await _enviar(player, tag, "/choose move tackle")
+    with patch.object(client_module.RandomPlayer, "_handle_battle_message", _sin_super):
+        await player._handle_battle_message([
+            [f">{tag}"],
+            _split("|error|[Unavailable choice] Move disabled"),
+        ])
+        with pytest.raises(RuntimeError, match=r"phase=rejected"):
+            await player._handle_battle_message([
+                [f">{tag}"], _split("|win|Bot")
+            ])
+
+    assert player.rejected_choice_count == 1, "CANARIO: hubo un rechazo"
+    assert player.trajectory_blocker(tag) == (0, "rejected")
+
+
+async def test_deinit_con_pending_falla_y_limpia_la_correlacion():
+    player = _player()
+    tag = "battle-deinit-pending"
+    websocket = _RecordingWebsocket()
+    player.ps_client.websocket = websocket
+    _reservar_choice(player, tag)
+    await _enviar(player, tag, "/choose move tackle")
+
+    with patch.object(client_module.RandomPlayer, "_handle_battle_message", _sin_super):
+        with pytest.raises(RuntimeError, match=r"deinit.*phase=reserved"):
+            await player._handle_battle_message([
+                [f">{tag}"], _split("|deinit")
+            ])
+
+    assert tag not in player._pending_choices
+    assert tag not in player._last_outbound
+    assert tag not in player._request_heads
+    blocker = player.trajectory_blocker(tag)
+    assert blocker is not None and blocker[1].startswith("terminal_failure:")
+
+
+async def test_invalid_desconocido_sin_choice_correlacionable_falla_cerrado():
+    player = _player()
+    tag = "battle-invalid-unknown"
+    lote = [[f">{tag}"], _split("|error|[Invalid choice] Future server text")]
+    with patch.object(client_module.RandomPlayer, "_handle_battle_message", _sin_super):
+        with pytest.raises(RuntimeError, match=tag):
+            await player._handle_battle_message(lote)
+
+    assert player.steps[tag] == []
+    assert player.rejected_choice_count == 0
+    assert player.recorders[tag].all_lines[-1].endswith("Future server text")
 
 
 async def test_excepcion_de_mensajes_se_publica_al_runner():
@@ -1137,26 +1595,6 @@ async def test_cancelar_un_vigilante_no_cancela_el_future_compartido():
     player._background_failure.set_result(failure)
 
     assert await second_waiter is failure
-
-
-def test_discard_last_step_descarta_el_ultimo_paso():
-    """El paso descartado llega siempre ya finalizado (ver docstring de
-    `_discard_last_step`): no hay ninguna task de fondo que cancelar."""
-    player = _player()
-    tag = "battle-x-1"
-    player.steps[tag].append({
-        "turn": 3, "decision_turn": 3, "state": {"turn": 3},
-        "action_taken": {"kind": "switch", "species": "regice"},
-    })
-
-    player._discard_last_step(tag)
-
-    assert player.steps[tag] == []
-
-
-async def test_discard_last_step_sin_pasos_no_revienta():
-    player = _player()
-    player._discard_last_step("tag-vacio")
 
 
 # --- D31 (MON-6): camino pre-lock ------------------------------------------
@@ -1248,7 +1686,7 @@ async def test_el_grafo_recibe_el_rival_revelado_por_la_narracion_ya_emitida():
     async def fake_send(message, room="", message_2=None):
         enviados.append(message)
 
-    player.ps_client.send_message = fake_send
+    player._send_message_original = fake_send
     await _correr_fixture(player, _frames_reales())
 
     assert vistas, "el grafo nunca se invoco: el fixture no ejercio nada"
@@ -1289,7 +1727,7 @@ async def test_la_proyeccion_no_filtra_informacion_oculta_del_rival():
     async def fake_send(message, room="", message_2=None):
         return None
 
-    player.ps_client.send_message = fake_send
+    player._send_message_original = fake_send
     await _correr_fixture(player, _frames_reales())
 
     decision = vistas[-1]
@@ -1334,7 +1772,7 @@ async def test_snapshot_del_proveedor_y_fila_persistida_son_el_mismo_objeto():
     async def fake_send(message, room="", message_2=None):
         return None
 
-    player.ps_client.send_message = fake_send
+    player._send_message_original = fake_send
     await _correr_fixture(player, _frames_reales())
 
     tag = "battle-gen6randombattle-397"
@@ -1360,7 +1798,7 @@ async def test_la_mascara_capturada_no_cambia_por_la_espera():
     async def fake_send(message, room="", message_2=None):
         return None
 
-    player.ps_client.send_message = fake_send
+    player._send_message_original = fake_send
     await _correr_fixture(player, _frames_reales())
 
     tag = "battle-gen6randombattle-397"

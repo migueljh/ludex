@@ -52,6 +52,10 @@ from .state.schema import STATE_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
+
+class IncompleteTrajectoryError(RuntimeError):
+    """Una trayectoria no puede escribirse completa y queda fuera del dataset."""
+
 app = typer.Typer(pretty_exceptions_show_locals=False)
 AGENT_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -108,6 +112,35 @@ async def _check_showdown_reachable(ws_url: str) -> None:
         ) from exc
 
 
+async def _battle_against_or_failure(agent: Any, rival: Any) -> None:
+    """Propaga fallos del listener al loop que gobierna la batalla.
+
+    poke-env procesa frames en una task/loop de fondo; esperar solamente
+    `battle_against` puede dejar al runner colgado hasta su timeout aunque el
+    handler ya haya fallado. El future compartido de Ludex está shielded, por
+    lo que cancelar este vigilante no cancela la señal para la batalla
+    siguiente.
+    """
+    wait_for_failure = getattr(agent, "wait_for_background_failure", None)
+    if wait_for_failure is None:
+        await agent.battle_against(rival, n_battles=1)
+        return
+    battle_task = asyncio.create_task(agent.battle_against(rival, n_battles=1))
+    failure_task = asyncio.create_task(wait_for_failure())
+    try:
+        await asyncio.wait(
+            {battle_task, failure_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if failure_task.done():
+            raise failure_task.result()
+        await battle_task
+    finally:
+        for task in (battle_task, failure_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(battle_task, failure_task, return_exceptions=True)
+
+
 async def play(n: int, fmt: str, *, source: str = "local") -> list[str]:
     """Juega `n` batallas y las persiste.
 
@@ -143,10 +176,13 @@ async def play(n: int, fmt: str, *, source: str = "local") -> list[str]:
             # lote, y la batalla se persiste apenas termina, no despues de
             # jugar las n. Un cuelgue en la batalla 5 de 5 ya no tira a la
             # basura las 4 anteriores, que quedaron commiteadas.
+            battle_timeout = asyncio.timeout(BATTLE_TIMEOUT_SECONDS)
             try:
-                async with asyncio.timeout(BATTLE_TIMEOUT_SECONDS):
-                    await agent.battle_against(rival, n_battles=1)
+                async with battle_timeout:
+                    await _battle_against_or_failure(agent, rival)
             except TimeoutError:
+                if not battle_timeout.expired():
+                    raise
                 break
             nuevas = [t for t in agent.battles if t not in antes]
             for tag in nuevas:
@@ -209,39 +245,27 @@ async def _persist_one(
     for turn in recorder.turns():
         await repo.save_turn(battle_id, side, turn, recorder.lines_for_turn(turn))
 
+    # C1/D22: la materializacion del estado es sincronica, dentro del manejo
+    # de mensajes; esto corrige la etiqueta de turno contra el protocolo antes
+    # de validar el conjunto completo de slots. El preflight ocurre antes de
+    # crear la trayectoria: una batalla incompleta conserva protocolo crudo,
+    # pero no deja una fila vacia dentro del dataset de politica.
+    await agent.wait_for_pending_steps(tag)
+    blocker = agent.trajectory_blocker(tag)
+    if blocker is not None:
+        decision_index, phase = blocker
+        agent.lost_step_count += 1
+        raise IncompleteTrajectoryError(
+            f"{tag}: trajectory_step incompleto decision_index={decision_index} "
+            f"phase={phase} (lost_step_count={agent.lost_step_count})"
+        )
     traj = await repo.save_trajectory(
         battle_id, gen_number=battle.gen, fmt=fmt, player_side=side
     )
-    # C1 (ver LudexPlayer._finalize_pending_steps, D22): la materializacion
-    # del estado ahora es sincronica, dentro del manejo de mensajes; esto
-    # solo corrige la etiqueta de turno contra el protocolo antes de leer
-    # agent.steps[tag].
-    await agent.wait_for_pending_steps(tag)
-    # D21 (C2): decision_index es el indice de la lista, que ya numera una
-    # vez por decision (una vez por llamada a choose_move), no por turno.
+    # D21/F2-02: decision_index cuenta decisiones canonicas resueltas. Los
+    # retries rechazados reemplazan el mismo slot y no producen filas.
     for decision_index, step in enumerate(agent.steps[tag]):
-        # I3 (review de merge): este camino era el mismo modo de falla de C2
-        # recreado -- perder una decision del dataset sin que nadie se
-        # entere. Hoy no ocurre nunca (0 huecos de decision_index medidos
-        # sobre toda la base), pero si el dia de mañana se graban miles de
-        # batallas desatendidas, un hueco tiene que dejar rastro: un warning
-        # con el detalle y un contador consultable (`agent.lost_step_count`),
-        # no un `continue` mudo. `step["state"] is None` cubre ademas el paso
-        # defensivo de `wait_for_pending_steps` (paso reservado que nunca se
-        # llego a materializar): sin este chequeo aca tambien, ese paso no
-        # es `None` pero igual revienta con un TypeError al leer
-        # `step["state"]["legal_actions"]`, cambiando una perdida silenciosa
-        # por un crash a mitad de la persistencia de la batalla.
-        if step is None or step.get("state") is None:
-            agent.lost_step_count += 1
-            logger.warning(
-                "paso %d de %s se descarta sin persistir (%s): la decision "
-                "se pierde del dataset (lost_step_count=%d)",
-                decision_index, tag,
-                "step es None" if step is None else "step['state'] es None",
-                agent.lost_step_count,
-            )
-            continue
+        assert step is not None and step["state"] is not None
         await repo.save_step(
             traj, decision_index, step["turn"], step["state"], STATE_SCHEMA_VERSION,
             step["state"]["legal_actions"], step["action_taken"], "agent",

@@ -548,11 +548,14 @@ pisaba la primera con la segunda. Medido sobre las 57 trayectorias de prueba:
 debilitamientos propios — la clase completa "elegir el reemplazo tras un
 debilitamiento" (~7.5% de las decisiones) no llegaba nunca a la base.
 
-`decision_index` cuenta decisiones, no turnos: arranca en 0 por trayectoria y
-avanza una vez por cada llamada a `choose_move` (el índice de
-`LudexPlayer.steps[tag]` en `client.py`, que ya numera así por construcción).
-`turn_number` queda como columna común, ya no parte de la clave: dos
-decisiones pueden compartir turno y eso ahora es representable.
+`decision_index` cuenta **decisiones canónicas resueltas**, no turnos ni
+invocaciones técnicas: arranca en 0 por trayectoria y avanza cuando Showdown
+resuelve una elección de juego. Un retry causado por `[Invalid choice]` o
+`[Unavailable choice]` es otro `attempt_index` interno de la **misma** decisión
+y reemplaza su mismo slot; no crea otro `decision_index` (D34). En cambio, un
+`forceSwitch` posterior sí es una decisión canónica nueva aunque comparta
+`battle.turn`. `turn_number` queda como columna común, ya no parte de la clave:
+dos decisiones pueden compartir turno y eso ahora es representable.
 
 Sin backfill (migración `20260727000006`): las 57 batallas grabadas hasta la
 review final eran de prueba, random contra random, y no sirven para entrenar.
@@ -1545,3 +1548,82 @@ Lo constante es el conteo de queries, y eso es lo que el canario mide.
 remite a "D19" para el contrato `source <> 'test'`, pero D19 es *"se juega
 `gen6randombattle`, no `gen6ou`"*. La migración histórica **no se edita**; esta
 decisión es la canónica del scope y deja constancia del error de referencia.
+## D34 — Los retries rechazados comparten una decisión canónica y sólo la acción resuelta entra al dataset
+
+**Contexto.** Showdown rechaza elecciones por dos rutas distintas de poke-env
+0.15.0. `[Invalid choice]` llama otra vez a `choose_move` dentro del handler del
+mismo frame; `[Unavailable choice]` espera un request posterior que puede
+revelar, por ejemplo, que el activo está atrapado. El código anterior buscaba
+el prefijo, hacía `pop()` del último step y luego lo volvía a agregar. Eso
+compactaba el índice por accidente en el caso feliz, pero no correlacionaba el
+error con un intento enviado. El mismo canal también emite errores auxiliares:
+un `/undo` sin nada que cancelar produce `[Invalid choice] There's nothing to
+cancel` y borraba una decisión válida. El protocolo real y `battle_turns`
+demuestran que estos errores **sí** llegan por el canal de batalla.
+
+**Decisión canónica e intentos.** Una decisión canónica es el request de juego
+que Showdown finalmente resuelve. Tiene un solo slot y `decision_index`; cada
+reintento técnico incrementa un `attempt_index` sólo en memoria. El estado
+separado `PendingChoice` transiciona `reserved/retried → rejected → retried` o
+`reserved/retried → resolved`. Un rechazo invalida el slot sin eliminarlo. El
+retry instala un dict nuevo en el mismo índice con snapshot, máscara, mapa de
+órdenes, acción, `action_path` y reasoning propios. De D31 sólo reutiliza copias
+de `opponent`, `field` y `turn` de la última proyección pública válida; nunca el
+dict completo ni la máscara anterior.
+
+**Correlación outbound atómica.** El wrapper de `PSClient.send_message` crea una
+secuencia por `battle_tag` y enlaza el intento **antes del primer `await`**. La
+fase es `sending`, `sent` o `failed`; si el websocket falla, el intento no queda
+ficticiamente enviado. El original se delega exactamente una vez y los comandos
+ajenos mantienen su comportamiento. Un rechazo sólo se acepta si coinciden el
+tag, el request (`rqid` + frame pre-lock), el pending actual y el último comando
+`/choose` de ese intento. La correlación se libera al cerrar la batalla.
+
+**Taxonomía fail-closed.** Hay tres clases, determinadas por texto y por comando
+outbound asociado:
+
+- rechazo correlacionado de `/choose`: invalida el slot y habilita el retry;
+- error auxiliar probado de `/undo` (`nothing/too late to cancel`): conserva el
+  pending, no reintenta, incrementa un contador consultable y deja log
+  estructurado; la línea cruda ya quedó en el recorder;
+- `nothing to choose`, `too late to make`, `The battle crashed` o cualquier
+  Invalid/Unavailable no clasificable: `ChoiceProtocolError` por el canal de
+  background/runner, sin retry ni mutación del step.
+
+La línea auxiliar se quita sólo del lote delegado a la rama demasiado amplia
+de poke-env; D17 conserva siempre el frame crudo completo.
+
+**Resolución.** Un request ordinario siguiente, incluido un `forceSwitch`,
+resuelve el intento aceptado anterior antes de reservar el próximo índice. Un
+request `wait:true` también confirma resolución aunque poke-env no llame a
+`choose_move`. `win`/`tie` resuelve un intento enviado y aceptado. `win`/`tie`
+con fase `rejected`, o `deinit` con cualquier pending, fallan cerrado. El cierre
+libera inbox, request head, outbound, retry y proyección temporal del tag.
+
+**Gate del dataset.** Después de `wait_for_pending_steps` y antes de crear la
+`trajectory`, `_persist_one` valida todos los slots y el pending. Un slot
+ausente, sin estado/acción, rechazado o terminalmente incoherente incrementa
+`lost_step_count` y lanza `IncompleteTrajectoryError` con tag, índice y fase.
+La batalla y sus `battle_turns` conservan el protocolo crudo como evidencia,
+pero no queda una trayectoria vacía ni se escriben `trajectory_steps`
+parciales, no se llama `finalize` y no se reparte reward a una trayectoria
+incompleta. Sólo la acción finalmente resuelta entra en `trajectory_steps`; el
+intento rechazado queda auditable en el protocolo crudo y en
+`rejected_choice_count`.
+
+**Lifetime del runner.** `play` compite `battle_against` con el future de fallo
+background mediante dos tareas hijas que pertenecen a
+`_battle_against_or_failure`. El helper las cancela y espera en `finally` ante
+éxito, fallo o cancelación externa; cancelar el vigilante no cancela el future
+compartido, que está shielded en `LudexPlayer`. El `TimeoutError` se interpreta
+como deadline silencioso sólo cuando `asyncio.Timeout.expired()` confirma que
+ese contexto inició la cancelación. Un `TimeoutError` recibido por el canal
+background —por ejemplo, del websocket— se propaga sin convertirse en una
+batalla omitida.
+
+**Consecuencias.** D21 queda precisada: `decision_index` cuenta decisiones
+canónicas resueltas y los retries comparten índice. No se agrega migración ni
+se cambia `BattleRepository`; la PK `(trajectory_id, decision_index)` y el
+`finalize` existente son correctos porque ningún intento rechazado llega a esa
+tabla. Los tests controlados de Shadow Tag y `move 99` verifican protocolo,
+índices contiguos y reward sólo sobre filas resueltas.
