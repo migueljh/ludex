@@ -1519,14 +1519,26 @@ request `wait:true` también confirma resolución aunque poke-env no llame a
 con fase `rejected`, o `deinit` con cualquier pending, fallan cerrado. El cierre
 libera inbox, request head, outbound, retry y proyección temporal del tag.
 
-**Gate del dataset.** Después de `wait_for_pending_steps` y antes del primer
-`save_step`, `_persist_one` valida todos los slots y el pending. Un slot ausente,
-sin estado/acción, rechazado o terminalmente incoherente incrementa
+**Gate del dataset.** Después de `wait_for_pending_steps` y antes de crear la
+`trajectory`, `_persist_one` valida todos los slots y el pending. Un slot
+ausente, sin estado/acción, rechazado o terminalmente incoherente incrementa
 `lost_step_count` y lanza `IncompleteTrajectoryError` con tag, índice y fase.
-No se escriben `trajectory_steps` parciales, no se llama `finalize` y no se
-reparte reward a una trayectoria incompleta. Sólo la acción finalmente resuelta
-entra en `trajectory_steps`; el intento rechazado queda auditable en el
-protocolo crudo y en `rejected_choice_count`.
+La batalla y sus `battle_turns` conservan el protocolo crudo como evidencia,
+pero no queda una trayectoria vacía ni se escriben `trajectory_steps`
+parciales, no se llama `finalize` y no se reparte reward a una trayectoria
+incompleta. Sólo la acción finalmente resuelta entra en `trajectory_steps`; el
+intento rechazado queda auditable en el protocolo crudo y en
+`rejected_choice_count`.
+
+**Lifetime del runner.** `play` compite `battle_against` con el future de fallo
+background mediante dos tareas hijas que pertenecen a
+`_battle_against_or_failure`. El helper las cancela y espera en `finally` ante
+éxito, fallo o cancelación externa; cancelar el vigilante no cancela el future
+compartido, que está shielded en `LudexPlayer`. El `TimeoutError` se interpreta
+como deadline silencioso sólo cuando `asyncio.Timeout.expired()` confirma que
+ese contexto inició la cancelación. Un `TimeoutError` recibido por el canal
+background —por ejemplo, del websocket— se propaga sin convertirse en una
+batalla omitida.
 
 **Consecuencias.** D21 queda precisada: `decision_index` cuenta decisiones
 canónicas resueltas y los retries comparten índice. No se agrega migración ni
