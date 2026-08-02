@@ -380,10 +380,12 @@ function compareMon(
   if (!mon.unresolved.has("moves") || copied !== undefined) {
     const expectedKeys = copied === undefined ? [...expectedMoves.keys()] : [...copied.moves.keys()];
     const absent = expectedKeys.filter((key) => !seen.has(key));
-    if (absent.length > 0 && copied === undefined) {
+    if (absent.length > 0) {
       if (push(
         "moves",
-        () => `faltan movimientos ya revelados de '${species}': ${absent.join(", ")}`,
+        () => copied === undefined
+          ? `faltan movimientos ya revelados de '${species}': ${absent.join(", ")}`
+          : `faltan movimientos que este Transform copió de '${species}': ${absent.join(", ")}`,
       )) return true;
     }
   }
