@@ -232,6 +232,15 @@ describe("Ronda 2 · un único cursor coherente para toda la fila", () => {
     expect(fields(transformed())).toEqual([]);
   });
 
+  it("transform_resolved_but_moves_empty", () => {
+    // T-01 (LINEAR_VERDICT): la ausencia sólo se reportaba cuando `copied`
+    // era `undefined`. Un Transform RESUELTO con `moves: []` pasaba con cero
+    // violaciones aunque le faltara el único movimiento copiado.
+    const dataset = transformed();
+    auditedOpponentOf(dataset).moves = [];
+    expect(fields(dataset)).toEqual(["moves"]);
+  });
+
   it("max_pp_after_move_was_used", () => {
     const dataset = baseDataset();
     auditedOpponentOf(dataset).moves = [
@@ -513,14 +522,19 @@ describe("canario · las reproducciones de los dos reviews están todas cubierta
     "pp_null_without_public_cause_is_rejected",
   ];
 
+  const ROUND_FOUR = [
+    "transform_resolved_but_moves_empty",
+  ];
+
   it("hay un test con el nombre exacto de cada reproducción reportada", async () => {
     const source = await import("node:fs/promises")
       .then((fs) => fs.readFile(new URL("./lifecycle.test.ts", import.meta.url), "utf8"));
-    for (const mutation of [...ROUND_ONE, ...ROUND_TWO, ...ROUND_THREE]) {
+    for (const mutation of [...ROUND_ONE, ...ROUND_TWO, ...ROUND_THREE, ...ROUND_FOUR]) {
       expect(source, `falta el canario de ${mutation}`).toContain(`it("${mutation}"`);
     }
     expect(ROUND_ONE).toHaveLength(11);
     expect(ROUND_TWO).toHaveLength(12);
     expect(ROUND_THREE).toHaveLength(5);
+    expect(ROUND_FOUR).toHaveLength(1);
   });
 });
