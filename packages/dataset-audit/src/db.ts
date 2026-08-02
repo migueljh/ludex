@@ -72,7 +72,7 @@ export const READ_QUERIES = {
                JOIN generations g ON g.id = p.gen_id
                WHERE ($1::int IS NULL OR g.gen_number = $1::int)
                ORDER BY g.gen_number, p.showdown_id`,
-  dexMoves: `SELECT g.gen_number, m.showdown_id, m.pp
+  dexMoves: `SELECT g.gen_number, m.showdown_id, m.pp, m.target, m.flags
              FROM moves m
              JOIN generations g ON g.id = m.gen_id
              WHERE ($1::int IS NULL OR g.gen_number = $1::int)
@@ -149,6 +149,8 @@ interface DexMoveRow {
   gen_number: number;
   showdown_id: string;
   pp: number | null;
+  target: string | null;
+  flags: Record<string, unknown> | null;
 }
 
 /** Lo mínimo que `loadDataset` necesita de un pool. Existe para que el canario
@@ -232,6 +234,11 @@ export async function loadDataset(
     gen: row.gen_number,
     showdownId: row.showdown_id,
     pp: row.pp,
+    // `target` y `flags` son lo que `_pressure_on` necesita para decidir si
+    // Pressure descuenta 2 PP en vez de 1: con ellos el PP esperado es EXACTO
+    // y no un rango.
+    target: row.target ?? "",
+    flags: Object.keys(row.flags ?? {}),
   }));
 
   return { battles, turns, trajectories, steps, dexPokemon, dexMoves };

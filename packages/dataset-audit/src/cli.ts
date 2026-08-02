@@ -124,6 +124,31 @@ async function main(): Promise<void> {
       throw new Error("el auditor no visitó ningún paso pese a que el dataset tiene filas");
     }
 
+    // Split por versión de esquema: v1 y v2 conviven en el mismo corpus y sus
+    // defectos tienen causas distintas (v2 nace con D31). Un total agregado
+    // esconde de quién es cada violación.
+    const versions = [...new Set(dataset.steps.map((step) => step.stateSchemaVersion))].sort();
+    if (versions.length > 0) {
+      console.log("\nSplit por state_schema_version:");
+      for (const version of versions) {
+        const rows = dataset.steps.filter((step) => step.stateSchemaVersion === version).length;
+        const own = result.violations.filter((violation) => violation.schemaVersion === version);
+        console.log(`  v${version}: ${rows} filas · ${own.length} violaciones`);
+        const byKey = new Map<string, number>();
+        for (const violation of own) {
+          const key = violation.field === undefined
+            ? violation.invariant
+            : `${violation.invariant}/${violation.field}`;
+          byKey.set(key, (byKey.get(key) ?? 0) + 1);
+        }
+        for (const [key, count] of [...byKey].sort((a, b) => b[1] - a[1])) {
+          console.log(`    ${key}: ${count}`);
+        }
+      }
+      const orphan = result.violations.filter((v) => v.schemaVersion === undefined).length;
+      if (orphan > 0) console.log(`  sin fila asociada (huérfanos): ${orphan}`);
+    }
+
     if (result.violations.length > 0) {
       console.log(`\nViolaciones (${result.violations.length}):`);
       const shown = new Map<string, number>();

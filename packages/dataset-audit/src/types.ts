@@ -120,6 +120,10 @@ export interface DexMove {
   gen: number;
   showdownId: string;
   pp: number | null;
+  /** Categoría de objetivo (`normal`, `all`, `self`...). La usa `_pressure_on`. */
+  target: string;
+  /** Banderas del movimiento; `mustpressure` fuerza el descuento de Pressure. */
+  flags: string[];
 }
 
 export interface Dataset {
@@ -156,6 +160,9 @@ export interface Violation {
   invariant: InvariantName;
   /** Sólo para `hidden_information`: cuál de las 11 claves rivales falló. */
   field?: OpponentField;
+  /** La versión de esquema de la fila que la produjo. Sin esto, un corpus con
+   * versiones mezcladas informa un total que no dice de quién es el defecto. */
+  schemaVersion?: number;
   detail: string;
   battleTag?: string;
   playerSide?: string;

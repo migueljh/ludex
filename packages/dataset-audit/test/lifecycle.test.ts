@@ -1,14 +1,16 @@
-/** Las mutaciones que el review del Tech Lead demostró que pasaban en silencio.
+/** Las mutaciones que los reviews del Tech Lead demostraron que pasaban.
  *
- * Cada test lleva el NOMBRE EXACTO de la mutación reportada, para que el
+ * Cada test lleva el NOMBRE EXACTO de la reproducción reportada, para que el
  * mapeo entre el hallazgo y su canario sea uno a uno y verificable sin leer
- * código. Todas parten del fixture positivo y cambian una sola cosa.
+ * código. Cada negativo va con su POSITIVO contrapuesto: un auditor que
+ * rechaza todo tampoco sirve, y sin el par la única forma de "arreglar" un
+ * canario sería endurecer el campo hasta que no pase nada.
  *
- * La causa común de las seis primeras era que el auditor sólo probaba
- * "revelado alguna vez": el dato existía en el protocolo, así que un valor
- * FALSO del mismo campo pasaba. Las dos siguientes eran excepciones abiertas
- * —`typechange` y `Transform`— que excusaban campos que no les corresponden.
- * Las tres últimas eran inferencias demasiado permisivas.
+ * La primera ronda entendió mal la causa: cambió "revelado alguna vez" por
+ * "revelado con este valor en algún momento de la ventana", que sigue siendo
+ * una pregunta POR CAMPO. Con eso, un HP del turno 3, un status del turno 4 y
+ * unos boosts del turno 5 pasaban juntos aunque nunca hubieran coexistido. La
+ * corrección es que la fila entera tiene que corresponder a UN instante.
  */
 
 import { describe, expect, it } from "vitest";
@@ -16,8 +18,11 @@ import { auditDataset } from "../src/invariants.js";
 import type { Dataset, OpponentField } from "../src/types.js";
 import {
   auditedOpponentOf,
+  auditedStep,
   baseDataset,
   faintedFixture,
+  freshOpponent,
+  soloFixture,
   withProtocolLine,
 } from "./fixtures.js";
 
@@ -30,20 +35,17 @@ function fields(dataset: Dataset): OpponentField[] {
 }
 
 // ---------------------------------------------------------------------------
-// Finding 1 — "revelado alguna vez" no demuestra el valor actual
+// Ronda 1 — "revelado alguna vez" no demuestra el valor actual
 // ---------------------------------------------------------------------------
 
-describe("Finding 1 · el valor del turno, no sólo que el dato fue público", () => {
+describe("Ronda 1 · el valor del turno, no sólo que el dato fue público", () => {
   it("wrong_hp_42_vs_public_55", () => {
-    // El protocolo narra 100/100 y 55/100 para Mr. Mime. 42 no existe.
     const dataset = baseDataset();
     auditedOpponentOf(dataset).hp_fraction = 0.42;
     expect(fields(dataset)).toEqual(["hp_fraction"]);
   });
 
   it("wrong_active_identity", () => {
-    // El protocolo tiene a Mr. Mime en el campo; la fila declara activa a la
-    // que está en el banco.
     const dataset = baseDataset();
     const opponent = dataset.steps[1].state.opponent!.pokemon!;
     opponent[0].active = false;
@@ -52,14 +54,12 @@ describe("Finding 1 · el valor del turno, no sólo que el dato fue público", (
   });
 
   it("missing_public_status", () => {
-    // `|-status|p2a: Mimien|par` es público y la fila dice que no tiene nada.
     const dataset = baseDataset();
     auditedOpponentOf(dataset).status = null;
     expect(fields(dataset)).toEqual(["status"]);
   });
 
   it("wrong_boost_magnitude_2_vs_public_1", () => {
-    // El protocolo narra `|-boost|p2a: Mimien|atk|1`, no 2.
     const dataset = baseDataset();
     auditedOpponentOf(dataset).boosts = {
       accuracy: 0, atk: 2, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0,
@@ -68,43 +68,26 @@ describe("Finding 1 · el valor del turno, no sólo que el dato fue público", (
   });
 
   it("arbitrary_pp_1", () => {
-    // Psychic tiene 16 PP y se narró UN uso: el piso derivable es 14.
     const dataset = baseDataset();
     auditedOpponentOf(dataset).moves = [{ id: "psychic", pp: 1, max_pp: 16 }];
     expect(fields(dataset)).toEqual(["moves"]);
   });
 
   it("fainted_false_after_public_faint", () => {
-    // `|faint|p2a: Mimien` es público y la fila dice que sigue en pie.
     expect(fields(faintedFixture(false))).toEqual(["fainted"]);
-    // El positivo del mismo fixture no viola nada.
     expect(fields(faintedFixture(true))).toEqual([]);
   });
-});
 
-// ---------------------------------------------------------------------------
-// Finding 2 — typechange / Transform no pueden excusar cualquier cosa
-// ---------------------------------------------------------------------------
-
-describe("Finding 2 · las excepciones no habilitan fuga arbitraria", () => {
   it("typechange_excuses_hidden_ability", () => {
-    // Un cambio de TIPOS no revela ni cambia una ability. `technician` es una
-    // ability real de Mr. Mime pero el protocolo nunca la narró y el dex no la
-    // determina (Mr. Mime tiene tres posibles).
     const dataset = withProtocolLine(baseDataset(), "|-start|p2a: Mimien|typechange|Water");
-    auditedOpponentOf(dataset).ability = "technician";
+    const audited = auditedOpponentOf(dataset);
+    audited.types = ["WATER"];
+    audited.ability = "technician";
     expect(fields(dataset)).toEqual(["ability"]);
   });
 
-  it("typechange sigue excusando los TIPOS, que es lo suyo", () => {
-    const dataset = withProtocolLine(baseDataset(), "|-start|p2a: Mimien|typechange|Water");
-    auditedOpponentOf(dataset).types = ["WATER"];
-    expect(fields(dataset)).toEqual([]);
-  });
-
   it("transform_excuses_arbitrary_hidden_data", () => {
-    // Transform copia a NUESTRO Gengar. Nada de esto salió de ahí.
-    const dataset = withProtocolLine(baseDataset(), "|-transform|p2a: Mimien|p1a: Gengar");
+    const dataset = transformed();
     const audited = auditedOpponentOf(dataset);
     audited.ability = "hugepower";
     audited.types = ["DARK"];
@@ -112,28 +95,228 @@ describe("Finding 2 · las excepciones no habilitan fuga arbitraria", () => {
     expect(fields(dataset)).toEqual(["ability", "moves", "types"]);
   });
 
-  it("Transform acepta exactamente lo que copió, con el PP topeado en 5", () => {
-    // `_transformed_move`: `min(5, max_pp)` desde gen 5.
-    const dataset = withProtocolLine(baseDataset(), "|-transform|p2a: Mimien|p1a: Gengar");
-    const audited = auditedOpponentOf(dataset);
-    audited.ability = "levitate";
-    audited.types = ["GHOST", "POISON"];
-    audited.moves = [{ id: "shadowball", pp: 5, max_pp: 5 }];
-    expect(fields(dataset)).toEqual([]);
+  it("explicit_L82_but_state_L100", () => {
+    const dataset = baseDataset();
+    auditedOpponentOf(dataset).level = 100;
+    expect(fields(dataset)).toEqual(["level"]);
   });
 
-  it("Transform acepta Imposter, que es la ability del que se transforma", () => {
-    const dataset = withProtocolLine(baseDataset(), "|-transform|p2a: Mimien|p1a: Gengar");
-    const audited = auditedOpponentOf(dataset);
-    audited.ability = "imposter";
-    audited.types = ["GHOST", "POISON"];
-    audited.moves = [{ id: "transform", pp: null, max_pp: null }];
-    expect(fields(dataset)).toEqual([]);
+  it("fabricated_suffix_species", () => {
+    const dataset = baseDataset();
+    dataset.steps[1].state.opponent!.pokemon![1].species = "furfroubanana";
+    expect(fields(dataset)).toContain("species");
   });
 
+  it("empty_boost_shape", () => {
+    const dataset = baseDataset();
+    auditedOpponentOf(dataset).boosts = {};
+    expect(fields(dataset)).toEqual(["boosts"]);
+  });
+
+  it("el fixture positivo del que salen todas sigue sin violar nada", () => {
+    expect(fields(baseDataset())).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ronda 2 — la fila tiene que describir UN instante, no un collage
+// ---------------------------------------------------------------------------
+
+/** El rival auditado, transformado en NUESTRO Gengar. Lo copiado queda listo:
+ * lo que cambie el test es la mutación, no el andamiaje. */
+function transformed(imposter = true): Dataset {
+  const dataset = withProtocolLine(
+    baseDataset(),
+    `|-transform|p2a: Mimien|p1a: Gengar${imposter ? "|[from] ability: Imposter" : ""}`,
+  );
+  const audited = auditedOpponentOf(dataset);
+  audited.ability = "levitate";
+  audited.types = ["GHOST", "POISON"];
+  audited.moves = [{ id: "shadowball", pp: 5, max_pp: 5 }];
+  // `transform()` copia los boosts del objetivo: el +1 atk propio se pierde.
+  audited.boosts = { accuracy: 0, atk: 0, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0 };
+  return dataset;
+}
+
+describe("Ronda 2 · un único cursor coherente para toda la fila", () => {
+  it("all_opponents_active_false", () => {
+    // Con `active` validado en un solo sentido, un equipo entero en `false`
+    // no contradecía nada: nadie afirmaba estar donde no estaba.
+    const dataset = baseDataset();
+    for (const entry of dataset.steps[1].state.opponent!.pokemon!) entry.active = false;
+    expect(fields(dataset)).toEqual(["active"]);
+  });
+
+  it("typechange_water_but_state_dragon", () => {
+    const dataset = withProtocolLine(baseDataset(), "|-start|p2a: Mimien|typechange|Water");
+    auditedOpponentOf(dataset).types = ["DRAGON"];
+    expect(fields(dataset)).toEqual(["types"]);
+    // Positivo: los tipos NARRADOS sí se aceptan.
+    const positive = withProtocolLine(baseDataset(), "|-start|p2a: Mimien|typechange|Water");
+    auditedOpponentOf(positive).types = ["WATER"];
+    expect(fields(positive)).toEqual([]);
+  });
+
+  it("soundproof_kept_after_skill_swap", () => {
+    const line = "|-ability|p2a: Mimien|Technician|[from] move: Skill Swap";
+    const dataset = withProtocolLine(baseDataset(), line);
+    expect(auditedOpponentOf(dataset).ability).toBe("soundproof");
+    expect(fields(dataset)).toEqual(["ability"]);
+    // Positivo: la ability VIGENTE es la que el Skill Swap dejó.
+    const positive = withProtocolLine(baseDataset(), line);
+    auditedOpponentOf(positive).ability = "technician";
+    expect(fields(positive)).toEqual([]);
+  });
+
+  it("leftovers_kept_after_enditem", () => {
+    const line = "|-enditem|p2a: Mimien|Leftovers";
+    const dataset = withProtocolLine(baseDataset(), line);
+    expect(auditedOpponentOf(dataset).item).toBe("leftovers");
+    expect(fields(dataset)).toEqual(["item"]);
+    // Positivo: `end_item` deja `None`, que NO es el centinela.
+    const positive = withProtocolLine(baseDataset(), line);
+    auditedOpponentOf(positive).item = null;
+    expect(fields(positive)).toEqual([]);
+  });
+
+  it("charizard_base_claims_mega_x_types_and_ability", () => {
+    const SWITCH = "|switch|p2a: Charizard|Charizard, L79, M|100/100";
+    const MEGA = "|detailschange|p2a: Charizard|Charizard-Mega-X, L79, M";
+    const mega = (): Record<string, unknown> => ({
+      // `forme_change` usa `store_species=False`: la especie sigue siendo la base.
+      ...freshOpponent("charizard", 79, ["FIRE", "DRAGON"]),
+      ability: "toughclaws",
+    });
+    // Antes de la evidencia pública, los tipos y la ability de la Mega son fuga.
+    expect(fields(soloFixture([SWITCH], mega()))).toEqual(["ability", "types"]);
+    // Después del `detailschange`, son el estado vigente.
+    expect(fields(soloFixture([SWITCH, MEGA], mega()))).toEqual([]);
+    // Y entonces son los de la forma BASE los que ya no corresponden: la Mega
+    // impone SU ability, así que un `ability: null` tampoco pasa.
+    expect(fields(soloFixture([SWITCH, MEGA], freshOpponent("charizard", 79, ["FIRE", "FLYING"]))))
+      .toEqual(["ability", "types"]);
+    // Positivo simétrico: antes de la Mega, la forma base es correcta.
+    expect(fields(soloFixture([SWITCH], freshOpponent("charizard", 79, ["FIRE", "FLYING"]))))
+      .toEqual([]);
+  });
+
+  it("spore_attributed_from_magic_bounce", () => {
+    const line = "|move|p2a: Mimien|Spore|p1a: Gengar|[from] ability: Magic Bounce";
+    const dataset = withProtocolLine(baseDataset(), line);
+    const audited = auditedOpponentOf(dataset);
+    // La línea SÍ revela la ability del que rebota; lo que no revela es el
+    // movimiento rebotado, que es del atacante.
+    audited.ability = "magicbounce";
+    audited.moves = [
+      { id: "psychic", pp: 15, max_pp: 16 },
+      { id: "hiddenpower", pp: 23, max_pp: 24 },
+      { id: "spore", pp: 24, max_pp: 24 },
+    ];
+    expect(fields(dataset)).toEqual(["moves"]);
+    // Positivo: sin el movimiento rebotado, la misma fila pasa.
+    const positive = withProtocolLine(baseDataset(), line);
+    auditedOpponentOf(positive).ability = "magicbounce";
+    expect(fields(positive)).toEqual([]);
+  });
+
+  it("transform_moveset_plus_transform", () => {
+    // `_transform_moves` TAPA el moveset base: el `transform` que `_add_move`
+    // agregó por Imposter queda debajo y no se serializa.
+    const dataset = transformed();
+    auditedOpponentOf(dataset).moves = [
+      { id: "shadowball", pp: 5, max_pp: 5 },
+      { id: "transform", pp: 16, max_pp: 16 },
+    ];
+    expect(fields(dataset)).toEqual(["moves"]);
+    // Positivo: exactamente el moveset copiado, con el PP topeado en 5.
+    expect(fields(transformed())).toEqual([]);
+  });
+
+  it("max_pp_after_move_was_used", () => {
+    const dataset = baseDataset();
+    auditedOpponentOf(dataset).moves = [
+      { id: "psychic", pp: 16, max_pp: 16 },
+      { id: "hiddenpower", pp: 23, max_pp: 24 },
+    ];
+    expect(fields(dataset)).toEqual(["moves"]);
+    // Positivo: el PP exacto tras un uso narrado.
+    expect(fields(baseDataset())).toEqual([]);
+  });
+
+  it("move_with_extra_schema_key", () => {
+    const dataset = baseDataset();
+    auditedOpponentOf(dataset).moves = [
+      { id: "psychic", pp: 15, max_pp: 16, secret: "filtrado" },
+      { id: "hiddenpower", pp: 23, max_pp: 24 },
+    ];
+    expect(fields(dataset)).toEqual(["moves"]);
+  });
+
+  it("values_that_never_coexisted_in_one_snapshot", () => {
+    // El turno 1 narra, en este orden: +1 atk, daño a 55/100, +1 atk otra vez.
+    // `hp=1.0` existió y `atk=2` existió, pero NUNCA a la vez.
+    const lines = [
+      "|switch|p2a: Mimien|Mr. Mime, L82, M|100/100",
+      "|-boost|p2a: Mimien|atk|1",
+      "|-damage|p2a: Mimien|55/100",
+      "|-boost|p2a: Mimien|atk|1",
+    ];
+    const at = (hp: number, atk: number): Dataset => soloFixture(
+      lines,
+      {
+        ...freshOpponent("mrmime", 82, ["PSYCHIC", "FAIRY"]),
+        hp_fraction: hp,
+        boosts: { accuracy: 0, atk, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0 },
+      },
+      1, // la ventana abre en el turno 1: los cursores intermedios cuentan
+    );
+    // Los dos instantes que existieron de verdad.
+    expect(fields(at(1, 1))).toEqual([]);
+    expect(fields(at(0.55, 2))).toEqual([]);
+    // El collage de los dos, con cada valor por separado impecable. Se reporta
+    // contra el cursor que MÁS se le acerca —el primero al que sólo le sobra un
+    // campo—; lo que demuestra el test es que la combinación no corresponde a
+    // ningún instante de la batalla.
+    expect(fields(at(1, 2))).toEqual(["boosts"]);
+  });
+
+  it("copyboost_unknown_applied_to_source", () => {
+    // `|-copyboost|FUENTE|OBJETIVO`: la FUENTE no cambia, así que marcarla
+    // desconocida borraba un boost público y aceptaba cualquier valor.
+    const dataset = withProtocolLine(baseDataset(), "|-copyboost|p2a: Mimien|p1a: Gengar");
+    auditedOpponentOf(dataset).boosts = {
+      accuracy: 0, atk: 4, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0,
+    };
+    expect(fields(dataset)).toEqual(["boosts"]);
+    // Positivo: como fuente conserva su +1 atk.
+    const positive = withProtocolLine(baseDataset(), "|-copyboost|p2a: Mimien|p1a: Gengar");
+    expect(fields(positive)).toEqual([]);
+    // Y como OBJETIVO sí copia: los de nuestro Gengar están en cero.
+    const target = withProtocolLine(baseDataset(), "|-copyboost|p1a: Gengar|p2a: Mimien");
+    auditedOpponentOf(target).boosts = {
+      accuracy: 0, atk: 0, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0,
+    };
+    expect(fields(target)).toEqual([]);
+  });
+
+  it("formechange_read_as_details_adds_level_100", () => {
+    // `forme_change` no toca el nivel: leer `-formechange` como un `details`
+    // inventaba un `L100` que la línea nunca dijo.
+    const dataset = withProtocolLine(baseDataset(), "|-formechange|p2a: Mimien|Mr. Mime");
+    auditedOpponentOf(dataset).level = 100;
+    expect(fields(dataset)).toEqual(["level"]);
+    // Positivo: el nivel narrado en el `|switch|` sigue siendo el vigente.
+    const positive = withProtocolLine(baseDataset(), "|-formechange|p2a: Mimien|Mr. Mime");
+    expect(fields(positive)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Otras protecciones que el rediseño no puede perder
+// ---------------------------------------------------------------------------
+
+describe("las excepciones siguen sin ser comodines", () => {
   it("un Transform sin objetivo resoluble NO excusa nada", () => {
-    // Si no se puede decir qué se copió, aceptar cualquier valor sería la fuga
-    // que este chequeo existe para impedir.
     const dataset = withProtocolLine(baseDataset(), "|-transform|p2a: Mimien|p1a: Fantasma");
     const audited = auditedOpponentOf(dataset);
     audited.ability = "hugepower";
@@ -142,55 +325,18 @@ describe("Finding 2 · las excepciones no habilitan fuga arbitraria", () => {
   });
 
   it("el Transform TERMINA cuando el pokémon sale del campo", () => {
-    const dataset = withProtocolLine(baseDataset(), "|-transform|p2a: Mimien|p1a: Gengar");
+    const dataset = transformed();
     withProtocolLine(dataset, "|switch|p2a: Furfrou|Furfrou-Pharaoh, L85, F|100/100");
-    const audited = auditedOpponentOf(dataset);
-    audited.active = false;
-    // Salir del campo también limpia los boosts (`Pokemon.switch_out`).
-    audited.boosts = { accuracy: 0, atk: 0, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0 };
-    audited.ability = "levitate";
-    audited.moves = [{ id: "shadowball", pp: 5, max_pp: 5 }];
-    // Ya no hay Transform vigente: lo copiado deja de estar excusado.
-    expect(fields(dataset)).toEqual(["ability", "moves"]);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Finding 3 — inferencias permisivas
-// ---------------------------------------------------------------------------
-
-describe("Finding 3 · las inferencias legítimas no tapan corrupción", () => {
-  it("explicit_L82_but_state_L100", () => {
-    // Showdown omite `L100`, así que 100 sólo es válido cuando el details NO
-    // trae nivel. Acá trae `L82`.
-    const dataset = baseDataset();
-    auditedOpponentOf(dataset).level = 100;
-    expect(fields(dataset)).toEqual(["level"]);
-  });
-
-  it("un details sin nivel sí significa 100", () => {
-    const dataset = baseDataset();
-    dataset.turns[1].protocolLines[1] = "|switch|p2a: Mimien|Mr. Mime|100/100";
-    auditedOpponentOf(dataset).level = 100;
-    expect(fields(dataset)).toEqual([]);
-  });
-
-  it("fabricated_suffix_species", () => {
-    // `furfroubanana` resuelve por prefijo a Furfrou, pero el protocolo nunca
-    // lo narró y el dex no lo conoce: es una especie inventada.
-    const dataset = baseDataset();
-    dataset.steps[1].state.opponent!.pokemon![1].species = "furfroubanana";
-    expect(fields(dataset)).toContain("species");
+    const opponent = auditedStep(dataset).state.opponent!.pokemon!;
+    opponent[0].active = false;
+    opponent[1].active = true;
+    // Ya no hay Transform vigente: lo copiado deja de estar excusado, y
+    // `switch_out` revierte además el override temporal de la ability.
+    expect(fields(dataset)).toEqual(["ability", "moves", "types"]);
   });
 
   it("una forma cosmética REAL, narrada verbatim, sigue pasando", () => {
     expect(fields(baseDataset())).toEqual([]);
-  });
-
-  it("empty_boost_shape", () => {
-    const dataset = baseDataset();
-    auditedOpponentOf(dataset).boosts = {};
-    expect(fields(dataset)).toEqual(["boosts"]);
   });
 
   it("rechaza también un boost al que le falta un solo stat", () => {
@@ -212,8 +358,8 @@ describe("Finding 3 · las inferencias legítimas no tapan corrupción", () => {
 // Canario de cobertura de este archivo
 // ---------------------------------------------------------------------------
 
-describe("canario · las mutaciones del review están todas cubiertas", () => {
-  const REPORTED = [
+describe("canario · las reproducciones de los dos reviews están todas cubiertas", () => {
+  const ROUND_ONE = [
     "wrong_hp_42_vs_public_55",
     "wrong_active_identity",
     "missing_public_status",
@@ -226,13 +372,28 @@ describe("canario · las mutaciones del review están todas cubiertas", () => {
     "fabricated_suffix_species",
     "empty_boost_shape",
   ];
+  const ROUND_TWO = [
+    "all_opponents_active_false",
+    "typechange_water_but_state_dragon",
+    "soundproof_kept_after_skill_swap",
+    "leftovers_kept_after_enditem",
+    "charizard_base_claims_mega_x_types_and_ability",
+    "spore_attributed_from_magic_bounce",
+    "transform_moveset_plus_transform",
+    "max_pp_after_move_was_used",
+    "move_with_extra_schema_key",
+    "values_that_never_coexisted_in_one_snapshot",
+    "copyboost_unknown_applied_to_source",
+    "formechange_read_as_details_adds_level_100",
+  ];
 
-  it("hay un test con el nombre exacto de cada mutación reportada", async () => {
+  it("hay un test con el nombre exacto de cada reproducción reportada", async () => {
     const source = await import("node:fs/promises")
       .then((fs) => fs.readFile(new URL("./lifecycle.test.ts", import.meta.url), "utf8"));
-    for (const mutation of REPORTED) {
+    for (const mutation of [...ROUND_ONE, ...ROUND_TWO]) {
       expect(source, `falta el canario de ${mutation}`).toContain(`it("${mutation}"`);
     }
-    expect(REPORTED).toHaveLength(11);
+    expect(ROUND_ONE).toHaveLength(11);
+    expect(ROUND_TWO).toHaveLength(12);
   });
 });

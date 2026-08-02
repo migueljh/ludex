@@ -94,24 +94,38 @@ describe("inferencias legítimas: no son fuga", () => {
     expect(auditDataset(dataset).violations).toEqual([]);
   });
 
-  it("acepta `unknown_item` y `null`: son centinelas de poke-env, no una afirmación", () => {
-    expect(fieldsViolated(withOpponentField("item", "unknown_item"))).toEqual([]);
-    expect(fieldsViolated(withOpponentField("item", null))).toEqual([]);
-    expect(fieldsViolated(withOpponentField("ability", null))).toEqual([]);
+  it("`unknown_item` es el centinela de 'nadie lo reveló', no un comodín", () => {
+    // El rival del banco nunca reveló su item y lo declara con el centinela.
+    expect(fieldsViolated(baseDataset())).toEqual([]);
+    // Pero el auditado SÍ reveló Leftovers: volver al centinela, o a `null`,
+    // contradice el valor vigente igual que inventar otro item.
+    expect(fieldsViolated(withOpponentField("item", "unknown_item"))).toEqual(["item"]);
+    expect(fieldsViolated(withOpponentField("item", null))).toEqual(["item"]);
+    expect(fieldsViolated(withOpponentField("ability", null))).toEqual(["ability"]);
   });
 
   it("recorta Hidden Power al id base: Showdown narra sólo 'Hidden Power'", () => {
-    // El fixture ya trae `hiddenpowerice` respaldado por `|move|...|Hidden Power|`.
+    // `Move.retrieve_id` colapsa los 17 Hidden Power en uno: el id que el
+    // protocolo revela es el mismo para todos.
     expect(fieldsViolated(baseDataset())).toEqual([]);
-    // Sin el recorte, un Hidden Power de otro tipo tampoco tendría que fallar:
-    // el id base es el mismo y es lo único que el protocolo revela.
-    const dataset = withOpponentField("moves", [{ id: "hiddenpowerfire", pp: 24, max_pp: null }]);
+    const dataset = withOpponentField("moves", [
+      { id: "psychic", pp: 15, max_pp: 16 },
+      { id: "hiddenpowerfire", pp: 23, max_pp: 24 },
+    ]);
     expect(fieldsViolated(dataset)).toEqual([]);
   });
 
   it("rechaza un movimiento que NO comparte el id base con nada narrado", () => {
     const dataset = withOpponentField("moves", [{ id: "hiddenblade", pp: 8, max_pp: 8 }]);
     expect(fieldsViolated(dataset)).toEqual(["moves"]);
+  });
+
+  it("acepta un movimiento con pp/max_pp en null sólo si el dex no lo trae", () => {
+    // `psychic` sí está en el dex: su PP es derivable y exacto.
+    expect(fieldsViolated(withOpponentField("moves", [
+      { id: "psychic", pp: null, max_pp: null },
+      { id: "hiddenpower", pp: 23, max_pp: 24 },
+    ]))).toEqual(["moves"]);
   });
 });
 
@@ -147,22 +161,22 @@ describe("chequeos estructurales del rival", () => {
     // Psychic tiene 10 PP en el dex: `Move.max_pp` es 10*8//5 = 16.
     expect(fieldsViolated(withOpponentField("moves", [
       { id: "psychic", pp: 10, max_pp: 32 },
+      { id: "hiddenpower", pp: 23, max_pp: 24 },
     ]))).toEqual(["moves"]);
-    expect(fieldsViolated(withOpponentField("moves", [
-      { id: "psychic", pp: 15, max_pp: 16 },
-    ]))).toEqual([]);
   });
 
-  it("rechaza pp por encima de su máximo y acepta pp null (no derivable)", () => {
+  it("el PP es EXACTO: un uso narrado es exactamente un PP menos", () => {
+    const base = [{ id: "hiddenpower", pp: 23, max_pp: 24 }];
     expect(fieldsViolated(withOpponentField("moves", [
-      { id: "psychic", pp: 17, max_pp: 16 },
-    ]))).toEqual(["moves"]);
-    expect(fieldsViolated(withOpponentField("moves", [
-      { id: "psychic", pp: 16, max_pp: 16 },
+      { id: "psychic", pp: 15, max_pp: 16 }, ...base,
     ]))).toEqual([]);
-    expect(fieldsViolated(withOpponentField("moves", [
-      { id: "psychic", pp: null, max_pp: null },
-    ]))).toEqual([]);
+    // Ni de más ni de menos: el piso permisivo dejaba pasar cualquier valor
+    // por debajo.
+    for (const pp of [16, 14, 1]) {
+      expect(fieldsViolated(withOpponentField("moves", [
+        { id: "psychic", pp, max_pp: 16 }, ...base,
+      ]))).toEqual(["moves"]);
+    }
   });
 
   it("rechaza un boost fuera de [-6,6] y una clave de boost desconocida", () => {
@@ -172,25 +186,12 @@ describe("chequeos estructurales del rival", () => {
     expect(fieldsViolated(withOpponentField("boosts", { atk: 1, crit: 1 }))).toEqual(["boosts"]);
   });
 
-  it("rechaza un HP fuera de la grilla de centésimos con HP Percentage Mod activo", () => {
+  it("el HP se compara contra el valor narrado, no contra una grilla", () => {
     expect(fieldsViolated(withOpponentField("hp_fraction", 0.55))).toEqual([]);
+    // 0.5537 es un centésimo inventado y 0.54 es un centésimo perfectamente
+    // formado que el protocolo tampoco narró: los dos son igual de falsos.
     expect(fieldsViolated(withOpponentField("hp_fraction", 0.5537))).toEqual(["hp_fraction"]);
-  });
-
-  it("la grilla de centésimos sólo se exige si el protocolo declara la regla", () => {
-    const conRegla = auditDataset(withOpponentField("hp_fraction", 0.5537)).violations;
-    expect(conRegla[0].detail).toContain("centésimo");
-
-    const dataset = withOpponentField("hp_fraction", 0.5537);
-    const turn0 = dataset.turns.find((turn) => turn.turnNumber === 0)!;
-    turn0.protocolLines = turn0.protocolLines.filter(
-      (line) => !line.startsWith("|rule|HP Percentage Mod"),
-    );
-    // Sin la regla, el reproche ya no es la grilla: es que el protocolo nunca
-    // narró ese HP. El valor sigue sin pasar, por el motivo correcto.
-    const sinRegla = auditDataset(dataset).violations;
-    expect(sinRegla[0].detail).toContain("narró");
-    expect(sinRegla[0].detail).not.toContain("centésimo");
+    expect(fieldsViolated(withOpponentField("hp_fraction", 0.54))).toEqual(["hp_fraction"]);
   });
 
   it("exige que fainted coincida con el |faint| público, en los dos sentidos", () => {
@@ -221,14 +222,20 @@ describe("chequeos estructurales del rival", () => {
     expect(fieldsViolated(dataset)).toEqual([]);
   });
 
-  it("se abstiene cuando el protocolo no permite derivar el boost", () => {
-    // `-copyboost` necesita los boosts del OTRO lado, que esta proyección no
-    // tiene: marcar DESCONOCIDO y no afirmar nada es lo correcto.
-    const dataset = withOpponentField("boosts", {
-      accuracy: 0, atk: 4, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0,
+  it("`-copyboost` escribe en el OBJETIVO, y la fuente no cambia", () => {
+    // `|-copyboost|FUENTE|OBJETIVO` (`abstract_battle.py:912-914`). Con Mimien
+    // como FUENTE, sus boosts siguen siendo los suyos.
+    const source = withOpponentField("boosts", {
+      accuracy: 0, atk: 0, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0,
     });
-    expect(fieldsViolated(dataset)).toEqual(["boosts"]);
-    dataset.turns[1].protocolLines.push("|-copyboost|p2a: Mimien|p1a: Gengar");
-    expect(fieldsViolated(dataset)).toEqual([]);
+    source.turns[1].protocolLines.push("|-copyboost|p2a: Mimien|p1a: Gengar");
+    expect(fieldsViolated(source)).toEqual(["boosts"]);
+
+    // Como OBJETIVO sí cambia: copia los de nuestro Gengar, que están en cero.
+    const target = withOpponentField("boosts", {
+      accuracy: 0, atk: 0, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0,
+    });
+    target.turns[1].protocolLines.push("|-copyboost|p1a: Gengar|p2a: Mimien");
+    expect(fieldsViolated(target)).toEqual([]);
   });
 });

@@ -43,15 +43,43 @@ export function dexPokemon(): DexPokemon[] {
       gen: 6, showdownId: "gengar", baseSpecies: "gengar", forme: null,
       types: ["Ghost", "Poison"], abilities: ["Levitate"],
     },
+    {
+      gen: 6, showdownId: "lapras", baseSpecies: "lapras", forme: null,
+      types: ["Water", "Ice"], abilities: ["Water Absorb", "Shell Armor", "Hydration"],
+    },
+    {
+      gen: 6, showdownId: "ditto", baseSpecies: "ditto", forme: null,
+      types: ["Normal"], abilities: ["Limber", "Imposter"],
+    },
+    // Ability única: el dex la determina y decirla no es fuga. Además es la
+    // única forma de tener Pressure enfrente sin que nadie la narre.
+    {
+      gen: 6, showdownId: "dusknoir", baseSpecies: "dusknoir", forme: null,
+      types: ["Ghost"], abilities: ["Pressure"],
+    },
   ];
 }
 
-/** `Move.max_pp` de poke-env es `pp * 8 // 5`: Psychic tiene 10 PP -> 16. */
+/** `Move.max_pp` de poke-env es `pp * 8 // 5`: Psychic tiene 10 PP -> 16.
+ *
+ * `target` y `flags` son los del dex real: con ellos `_pressure_on` es exacto
+ * y el PP esperado es un número, no un rango. El dex de gen 6 no tiene
+ * `hiddenpowerice`: `Move.retrieve_id` colapsa los 17 en `hiddenpower`. */
 export function dexMoves(): DexMove[] {
   return [
-    { gen: 6, showdownId: "psychic", pp: 10 },
-    { gen: 6, showdownId: "hiddenpowerice", pp: 15 },
-    { gen: 6, showdownId: "shadowball", pp: 15 },
+    { gen: 6, showdownId: "psychic", pp: 10, target: "normal", flags: [] },
+    { gen: 6, showdownId: "hiddenpower", pp: 15, target: "normal", flags: [] },
+    { gen: 6, showdownId: "shadowball", pp: 15, target: "normal", flags: [] },
+    { gen: 6, showdownId: "spore", pp: 15, target: "normal", flags: [] },
+    { gen: 6, showdownId: "transform", pp: 10, target: "normal", flags: [] },
+    { gen: 6, showdownId: "swordsdance", pp: 20, target: "self", flags: [] },
+    { gen: 6, showdownId: "trick", pp: 10, target: "normal", flags: [] },
+    { gen: 6, showdownId: "copycat", pp: 20, target: "self", flags: [] },
+    { gen: 6, showdownId: "sleeptalk", pp: 10, target: "self", flags: [] },
+    { gen: 6, showdownId: "rest", pp: 10, target: "self", flags: [] },
+    { gen: 6, showdownId: "outrage", pp: 10, target: "randomNormal", flags: [] },
+    { gen: 6, showdownId: "petaldance", pp: 10, target: "randomNormal", flags: [] },
+    { gen: 6, showdownId: "reflecttype", pp: 15, target: "normal", flags: [] },
   ];
 }
 
@@ -99,9 +127,10 @@ export function auditedOpponent(): OpponentPokemonState {
     ability: "soundproof",
     types: ["PSYCHIC", "FAIRY"],
     boosts: { accuracy: 0, atk: 1, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0 },
+    // Un uso narrado de cada uno, sin Pressure enfrente: el PP es exacto.
     moves: [
-      { id: "psychic", pp: 14, max_pp: 16 },
-      { id: "hiddenpowerice", pp: 24, max_pp: 24 },
+      { id: "psychic", pp: 15, max_pp: 16 },
+      { id: "hiddenpower", pp: 23, max_pp: 24 },
     ],
   };
 }
@@ -244,8 +273,58 @@ export function faintedFixture(fainted: boolean): Dataset {
   audited.fainted = fainted;
   audited.hp_fraction = 0;
   audited.status = "FNT";
-  audited.active = false;
+  // `faint()` (`pokemon.py:422-430`) NO desactiva: el debilitado sigue en la
+  // ranura hasta que entra su reemplazo.
+  audited.active = true;
   return dataset;
+}
+
+/** Dataset con UN SOLO rival revelado y una secuencia de protocolo a medida.
+ *
+ * Sirve para ejercer una regla puntual (una Mega, un `-formechange`, un
+ * Transform) sin arrastrar el resto del fixture. El paso auditado vive en el
+ * turno 2; `stateTurn` abre la ventana antes para poder ejercer los cursores
+ * INTERMEDIOS de un turno. */
+export function soloFixture(
+  turnOneLines: string[],
+  entry: OpponentPokemonState,
+  stateTurn = 2,
+): Dataset {
+  const dataset = baseDataset();
+  dataset.turns = [
+    { battleId: BATTLE_ID, playerSide: "p1", turnNumber: 0, protocolLines: [
+      "|switch|p1a: Gengar|Gengar, L80, M|280/280",
+    ] },
+    { battleId: BATTLE_ID, playerSide: "p1", turnNumber: 1, protocolLines: ["|turn|1", ...turnOneLines] },
+    { battleId: BATTLE_ID, playerSide: "p1", turnNumber: 2, protocolLines: ["|turn|2", "|upkeep"] },
+  ];
+  const step = dataset.steps[1];
+  step.decisionIndex = 0;
+  step.state.turn = stateTurn;
+  step.state.opponent = { pokemon: [entry] };
+  dataset.steps = [step];
+  return dataset;
+}
+
+/** El rival de `soloFixture`, con todo en su valor de recién revelado. */
+export function freshOpponent(
+  species: string,
+  level: number,
+  types: string[],
+): OpponentPokemonState {
+  return {
+    species,
+    hp_fraction: 1,
+    active: true,
+    fainted: false,
+    status: null,
+    level,
+    item: "unknown_item",
+    ability: null,
+    types,
+    boosts: { accuracy: 0, atk: 0, def: 0, evasion: 0, spa: 0, spd: 0, spe: 0 },
+    moves: [],
+  };
 }
 
 /** Devuelve un dataset con UN campo del rival auditado cambiado. */

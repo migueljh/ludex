@@ -6,18 +6,20 @@
  * scope y generación, y se hace en el SQL, nunca escondiendo violaciones.
  */
 
-import { buildDexIndex, auditOpponentPokemon, type DexIndex } from "./opponent.js";
+import { matchOpponentTeam, type FieldMismatch, type OpponentContext } from "./opponent.js";
 import {
-  buildProtocolIndex,
   buildSpeciesIndex,
   normalizeProtocolText,
   opponentSideOf,
 } from "./protocol.js";
+import { BattleProjection, buildDexView, type DexView } from "./projection.js";
 import type {
   AuditResult,
+  BattleTurnRecord,
   Dataset,
   InvariantName,
   OpponentField,
+  OpponentPokemonState,
   TrajectoryRecord,
   TrajectoryStepRecord,
   Violation,
@@ -68,6 +70,7 @@ function stepLocation(
   return {
     invariant,
     ...(field === undefined ? {} : { field }),
+    schemaVersion: step.stateSchemaVersion,
     detail,
     battleTag,
     playerSide: trajectory.playerSide,
@@ -89,30 +92,46 @@ export function auditDataset(dataset: Dataset): AuditResult {
     dataset.trajectories.map((trajectory) => [trajectory.id, trajectory]),
   );
 
-  // `base_species` es lo único que el índice de protocolo necesita del dex, y
+  // `base_species` es lo único que el índice de especies necesita del dex, y
   // es estable entre generaciones: un solo resolvedor fusionado alcanza para
   // un corpus multi-gen sin volver a recorrer el protocolo por generación.
   const speciesIndex = buildSpeciesIndex(dataset.dexPokemon);
-  const dexIndexByGen = new Map<number, DexIndex>();
-  const dexFor = (gen: number): DexIndex => {
-    let index = dexIndexByGen.get(gen);
-    if (index === undefined) {
-      index = buildDexIndex(dataset.dexPokemon, dataset.dexMoves, gen, speciesIndex);
-      dexIndexByGen.set(gen, index);
+  const dexViewByGen = new Map<number, DexView>();
+  const dexFor = (gen: number): DexView => {
+    let view = dexViewByGen.get(gen);
+    if (view === undefined) {
+      view = buildDexView(dataset.dexPokemon, dataset.dexMoves, gen);
+      dexViewByGen.set(gen, view);
     }
-    return index;
+    return view;
   };
 
-  // El protocolo se recorre UNA vez, acá. Nada dentro del loop de pasos vuelve
-  // a tocar `dataset.turns`: ése era el N+1 (92 277 173 normalizaciones sobre
-  // un corpus de 447 428 líneas).
-  const protocolIndex = buildProtocolIndex(dataset.turns, speciesIndex);
+  // El protocolo se agrupa UNA vez por (batalla, lado). Nada dentro del loop de
+  // pasos vuelve a recorrer `dataset.turns`: ése era el N+1 (92 277 173
+  // normalizaciones sobre un corpus de 447 428 líneas).
+  const turnsByBattleSide = new Map<string, BattleTurnRecord[]>();
+  for (const turn of dataset.turns) {
+    const key = `${turn.battleId}:${turn.playerSide}`;
+    const bucket = turnsByBattleSide.get(key);
+    if (bucket === undefined) turnsByBattleSide.set(key, [turn]);
+    else bucket.push(turn);
+  }
+  const turnsWithLines = new Map<string, Set<number>>();
+  for (const [key, bucket] of turnsByBattleSide) {
+    bucket.sort((a, b) => a.turnNumber - b.turnNumber);
+    const present = new Set<number>();
+    for (const turn of bucket) {
+      if (turn.protocolLines.length > 0) present.add(turn.turnNumber);
+    }
+    turnsWithLines.set(key, present);
+  }
 
   const stats = {
     stepsAudited: 0,
     opponentEntriesAudited: 0,
     opponentFieldChecksRun: 0,
-    protocolLinesScanned: protocolIndex.linesScanned,
+    protocolLinesScanned: 0,
+    cursorsEvaluated: 0,
   };
 
   const stepsByTrajectory = new Map<number, TrajectoryStepRecord[]>();
@@ -134,37 +153,15 @@ export function auditDataset(dataset: Dataset): AuditResult {
       );
 
     // --- 1. cero fuga de información oculta -------------------------------
+    // Los 11 campos rivales NO se auditan acá: una fila tiene que corresponder
+    // a un instante coherente de la batalla, y eso se decide reproduciendo el
+    // protocolo (`auditOpponentRows`, más abajo), no fila por fila.
     const opponent = step.state.opponent?.pokemon;
     if (!Array.isArray(opponent)) {
       at("hidden_information", "state.opponent.pokemon ausente o no es una lista");
     } else {
-      const view = protocolIndex.get(
-        trajectory.battleId,
-        trajectory.playerSide,
-        opponentSideOf(trajectory.playerSide),
-      );
-      const ownTeam = step.state.me?.pokemon;
-      const context = {
-        evidence: view?.evidence,
-        timeline: view?.timeline,
-        dex: dexFor(trajectory.gen),
-        gen: trajectory.gen,
-        turn: step.turnNumber,
-        stateTurn: step.state.turn,
-        ownTeam: Array.isArray(ownTeam) ? ownTeam : [],
-        playerSide: trajectory.playerSide,
-      };
       let actives = 0;
-      for (const pokemon of opponent) {
-        stats.opponentEntriesAudited += 1;
-        stats.opponentFieldChecksRun += auditOpponentPokemon(
-          pokemon,
-          context,
-          (field, detail) => at("hidden_information", detail, field),
-          (detail) => at("hidden_information", detail),
-        );
-        if (pokemon.active === true) actives += 1;
-      }
+      for (const pokemon of opponent) if (pokemon.active === true) actives += 1;
       if (actives > 1) {
         at("hidden_information", `${actives} rivales marcados active a la vez`, "active");
       }
@@ -205,12 +202,8 @@ export function auditDataset(dataset: Dataset): AuditResult {
     }
 
     // --- 5. rederivabilidad: protocolo crudo + fila autoconsistente -------
-    const sideView = protocolIndex.get(
-      trajectory.battleId,
-      trajectory.playerSide,
-      opponentSideOf(trajectory.playerSide),
-    );
-    if (sideView === undefined || !sideView.evidence.turnsWithLines.has(step.turnNumber)) {
+    const present = turnsWithLines.get(`${trajectory.battleId}:${trajectory.playerSide}`);
+    if (present === undefined || !present.has(step.turnNumber)) {
       at("state_rederivable", "el paso no tiene protocol_lines crudas para su battle/player_side/turn");
     }
     if (stableKey(step.state.legal_actions) !== stableKey(step.legalActions)) {
@@ -264,6 +257,190 @@ export function auditDataset(dataset: Dataset): AuditResult {
     }
   }
 
+  // --- 1bis. la fila describe UN instante real de la batalla ---------------
+  //
+  // El protocolo se reproduce una vez por (batalla, lado) y las filas se van
+  // contrastando contra el estado vigente. Una fila es admisible si ALGÚN
+  // cursor de su ventana `[state.turn, turn_number]` explica su equipo rival
+  // entero: no se le permite a cada campo elegir un instante distinto.
+  interface PendingRow {
+    step: TrajectoryStepRecord;
+    trajectory: TrajectoryRecord;
+    battleTag: string;
+    entries: OpponentPokemonState[];
+    ownTeam: OpponentPokemonState[];
+    from: number;
+    to: number;
+    resolved: boolean;
+    /** Los desajustes del cursor que MEJOR explica la fila. Reportar contra el
+     * último cursor de la ventana mezclaba el defecto real con el arrastre de
+     * todo lo que cambió después: una fila correcta salvo el HP aparecía con
+     * cinco campos rotos. */
+    best?: FieldMismatch[];
+    bestScore?: number;
+  }
+  const rowsByBattleSide = new Map<string, PendingRow[]>();
+  for (const step of dataset.steps) {
+    const trajectory = trajectories.get(step.trajectoryId);
+    if (!trajectory) continue;
+    const battle = battles.get(trajectory.battleId);
+    if (!battle) continue;
+    const entries = step.state.opponent?.pokemon;
+    if (!Array.isArray(entries)) continue;
+    const stateTurn = step.state.turn;
+    // `state.turn` es el `battle.turn` capturado DENTRO de `choose_move` y
+    // `turn_number` el turno en que la decisión se resolvió; `_correct_step_turns`
+    // sólo puede subirlo (D20/D22/D23). El snapshot está en algún punto de ese
+    // rango, y un `state.turn` inválido no puede ensanchar la ventana.
+    const from = typeof stateTurn === "number" && Number.isInteger(stateTurn)
+      && stateTurn >= 0 && stateTurn <= step.turnNumber
+      ? stateTurn
+      : step.turnNumber;
+    const ownTeam = step.state.me?.pokemon;
+    const row: PendingRow = {
+      step,
+      trajectory,
+      battleTag: battle.battleTag,
+      entries,
+      ownTeam: Array.isArray(ownTeam) ? ownTeam : [],
+      from,
+      to: step.turnNumber,
+      resolved: false,
+    };
+    const key = `${trajectory.battleId}:${trajectory.playerSide}`;
+    const bucket = rowsByBattleSide.get(key);
+    if (bucket === undefined) rowsByBattleSide.set(key, [row]);
+    else bucket.push(row);
+  }
+
+  for (const [key, rows] of rowsByBattleSide) {
+    const blocks = turnsByBattleSide.get(key);
+    // Sin protocolo crudo no hay con qué contrastar: lo reporta `state_rederivable`.
+    if (blocks === undefined || blocks.length === 0) continue;
+    const playerSide = rows[0].trajectory.playerSide;
+    const opponentSide = opponentSideOf(playerSide);
+    // Las abilities de NUESTRO equipo las conoce poke-env por el request
+    // privado y el protocolo no las trae. Sin ellas, un Pressure nuestro que
+    // nadie narró haría que el PP esperado del rival se fuera por uno.
+    const ownAbilities = new Map<string, string>();
+    const ownItems = new Map<string, string | null>();
+    for (const row of [...rows].sort((a, b) => a.step.decisionIndex - b.step.decisionIndex)) {
+      for (const mine of row.ownTeam) {
+        if (typeof mine.species !== "string") continue;
+        const species = normalizeProtocolText(mine.species);
+        if (typeof mine.ability === "string" && !ownAbilities.has(species)) {
+          ownAbilities.set(species, normalizeProtocolText(mine.ability));
+        }
+        // El item propio es lo que un Trick le ENTREGA al rival: sin él, el
+        // auditor no puede decir qué item tiene el rival después del canje.
+        if (!ownItems.has(species) && (typeof mine.item === "string" || mine.item === null)) {
+          ownItems.set(
+            species,
+            typeof mine.item === "string" ? normalizeProtocolText(mine.item) : null,
+          );
+        }
+      }
+    }
+    const projection = new BattleProjection(
+      dexFor(rows[0].trajectory.gen),
+      speciesIndex,
+      { side: playerSide, abilities: ownAbilities, items: ownItems },
+    );
+    const contextOf = (row: PendingRow): OpponentContext => ({
+      projection,
+      dex: dexFor(row.trajectory.gen),
+      species: speciesIndex,
+      gen: row.trajectory.gen,
+      opponentSide,
+      playerSide: row.trajectory.playerSide,
+      ownTeam: row.ownTeam,
+    });
+    const reportRow = (row: PendingRow, cursorTurn: number | undefined): void => {
+      const mismatches = row.best
+        ?? matchOpponentTeam(row.entries, contextOf(row), { limit: Infinity, collect: true }).mismatches;
+      if (mismatches.length === 0) {
+        row.resolved = true;
+        return;
+      }
+      const window = row.from === row.to ? `turno ${row.to}` : `ventana ${row.from}-${row.to}`;
+      const suffix = cursorTurn === undefined
+        ? " (la ventana no tiene protocolo)"
+        : "";
+      for (const mismatch of mismatches) {
+        violations.push(stepLocation(
+          "hidden_information",
+          `ningún instante de la ${window} explica la fila${suffix}; en el que más se le acerca: ${mismatch.detail}`,
+          row.trajectory,
+          row.step,
+          row.battleTag,
+          mismatch.field,
+        ));
+      }
+    };
+
+    rows.sort((a, b) => a.from - b.from || a.to - b.to);
+    let next = 0;
+    let active: PendingRow[] = [];
+    let lastRevision = -1;
+    const test = (): void => {
+      if (active.length === 0 || projection.revision === lastRevision) return;
+      lastRevision = projection.revision;
+      stats.cursorsEvaluated += 1;
+      for (const row of active) {
+        if (row.resolved) continue;
+        // Primero se CUENTA sin construir mensajes, y cortando apenas el
+        // cursor deja de poder ser mejor que el mejor visto. Los mensajes se
+        // arman una sola vez por fila, sobre el cursor que más se le acerca.
+        const limit = row.bestScore ?? Infinity;
+        const scored = matchOpponentTeam(row.entries, contextOf(row), { limit, collect: false });
+        if (scored.count === 0) {
+          row.resolved = true;
+        } else if (scored.count < limit) {
+          row.bestScore = scored.count;
+          row.best = matchOpponentTeam(
+            row.entries,
+            contextOf(row),
+            { limit: Infinity, collect: true },
+          ).mismatches;
+        }
+      }
+    };
+
+    const ownIdent = `${playerSide}a:`;
+    const opponentIdent = `${opponentSide}a:`;
+    let lastTurn: number | undefined;
+    for (const block of blocks) {
+      const turn = block.turnNumber;
+      lastTurn = turn;
+      while (next < rows.length && rows[next].from <= turn) active.push(rows[next]!), next += 1;
+      // El estado con el que ARRANCA el turno también es un cursor válido: una
+      // decisión puede haberse tomado antes de que se narrara nada del turno.
+      lastRevision = -1;
+      test();
+      for (const line of block.protocolLines) {
+        stats.protocolLinesScanned += 1;
+        projection.apply(line);
+        // Una línea que sólo nombra a NUESTRO lado no puede haber movido el
+        // estado rival: no hay cursor nuevo que probar. Las que no nombran a
+        // nadie (`-clearallboost`, `|turn|`) sí se prueban.
+        if (!(line.includes(ownIdent) && !line.includes(opponentIdent))) test();
+      }
+      const remaining: PendingRow[] = [];
+      for (const row of active) {
+        if (row.resolved) continue;
+        if (row.to <= turn) reportRow(row, turn);
+        else remaining.push(row);
+      }
+      active = remaining;
+    }
+    while (next < rows.length) active.push(rows[next]!), next += 1;
+    for (const row of active) if (!row.resolved) reportRow(row, lastTurn);
+    for (const row of rows) {
+      stats.opponentEntriesAudited += row.entries.length;
+      stats.opponentFieldChecksRun += row.entries.length * OPPONENT_FIELDS.length;
+    }
+  }
+
   // --- 4. una decisión por decision_index --------------------------------
   for (const [trajectoryId, steps] of stepsByTrajectory) {
     const trajectory = trajectories.get(trajectoryId);
@@ -276,6 +453,7 @@ export function auditDataset(dataset: Dataset): AuditResult {
     for (const [position, step] of ordered.entries()) {
       const location = {
         invariant: "decision_index" as const,
+        schemaVersion: step.stateSchemaVersion,
         battleTag,
         playerSide: trajectory.playerSide,
         turnNumber: step.turnNumber,
