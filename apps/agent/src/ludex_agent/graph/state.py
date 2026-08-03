@@ -15,6 +15,7 @@ class GraphState(TypedDict, total=False):
     context: dict[str, Any]
     prompt_context: dict[str, Any]
     damage: list[dict[str, Any]]
+    damage_metrics: dict[str, Any]
     action: dict[str, Any]
     action_path: str
     reasoning: str

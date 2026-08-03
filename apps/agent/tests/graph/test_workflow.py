@@ -253,3 +253,103 @@ async def test_calc_damage_recibe_contexto_rico_no_prompt_context(monkeypatch):
     })
 
     assert result["context"]["rich_sentinel"] == rich_sentinel
+
+
+# --- L-02 metrics: damage_metrics debe sobrevivir al workflow productivo ---
+
+
+@pytest.mark.asyncio
+async def test_grafo_conserva_damage_metrics_en_la_salida():
+    """T-02: calc_damage devuelve damage_metrics, pero GraphState no la
+    declaraba y StateGraph la descartaba en el merge. El contrato la conserva
+    en la salida del workflow (sin ampliar persistencia)."""
+
+    class Calculator:
+        async def calculate(self, request):
+            return {
+                "damage_rolls": [[86, 104]],
+                "min_damage": 86,
+                "max_damage": 104,
+                "min_percent": 35.6,
+                "max_percent": 43.1,
+                "ko_chance": {"n": 5, "text": "possible 5HKO"},
+                "description": "Pikachu Thunderbolt vs. Blastoise",
+                "defender_hp": {"cur": 241, "max": 241},
+                "effective": {
+                    "attacker": {
+                        "species": "Pikachu", "level": 80, "nature": "Serious",
+                        "ability": "Static", "item": None,
+                        "evs": {"hp": 0}, "ivs": {"hp": 31},
+                        "boosts": {"hp": 0}, "status": "", "curHP": 170,
+                        "gender": "M",
+                    },
+                    "defender": {
+                        "species": "Blastoise", "level": 80,
+                        "nature": "Serious", "ability": "Torrent",
+                        "item": None,
+                        "evs": {"hp": 0}, "ivs": {"hp": 31},
+                        "boosts": {"hp": 0}, "status": "", "curHP": 241,
+                        "gender": "M",
+                    },
+                },
+            }
+
+    class Provider:
+        async def complete(self, prompt, *, deadline, turn_id):
+            return {
+                "action": {"kind": "move", "id": "tackle"},
+                "reasoning": "legal",
+            }
+
+    class Repository:
+        async def load_battle_context(
+            self, *, gen_number, own_species, opponent_species
+        ):
+            return {
+                "generation": {"gen_number": 6, "label": "XY/ORAS"},
+                "own": [],
+                "opponent": [],
+                "mega_forms": {},
+            }
+
+        async def load_moves(self, *, gen_number, move_ids):
+            return {
+                "tackle": {
+                    "showdown_id": "tackle", "name": "Tackle",
+                    "type": "Normal", "category": "Physical", "power": 50,
+                    "power_kind": "standard", "accuracy": 100,
+                    "never_misses": False, "pp": 35, "priority": 0,
+                    "target": "normal", "flags": {"contact": 1},
+                    "description": "Hits the target.",
+                },
+            }
+
+        async def load_mega_forms(self, *, gen_number, item_ids):
+            return {}
+
+    graph = build_decision_graph(
+        Calculator(), Provider(), DecisionMetrics(), Repository()
+    )
+    result = await graph.ainvoke({
+        "raw_state": {
+            "gen": 6,
+            "me": {"pokemon": [{
+                "species": "pikachu", "active": True, "hp_fraction": 1,
+                "moves": [{"id": "tackle"}],
+            }]},
+            "opponent": {"pokemon": [{
+                "species": "eevee", "active": True, "hp_fraction": 1,
+                "moves": [],
+            }]},
+            "field": {},
+            "legal_actions": [{"kind": "move", "id": "tackle"}],
+        },
+        "turn_id": "battle:1",
+        "deadline": time.monotonic() + 5,
+    })
+
+    assert result["action"] == {"kind": "move", "id": "tackle"}
+    metrics = result["damage_metrics"]
+    assert metrics["calls"] == 1
+    assert metrics["bytes"] > 0
+    assert set(metrics["latency_ms"]) == {"median", "p90", "p99", "max"}
