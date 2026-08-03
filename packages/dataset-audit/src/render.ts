@@ -8,7 +8,11 @@ function actionLabel(action: TrajectoryStepRecord["actionTaken"]): string {
     : typeof action.species === "string"
       ? action.species
       : JSON.stringify(action);
-  return `${kind} ${target}`;
+  const flags = ["mega", "z_move", "dynamax", "terastallize"]
+    .filter((flag) => action[flag] === true)
+    .map((flag) => ` +${flag}`)
+    .join("");
+  return `${kind} ${target}${flags}`;
 }
 
 function visibleProtocol(lines: string[]): string[] {
@@ -42,12 +46,24 @@ export function renderBattle(dataset: Dataset, selector: string | number): strin
   );
   if (!battle) throw new Error(`batalla '${selector}' no encontrada`);
 
+  // Índices armados una vez: buscar el turno con `find` dentro del loop de
+  // pasos era el mismo N+1 que el chequeo de fuga.
+  const turnsByKey = new Map(
+    dataset.turns.map((turn) => [`${turn.battleId}:${turn.playerSide}:${turn.turnNumber}`, turn]),
+  );
+  const stepsByTrajectory = new Map<number, TrajectoryStepRecord[]>();
+  for (const step of dataset.steps) {
+    const bucket = stepsByTrajectory.get(step.trajectoryId);
+    if (bucket === undefined) stepsByTrajectory.set(step.trajectoryId, [step]);
+    else bucket.push(step);
+  }
+
   const trajectories = dataset.trajectories
     .filter((trajectory) => trajectory.battleId === battle.id)
     .sort((a, b) => a.playerSide.localeCompare(b.playerSide));
   const lines = [
     `Batalla ${battle.battleTag} (#${battle.id})`,
-    `${battle.p1} vs ${battle.p2} · formato ${battle.format} · ganador ${battle.winner ?? "(sin terminar)"}`,
+    `${battle.p1} vs ${battle.p2} · formato ${battle.format} · source ${battle.source} · ganador ${battle.winner ?? "(sin terminar)"}`,
   ];
 
   if (trajectories.length === 0) {
@@ -56,28 +72,21 @@ export function renderBattle(dataset: Dataset, selector: string | number): strin
   }
 
   for (const trajectory of trajectories) {
-    const steps = dataset.steps
-      .filter((step) => step.trajectoryId === trajectory.id)
+    const steps = [...(stepsByTrajectory.get(trajectory.id) ?? [])]
       .sort((a, b) => a.decisionIndex - b.decisionIndex);
     lines.push(
       "",
       `Trayectoria ${trajectory.id} · ${trajectory.playerSide} · gen ${trajectory.gen} · resultado ${trajectory.finalResult ?? "(pendiente)"}`,
     );
     for (const step of steps) {
-      const stateTurn = dataset.turns.find((candidate) =>
-        candidate.battleId === battle.id
-        && candidate.playerSide === trajectory.playerSide
-        && candidate.turnNumber === step.turnNumber
+      const stateTurn = turnsByKey.get(
+        `${battle.id}:${trajectory.playerSide}:${step.turnNumber}`,
       );
       // Showdown entrega la primera request antes de emitir |turn|1: el
       // estado observado es turn 0, pero el resultado de esa acción queda en
       // battle_turns 1. Las decisiones posteriores usan su mismo número.
       const initialOutcome = step.turnNumber === 0
-        ? dataset.turns.find((candidate) =>
-            candidate.battleId === battle.id
-            && candidate.playerSide === trajectory.playerSide
-            && candidate.turnNumber === 1
-          )
+        ? turnsByKey.get(`${battle.id}:${trajectory.playerSide}:1`)
         : undefined;
       const outcomeTurn = initialOutcome ?? stateTurn;
       lines.push(

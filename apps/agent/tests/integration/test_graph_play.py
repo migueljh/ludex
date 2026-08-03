@@ -7,7 +7,7 @@ from poke_env import AccountConfiguration
 from poke_env.player import RandomPlayer
 from sqlalchemy import text
 
-from ludex_agent.cli import _persist_one
+from ludex_agent.cli import _battle_against_or_failure, _persist_one
 from ludex_agent.config import load_settings
 from ludex_agent.db.context_repository import PostgresContextRepository
 from ludex_agent.db.repository import BattleRepository
@@ -36,6 +36,87 @@ class AlwaysIllegalProvider:
             "action": {"kind": "move", "id": "definitelyillegal"},
             "reasoning": "forced invalid response",
         }
+
+
+SHADOW_TAG_AGENT_TEAM = """
+Pikachu
+Ability: Static
+Level: 100
+- Thunderbolt
+
+Bulbasaur
+Ability: Overgrow
+Level: 100
+- Energy Ball
+"""
+
+SHADOW_TAG_OPPONENT_TEAM = """
+Wobbuffet
+Ability: Shadow Tag
+Level: 1
+- Splash
+
+Magikarp
+Ability: Swift Swim
+Level: 1
+- Splash
+"""
+
+
+class PreferSwitchGraph:
+    """El primer request maybeTrapped ofrece un switch que Shadow Tag rechaza."""
+
+    async def ainvoke(self, graph_input):
+        legal = graph_input["raw_state"]["legal_actions"]
+        active_opponent = next(
+            (
+                pokemon
+                for pokemon in graph_input["raw_state"]["opponent"]["pokemon"]
+                if pokemon["active"]
+            ),
+            None,
+        )
+        switch = next(
+            (candidate for candidate in legal if candidate["kind"] == "switch"),
+            None,
+        )
+        action = (
+            switch
+            if switch is not None
+            and active_opponent is not None
+            and active_opponent["species"] == "wobbuffet"
+            else legal[0]
+        )
+        return {
+            "action": action,
+            "action_path": "llm",
+            "reasoning": "prefer a switch when Showdown still offers one",
+        }
+
+
+class OrderedLudexPlayer(LudexPlayer):
+    def teampreview(self, battle):
+        for pokemon in battle.team.values():
+            pokemon._selected_in_teampreview = True
+        return "/team 12"
+
+
+class OrderedRandomPlayer(RandomPlayer):
+    def teampreview(self, battle):
+        for pokemon in battle.team.values():
+            pokemon._selected_in_teampreview = True
+        return "/team 12"
+
+
+async def _delete_test_battles(repo, tags):
+    if not tags:
+        return
+    async with repo.factory() as session:
+        await session.execute(text(
+            "DELETE FROM battles "
+            "WHERE battle_tag = ANY(:tags) AND source='test'"
+        ), {"tags": tags})
+        await session.commit()
 
 
 @pytest.mark.asyncio
@@ -167,4 +248,152 @@ async def test_respuesta_ilegal_dos_veces_juega_y_persiste_fallback():
                 await session.commit()
         await calculator.aclose()
         await context_repository.aclose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shadow_tag_reconcilia_unavailable_sin_persistir_ni_premiar_switch():
+    settings = load_settings()
+    server = local_server_configuration(settings.showdown_ws_url)
+    suffix = str(time.time_ns())[-8:]
+    fmt = "gen6customgame"
+    common = {
+        "server_configuration": server,
+        "battle_format": fmt,
+        "log_level": 40,
+    }
+    agent = OrderedLudexPlayer(
+        account_configuration=AccountConfiguration(f"Trap{suffix}", None),
+        decision_graph=PreferSwitchGraph(),
+        team=SHADOW_TAG_AGENT_TEAM,
+        **common,
+    )
+    rival = OrderedRandomPlayer(
+        account_configuration=AccountConfiguration(f"TrapOpp{suffix}", None),
+        team=SHADOW_TAG_OPPONENT_TEAM,
+        **common,
+    )
+    engine = make_engine(settings.database_url)
+    repo = BattleRepository(session_factory(engine))
+    tags: list[str] = []
+    try:
+        async with asyncio.timeout(45):
+            await _battle_against_or_failure(agent, rival)
+        tags = list(agent.battles)
+        assert len(tags) == 1
+        tag = tags[0]
+        assert agent.rejected_choice_count >= 1, (
+            "CANARIO: Shadow Tag no produjo ningun Unavailable choice"
+        )
+        await _persist_one(agent, repo, tag, fmt, "test")
+
+        async with repo.factory() as session:
+            raw_errors = (await session.execute(text("""
+                SELECT count(*)
+                FROM battles b
+                JOIN battle_turns bt ON bt.battle_id=b.id,
+                     LATERAL unnest(bt.protocol_lines) line
+                WHERE b.battle_tag=:tag
+                  AND line LIKE '|error|[Unavailable choice]%'
+            """), {"tag": tag})).scalar_one()
+            rows = (await session.execute(text("""
+                SELECT ts.decision_index, ts.action_taken, ts.reward
+                FROM trajectory_steps ts
+                JOIN trajectories t ON t.id=ts.trajectory_id
+                JOIN battles b ON b.id=t.battle_id
+                WHERE b.battle_tag=:tag
+                ORDER BY ts.decision_index
+            """), {"tag": tag})).all()
+
+        assert raw_errors >= 1
+        assert rows
+        assert [row[0] for row in rows] == list(range(len(rows)))
+        assert len(rows) == len(agent.steps[tag])
+        assert all(row[2] is not None for row in rows)
+        assert rows[0][1] != {"kind": "switch", "species": "bulbasaur"}, (
+            "el switch rechazado del primer slot no puede entrar al dataset "
+            "ni recibir reward; un switch posterior aceptado si es una "
+            "decision distinta y valida"
+        )
+    finally:
+        tags = tags or list(agent.battles)
+        await _delete_test_battles(repo, tags)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_invalid_move_99_reintenta_inline_sin_crear_un_step_fantasma():
+    settings = load_settings()
+    server = local_server_configuration(settings.showdown_ws_url)
+    suffix = str(time.time_ns())[-8:]
+    fmt = "gen6customgame"
+    common = {
+        "server_configuration": server,
+        "battle_format": fmt,
+        "log_level": 40,
+    }
+    agent = OrderedLudexPlayer(
+        account_configuration=AccountConfiguration(f"Invalid{suffix}", None),
+        decision_graph=FirstLegalGraph(),
+        team=SHADOW_TAG_AGENT_TEAM,
+        **common,
+    )
+    rival = OrderedRandomPlayer(
+        account_configuration=AccountConfiguration(f"InvalidOpp{suffix}", None),
+        team=SHADOW_TAG_OPPONENT_TEAM.replace("Shadow Tag", "Telepathy"),
+        **common,
+    )
+    real_send = agent._send_message_original
+    corrupted = 0
+
+    async def corrupt_one_choice(message, room="", message_2=None):
+        nonlocal corrupted
+        if corrupted == 0 and message.startswith("/choose"):
+            corrupted += 1
+            message = "/choose move 99"
+        return await real_send(message, room, message_2)
+
+    agent._send_message_original = corrupt_one_choice
+    engine = make_engine(settings.database_url)
+    repo = BattleRepository(session_factory(engine))
+    tags: list[str] = []
+    try:
+        async with asyncio.timeout(45):
+            await _battle_against_or_failure(agent, rival)
+        tags = list(agent.battles)
+        assert corrupted == 1, "CANARIO: el seam nunca envio move 99"
+        assert agent.rejected_choice_count == 1
+        tag = tags[0]
+        await _persist_one(agent, repo, tag, fmt, "test")
+
+        async with repo.factory() as session:
+            raw_errors = (await session.execute(text("""
+                SELECT count(*)
+                FROM battles b
+                JOIN battle_turns bt ON bt.battle_id=b.id,
+                     LATERAL unnest(bt.protocol_lines) line
+                WHERE b.battle_tag=:tag
+                  AND line LIKE '|error|[Invalid choice]%'
+            """), {"tag": tag})).scalar_one()
+            rows = (await session.execute(text("""
+                SELECT ts.decision_index, ts.action_taken, ts.reward
+                FROM trajectory_steps ts
+                JOIN trajectories t ON t.id=ts.trajectory_id
+                JOIN battles b ON b.id=t.battle_id
+                WHERE b.battle_tag=:tag
+                ORDER BY ts.decision_index
+            """), {"tag": tag})).all()
+
+        assert raw_errors == 1
+        assert rows
+        assert [row[0] for row in rows] == list(range(len(rows)))
+        assert len(rows) == len(agent.steps[tag])
+        assert all(row[2] is not None for row in rows)
+        assert not any(
+            action == {"kind": "move", "id": "99"}
+            for _, action, _ in rows
+        )
+    finally:
+        tags = tags or list(agent.battles)
+        await _delete_test_battles(repo, tags)
         await engine.dispose()

@@ -548,11 +548,14 @@ pisaba la primera con la segunda. Medido sobre las 57 trayectorias de prueba:
 debilitamientos propios — la clase completa "elegir el reemplazo tras un
 debilitamiento" (~7.5% de las decisiones) no llegaba nunca a la base.
 
-`decision_index` cuenta decisiones, no turnos: arranca en 0 por trayectoria y
-avanza una vez por cada llamada a `choose_move` (el índice de
-`LudexPlayer.steps[tag]` en `client.py`, que ya numera así por construcción).
-`turn_number` queda como columna común, ya no parte de la clave: dos
-decisiones pueden compartir turno y eso ahora es representable.
+`decision_index` cuenta **decisiones canónicas resueltas**, no turnos ni
+invocaciones técnicas: arranca en 0 por trayectoria y avanza cuando Showdown
+resuelve una elección de juego. Un retry causado por `[Invalid choice]` o
+`[Unavailable choice]` es otro `attempt_index` interno de la **misma** decisión
+y reemplaza su mismo slot; no crea otro `decision_index` (D34). En cambio, un
+`forceSwitch` posterior sí es una decisión canónica nueva aunque comparta
+`battle.turn`. `turn_number` queda como columna común, ya no parte de la clave:
+dos decisiones pueden compartir turno y eso ahora es representable.
 
 Sin backfill (migración `20260727000006`): las 57 batallas grabadas hasta la
 review final eran de prueba, random contra random, y no sirven para entrenar.
@@ -1463,3 +1466,164 @@ del rival, lecciones de análisis previos, playbook activo, retrieval por
 pgvector (embeddings) e internet. El grafo actual no depende de ninguna de
 estas fuentes; cualquier referencia futura las introducirá como capas
 adicionales, no reemplazando la game data local.
+
+## D33 — el auditor de dataset es la compuerta del corpus: un instante coherente, frontera cerrada y `pp: null` con dueño
+
+**Contexto.** `packages/dataset-audit` tenía que pasar de sonda a compuerta.
+Tres rondas de revisión mostraron que el problema no era la cobertura sino la
+*pregunta*: primero preguntaba "¿esto fue público alguna vez?", después "¿este
+valor fue público en algún momento de la ventana?". Las dos son preguntas **por
+campo**, y con cualquiera de ellas un snapshot podía tomar el HP del turno 3, el
+status del turno 4 y los boosts del turno 5 y pasar, aunque esos valores nunca
+hubieran coexistido.
+
+**Una fila vale si ALGÚN instante la explica entera.** El auditor reproduce el
+protocolo crudo (D17) sobre un modelo con el mismo ciclo de vida que `Pokemon`
+de poke-env 0.15.0 y compara el equipo rival **completo** contra un único
+cursor dentro de `[state.turn, turn_number]`. Ningún campo elige su propio
+instante. La ventana es esa y no otra porque `state.turn` es el `battle.turn`
+capturado dentro de `choose_move` y `_correct_step_turns` sólo puede subir el
+turno (D20/D22/D23).
+
+**El oráculo es poke-env, no el recorder.** El auditor no reimplementa al
+proyector de D31: reimplementa a la librería, que es lo que el recorder debía
+producir. Por eso replica sus rarezas en vez de "arreglarlas" —`switch_out` no
+restaura los tipos de una Mega, `_update_from_details` corta temprano si el
+`details` repite, `faint()` no libera la ranura, `-clearallboost` alcanza sólo a
+los dos activos, `-copyboost|FUENTE|OBJETIVO` escribe en el segundo— y por eso
+un `|-mega|` cuyo `event[3]` trae la especie en vez de la piedra **no cambia
+nada**, igual que en `mega_evolve`.
+
+**Pertenencia de movimientos con la lista de la librería.** Magic Bounce, Magic
+Coat y Mirror Move no atribuyen el movimiento rebotado; Dancer descarta el
+evento entero; `lockedmove` y Sky Attack no revelan ni descuentan; Copycat,
+Metronome, Nature Power y Round llaman a un movimiento que **no** es del actor;
+Sleep Talk sí revela, porque sólo puede llamar a uno propio.
+
+**La frontera del dex falla CERRADA, generation-scoped y con el criterio de
+D32.** La fila directa de esa generación gana; si no hay fila, sólo un miembro
+real de `cosmeticFormes` cae a su base, y sólo si la base tiene fila en esa
+generación. Todo lo demás es especie desconocida y **se reporta**: no se
+"resuelve por prefijo" ni se degradan `types`/`ability` a no auditables. Sin
+esto, una fila con `Furfrou-Banana`, tipos DRAGON y Wonder Guard —narrada por un
+protocolo igual de falso— pasaba con cero violaciones, y un `gholdengo` de gen 9
+resolvía dentro de una batalla de gen 6. Medido sobre el corpus: el único id que
+cae por esta frontera es `floetteeternal` (393 filas, todas v1), que es
+exactamente el canario de fallo ruidoso que fija D32.
+
+**`pp: null` es "no derivable con exactitud" (D31), no "omitido".** El proyector
+del recorder escribe `null` cuando `pressure_on_us()` —nuestro activo con
+Pressure—, porque el descuento pudo ser de uno o de dos y la regla exacta
+depende de la categoría de objetivo; y una vez en `null` la cuenta no vuelve
+sola. El replay del auditor modela ese ciclo de vida: acepta `null` **sólo**
+sobre un movimiento con esa indeterminación vigente o heredada, y lo rechaza
+cuando el valor sí era derivable. Fuera de ese caso el PP es **exacto**, no un
+piso: la tabla `moves` trae `target` y `flags`, que son las dos condiciones que
+`_pressure_on` evalúa además de la ability del defensor.
+
+**Lo propio no es fuga.** La ability y el item de nuestro equipo salen de
+`state.me` de la misma fila: poke-env los conoce por el `|request|` privado, que
+el protocolo no contiene. Sin ellos no se puede decidir Pressure ni saber qué
+item recibe el rival en un Trick. Un Transform sólo acepta lo efectivamente
+copiado —tipos del dex de la especie copiada, ability copiada, moveset con el PP
+en `min(5, max_pp)`— y si su objetivo no es resoluble no excusa nada.
+
+**Scopes y versiones.** `--scope all` no excluye nada, incluidas las filas
+`source='test'`; `--scope training` excluye `battles.source='test'` y
+`trajectories.final_result IS NULL`; `--gen N` es el mismo contrato filtrado.
+Los dos son read-only (`default_transaction_read_only=on`) y salen con código 1
+ante cualquier violación. `state_schema_version` 1 y 2 conviven porque comparten
+forma; una versión fuera del conjunto se rechaza. `win→1`, `loss→-1`, `tie→0`, y
+`final_result IS NULL ⇒ reward IS NULL`: `NULL` no es empate, es "no terminó".
+
+**Costo, escrito como es.** Seis `SELECT` parametrizados, siempre, con scope y
+generación dentro del SQL; el protocolo se recorre una vez por `(batalla, lado)`
+y no hay N+1. La tabla de alias cosméticos **no** es una query: sale del mismo
+dex local empaquetado que usa `PokeEnvSpeciesVocabulary`, sin internet. La
+complejidad real es `O(L + Σ_filas C_ventana · E · F)` —líneas del corpus, más
+cursores de la ventana por entradas rivales por campos—, **no** `O(L + pasos)`.
+Lo constante es el conteo de queries, y eso es lo que el canario mide.
+
+**La cita a D19 de la migración es incorrecta.** `20260727000007_battle_source_test.sql`
+remite a "D19" para el contrato `source <> 'test'`, pero D19 es *"se juega
+`gen6randombattle`, no `gen6ou`"*. La migración histórica **no se edita**; esta
+decisión es la canónica del scope y deja constancia del error de referencia.
+## D34 — Los retries rechazados comparten una decisión canónica y sólo la acción resuelta entra al dataset
+
+**Contexto.** Showdown rechaza elecciones por dos rutas distintas de poke-env
+0.15.0. `[Invalid choice]` llama otra vez a `choose_move` dentro del handler del
+mismo frame; `[Unavailable choice]` espera un request posterior que puede
+revelar, por ejemplo, que el activo está atrapado. El código anterior buscaba
+el prefijo, hacía `pop()` del último step y luego lo volvía a agregar. Eso
+compactaba el índice por accidente en el caso feliz, pero no correlacionaba el
+error con un intento enviado. El mismo canal también emite errores auxiliares:
+un `/undo` sin nada que cancelar produce `[Invalid choice] There's nothing to
+cancel` y borraba una decisión válida. El protocolo real y `battle_turns`
+demuestran que estos errores **sí** llegan por el canal de batalla.
+
+**Decisión canónica e intentos.** Una decisión canónica es el request de juego
+que Showdown finalmente resuelve. Tiene un solo slot y `decision_index`; cada
+reintento técnico incrementa un `attempt_index` sólo en memoria. El estado
+separado `PendingChoice` transiciona `reserved/retried → rejected → retried` o
+`reserved/retried → resolved`. Un rechazo invalida el slot sin eliminarlo. El
+retry instala un dict nuevo en el mismo índice con snapshot, máscara, mapa de
+órdenes, acción, `action_path` y reasoning propios. De D31 sólo reutiliza copias
+de `opponent`, `field` y `turn` de la última proyección pública válida; nunca el
+dict completo ni la máscara anterior.
+
+**Correlación outbound atómica.** El wrapper de `PSClient.send_message` crea una
+secuencia por `battle_tag` y enlaza el intento **antes del primer `await`**. La
+fase es `sending`, `sent` o `failed`; si el websocket falla, el intento no queda
+ficticiamente enviado. El original se delega exactamente una vez y los comandos
+ajenos mantienen su comportamiento. Un rechazo sólo se acepta si coinciden el
+tag, el request (`rqid` + frame pre-lock), el pending actual y el último comando
+`/choose` de ese intento. La correlación se libera al cerrar la batalla.
+
+**Taxonomía fail-closed.** Hay tres clases, determinadas por texto y por comando
+outbound asociado:
+
+- rechazo correlacionado de `/choose`: invalida el slot y habilita el retry;
+- error auxiliar probado de `/undo` (`nothing/too late to cancel`): conserva el
+  pending, no reintenta, incrementa un contador consultable y deja log
+  estructurado; la línea cruda ya quedó en el recorder;
+- `nothing to choose`, `too late to make`, `The battle crashed` o cualquier
+  Invalid/Unavailable no clasificable: `ChoiceProtocolError` por el canal de
+  background/runner, sin retry ni mutación del step.
+
+La línea auxiliar se quita sólo del lote delegado a la rama demasiado amplia
+de poke-env; D17 conserva siempre el frame crudo completo.
+
+**Resolución.** Un request ordinario siguiente, incluido un `forceSwitch`,
+resuelve el intento aceptado anterior antes de reservar el próximo índice. Un
+request `wait:true` también confirma resolución aunque poke-env no llame a
+`choose_move`. `win`/`tie` resuelve un intento enviado y aceptado. `win`/`tie`
+con fase `rejected`, o `deinit` con cualquier pending, fallan cerrado. El cierre
+libera inbox, request head, outbound, retry y proyección temporal del tag.
+
+**Gate del dataset.** Después de `wait_for_pending_steps` y antes de crear la
+`trajectory`, `_persist_one` valida todos los slots y el pending. Un slot
+ausente, sin estado/acción, rechazado o terminalmente incoherente incrementa
+`lost_step_count` y lanza `IncompleteTrajectoryError` con tag, índice y fase.
+La batalla y sus `battle_turns` conservan el protocolo crudo como evidencia,
+pero no queda una trayectoria vacía ni se escriben `trajectory_steps`
+parciales, no se llama `finalize` y no se reparte reward a una trayectoria
+incompleta. Sólo la acción finalmente resuelta entra en `trajectory_steps`; el
+intento rechazado queda auditable en el protocolo crudo y en
+`rejected_choice_count`.
+
+**Lifetime del runner.** `play` compite `battle_against` con el future de fallo
+background mediante dos tareas hijas que pertenecen a
+`_battle_against_or_failure`. El helper las cancela y espera en `finally` ante
+éxito, fallo o cancelación externa; cancelar el vigilante no cancela el future
+compartido, que está shielded en `LudexPlayer`. El `TimeoutError` se interpreta
+como deadline silencioso sólo cuando `asyncio.Timeout.expired()` confirma que
+ese contexto inició la cancelación. Un `TimeoutError` recibido por el canal
+background —por ejemplo, del websocket— se propaga sin convertirse en una
+batalla omitida.
+
+**Consecuencias.** D21 queda precisada: `decision_index` cuenta decisiones
+canónicas resueltas y los retries comparten índice. No se agrega migración ni
+se cambia `BattleRepository`; la PK `(trajectory_id, decision_index)` y el
+`finalize` existente son correctos porque ningún intento rechazado llega a esa
+tabla. Los tests controlados de Shadow Tag y `move 99` verifican protocolo,
+índices contiguos y reward sólo sobre filas resueltas.
