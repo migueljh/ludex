@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 from ludex_agent import cli as cli_module
-from ludex_agent.benchmark import BenchmarkDeadlineExceeded, BenchmarkResult
+from ludex_agent.benchmark import BenchmarkDeadlineExceeded, BenchmarkResult, run_benchmark
 from ludex_agent.graph.provider import FatalProviderError
 from typer.testing import CliRunner
 
@@ -706,6 +706,19 @@ def test_benchmark_command_deadline_clasificado_y_escribe_final(
     monkeypatch.setattr(cli_module, "BATTLE_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path)
 
+    real_run_benchmark = run_benchmark
+    timeout_values: list[float | None] = []
+
+    async def spy_run_benchmark(*args, timeout=None, **kwargs):
+        expected = cli_module.BATTLE_TIMEOUT_SECONDS
+        timeout_values.append(timeout)
+        assert timeout == expected, (
+            f"timeout={timeout!r} != BATTLE_TIMEOUT_SECONDS={expected!r}"
+        )
+        return await real_run_benchmark(*args, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(cli_module, "run_benchmark", spy_run_benchmark)
+
     ledger_path = tmp_path / "ledger.md"
 
     result = CliRunner().invoke(
@@ -730,6 +743,7 @@ def test_benchmark_command_deadline_clasificado_y_escribe_final(
     assert result.exit_code == 1
     assert "ABORTED: BenchmarkDeadlineExceeded" in result.stdout
     assert "completed=1/3" in result.stdout
+    assert timeout_values == [0.01], f"timeout_values={timeout_values}"
 
     artifact = tmp_path / "test-deadline.json"
     assert artifact.exists()
