@@ -1,6 +1,7 @@
 import pytest
 
 from ludex_agent.graph.calc import (
+    CalcSemanticError,
     calc_damage,
     rank_move_fallback,
     rank_switch_fallback,
@@ -126,13 +127,8 @@ async def test_calc_damage_pasa_generacion_y_construye_matchups_de_movimiento():
 
 class FailingCalculator:
     async def calculate(self, request):
-        import httpx
-        raise httpx.HTTPStatusError(
-            "invalid_request",
-            request=httpx.Request("POST", "http://test/calc"),
-            response=httpx.Response(
-                400, json={"error": "invalid_request", "message": "unknown move"}
-            ),
+        raise CalcSemanticError(
+            "invalid_request", "unknown move"
         )
 
 
@@ -401,7 +397,6 @@ async def test_cambio_forzado_usa_possible_moves_sin_presentarlos_como_revelados
 
 @pytest.mark.asyncio
 async def test_request_semanticamente_invalido_queda_diagnosticado_por_accion():
-    import httpx
     battle = _battle(legal_actions=[
         {"kind": "move", "id": "thunderbolt"},
         {"kind": "move", "id": "absolutelynotreal"},
@@ -410,12 +405,8 @@ async def test_request_semanticamente_invalido_queda_diagnosticado_por_accion():
     class SelectiveCalculator:
         async def calculate(self, request):
             if "absolutelynotreal" in request["move"]["name"]:
-                raise httpx.HTTPStatusError(
-                    "invalid_request",
-                    request=httpx.Request("POST", "http://test/calc"),
-                    response=httpx.Response(
-                        400, json={"error": "unknown_move", "message": "movimiento inexistente"}
-                    ),
+                raise CalcSemanticError(
+                    "unknown_move", "movimiento inexistente"
                 )
             return _result([[10, 20]], hp=200)
 
@@ -543,3 +534,156 @@ async def test_magic_room_se_mapea_a_isMagicRoom():
     battle = _battle(field={"weather": {}, "field_effects": {"MAGIC_ROOM": 3}, "my_side": {}, "opponent_side": {}})
     await calc_damage({"battle_state": battle}, calculator)
     assert calculator.requests[0]["field"]["isMagicRoom"] is True
+
+
+# --- L-01: observado / desconocido / asumido por matchup ---
+
+from ludex_agent.graph.calc import (
+    _depends_on_assumptions,
+    _matchup_assumptions,
+    _reduce_incoming_batch,
+    _union_revealed_possible,
+)
+
+
+def test_matchup_assumptions_clasifica_observado_desconocido_asumido():
+    descriptor = {
+        "species": "blastoise", "level": 80, "hpFraction": 0.5,
+    }
+    effective = {
+        "level": 80, "nature": "Serious", "ability": "Torrent", "item": None,
+        "evs": {"hp": 0}, "ivs": {"hp": 31}, "status": "", "gender": "M",
+        "boosts": {}, "curHP": 121,
+    }
+    classified = _matchup_assumptions(descriptor, effective)
+    assert classified["observed"] == {"level": 80, "hpFraction": 0.5}
+    assert "curHP" not in classified["assumed"]  # derivado de hpFraction, no asumido
+    assert classified["assumed"]["ability"] == "Torrent"
+    assert classified["assumed"]["nature"] == "Serious"
+    assert classified["assumed"]["item"] is None
+    assert "ability" in classified["unknown"]
+    assert "nature" in classified["unknown"]
+
+
+def test_rank_move_fallback_no_claim_ko_bajo_supuestos():
+    legal = [
+        {"kind": "move", "id": "asumido"},
+        {"kind": "move", "id": "real"},
+    ]
+    assumed_entry = {
+        "action": legal[0], "direction": "outgoing", "remaining_hp": 50,
+        "result": _result([[100, 100]]),
+        "assumptions": {
+            "attacker": {"observed": {}, "unknown": ["ability"],
+                         "assumed": {"ability": "Blaze"}},
+            "defender": {"observed": {}, "unknown": [], "assumed": {}},
+        },
+    }
+    real_entry = {
+        "action": legal[1], "direction": "outgoing", "remaining_hp": 50,
+        "result": _result([[100, 100]]),
+        "assumptions": {
+            "attacker": {"observed": {"ability": "No Guard"}, "unknown": [],
+                         "assumed": {}},
+            "defender": {"observed": {}, "unknown": [], "assumed": {}},
+        },
+    }
+    assert _depends_on_assumptions(assumed_entry) is True
+    assert _depends_on_assumptions(real_entry) is False
+    # Ambos KO por min_damage, pero el KO del "asumido" no es certeza: gana el real.
+    assert rank_move_fallback(legal, [assumed_entry, real_entry]) == legal[1]
+
+
+# --- L-02: possible_moves con categoría, dedupe, concurrencia, reducción ---
+
+
+def _move(id, category):
+    return {
+        "showdown_id": id, "name": id, "type": "Normal",
+        "category": category, "power": 60, "power_kind": "base", "pp": 10,
+    }
+
+
+def test_union_revelados_preserva_todos_y_excluye_solo_status():
+    revealed = ["surf"]
+    possible = [
+        _move("surf", "Special"),          # coincide con revealed -> revealed gana
+        _move("icebeam", "Special"),
+        _move("earthquake", "Physical"),
+        _move("toxic", "Status"),          # status -> excluido
+        _move("protect", "Status"),        # status -> excluido
+        _move("scald", "Special"),
+    ]
+    union = _union_revealed_possible(revealed, possible)
+    assert {d["id"] for d, is_possible, _ in union} == {
+        "surf", "icebeam", "earthquake", "scald",
+    }
+    by_id = {d["id"]: (is_possible, desc) for d, is_possible, desc in union}
+    assert by_id["surf"] == (False, None)  # revealed gana
+    assert by_id["icebeam"][0] is True
+    assert by_id["icebeam"][1]["category"] == "Special"
+
+
+def test_reduce_incoming_batch_conserva_revelados_y_top_n_posibles():
+    revealed = [
+        {"revealed": True, "move_id": f"r{i}", "result": {"max_damage": 50}}
+        for i in range(2)
+    ]
+    possible = [
+        {"possible": True, "move_id": f"p{i}", "result": {"max_damage": d}}
+        for i, d in enumerate([100, 90, 80, 70, 60, 5])
+    ]
+    reduced = _reduce_incoming_batch(revealed + possible, top_n=3)
+    assert {e["move_id"] for e in reduced if e.get("revealed")} == {"r0", "r1"}
+    top_possible = [e["move_id"] for e in reduced if e.get("possible")]
+    assert top_possible == ["p0", "p1", "p2"]
+
+
+@pytest.mark.asyncio
+async def test_possible_moves_102_con_29_status_se_filtran_y_se_reducen():
+    """Canario unitario: Blastoise Gen 6 trae 102 posibles, 29 status."""
+    calculator = RecordingCalculator()
+    battle = _battle()
+    battle["opponent"]["pokemon"][0]["moves"] = []
+    battle["legal_actions"] = [{"kind": "switch", "species": "charizard"}]
+    battle["me"]["pokemon"].append({
+        "species": "charizard", "level": 80, "active": False,
+        "hp_fraction": 1.0, "moves": [], "boosts": {},
+        "item": None, "ability": None, "status": None,
+    })
+    possible = []
+    for i in range(102):
+        category = "Status" if i < 29 else ("Special" if i % 2 else "Physical")
+        possible.append(_move(f"move{i}", category))
+    context = {
+        "own": [],
+        "opponent": [{"showdown_id": "blastoise", "moves": possible}],
+        "mega_forms": {},
+    }
+    update = await calc_damage(
+        {"battle_state": battle, "context": context}, calculator
+    )
+    # 102 posibles - 29 status = 73 requests; ninguno de status se calcula.
+    assert len(calculator.requests) == 73
+    assert all(
+        "status" not in request["move"]["name"] for request in calculator.requests
+    )
+    incoming = [e for e in update["damage"] if e["direction"] == "incoming"]
+    assert len(incoming) <= 73
+    # Tras la reducción: solo los top-3 posibles por daño (no los 73).
+    assert len(incoming) == 3
+    metrics = update["damage_metrics"]
+    assert metrics["calls"] == 73
+    assert metrics["latency_ms"] is not None
+    assert set(metrics["latency_ms"]) == {"median", "p90", "p99", "max"}
+
+
+@pytest.mark.asyncio
+async def test_damage_metrics_reporta_calls_bytes_y_percentiles():
+    calculator = RecordingCalculator()
+    battle = _battle()
+    update = await calc_damage({"battle_state": battle}, calculator)
+    metrics = update["damage_metrics"]
+    assert metrics["calls"] == 1
+    assert metrics["bytes"] > 0
+    assert metrics["latency_ms"]["max"] >= metrics["latency_ms"]["median"]

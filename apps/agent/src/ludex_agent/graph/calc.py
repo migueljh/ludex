@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import time
 from types import TracebackType
 from typing import Any, Protocol, Self
 
@@ -66,6 +69,66 @@ class DamageCalculator(Protocol):
     async def calculate(self, request: dict[str, Any]) -> CalcResult: ...
 
 
+class CalcSemanticError(Exception):
+    """HTTP 400 con el schema real del servicio (`{"error":{"code","message"}}`).
+
+    Es la única excepción que se captura por acción: un matchup inválido de esa
+    acción queda diagnosticado sin abortar el resto. Todo lo demás (JSON/shape
+    inválido, 5xx, timeout, RequestError, bugs de programación) propaga.
+    """
+
+    def __init__(self, code: str, message: str, *, status: int = 400) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+        self.status = status
+
+    def as_entry(self) -> dict[str, Any]:
+        return {
+            "kind": "semantic_error",
+            "status": self.status,
+            "code": self.code,
+            "message": self.message,
+        }
+
+
+class CalcProtocolError(Exception):
+    """Respuesta del calc que no cumple el contrato (JSON inválido o shape
+    inválido): es un fallo de protocolo/infraestructura y debe propagar."""
+
+
+def _parse_semantic_error(response: httpx.Response) -> CalcSemanticError:
+    """Valida el 400 contra el schema real del servicio.
+
+    El servicio devuelve `{"error":{"code":string,"message":string}}` (medido
+    contra el server real). Un 400 con JSON inválido o shape distinto NO es un
+    error semántico: es un fallo de protocolo y propaga como
+    ``CalcProtocolError``.
+    """
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise CalcProtocolError(
+            f"calc respondió HTTP 400 sin JSON válido: {response.text[:200]!r}"
+        ) from exc
+    if not isinstance(body, dict):
+        raise CalcProtocolError(
+            f"calc respondió HTTP 400 con shape inválido: {response.text[:200]!r}"
+        )
+    error = body.get("error")
+    if not isinstance(error, dict):
+        raise CalcProtocolError(
+            f"calc respondió HTTP 400 con shape inválido: {response.text[:200]!r}"
+        )
+    code = error.get("code")
+    message = error.get("message")
+    if not isinstance(code, str) or not isinstance(message, str):
+        raise CalcProtocolError(
+            f"calc respondió HTTP 400 con shape inválido: {response.text[:200]!r}"
+        )
+    return CalcSemanticError(code, message)
+
+
 class CalcClient:
     def __init__(self, base_url: str, timeout_seconds: float) -> None:
         self._client = httpx.AsyncClient(
@@ -93,8 +156,17 @@ class CalcClient:
 
     async def calculate(self, request: dict[str, Any]) -> CalcResult:
         response = await self._client.post("/calc", json=request)
+        if response.status_code == 400:
+            raise _parse_semantic_error(response)
+        # 4xx/5xx restantes (404, 405, 500, 502...) no son semánticos: propagan
+        # como fallo de infraestructura/protocolo.
         response.raise_for_status()
-        return response.json()
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise CalcProtocolError(
+                f"calc respondió 200 con JSON inválido: {response.text[:200]!r}"
+            ) from exc
 
 
 def _active(side: dict[str, Any]) -> dict[str, Any] | None:
@@ -280,69 +352,261 @@ def _remaining_hp(result: CalcResult, fraction: float | None) -> float:
     return maximum * (fraction if fraction is not None else 1)
 
 
-def _is_calc_error(exc: Exception) -> bool:
-    """True si exc es un error semantico 4xx del calc (httpx.HTTPStatusError
-    con status 400). Falso para 5xx, timeouts, connect errors, JSON invalido,
-    bugs de programacion."""
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code == 400
-    return False
-
-
-def _calc_error_entry(exc: httpx.HTTPStatusError) -> dict[str, Any]:
-    """Estructura un error semantico 4xx del calc."""
-    entry: dict[str, Any] = {
-        "kind": "semantic_error",
-        "status": exc.response.status_code,
-    }
-    try:
-        body = exc.response.json()
-        entry["code"] = body.get("error", body.get("code", "invalid_request"))
-        entry["message"] = str(body.get("message", exc.response.text))
-    except Exception:
-        entry["code"] = "invalid_request"
-        entry["message"] = exc.response.text
-    return entry
-
-
-async def _do_calc(
-    calculator: DamageCalculator,
-    request: dict[str, Any],
-) -> CalcResult:
-    """Ejecuta una llamada al calc, propagando todo menos 4xx semantic errors."""
-    try:
-        return await calculator.calculate(request)
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 400:
-            raise
-        raise
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError):
-        raise
-
-
 def _rival_possible_moves(
     context: dict[str, Any] | None, rival_species: str
-) -> list[str]:
+) -> list[dict[str, Any]]:
+    """Devuelve los descriptores completos del learnset visible del rival."""
     if context is None:
         return []
     for mon in context.get("opponent", []):
         if mon.get("showdown_id") == rival_species:
             return [
-                m["showdown_id"]
-                for m in mon.get("moves", [])
-                if isinstance(m, dict) and m.get("showdown_id")
+                move
+                for move in mon.get("moves", [])
+                if isinstance(move, dict) and move.get("showdown_id")
             ]
     return []
 
 
+# Campos que @smogon/calc resuelve con un default cuando el request los omite
+# (ver D35 y la inspección del constructor de Pokemon del paquete).
+_ASSUMED_FIELDS = (
+    "ability", "item", "nature", "evs", "ivs", "level",
+    "gender", "status", "boosts", "curHP",
+)
+
+
+def _matchup_assumptions(
+    descriptor: dict[str, Any],
+    effective: dict[str, Any],
+) -> dict[str, Any]:
+    """Clasifica un lado del matchup en observado / desconocido / asumido.
+
+    ``observed`` es lo que el adaptador envió (evidencia pública de la
+    batalla). ``unknown`` son los campos de juego que la batalla no expuso.
+    ``assumed`` son los valores efectivos que @smogon/calc aplicó para esos
+    campos omitidos (defaults medidos del paquete, reportados por el server).
+    """
+    observed = {
+        key: value for key, value in descriptor.items()
+        if key != "species"
+    }
+    hp_known = "curHP" in observed or "hpFraction" in observed
+    unknown: list[str] = []
+    assumed: dict[str, Any] = {}
+    for field in _ASSUMED_FIELDS:
+        if field in observed:
+            continue
+        if field == "curHP" and hp_known:
+            continue
+        if field in effective:
+            unknown.append(field)
+            assumed[field] = effective[field]
+    return {
+        "observed": observed,
+        "unknown": unknown,
+        "assumed": assumed,
+    }
+
+
+_DAMAGE_RELEVANT_FIELDS = (
+    "ability", "item", "nature", "evs", "ivs", "level", "boosts", "status",
+)
+
+
+def _attach_assumptions(
+    entry: dict[str, Any],
+    attacker_desc: dict[str, Any],
+    defender_desc: dict[str, Any],
+    result: CalcResult,
+) -> None:
+    effective = result.get("effective", {})
+    entry["assumptions"] = {
+        "attacker": _matchup_assumptions(
+            attacker_desc, effective.get("attacker", {})
+        ),
+        "defender": _matchup_assumptions(
+            defender_desc, effective.get("defender", {})
+        ),
+    }
+
+
+def _depends_on_assumptions(entry: dict[str, Any]) -> bool:
+    """True si el daño depende de algún default asumido por calc.
+
+    Un KO presentado bajo ability/item/nature/EVs/IVs asumidos no es certeza:
+    el fallback no debe tratarlo como tal.
+    """
+    assumptions = entry.get("assumptions", {})
+    for side in ("attacker", "defender"):
+        assumed = assumptions.get(side, {}).get("assumed", {})
+        if any(field in assumed for field in _DAMAGE_RELEVANT_FIELDS):
+            return True
+    return False
+
+
+_MAX_CONCURRENCY = 8
+_TOP_N_POSSIBLE = 3
+
+
+def _percentiles(values: list[float]) -> dict[str, float] | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    n = len(ordered)
+
+    def at(p: float) -> float:
+        return ordered[min(n - 1, int(p * n))]
+
+    return {
+        "median": at(0.5),
+        "p90": at(0.9),
+        "p99": at(0.99),
+        "max": ordered[-1],
+    }
+
+
+def _reduce_incoming_batch(
+    entries: list[dict[str, Any]], *, top_n: int
+) -> list[dict[str, Any]]:
+    """Reduce un batch de movimientos entrantes de UN candidato.
+
+    Preserva todos los revelados y los posibles con error (diagnósticos), y
+    deja las top_n mayores amenazas posibles medidas (por daño máximo).
+    """
+    revealed = [entry for entry in entries if entry.get("revealed")]
+    possible_ok = sorted(
+        (
+            entry for entry in entries
+            if entry.get("possible") and "result" in entry
+        ),
+        key=lambda entry: entry["result"]["max_damage"],
+        reverse=True,
+    )
+    possible_error = [
+        entry for entry in entries
+        if entry.get("possible") and "result" not in entry
+    ]
+    return revealed + possible_ok[:top_n] + possible_error
+
+
+async def _calc_matchup(
+    calculator: DamageCalculator,
+    request: dict[str, Any],
+    metrics: dict[str, Any],
+) -> tuple[CalcResult | None, dict[str, Any] | None]:
+    """Una llamada al calc. Devuelve (result, error_entry).
+
+    Mide calls/bytes/latencia en ``metrics`` (mutación segura: asyncio es
+    single-threaded). Todo lo que no es ``CalcSemanticError`` propaga.
+    """
+    payload_bytes = len(json.dumps(request, separators=(",", ":")))
+    start = time.perf_counter()
+    try:
+        result = await calculator.calculate(request)
+        return result, None
+    except CalcSemanticError as exc:
+        return None, exc.as_entry()
+    finally:
+        metrics["calls"] += 1
+        metrics["bytes"] += payload_bytes
+        metrics["latencies"].append(time.perf_counter() - start)
+
+
+async def _concurrent_matchups(
+    calculator: DamageCalculator,
+    items: list[tuple[dict[str, Any], dict[str, Any]]],
+    metrics: dict[str, Any],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Ejecuta matchups con concurrencia acotada y orden determinista.
+
+    ``items`` es una lista de (entry, request). El orden del resultado es el
+    orden de entrada (``asyncio.gather`` preserva el orden de los coros).
+    """
+    if not items:
+        return []
+    semaphore = asyncio.Semaphore(limit)
+
+    async def run(item: tuple[dict[str, Any], dict[str, Any]]) -> dict[str, Any]:
+        entry, request = item
+        async with semaphore:
+            result, error = await _calc_matchup(
+                calculator, request, metrics
+            )
+        if error is not None:
+            entry["error"] = error
+        else:
+            assert result is not None
+            entry["result"] = result
+        return entry
+
+    return list(await asyncio.gather(*(run(item) for item in items)))
+
+
+def _incoming_field(battle: dict[str, Any]) -> dict[str, Any] | None:
+    """Field para un switch-in: hazards aplican y el lado se invierte
+    (attackerSide = opponent_side, defenderSide = my_side)."""
+    base_field = _build_field(battle, include_hazards=True)
+    if base_field is None:
+        return None
+    incoming: dict[str, Any] = dict(base_field)
+    attacker_side = base_field.get("defenderSide")
+    defender_side = base_field.get("attackerSide")
+    if attacker_side:
+        incoming["attackerSide"] = attacker_side
+    else:
+        incoming.pop("attackerSide", None)
+    if defender_side:
+        incoming["defenderSide"] = defender_side
+    else:
+        incoming.pop("defenderSide", None)
+    return incoming
+
+
+def _union_revealed_possible(
+    revealed_ids: list[str],
+    possible_moves: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], bool, dict[str, Any] | None]]:
+    """Unión deduplicada revelados+posibles con procedencia y descriptor.
+
+    Devuelve (descriptor, is_possible, descriptor_possible). Si un id está en
+    ambos, revealed gana (posible se omite). Sólo los movimientos posibles con
+    ``category`` distinto de status entran: los status no calculan daño.
+    """
+    seen: set[str] = set()
+    result: list[tuple[dict[str, Any], bool, dict[str, Any] | None]] = []
+    for move_id in revealed_ids:
+        if move_id not in seen:
+            seen.add(move_id)
+            result.append(({"id": move_id}, False, None))
+    for move in possible_moves:
+        move_id = move.get("showdown_id")
+        if not isinstance(move_id, str) or not move_id:
+            continue
+        if move_id in seen:
+            continue
+        if str(move.get("category", "")).lower() == "status":
+            continue
+        seen.add(move_id)
+        result.append(({"id": move_id}, True, move))
+    return result
+
+
 async def calc_damage(
     state: GraphState, calculator: DamageCalculator
-) -> dict[str, list[dict[str, Any]]]:
+) -> dict[str, Any]:
     """Calcula salidas disponibles; un matchup inválido queda diagnosticado.
 
-    - 4xx semantico: capturado por accion con kind/code/status/message.
-    - 5xx, timeout, RequestError, JSON invalido: propagan ruidosamente.
-    - Errores de programacion (TypeError, etc.): propagan.
+    - ``CalcSemanticError`` (400 con schema real): capturado por acción con
+      kind/code/status/message.
+    - JSON/shape inválido, 5xx, timeout, RequestError, errores de programación:
+      propagan ruidosamente (``CalcProtocolError`` u original).
+    - Los possible_moves se calculan con concurrencia acotada, orden
+      determinista, y se reducen post-cálculo a las mayores amenazas por
+      candidato preservando los revelados. Se reporta `damage_metrics` con
+      calls/bytes y latencia mediana/p90/p99/máximo.
     """
     battle = state["battle_state"]
     me = battle.get("me", {})
@@ -350,8 +614,9 @@ async def calc_damage(
     mine = _active(me)
     rival = _active(opponent)
     damage: list[dict[str, Any]] = []
+    metrics: dict[str, Any] = {"calls": 0, "bytes": 0, "latencies": []}
     if mine is None or rival is None:
-        return {"damage": damage}
+        return {"damage": damage, "damage_metrics": _final_metrics(metrics)}
 
     gen = battle["gen"]
     context = state.get("context")
@@ -370,23 +635,22 @@ async def calc_damage(
                 "action": dict(action),
                 "direction": "outgoing",
             }
-            try:
-                result = await _do_calc(calculator, _request(
-                    gen=gen,
-                    attacker=attacker_desc,
-                    defender=defender_desc,
-                    move_id=action["id"],
-                    field=field,
-                ))
+            result, error = await _calc_matchup(calculator, _request(
+                gen=gen,
+                attacker=attacker_desc,
+                defender=defender_desc,
+                move_id=action["id"],
+                field=field,
+            ), metrics)
+            if error is not None:
+                entry["error"] = error
+            else:
+                assert result is not None
                 entry["result"] = result
                 entry["remaining_hp"] = _remaining_hp(
                     result, rival.get("hp_fraction")
                 )
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 400:
-                    entry["error"] = _calc_error_entry(exc)
-                else:
-                    raise
+                _attach_assumptions(entry, attacker_desc, defender_desc, result)
             damage.append(entry)
 
         elif action.get("kind") == "switch":
@@ -401,73 +665,72 @@ async def calc_damage(
                 continue
             attacker_desc = _pokemon_descriptor(rival)
             defender_desc = _pokemon_descriptor(candidate)
-            # Incoming: el rival ataca a nuestro candidato que ENTRA.
-            # Hazards SI aplican (switch-in). El field se invierte:
-            # attackerSide = opponent_side, defenderSide = my_side.
-            base_field = _build_field(battle, include_hazards=True)
-            incoming_field: dict[str, Any] | None = None
-            if base_field is not None:
-                incoming_field = dict(base_field)
-                attacker_side = base_field.get("defenderSide")
-                defender_side = base_field.get("attackerSide")
-                if attacker_side:
-                    incoming_field["attackerSide"] = attacker_side
-                else:
-                    incoming_field.pop("attackerSide", None)
-                if defender_side:
-                    incoming_field["defenderSide"] = defender_side
-                else:
-                    incoming_field.pop("defenderSide", None)
+            incoming_field = _incoming_field(battle)
 
-            # Union deduplicada: revelados + posibles adicionales.
-            # Revealed conserva categoria revealed; possible adicionales
-            # conservan possible=True.
+            # Unión deduplicada: revelados conservan categoría revealed;
+            # posibles adicionales conservan possible=True y su descriptor.
             rival_moves = [
                 m["id"] for m in rival.get("moves", [])
                 if isinstance(m, dict) and m.get("id")
             ]
             rival_species = rival.get("species", "")
             possible_moves = _rival_possible_moves(context, rival_species)
+            union = _union_revealed_possible(rival_moves, possible_moves)
 
-            # Union deduplicada: revealed first, then possible not in revealed.
-            seen: set[str] = set()
-            move_entries: list[tuple[str, bool]] = []
-            for move_id in rival_moves:
-                if move_id not in seen:
-                    seen.add(move_id)
-                    move_entries.append((move_id, False))
-            for move_id in possible_moves:
-                if move_id not in seen:
-                    seen.add(move_id)
-                    move_entries.append((move_id, True))
-
-            for move_id, is_possible in move_entries:
-                entry = {
+            batch: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for move_desc, is_possible, possible_desc in union:
+                move_id = move_desc["id"]
+                entry: dict[str, Any] = {
                     "action": dict(action),
                     "direction": "incoming",
                     "move_id": move_id,
                 }
                 if is_possible:
                     entry["possible"] = True
+                    if possible_desc is not None:
+                        entry["descriptor"] = {
+                            key: possible_desc[key]
+                            for key in (
+                                "showdown_id", "name", "type", "category",
+                                "power", "power_kind", "accuracy", "pp",
+                                "priority", "target", "flags",
+                            )
+                            if key in possible_desc
+                        }
                 else:
                     entry["revealed"] = True
-                try:
-                    result = await _do_calc(calculator, _request(
-                        gen=gen,
-                        attacker=attacker_desc,
-                        defender=defender_desc,
-                        move_id=move_id,
-                        field=incoming_field,
-                    ))
-                    entry["result"] = result
-                    entry["defender_max_hp"] = result["defender_hp"]["max"]
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code == 400:
-                        entry["error"] = _calc_error_entry(exc)
-                    else:
-                        raise
-                damage.append(entry)
-    return {"damage": damage}
+                batch.append((entry, _request(
+                    gen=gen,
+                    attacker=attacker_desc,
+                    defender=defender_desc,
+                    move_id=move_id,
+                    field=incoming_field,
+                )))
+
+            computed = await _concurrent_matchups(
+                calculator, batch, metrics, limit=_MAX_CONCURRENCY
+            )
+            for entry in computed:
+                if "result" in entry:
+                    entry["defender_max_hp"] = entry["result"]["defender_hp"]["max"]
+                    _attach_assumptions(
+                        entry, attacker_desc, defender_desc, entry["result"]
+                    )
+            damage.extend(_reduce_incoming_batch(
+                computed, top_n=_TOP_N_POSSIBLE
+            ))
+    return {"damage": damage, "damage_metrics": _final_metrics(metrics)}
+
+
+def _final_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    latencies = metrics["latencies"]
+    return {
+        "calls": metrics["calls"],
+        "bytes": metrics["bytes"],
+        "latency_ms": _percentiles(
+            [latency * 1000 for latency in latencies]
+        ),
+    }
 
 
 def _roll_totals(result: CalcResult) -> list[float]:
@@ -503,8 +766,15 @@ def rank_move_fallback(
             continue
         remaining = entry["remaining_hp"]
         result = entry["result"]
+        # Un KO solo cuenta como certeza si el daño no depende de defaults
+        # asumidos por calc (ability/item/nature/EVs/IVs omitidos). Bajo
+        # supuestos, se rankea por valor esperado, nunca como KO garantizado.
+        ko_certain = (
+            result["min_damage"] >= remaining
+            and not _depends_on_assumptions(entry)
+        )
         score = (
-            result["min_damage"] >= remaining,
+            ko_certain,
             _expected_capped(result, remaining),
         )
         if score > best_score:
