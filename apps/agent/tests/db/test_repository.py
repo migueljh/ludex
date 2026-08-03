@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 import pytest
@@ -6,7 +7,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from ludex_agent.config import load_settings
-from ludex_agent.db.repository import BattleIdentityConflictError, BattleRepository
+from ludex_agent.db.repository import (
+    _SAVE_BATTLE_SQL,
+    BattleIdentityConflictError,
+    BattleRepository,
+)
 from ludex_agent.db.session import make_engine, session_factory
 from ludex_agent.showdown.protocol import compute_opening_identity
 
@@ -252,6 +257,122 @@ async def test_winner_repetido_no_revienta(repo):
             "SELECT winner FROM battles WHERE id = :b"
         ), {"b": otra_vez})).scalar_one()
         assert winner == "A"
+
+
+# --- L-01 (LINEAR_VERDICT CRITICAL): atomicidad bajo concurrencia real -----
+#
+# Latwan reprodujo la fusion forzando que dos llamadas pasaran un `SELECT` de
+# precheck ANTES de que cualquiera insertara. Un `asyncio.gather` ingenuo NO
+# alcanza para probarlo ni para probar el arreglo: medido contra Postgres por
+# loopback, el round-trip es tan rapido que las dos corrutinas casi nunca
+# interlevan de verdad -- ni con 12 escritoras concurrentes contra el codigo
+# viejo con el precheck aparecio la fusion (0 fusiones observadas). Depender
+# de esa suerte de scheduling es exactamente lo que Latwan pidio NO hacer.
+#
+# Las dos pruebas siguientes fuerzan la interleaving de verdad, a nivel de
+# Postgres: la conexion 1 ejecuta `_SAVE_BATTLE_SQL` (la sentencia REAL de
+# produccion, importada del modulo) y NO commitea; se demuestra POSITIVAMENTE
+# que la conexion 2 queda bloqueada mientras tanto (no es una inferencia por
+# ausencia de fusion, es un `wait_for` que efectivamente expira). Recien
+# despues se commitea la conexion 1 y se observa que RETURNING de la
+# conexion 2 viene vacio: la unica forma de que eso pase es que el WHERE del
+# conflicto haya evaluado la incompatibilidad, ATOMICAMENTE, contra la fila
+# que la conexion 1 acaba de confirmar.
+
+async def _dos_conexiones_forzando_conflicto(datos1: dict, datos2: dict):
+    """Devuelve (bloqueada_mientras_txn1_abierta, resultado2, filas_finales)."""
+    engine = make_engine(load_settings().database_url)
+    try:
+        async with engine.connect() as conn1, engine.connect() as conn2:
+            await conn1.execute(_SAVE_BATTLE_SQL, datos1)
+            tarea2 = asyncio.create_task(conn2.execute(_SAVE_BATTLE_SQL, datos2))
+
+            bloqueada = False
+            try:
+                await asyncio.wait_for(asyncio.shield(tarea2), timeout=0.3)
+            except asyncio.TimeoutError:
+                bloqueada = True
+
+            await conn1.commit()
+            resultado2 = await tarea2
+            filas_devueltas2 = resultado2.all()
+            await conn2.commit()
+        return bloqueada, filas_devueltas2
+    finally:
+        await engine.dispose()
+
+
+async def test_dos_conexiones_reales_se_serializan_por_metadata_incompatible(repo):
+    key = _identity(TAG)
+    datos1 = {"tag": TAG, "key": key, "fmt": "gen6randombattle",
+             "p1": "A", "p2": "B", "w": None, "pb": "bot", "src": SOURCE}
+    datos2 = {"tag": TAG, "key": key, "fmt": "gen6randombattle",
+             "p1": "OTRO", "p2": "B", "w": None, "pb": "bot", "src": SOURCE}
+
+    bloqueada, filas2 = await _dos_conexiones_forzando_conflicto(datos1, datos2)
+
+    assert bloqueada, (
+        "la conexion 2 tendria que haber quedado bloqueada por el lock de "
+        "fila mientras la conexion 1 seguia con su transaccion abierta"
+    )
+    assert filas2 == [], (
+        "con metadata incompatible, RETURNING de la conexion 2 tiene que "
+        "venir vacio: su WHERE de conflicto evaluo falso"
+    )
+    async with repo.factory() as s:
+        filas = (await s.execute(text(
+            "SELECT p1 FROM battles WHERE source = 'test' AND identity_key = :k"
+        ), {"k": key})).all()
+    assert len(filas) == 1, "no puede haber quedado mas de una fila"
+    assert filas[0][0] == "A", "conn1 comiteo primero: su metadata es la que queda, sin pisar"
+
+
+async def test_dos_conexiones_reales_se_serializan_por_winner_incompatible(repo):
+    key = _identity(TAG)
+    datos1 = {"tag": TAG, "key": key, "fmt": "f",
+             "p1": "A", "p2": "B", "w": "A", "pb": "bot", "src": SOURCE}
+    datos2 = {"tag": TAG, "key": key, "fmt": "f",
+             "p1": "A", "p2": "B", "w": "B", "pb": "bot", "src": SOURCE}
+
+    bloqueada, filas2 = await _dos_conexiones_forzando_conflicto(datos1, datos2)
+
+    assert bloqueada, (
+        "la conexion 2 tendria que haber quedado bloqueada mientras la "
+        "conexion 1 seguia con su transaccion abierta"
+    )
+    assert filas2 == [], (
+        "con dos winners conocidos distintos, RETURNING de la conexion 2 "
+        "tiene que venir vacio"
+    )
+    async with repo.factory() as s:
+        winner = (await s.execute(text(
+            "SELECT winner FROM battles WHERE source = 'test' AND identity_key = :k"
+        ), {"k": key})).scalar_one()
+        n = (await s.execute(text(
+            "SELECT count(*) FROM battles WHERE source = 'test' AND identity_key = :k"
+        ), {"k": key})).scalar_one()
+    assert n == 1
+    assert winner == "A", "el winner de conn1 (la que comiteo primero) no se pierde ni se pisa"
+
+
+async def test_concurrencia_de_un_retry_compatible_devuelve_el_mismo_battle_id(repo):
+    """Contrapeso positivo: la concurrencia no rompe el caso legitimo. Dos
+    escrituras CONCURRENTES pero compatibles (mismo contenido exacto, el
+    reintento real de un runner) tienen que resolver al mismo id, nunca
+    lanzar, y dejar una sola fila."""
+    key = _identity(TAG)
+    resultados = await asyncio.gather(
+        repo.save_battle(battle_tag=TAG, identity_key=key, fmt="f", p1="A", p2="B",
+                         winner="A", source=SOURCE, played_by="bot"),
+        repo.save_battle(battle_tag=TAG, identity_key=key, fmt="f", p1="A", p2="B",
+                         winner="A", source=SOURCE, played_by="bot"),
+    )
+    assert resultados[0] == resultados[1], "dos escrituras compatibles concurrentes deben dar el mismo battle_id"
+    async with repo.factory() as s:
+        n = (await s.execute(text(
+            "SELECT count(*) FROM battles WHERE source = 'test' AND identity_key = :k"
+        ), {"k": key})).scalar_one()
+    assert n == 1
 
 
 async def test_dos_recorders_de_lados_opuestos_crean_una_battle_y_dos_trajectories(repo):

@@ -147,6 +147,73 @@ def test_gametype_desconocido_falla_cerrado():
         compute_opening_identity(BATTLE_TAG, _p1_opening(gametype=["|gametype|rotacion"]))
 
 
+# --- L-02 (LINEAR_VERDICT): la completitud es ESTRUCTURAL, no un conteo ----
+#
+# Latwan reprodujo que duplicar las lineas de p1 (player/teamsize/switch) y
+# no incluir NINGUNA de p2 producia una clave valida: los conteos cuadraban
+# (2 'player', 2 'teamsize', 2 'switch' con singles) aunque el segundo lado
+# nunca existio.
+
+def test_p2_ausente_pero_player_duplicado_de_p1_falla_cerrado():
+    with pytest.raises(OpeningIdentityError, match="roles 'player' repetidos"):
+        compute_opening_identity(BATTLE_TAG, _p1_opening(
+            player=["|player|p1|LudexBot3682|101|", "|player|p1|LudexBot3682|101|"],
+        ))
+
+
+def test_p2_ausente_pero_teamsize_duplicado_de_p1_falla_cerrado():
+    # player SI tiene p1/p2 reales; el ataque esta en teamsize: 'p1' dos
+    # veces en vez de 'p1'+'p2'. Falla cerrado por rol repetido, que ya
+    # implica que no puede cubrir los dos roles declarados por 'player'.
+    with pytest.raises(OpeningIdentityError, match="roles 'teamsize' repetidos"):
+        compute_opening_identity(BATTLE_TAG, _p1_opening(
+            teamsize=["|teamsize|p1|6", "|teamsize|p1|6"],
+        ))
+
+
+def test_p2_ausente_pero_switch_duplicado_de_p1_falla_cerrado():
+    # player y teamsize reales; el ataque esta en los switches iniciales:
+    # exactamente el repro de Latwan (dos 'p1a', cero 'p2a').
+    with pytest.raises(OpeningIdentityError, match="slots 'switch' duplicados"):
+        compute_opening_identity(BATTLE_TAG, _p1_opening(switch=[
+            "|switch|p1a: Furret|Furret, L93, F|309/309",
+            "|switch|p1a: Furret|Furret, L93, F|309/309",
+        ]))
+
+
+def test_switch_con_slot_repetido_aunque_el_otro_lado_exista_falla_cerrado():
+    # 3 switches: p1a x2 + p2a. El CONTEO (3) no dice nada; el slot p1a esta
+    # duplicado y ningun duplicado puede sustituir a un slot ausente.
+    with pytest.raises(OpeningIdentityError, match="slots 'switch' duplicados"):
+        compute_opening_identity(BATTLE_TAG, _p1_opening(switch=[
+            "|switch|p1a: Furret|Furret, L93, F|309/309",
+            "|switch|p1a: Furret|Furret, L93, F|309/309",
+            "|switch|p2a: Lapras|Lapras, L88, M|100/100",
+        ]))
+
+
+def test_switch_con_slot_mal_formado_falla_cerrado():
+    with pytest.raises(OpeningIdentityError, match="ident invalido"):
+        compute_opening_identity(BATTLE_TAG, _p1_opening(switch=[
+            "|switch|p1: Furret|Furret, L93, F|309/309",  # falta la letra de slot
+            "|switch|p2a: Lapras|Lapras, L88, M|100/100",
+        ]))
+
+
+def test_player_con_rol_mal_formado_falla_cerrado():
+    with pytest.raises(OpeningIdentityError, match="rol invalido"):
+        compute_opening_identity(BATTLE_TAG, _p1_opening(
+            player=["|player|p1|LudexBot3682|101|", "|player|equipoB|Rival3682|102|"],
+        ))
+
+
+def test_teamsize_de_un_rol_que_player_no_declaro_falla_cerrado():
+    with pytest.raises(OpeningIdentityError, match="'teamsize' no cubre"):
+        compute_opening_identity(BATTLE_TAG, _p1_opening(
+            teamsize=["|teamsize|p1|6", "|teamsize|p3|6"],
+        ))
+
+
 def test_agrupa_las_lineas_por_turno():
     r = ProtocolRecorder()
     r.record([_split("|init|battle"), _split("|turn|1")])

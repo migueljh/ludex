@@ -161,6 +161,80 @@ def _gametype_of(by_label: dict[str, list[str]]) -> str:
     return parts[2].strip().lower()
 
 
+_ROLE_RE = re.compile(r"^p\d+$")
+_SWITCH_IDENT_RE = re.compile(r"^(p\d+)([a-z])$")
+
+
+def _player_roles(by_label: dict[str, list[str]]) -> frozenset[str]:
+    """L-02: contar lineas `player` no alcanza -- dos `|player|p1|...`
+    (mismo rol repetido) cuentan 2 sin que exista ningun p2. El rol declarado
+    en el campo 2 tiene que ser valido y, sobre todo, DISTINTO por linea."""
+    roles: list[str] = []
+    for line in by_label.get("player", []):
+        parts = line.split("|")
+        role = parts[2] if len(parts) > 2 else ""
+        if not _ROLE_RE.match(role):
+            raise OpeningIdentityError(f"linea 'player' con rol invalido: {line!r}")
+        roles.append(role)
+    if len(roles) < 2:
+        raise OpeningIdentityError(
+            f"apertura incompleta: se esperaban al menos 2 roles 'player', se vieron {len(roles)}"
+        )
+    if len(set(roles)) != len(roles):
+        raise OpeningIdentityError(
+            f"apertura incompleta: roles 'player' repetidos en vez de un p2 real: {roles}"
+        )
+    return frozenset(roles)
+
+
+def _validate_teamsize(by_label: dict[str, list[str]], player_roles: frozenset[str]) -> None:
+    """Exactamente un `teamsize` por rol declarado en `player` -- ni de mas
+    (rol duplicado) ni de menos (un lado sin su teamsize)."""
+    roles: list[str] = []
+    for line in by_label.get("teamsize", []):
+        parts = line.split("|")
+        role = parts[2] if len(parts) > 2 else ""
+        if not _ROLE_RE.match(role):
+            raise OpeningIdentityError(f"linea 'teamsize' con rol invalido: {line!r}")
+        roles.append(role)
+    if len(set(roles)) != len(roles):
+        raise OpeningIdentityError(f"apertura incompleta: roles 'teamsize' repetidos: {roles}")
+    if set(roles) != player_roles:
+        raise OpeningIdentityError(
+            f"apertura incompleta: 'teamsize' no cubre exactamente los roles de 'player' "
+            f"({sorted(player_roles)}); se vio {sorted(set(roles))}"
+        )
+
+
+def _validate_switches(
+    by_label: dict[str, list[str]], player_roles: frozenset[str], slots: int,
+) -> None:
+    """L-02: cada rol necesita sus `slots` activos iniciales, cada uno UNA
+    sola vez. Un slot duplicado (p.ej. dos `p1a`) no puede sustituir al slot
+    de un lado ausente (p.ej. `p2a`): se valida el CONJUNTO de (rol, slot),
+    no la cantidad de lineas."""
+    keys: list[tuple[str, str]] = []
+    for line in by_label.get("switch", []):
+        parts = line.split("|")
+        ident = parts[2].split(":", 1)[0].strip() if len(parts) > 2 else ""
+        match = _SWITCH_IDENT_RE.match(ident)
+        if match is None:
+            raise OpeningIdentityError(f"switch inicial con ident invalido: {line!r}")
+        keys.append((match.group(1), match.group(2)))
+    if len(set(keys)) != len(keys):
+        raise OpeningIdentityError(
+            f"apertura incompleta: slots 'switch' duplicados en vez de cubrir todos "
+            f"los lados: {keys}"
+        )
+    letters = "abcdefghijklmnopqrstuvwxyz"[:slots]
+    expected = {(role, letter) for role in player_roles for letter in letters}
+    if set(keys) != expected:
+        raise OpeningIdentityError(
+            f"apertura incompleta: los switches iniciales no cubren exactamente "
+            f"{sorted(expected)}; se vio {sorted(set(keys))}"
+        )
+
+
 def compute_opening_identity(battle_tag: str, opening_lines: Sequence[str]) -> str:
     """`ps-open-v1:sha256:<64hex>` — la identidad persistida de una batalla.
 
@@ -202,25 +276,12 @@ def compute_opening_identity(battle_tag: str, opening_lines: Sequence[str]) -> s
             f"gametype desconocido, no se puede validar completitud: {gametype!r}"
         )
 
-    n_players = len(by_label.get("player", []))
-    if n_players < 2:
-        raise OpeningIdentityError(
-            f"apertura incompleta: se esperaban al menos 2 lineas 'player', se vieron {n_players}"
-        )
-
-    n_teamsize = len(by_label.get("teamsize", []))
-    if n_teamsize != n_players:
-        raise OpeningIdentityError(
-            f"apertura incompleta: {n_players} jugadores pero {n_teamsize} 'teamsize'"
-        )
-
-    expected_switches = n_players * slots
-    n_switch = len(by_label.get("switch", []))
-    if n_switch != expected_switches:
-        raise OpeningIdentityError(
-            f"apertura incompleta: se esperaban {expected_switches} 'switch' iniciales "
-            f"({n_players} jugadores x {slots} activos de {gametype!r}), se vieron {n_switch}"
-        )
+    # L-02: la completitud es ESTRUCTURAL (roles y slots distintos y
+    # completos), no una cuenta de lineas -- un conteo se cumple con lineas
+    # de un solo lado duplicadas, sin que el otro lado exista.
+    player_roles = _player_roles(by_label)
+    _validate_teamsize(by_label, player_roles)
+    _validate_switches(by_label, player_roles, slots)
 
     payload = "\n".join([f"domain:{_tag_domain(battle_tag)}", *sorted(normalized)])
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
