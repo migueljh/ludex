@@ -1845,3 +1845,59 @@ re-vincular a una reingesta futura de la misma batalla porque no hay forma
 de recalcular su fingerprint de apertura post-hoc. D33/D34/D35 quedan
 integrados por merge aditivo de `integration/phase-2-accepted`, sin
 reabrirse.
+
+## D37 — el PP indeterminable por Pressure se marca en `persistent_state`, no en el snapshot de una sola llamada
+
+**Contexto.** MON-18 diagnosticó por eliminación (`FINAL ROOT-CAUSE
+CHECKPOINT`, MON-18) que el PP de un movimiento rival marcado `null` por
+Pressure (D-existente, `register_move`/`pressure_on_us`) reaparecía como
+número en la decisión siguiente sin que el rival volviera a usar ese
+movimiento. Causa: `client.py` construye el `snapshot` de **cada** llamada
+a `project_observable_state` fresco desde `serialize_battle(battle)`
+(nunca encadena la proyección anterior — `client.py:1185/1390`), y
+`serializer.py::_moves` lee `mv.current_pp` directo del objeto `Move` de
+poke-env, que cuenta su propio PP sin saber de Pressure. El `None` de
+`register_move` sólo vivía dentro de la llamada que lo produjo.
+
+**Solución.** `persistent_state[identidad]` gana dos claves nuevas,
+paralelas al patrón ya existente de `types`/`ability`/`moves`:
+
+- **`unknown_pp_moves`** (`set[str]` de `move_id`): permanente, como
+  `ability`. `register_move` la puebla cuando `pressure_on_us()` es
+  verdadero. Al principio de **cada** llamada a `project_observable_state`
+  (antes de procesar cualquier línea nueva del frame), se reaplica `pp =
+  None` sobre todo movimiento cuyo `id` esté marcado, sin importar qué
+  número traiga el snapshot fresco. Sobrevive cualquier cantidad de
+  switches ordinarios: `switch_out` nunca la toca.
+- **`transform_unknown_pp_moves`**: temporal, como `types`/`moves` de un
+  Transform. Si el pokémon está transformado en el momento de marcar
+  (detectado por `"moves" in entry`, la misma señal que ya usa
+  `switch_out` para saber si hay un Transform activo), la marca va acá en
+  vez de en `unknown_pp_moves`, y `switch_out` la descarta junto con el
+  moveset copiado — para que un Transform posterior sobre un objetivo
+  distinto no herede una marca que no le corresponde.
+
+**Aislamiento.** Por construcción: `persistent_state` ya está indexado por
+identidad canónica (`base_species`), así que dos rivales distintos con el
+mismo `move_id` nunca comparten marca. Dentro de una identidad, la marca es
+un conjunto de `move_id`, no una bandera global del pokémon.
+
+**Lo que NO cambia.** `max_pp` no participa: `Move.max_pp` en poke-env es
+una property que siempre deriva del dex (`move.py:471-481`), nunca vuelve
+`None` por sí sola, así que no hay nada que reaplicar ahí. `client.py` no
+se tocó — el fix es enteramente interno a `project_observable_state`
+(reaplicación) y `register_move` (marca), ambos en `protocol.py`.
+
+**Verificado.** 5 tests nuevos en `test_protocol.py`: reaplicación con
+snapshot fresco e independiente (no encadenado) entre dos llamadas;
+persistencia a través de switch-out y switch-in ordinarios; aislamiento
+entre dos rivales con el mismo `move_id`; marca temporal de un Transform
+descartada al terminar y sin fuga a un Transform posterior distinto; y el
+contrapeso negativo — sin compartir el mismo `persistent_state` por
+`battle_tag` entre llamadas (como si el caller no reusara
+`self._temporary_state[tag]`), la marca se pierde y el PP numérico del
+snapshot fresco queda sin corregir, confirmando que la corrección depende
+de verdad de esa reutilización. Mutación: se retiró la reaplicación,
+2 de los 5 tests nuevos fallaron exactamente en la aserción de PP
+esperado; restaurada, vuelven a pasar junto con el resto de
+`test_protocol.py`/`test_client.py` (203/203).
