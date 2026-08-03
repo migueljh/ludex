@@ -262,6 +262,18 @@ async def test_fallo_background_conserva_identidad():
 
 
 @pytest.mark.asyncio
+async def test_timeouterror_background_no_se_confunde_con_deadline():
+    """Un TimeoutError del canal background se propia como fallo background,
+    no como timeout propio del benchmark."""
+    exc = asyncio.TimeoutError("projection timed out")
+    agent = _BackgroundFailureAgent(exc)
+    with pytest.raises(asyncio.TimeoutError, match="projection"):
+        await run_benchmark(agent, object(), n=1, timeout=3600)
+    assert agent.battle_done.is_set()
+    assert agent.battle_cancelled is True
+
+
+@pytest.mark.asyncio
 async def test_exito_normal_deja_cero_hijos_pendientes():
     agent = _CompletingAgent()
     result = await run_benchmark(agent, object(), n=3)
