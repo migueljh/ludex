@@ -372,6 +372,110 @@ async def test_connect_error_propaga_ruidosamente():
             await calc_damage({"battle_state": _error_battle()}, calc)
 
 
+# --- L-03.1: el HTTP 200 exitoso también se valida contra el shape completo ---
+
+_EFFECTIVE_SIDE = {
+    "species": "Charizard", "level": 80, "nature": "Serious",
+    "ability": "Blaze", "item": None,
+    "evs": {"hp": 0}, "ivs": {"hp": 31}, "boosts": {"hp": 0},
+    "status": "", "curHP": 239, "gender": "M",
+}
+
+
+def _valid_200():
+    return {
+        "damage_rolls": [[86, 90, 104]],
+        "min_damage": 86,
+        "max_damage": 104,
+        "min_percent": 35.6,
+        "max_percent": 43.1,
+        "ko_chance": {"chance": 1, "n": 3, "text": "guaranteed 3HKO"},
+        "description": "Pikachu Thunderbolt vs. Blastoise",
+        "defender_hp": {"cur": 241, "max": 241},
+        "effective": {
+            "attacker": _EFFECTIVE_SIDE,
+            "defender": dict(_EFFECTIVE_SIDE, species="Blastoise"),
+        },
+    }
+
+
+def _mutate_200(**changes):
+    body = _valid_200()
+    body.update(changes)
+    return body
+
+
+@pytest.mark.asyncio
+async def test_200_shape_valido_se_acepta(calc_available):
+    async with CalcClient(BASE_URL, timeout_seconds=3) as calc:
+        result = await calc.calculate({
+            "gen": 6,
+            "attacker": {"species": "Pikachu", "level": 80},
+            "defender": {"species": "Blastoise", "level": 80},
+            "move": {"name": "Thunderbolt"},
+        })
+    assert result["min_damage"] > 0
+    assert result["effective"]["attacker"]["species"] == "Pikachu"
+
+
+@pytest.mark.asyncio
+async def test_200_effective_ausente_propaga_como_protocolo():
+    body = _valid_200()
+    del body["effective"]
+    with _stub_calc([(200, json.dumps(body).encode(), "application/json")]) as url:
+        with pytest.raises(CalcProtocolError, match="shape incompleto"):
+            await _calc_damage_via(url)
+
+
+@pytest.mark.asyncio
+async def test_200_effective_attacker_malformado_propaga():
+    body = _valid_200()
+    attacker = dict(body["effective"]["attacker"])
+    del attacker["species"]
+    body["effective"]["attacker"] = attacker
+    with _stub_calc([(200, json.dumps(body).encode(), "application/json")]) as url:
+        with pytest.raises(CalcProtocolError, match="effective.attacker"):
+            await _calc_damage_via(url)
+
+
+@pytest.mark.asyncio
+async def test_200_effective_ivs_tipo_invalido_propaga():
+    body = _valid_200()
+    defender = dict(body["effective"]["defender"])
+    defender["ivs"] = {"hp": "31"}
+    body["effective"]["defender"] = defender
+    with _stub_calc([(200, json.dumps(body).encode(), "application/json")]) as url:
+        with pytest.raises(CalcProtocolError, match="effective.defender.ivs"):
+            await _calc_damage_via(url)
+
+
+@pytest.mark.asyncio
+async def test_200_campo_productivo_faltante_propaga():
+    body = _valid_200()
+    del body["min_damage"]
+    with _stub_calc([(200, json.dumps(body).encode(), "application/json")]) as url:
+        with pytest.raises(CalcProtocolError, match="shape incompleto"):
+            await _calc_damage_via(url)
+
+
+@pytest.mark.asyncio
+async def test_200_damage_rolls_tipo_invalido_propaga():
+    body = _valid_200()
+    body["damage_rolls"] = [[86, "no"], [104]]
+    with _stub_calc([(200, json.dumps(body).encode(), "application/json")]) as url:
+        with pytest.raises(CalcProtocolError, match="damage_rolls"):
+            await _calc_damage_via(url)
+
+
+@pytest.mark.asyncio
+async def test_200_ko_chance_malformado_propaga():
+    body = _valid_200()
+    body["ko_chance"] = {"chance": "no", "n": 1, "text": 5}
+    with _stub_calc([(200, json.dumps(body).encode(), "application/json")]) as url:
+        with pytest.raises(CalcProtocolError, match="ko_chance"):
+            await _calc_damage_via(url)
+
+
 # --- Contexto real: canario Blastoise Gen 6 (102 posibles, 29 status) ---
 
 

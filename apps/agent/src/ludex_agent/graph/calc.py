@@ -129,6 +129,94 @@ def _parse_semantic_error(response: httpx.Response) -> CalcSemanticError:
     return CalcSemanticError(code, message)
 
 
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _validate_effective_pokemon(value: Any, side: str) -> None:
+    """Valida el shape de un lado de ``effective`` (medido contra el server)."""
+    if not isinstance(value, dict):
+        raise CalcProtocolError(f"effective.{side} inválido")
+    for key in ("species", "level", "nature", "ability", "item", "evs",
+                "ivs", "boosts", "status", "curHP", "gender"):
+        if key not in value:
+            raise CalcProtocolError(f"effective.{side}.{key} faltante")
+    if not isinstance(value["species"], str) or not _is_number(value["level"]):
+        raise CalcProtocolError(f"effective.{side} species/level inválidos")
+    if not _is_number(value["curHP"]):
+        raise CalcProtocolError(f"effective.{side}.curHP inválido")
+    for key in ("nature", "ability", "item", "status", "gender"):
+        if value[key] is not None and not isinstance(value[key], str):
+            raise CalcProtocolError(f"effective.{side}.{key} inválido")
+    for key in ("evs", "ivs", "boosts"):
+        table = value[key]
+        if not isinstance(table, dict) or not all(
+            _is_number(v) for v in table.values()
+        ):
+            raise CalcProtocolError(f"effective.{side}.{key} inválido")
+
+
+def _validate_calc_response(body: Any) -> CalcResult:
+    """Valida el shape completo del HTTP 200 contra el contrato real.
+
+    Campos productivos de ``CalcResponse`` (damage_rolls, min/max_damage,
+    min/max_percent, ko_chance, description, defender_hp) y
+    ``effective.attacker/defender``. JSON válido con shape ausente, parcial o
+    tipos inválidos es un fallo de protocolo y lanza ``CalcProtocolError``.
+    """
+    if not isinstance(body, dict):
+        raise CalcProtocolError(f"calc devolvió shape inválido: {body!r}")
+    required = (
+        "damage_rolls", "min_damage", "max_damage", "min_percent",
+        "max_percent", "ko_chance", "description", "defender_hp", "effective",
+    )
+    missing = [key for key in required if key not in body]
+    if missing:
+        raise CalcProtocolError(
+            f"calc devolvió shape incompleto: faltan {missing}"
+        )
+    rolls = body["damage_rolls"]
+    if not isinstance(rolls, list) or not all(
+        isinstance(position, list)
+        and all(_is_number(value) for value in position)
+        for position in rolls
+    ):
+        raise CalcProtocolError("calc devolvió damage_rolls inválido")
+    for key in ("min_damage", "max_damage", "min_percent", "max_percent"):
+        if not _is_number(body[key]):
+            raise CalcProtocolError(f"calc devolvió {key} inválido")
+    ko_chance = body["ko_chance"]
+    if ko_chance is not None:
+        # Contrato real (calc.ts): `{chance?: number; n: number; text: string}`.
+        # El server omite `chance` (undefined en JS no se serializa) cuando el
+        # paquete no lo calcula: es opcional. `n` y `text` siempre van.
+        if not isinstance(ko_chance, dict):
+            raise CalcProtocolError("calc devolvió ko_chance inválido")
+        if not _is_number(ko_chance.get("n")) or not isinstance(
+            ko_chance.get("text"), str
+        ):
+            raise CalcProtocolError("calc devolvió ko_chance inválido")
+        if (
+            "chance" in ko_chance
+            and ko_chance["chance"] is not None
+            and not _is_number(ko_chance["chance"])
+        ):
+            raise CalcProtocolError("calc devolvió ko_chance.chance inválido")
+    if not isinstance(body["description"], str):
+        raise CalcProtocolError("calc devolvió description inválido")
+    defender_hp = body["defender_hp"]
+    if not isinstance(defender_hp, dict) or not _is_number(
+        defender_hp.get("cur")
+    ) or not _is_number(defender_hp.get("max")):
+        raise CalcProtocolError("calc devolvió defender_hp inválido")
+    effective = body["effective"]
+    if not isinstance(effective, dict):
+        raise CalcProtocolError("calc devolvió effective inválido")
+    _validate_effective_pokemon(effective.get("attacker"), "attacker")
+    _validate_effective_pokemon(effective.get("defender"), "defender")
+    return body
+
+
 class CalcClient:
     def __init__(self, base_url: str, timeout_seconds: float) -> None:
         self._client = httpx.AsyncClient(
@@ -162,11 +250,12 @@ class CalcClient:
         # como fallo de infraestructura/protocolo.
         response.raise_for_status()
         try:
-            return response.json()
+            body = response.json()
         except ValueError as exc:
             raise CalcProtocolError(
                 f"calc respondió 200 con JSON inválido: {response.text[:200]!r}"
             ) from exc
+        return _validate_calc_response(body)
 
 
 def _active(side: dict[str, Any]) -> dict[str, Any] | None:
