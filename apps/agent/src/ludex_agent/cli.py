@@ -446,6 +446,7 @@ async def _benchmark_command(
                 persist_battle=persist_tag if persist else None,
                 provider=provider_name, model=model,
                 on_progress=report_progress,
+                timeout=BATTLE_TIMEOUT_SECONDS,
             )
         except ProviderError as exc:
             completed = (

@@ -69,6 +69,7 @@ async def run_benchmark(
     on_progress: Callable[
         [BenchmarkResult], Awaitable[None] | None
     ] | None = None,
+    timeout: float | None = None,
 ) -> BenchmarkResult:
     if persist and persist_battle is None:
         raise ValueError("persist=True requires persist_battle")
@@ -105,23 +106,40 @@ async def run_benchmark(
             agent.battle_against(opponent, n_battles=1)
         )
         failure_task = asyncio.create_task(wait_for_failure())
-        await asyncio.wait(
-            {battle_task, failure_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if failure_task.done():
-            failure = failure_task.result()
-            battle_task.cancel()
-            await asyncio.gather(battle_task, return_exceptions=True)
-            raise failure
-        failure_task.cancel()
-        await asyncio.gather(failure_task, return_exceptions=True)
-        await battle_task
+        try:
+            await asyncio.wait(
+                {battle_task, failure_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if failure_task.done():
+                failure = failure_task.result()
+                battle_task.cancel()
+                await asyncio.gather(
+                    battle_task, return_exceptions=True
+                )
+                raise failure
+            failure_task.cancel()
+            await asyncio.gather(
+                failure_task, return_exceptions=True
+            )
+            await battle_task
+        finally:
+            if not battle_task.done():
+                battle_task.cancel()
+            if not failure_task.done():
+                failure_task.cancel()
+            await asyncio.gather(
+                battle_task, failure_task, return_exceptions=True
+            )
 
     try:
         for _ in range(n):
             known = set(agent.battles)
-            await play_one()
+            if timeout is not None:
+                async with asyncio.timeout(timeout):
+                    await play_one()
+            else:
+                await play_one()
             if persist:
                 for tag in agent.battles:
                     if tag not in known:
