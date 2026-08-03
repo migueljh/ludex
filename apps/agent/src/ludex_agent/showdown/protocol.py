@@ -99,9 +99,44 @@ _OPENING_LABELS = frozenset({
     "t:", "gametype", "gen", "tier", "rule", "teamsize", "player", "start", "switch",
 })
 
-# Activos por lado segun el gametype declarado (DESIGN VERDICT #3: la
+# Roles y activos por lado, UNO por gametype soportado (DESIGN VERDICT #3: la
 # completitud se parametriza por jugadores/gametype, nunca se fija "Singles").
-_ACTIVE_SLOTS_BY_GAMETYPE = {"singles": 1, "doubles": 2, "triples": 3, "multi": 1}
+# Confirmado leyendo el simulador VENDORIZADO (LINEAR_VERDICT L-02, re-review):
+# `pokemon-showdown@0.11.10` (la version pineada, D4) es explicito en
+# `sim/side.ts` sobre que roles/activos admite cada gametype, y en
+# `sim/pokemon.ts:504-507` (`Pokemon.getSlot`) sobre como se arma la letra:
+#
+#   positionOffset = floor(side.n / 2) * side.active.length
+#   letra = 'abcdef'[posicion_del_mon + positionOffset]
+#
+# `side.n` es el indice 0-based del rol (p1=0 .. p4=3). Para singles/doubles/
+# triples solo existen p1/p2 (n=0,1): floor(n/2) siempre da 0, asi que cada
+# rol usa sus propias letras 'a'.."slots" sin pisar al otro. Para 'multi'
+# (4 roles, 1 activo por lado) el offset SI depende del rol: p1/p2 caen en
+# 'a' pero p3/p4 caen en 'b' -- p1a, p2a, p3b, p4b. No es "cada rol usa las
+# mismas letras que los demas": _expected_switch_keys reproduce la formula
+# tal cual, no una aproximacion por gametype.
+_GAMETYPES: dict[str, tuple[tuple[str, ...], int]] = {
+    "singles": (("p1", "p2"), 1),
+    "doubles": (("p1", "p2"), 2),
+    "triples": (("p1", "p2"), 3),
+    "multi": (("p1", "p2", "p3", "p4"), 1),
+}
+
+_SLOT_LETTERS = "abcdef"
+
+
+def _expected_switch_keys(required_roles: tuple[str, ...], slots_per_side: int) -> frozenset[tuple[str, str]]:
+    """Espeja `Pokemon.getSlot()` (`sim/pokemon.ts:504-507`, ver comentario
+    de `_GAMETYPES`), no una aproximacion: la letra depende del INDICE del
+    rol y de cuantos activos tiene su lado, no solo de su propio rol."""
+    keys: set[tuple[str, str]] = set()
+    for role in required_roles:
+        n = int(role[1:]) - 1
+        offset = (n // 2) * slots_per_side
+        for i in range(slots_per_side):
+            keys.add((role, _SLOT_LETTERS[offset + i]))
+    return frozenset(keys)
 
 _TAG_DOMAIN_RE = re.compile(r"-\d+$")
 _SWITCH_HP_RE = re.compile(r"^(\d+)/(\d+)$")
@@ -161,14 +196,15 @@ def _gametype_of(by_label: dict[str, list[str]]) -> str:
     return parts[2].strip().lower()
 
 
-_ROLE_RE = re.compile(r"^p\d+$")
-_SWITCH_IDENT_RE = re.compile(r"^(p\d+)([a-z])$")
+_ROLE_RE = re.compile(r"^p[1-4]$")
+_SWITCH_IDENT_RE = re.compile(r"^(p[1-4])([a-z])$")
 
 
-def _player_roles(by_label: dict[str, list[str]]) -> frozenset[str]:
-    """L-02: contar lineas `player` no alcanza -- dos `|player|p1|...`
-    (mismo rol repetido) cuentan 2 sin que exista ningun p2. El rol declarado
-    en el campo 2 tiene que ser valido y, sobre todo, DISTINTO por linea."""
+def _player_roles(by_label: dict[str, list[str]], required_roles: tuple[str, ...]) -> frozenset[str]:
+    """L-02 (re-review): no alcanza con "al menos 2 roles distintos" -- eso
+    aceptaba singles con p1+p3, o multi con solo p1+p2. El CONJUNTO de roles
+    declarados tiene que ser exactamente el que el gametype exige, ni un rol
+    de mas ni de menos, y cada rol solo un valido `p1`..`p4`."""
     roles: list[str] = []
     for line in by_label.get("player", []):
         parts = line.split("|")
@@ -176,13 +212,14 @@ def _player_roles(by_label: dict[str, list[str]]) -> frozenset[str]:
         if not _ROLE_RE.match(role):
             raise OpeningIdentityError(f"linea 'player' con rol invalido: {line!r}")
         roles.append(role)
-    if len(roles) < 2:
-        raise OpeningIdentityError(
-            f"apertura incompleta: se esperaban al menos 2 roles 'player', se vieron {len(roles)}"
-        )
     if len(set(roles)) != len(roles):
         raise OpeningIdentityError(
-            f"apertura incompleta: roles 'player' repetidos en vez de un p2 real: {roles}"
+            f"apertura incompleta: roles 'player' repetidos en vez de un lado real: {roles}"
+        )
+    if set(roles) != set(required_roles):
+        raise OpeningIdentityError(
+            f"apertura incompleta: se esperaban exactamente los roles {sorted(required_roles)} "
+            f"para este gametype; se vio {sorted(set(roles))}"
         )
     return frozenset(roles)
 
@@ -209,10 +246,11 @@ def _validate_teamsize(by_label: dict[str, list[str]], player_roles: frozenset[s
 def _validate_switches(
     by_label: dict[str, list[str]], player_roles: frozenset[str], slots: int,
 ) -> None:
-    """L-02: cada rol necesita sus `slots` activos iniciales, cada uno UNA
-    sola vez. Un slot duplicado (p.ej. dos `p1a`) no puede sustituir al slot
-    de un lado ausente (p.ej. `p2a`): se valida el CONJUNTO de (rol, slot),
-    no la cantidad de lineas."""
+    """L-02: cada rol necesita sus activos iniciales exactos segun
+    `_expected_switch_keys` (que refleja `Pokemon.getSlot()` real, no una
+    aproximacion), cada uno UNA sola vez. Un slot duplicado (p.ej. dos
+    `p1a`) no puede sustituir al slot de un lado ausente (p.ej. `p2a`): se
+    valida el CONJUNTO de (rol, slot), no la cantidad de lineas."""
     keys: list[tuple[str, str]] = []
     for line in by_label.get("switch", []):
         parts = line.split("|")
@@ -226,8 +264,7 @@ def _validate_switches(
             f"apertura incompleta: slots 'switch' duplicados en vez de cubrir todos "
             f"los lados: {keys}"
         )
-    letters = "abcdefghijklmnopqrstuvwxyz"[:slots]
-    expected = {(role, letter) for role in player_roles for letter in letters}
+    expected = _expected_switch_keys(tuple(sorted(player_roles)), slots)
     if set(keys) != expected:
         raise OpeningIdentityError(
             f"apertura incompleta: los switches iniciales no cubren exactamente "
@@ -270,16 +307,18 @@ def compute_opening_identity(battle_tag: str, opening_lines: Sequence[str]) -> s
         )
 
     gametype = _gametype_of(by_label)
-    slots = _ACTIVE_SLOTS_BY_GAMETYPE.get(gametype)
-    if slots is None:
+    supported = _GAMETYPES.get(gametype)
+    if supported is None:
         raise OpeningIdentityError(
-            f"gametype desconocido, no se puede validar completitud: {gametype!r}"
+            f"gametype desconocido o no soportado, no se puede validar completitud: {gametype!r}"
         )
+    required_roles, slots = supported
 
     # L-02: la completitud es ESTRUCTURAL (roles y slots distintos y
-    # completos), no una cuenta de lineas -- un conteo se cumple con lineas
-    # de un solo lado duplicadas, sin que el otro lado exista.
-    player_roles = _player_roles(by_label)
+    # completos segun EXACTAMENTE lo que el gametype exige), no una cuenta de
+    # lineas -- un conteo se cumple con lineas de un solo lado duplicadas, sin
+    # que el otro lado exista, o con roles que no corresponden al gametype.
+    player_roles = _player_roles(by_label, required_roles)
     _validate_teamsize(by_label, player_roles)
     _validate_switches(by_label, player_roles, slots)
 

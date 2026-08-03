@@ -214,6 +214,107 @@ def test_teamsize_de_un_rol_que_player_no_declaro_falla_cerrado():
         ))
 
 
+# --- L-02, re-review de Latwan sobre 14df921 ---------------------------
+#
+# `compute_opening_identity` derivaba la topologia esperada de los roles
+# RECIBIDOS en vez de los roles REALES del gametype: aceptaba singles con
+# p1+p3, y 'multi' con solo p1+p2 (ambos con conteos que "cerraban" por
+# casualidad). La topologia de slots de 'multi' esta confirmada contra el
+# simulador VENDORIZADO `pokemon-showdown@0.11.10` (la version pineada,
+# D4): `Pokemon.getSlot()` (`sim/pokemon.ts:504-507`) calcula la letra como
+# `'abcdef'[posicion + floor(side.n/2)*activos_por_lado]`, y con 1 activo
+# por lado en multi eso da p1a/p2a/p3b/p4b -- NO "cada rol usa las mismas
+# letras", que es lo que la version anterior asumia.
+
+def test_singles_con_p1_y_p3_falla_cerrado():
+    with pytest.raises(OpeningIdentityError, match=r"roles \['p1', 'p2'\]"):
+        compute_opening_identity(BATTLE_TAG, _p1_opening(
+            player=["|player|p1|LudexBot3682|101|", "|player|p3|Rival3682|102|"],
+            teamsize=["|teamsize|p1|6", "|teamsize|p3|6"],
+            switch=[
+                "|switch|p1a: Furret|Furret, L93, F|309/309",
+                "|switch|p3a: Lapras|Lapras, L88, M|100/100",
+            ],
+        ))
+
+
+MULTI_TAG = "battle-gen6multibattle-1"
+
+
+def _multi_opening(**overrides: list[str]) -> list[str]:
+    """Apertura real de 'multi': 4 roles, 1 activo por lado, topologia
+    p1a/p2a/p3b/p4b (confirmada arriba contra el simulador vendorizado)."""
+    lines = {
+        "t:": ["|t:|1785186819"],
+        "gametype": ["|gametype|multi"],
+        "player": [
+            "|player|p1|LudexBot3682|101|", "|player|p2|Rival3682|102|",
+            "|player|p3|LudexAlly|103|", "|player|p4|RivalAlly|104|",
+        ],
+        "teamsize": [
+            "|teamsize|p1|6", "|teamsize|p2|6", "|teamsize|p3|6", "|teamsize|p4|6",
+        ],
+        "gen": ["|gen|8"],
+        "tier": ["|tier|[Gen 8] Multi Battle"],
+        "rule": ["|rule|HP Percentage Mod: HP is shown in percentages"],
+        "start": ["|start"],
+        "switch": [
+            "|switch|p1a: Furret|Furret, L93, F|309/309",
+            "|switch|p2a: Lapras|Lapras, L88, M|100/100",
+            "|switch|p3b: Gengar|Gengar, L80, M|280/280",
+            "|switch|p4b: Dusknoir|Dusknoir, L84, M|100/100",
+        ],
+    }
+    lines.update(overrides)
+    noise = [f">{MULTI_TAG}", "|init|battle", ""]
+    out: list[str] = list(noise)
+    for key in ("t:", "gametype", "player", "teamsize", "gen", "tier", "rule", "start", "switch"):
+        out.extend(lines[key])
+    return out
+
+
+def test_multi_real_completo_pasa():
+    # No revienta: los 4 roles, sus 4 teamsize y la topologia p1a/p2a/p3b/p4b
+    # estan completos y correctos.
+    compute_opening_identity(MULTI_TAG, _multi_opening())
+
+
+def test_multi_sin_p3_p4_falla_cerrado():
+    with pytest.raises(OpeningIdentityError, match=r"roles \['p1', 'p2', 'p3', 'p4'\]"):
+        compute_opening_identity(MULTI_TAG, _multi_opening(
+            player=["|player|p1|LudexBot3682|101|", "|player|p2|Rival3682|102|"],
+            teamsize=["|teamsize|p1|6", "|teamsize|p2|6"],
+            switch=[
+                "|switch|p1a: Furret|Furret, L93, F|309/309",
+                "|switch|p2a: Lapras|Lapras, L88, M|100/100",
+            ],
+        ))
+
+
+def test_multi_con_topologia_incorrecta_falla_cerrado():
+    # Los 4 roles estan, pero p3/p4 salen con letra 'a' (como si multi no
+    # compartiera semi-lado) en vez de 'b': la topologia real exige p3b/p4b.
+    with pytest.raises(OpeningIdentityError, match="no cubren exactamente"):
+        compute_opening_identity(MULTI_TAG, _multi_opening(switch=[
+            "|switch|p1a: Furret|Furret, L93, F|309/309",
+            "|switch|p2a: Lapras|Lapras, L88, M|100/100",
+            "|switch|p3a: Gengar|Gengar, L80, M|280/280",
+            "|switch|p4a: Dusknoir|Dusknoir, L84, M|100/100",
+        ]))
+
+
+def test_multi_con_slot_duplicado_falla_cerrado():
+    # p3b aparece dos veces y p4b nunca: el conteo (4) cuadra pero el
+    # conjunto no cubre el lado de p4.
+    with pytest.raises(OpeningIdentityError, match="slots 'switch' duplicados"):
+        compute_opening_identity(MULTI_TAG, _multi_opening(switch=[
+            "|switch|p1a: Furret|Furret, L93, F|309/309",
+            "|switch|p2a: Lapras|Lapras, L88, M|100/100",
+            "|switch|p3b: Gengar|Gengar, L80, M|280/280",
+            "|switch|p3b: Gengar|Gengar, L80, M|280/280",
+        ]))
+
+
 def test_agrupa_las_lineas_por_turno():
     r = ProtocolRecorder()
     r.record([_split("|init|battle"), _split("|turn|1")])
