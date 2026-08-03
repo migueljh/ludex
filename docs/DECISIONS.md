@@ -1665,7 +1665,14 @@ determinista (`asyncio.gather` preserva el orden; los learnsets llegan
 ordenados por `showdown_id` desde la base). Después del cálculo se reduce por
 candidato a los top-3 posibles por daño máximo, preservando todos los
 revelados y los diagnósticos. `damage_metrics` reporta calls, bytes y latencia
-en mediana/p90/p99/máximo. Canario real sobre la base: Blastoise Gen 6 trae
+en mediana/p90/p99/máximo. `damage_metrics` se declara en el contrato
+`GraphState` y sobrevive al workflow productivo
+(`build_decision_graph(...).ainvoke` la conserva en la salida; StateGraph
+descarta los canales no declarados). No amplía persistencia. El
+`Semaphore(8)` tiene regresión propia: un fake bloqueante con 12 requests
+demuestra `max_in_flight == 8`, y con latencias invertidas (el que empieza
+tarde termina primero) se demuestra que el orden de salida sigue siendo el de
+entrada. Canario real sobre la base: Blastoise Gen 6 trae
 102 movimientos (29 status) → 73 requests no-status, y el máximo de latencia
 medido cabe holgado en el presupuesto de decisión de 240 s (D26): no se
 necesitó endpoint batch.
@@ -1677,6 +1684,19 @@ JSON inválido, shape inválido, 5xx, timeout, `RequestError` y errores de
 programación propagan (como `CalcProtocolError` u original). No queda
 `except Exception` amplio. El camino se prueba con `CalcClient` contra el
 servidor real y contra un stub HTTP real para los 400 malformados.
+
+**El HTTP 200 también se valida contra el shape completo.** El 200 no se
+acepta sólo por parsear JSON: `CalcClient` valida contra `CalcResponse`
+(calc.ts) los campos productivos (`damage_rolls`, `min/max_damage`,
+`min/max_percent`, `ko_chance`, `description`, `defender_hp`) y
+`effective.attacker/defender` con sus sub-campos. Un 200 con JSON válido pero
+shape ausente, parcial o con tipos inválidos propaga `CalcProtocolError` y
+nunca llega a `_attach_assumptions` (una respuesta parcial podía fabricar
+assumptions vacías y volver a habilitar certeza falsa). `ko_chance.chance` es
+opcional: el server serializa `chance: number | undefined` y omite `undefined`
+cuando el paquete no calcula la chance; `ko_chance.n` y `ko_chance.text` son
+obligatorios. Stubs HTTP de regresión cubren `effective` ausente y malformado,
+campos productivos faltantes y tipos inválidos.
 
 **Mega por el camino completo.** `retrieve_context` recopila los items visibles
 y `ContextRepository.load_mega_forms` resuelve en batch `items.megaStone`/
