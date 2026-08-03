@@ -126,7 +126,14 @@ async def test_calc_damage_pasa_generacion_y_construye_matchups_de_movimiento():
 
 class FailingCalculator:
     async def calculate(self, request):
-        raise RuntimeError("unknown move")
+        import httpx
+        raise httpx.HTTPStatusError(
+            "invalid_request",
+            request=httpx.Request("POST", "http://test/calc"),
+            response=httpx.Response(
+                400, json={"error": "invalid_request", "message": "unknown move"}
+            ),
+        )
 
 
 @pytest.mark.asyncio
@@ -142,7 +149,8 @@ async def test_calc_damage_conserva_error_diagnostico_no_lo_convierte_en_cero():
 
     update = await calc_damage(state, FailingCalculator())
 
-    assert update["damage"][0]["error"] == "unknown move"
+    assert update["damage"][0]["error"]["code"] == "invalid_request"
+    assert update["damage"][0]["error"]["status"] == 400
     assert "result" not in update["damage"][0]
 
 
@@ -212,12 +220,32 @@ async def test_request_incluye_gravity_mapeado_a_isGravity():
 
 
 @pytest.mark.asyncio
-async def test_request_incluye_stealth_rock_y_spikes_en_defender_side():
+async def test_request_omit_stealth_rock_y_spikes_en_outgoing_contra_rival_activo():
     calculator = RecordingCalculator()
     battle = _battle(field={"weather": {}, "field_effects": {}, "my_side": {}, "opponent_side": {"STEALTH_ROCK": 3, "SPIKES": 2}})
     await calc_damage({"battle_state": battle}, calculator)
-    assert calculator.requests[0]["field"]["defenderSide"]["isSR"] is True
-    assert calculator.requests[0]["field"]["defenderSide"]["spikes"] == 2
+    defender_side = calculator.requests[0]["field"].get("defenderSide", {})
+    assert "isSR" not in defender_side
+    assert "spikes" not in defender_side
+
+
+@pytest.mark.asyncio
+async def test_request_incluye_hazards_en_switch_incoming():
+    calculator = RecordingCalculator()
+    battle = _battle()
+    battle["opponent"]["pokemon"][0]["moves"] = [{"id": "surf"}]
+    battle["legal_actions"] = [{"kind": "switch", "species": "charizard"}]
+    battle["me"]["pokemon"].append({
+        "species": "charizard", "level": 80, "active": False,
+        "hp_fraction": 1.0, "moves": [], "boosts": {},
+        "item": None, "ability": None, "status": None,
+    })
+    battle["field"]["my_side"] = {"STEALTH_ROCK": 3, "SPIKES": 2}
+    await calc_damage({"battle_state": battle}, calculator)
+    # En incoming, el field se invierte: defenderSide = my_side (con hazards)
+    defender_side = calculator.requests[0]["field"].get("defenderSide", {})
+    assert defender_side["isSR"] is True
+    assert defender_side["spikes"] == 2
 
 
 @pytest.mark.asyncio
@@ -243,28 +271,104 @@ async def test_request_mega_true_usa_forma_post_mega_del_context():
     calculator = RecordingCalculator()
     battle = _battle()
     battle["me"]["pokemon"][0]["species"] = "charizard"
+    battle["me"]["pokemon"][0]["item"] = "charizarditex"
     battle["legal_actions"] = [{"kind": "move", "id": "flareblitz", "mega": True}]
     context = {
-        "own": [{
-            "showdown_id": "charizard",
-            "base_species": "charizard",
-            "forme": None,
-            "types": ["Fire", "Flying"],
-            "abilities": {"0": "Blaze"},
-            "moves": [],
-        }, {
-            "showdown_id": "charizardmegax",
-            "base_species": "charizard",
-            "forme": "Mega-X",
-            "types": ["Fire", "Dragon"],
-            "abilities": {"0": "Tough Claws"},
-            "moves": [],
-        }],
+        "own": [],
         "opponent": [],
+        "mega_forms": {
+            "charizarditex": {
+                "mega_species": "charizardmegax",
+                "mega_ability": "Tough Claws",
+                "mega_evolves": "Charizard",
+            },
+        },
     }
     await calc_damage({"battle_state": battle, "context": context}, calculator)
     assert calculator.requests[0]["attacker"]["species"] == "charizardmegax"
     assert calculator.requests[0]["attacker"]["ability"] == "Tough Claws"
+
+
+@pytest.mark.asyncio
+async def test_request_mega_charizarditey_usa_forma_y():
+    calculator = RecordingCalculator()
+    battle = _battle()
+    battle["me"]["pokemon"][0]["species"] = "charizard"
+    battle["me"]["pokemon"][0]["item"] = "charizarditey"
+    battle["legal_actions"] = [{"kind": "move", "id": "flamethrower", "mega": True}]
+    context = {
+        "own": [],
+        "opponent": [],
+        "mega_forms": {
+            "charizarditey": {
+                "mega_species": "charizardmegay",
+                "mega_ability": "Drought",
+                "mega_evolves": "Charizard",
+            },
+        },
+    }
+    await calc_damage({"battle_state": battle, "context": context}, calculator)
+    assert calculator.requests[0]["attacker"]["species"] == "charizardmegay"
+    assert calculator.requests[0]["attacker"]["ability"] == "Drought"
+
+
+@pytest.mark.asyncio
+async def test_request_mega_venusaurite_forma_unica():
+    calculator = RecordingCalculator()
+    battle = _battle()
+    battle["me"]["pokemon"][0]["species"] = "venusaur"
+    battle["me"]["pokemon"][0]["item"] = "venusaurite"
+    battle["legal_actions"] = [{"kind": "move", "id": "sludgebomb", "mega": True}]
+    context = {
+        "own": [],
+        "opponent": [],
+        "mega_forms": {
+            "venusaurite": {
+                "mega_species": "venusaurmega",
+                "mega_ability": "Thick Fat",
+                "mega_evolves": "Venusaur",
+            },
+        },
+    }
+    await calc_damage({"battle_state": battle, "context": context}, calculator)
+    assert calculator.requests[0]["attacker"]["species"] == "venusaurmega"
+    assert calculator.requests[0]["attacker"]["ability"] == "Thick Fat"
+
+
+@pytest.mark.asyncio
+async def test_request_mega_piedra_equivocada_falla_ruidosamente():
+    battle = _battle()
+    battle["me"]["pokemon"][0]["species"] = "charizard"
+    battle["me"]["pokemon"][0]["item"] = "venusaurite"
+    battle["legal_actions"] = [{"kind": "move", "id": "flareblitz", "mega": True}]
+    context = {
+        "own": [],
+        "opponent": [],
+        "mega_forms": {
+            "venusaurite": {
+                "mega_species": "venusaurmega",
+                "mega_ability": "Thick Fat",
+                "mega_evolves": "Venusaur",
+            },
+        },
+    }
+    with pytest.raises(LookupError, match="megaEvolve"):
+        await calc_damage(
+            {"battle_state": battle, "context": context}, RecordingCalculator()
+        )
+
+
+@pytest.mark.asyncio
+async def test_request_mega_item_no_megastone_falla_ruidosamente():
+    battle = _battle()
+    battle["me"]["pokemon"][0]["species"] = "charizard"
+    battle["me"]["pokemon"][0]["item"] = "leftovers"
+    battle["legal_actions"] = [{"kind": "move", "id": "flareblitz", "mega": True}]
+    context = {"own": [], "opponent": [], "mega_forms": {}}
+    with pytest.raises(LookupError, match="leftovers"):
+        await calc_damage(
+            {"battle_state": battle, "context": context}, RecordingCalculator()
+        )
 
 
 @pytest.mark.asyncio
@@ -297,24 +401,28 @@ async def test_cambio_forzado_usa_possible_moves_sin_presentarlos_como_revelados
 
 @pytest.mark.asyncio
 async def test_request_semanticamente_invalido_queda_diagnosticado_por_accion():
-    calculator = RecordingCalculator()
+    import httpx
     battle = _battle(legal_actions=[
         {"kind": "move", "id": "thunderbolt"},
         {"kind": "move", "id": "absolutelynotreal"},
     ])
-    call_count = 0
 
     class SelectiveCalculator:
         async def calculate(self, request):
-            nonlocal call_count
-            call_count += 1
             if "absolutelynotreal" in request["move"]["name"]:
-                raise RuntimeError("unknown move")
+                raise httpx.HTTPStatusError(
+                    "invalid_request",
+                    request=httpx.Request("POST", "http://test/calc"),
+                    response=httpx.Response(
+                        400, json={"error": "unknown_move", "message": "movimiento inexistente"}
+                    ),
+                )
             return _result([[10, 20]], hp=200)
 
     update = await calc_damage({"battle_state": battle}, SelectiveCalculator())
     assert update["damage"][0].get("result") is not None
-    assert update["damage"][1].get("error") is not None
+    assert update["damage"][1]["error"]["code"] == "unknown_move"
+    assert update["damage"][1]["error"]["status"] == 400
     assert "result" not in update["damage"][1]
 
 
@@ -337,8 +445,101 @@ async def test_calc_infraestructura_no_disponible_propaga_ruidosamente():
 
 
 @pytest.mark.asyncio
+async def test_calc_http_500_propaga_ruidosamente():
+    import httpx
+    battle = _battle()
+
+    class ServerErrorCalculator:
+        async def calculate(self, request):
+            raise httpx.HTTPStatusError(
+                "internal error",
+                request=httpx.Request("POST", "http://test/calc"),
+                response=httpx.Response(500, text="internal"),
+            )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await calc_damage({"battle_state": battle}, ServerErrorCalculator())
+
+
+@pytest.mark.asyncio
+async def test_calc_json_invalido_propaga_ruidosamente():
+    import httpx
+    battle = _battle()
+
+    class JsonErrorCalculator:
+        async def calculate(self, request):
+            raise ValueError("invalid JSON response")
+
+    with pytest.raises(ValueError, match="invalid JSON"):
+        await calc_damage({"battle_state": battle}, JsonErrorCalculator())
+
+
+@pytest.mark.asyncio
+async def test_revealed_y_possible_coinciden_en_union_deduplicada():
+    calculator = RecordingCalculator()
+    battle = _battle()
+    battle["opponent"]["pokemon"][0]["moves"] = [
+        {"id": "surf"},
+    ]
+    battle["legal_actions"] = [{"kind": "switch", "species": "charizard"}]
+    battle["me"]["pokemon"].append({
+        "species": "charizard", "level": 80, "active": False,
+        "hp_fraction": 1.0, "moves": [], "boosts": {},
+        "item": None, "ability": None, "status": None,
+    })
+    context = {
+        "own": [],
+        "opponent": [{
+            "showdown_id": "blastoise",
+            "moves": [
+                {"showdown_id": "surf"},
+                {"showdown_id": "icebeam"},
+                {"showdown_id": "earthquake"},
+            ],
+        }],
+        "mega_forms": {},
+    }
+    update = await calc_damage({"battle_state": battle, "context": context}, calculator)
+    outgoing = [e for e in update["damage"] if e["direction"] == "incoming"]
+    assert outgoing, "canario: el test debe iterar"
+    revealed = [e for e in outgoing if e.get("revealed")]
+    possible = [e for e in outgoing if e.get("possible")]
+    assert len(revealed) == 1
+    assert revealed[0]["move_id"] == "surf"
+    assert {e["move_id"] for e in possible} == {"icebeam", "earthquake"}
+    assert all("possible" not in e for e in revealed)
+    assert all("revealed" not in e for e in possible)
+
+
+@pytest.mark.asyncio
+async def test_rival_hp_fraction_se_envia_al_calc():
+    calculator = RecordingCalculator()
+    battle = _battle()
+    battle["opponent"]["pokemon"][0]["hp_fraction"] = 0.25
+    await calc_damage({"battle_state": battle}, calculator)
+    assert "hpFraction" in calculator.requests[0]["defender"]
+    assert calculator.requests[0]["defender"]["hpFraction"] == 0.25
+
+
+@pytest.mark.asyncio
 async def test_singles_doubles_se_mapea_desde_format():
     calculator = RecordingCalculator()
     battle = _battle(format="gen6doublesou")
     await calc_damage({"battle_state": battle}, calculator)
     assert calculator.requests[0]["field"]["gameType"] == "Doubles"
+
+
+@pytest.mark.asyncio
+async def test_wonder_room_se_mapea_a_isWonderRoom():
+    calculator = RecordingCalculator()
+    battle = _battle(field={"weather": {}, "field_effects": {"WONDER_ROOM": 3}, "my_side": {}, "opponent_side": {}})
+    await calc_damage({"battle_state": battle}, calculator)
+    assert calculator.requests[0]["field"]["isWonderRoom"] is True
+
+
+@pytest.mark.asyncio
+async def test_magic_room_se_mapea_a_isMagicRoom():
+    calculator = RecordingCalculator()
+    battle = _battle(field={"weather": {}, "field_effects": {"MAGIC_ROOM": 3}, "my_side": {}, "opponent_side": {}})
+    await calc_damage({"battle_state": battle}, calculator)
+    assert calculator.requests[0]["field"]["isMagicRoom"] is True

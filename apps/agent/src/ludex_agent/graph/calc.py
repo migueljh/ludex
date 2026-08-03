@@ -53,10 +53,13 @@ _SIDE_BOOL_MAP = {
     "STEALTH_ROCK": "isSR",
     "TAILWIND": "isTailwind",
 }
-# Side conditions con valor numérico (stacks).
+# Side conditions con valor nmerico (stacks).
 _SIDE_INT_MAP = {
     "SPIKES": "spikes",
 }
+# Conditions que son hazards de entrada (solo aplican a switch-in, no a
+# un defensor ya activo en un outgoing request).
+_HAZARD_KEYS = {"STEALTH_ROCK", "SPIKES"}
 
 
 class DamageCalculator(Protocol):
@@ -102,13 +105,7 @@ def _active(side: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _pokemon_descriptor(mon: dict[str, Any]) -> dict[str, Any]:
-    """Construye el descriptor de pokemon para el calc, sin inventar datos.
-
-    Solo se incluyen campos observables conocidos. ability/item/nature/EVs/IVs
-    no revelados se omiten: el calc los asume por defecto si están ausentes.
-    status se normaliza de enum name a string lowercase del calc.
-    curHP se calcula solo cuando se conoce el maxHP (stats propios).
-    """
+    """Construye el descriptor de pokemon para el calc, sin inventar datos."""
     descriptor: dict[str, Any] = {"species": mon["species"]}
     if mon.get("level") is not None:
         descriptor["level"] = mon["level"]
@@ -122,6 +119,9 @@ def _pokemon_descriptor(mon: dict[str, Any]) -> dict[str, Any]:
     boosts = mon.get("boosts")
     if boosts and isinstance(boosts, dict) and any(v for v in boosts.values() if v):
         descriptor["boosts"] = dict(boosts)
+    # HP: si conocemos maxHP (stats propios), materializamos curHP.
+    # Si no (rival sin stats), enviamos hpFraction para que el calc lo
+    # derive internamente. Nunca inventamos un maxHP.
     hp_fraction = mon.get("hp_fraction")
     stats = mon.get("stats")
     if (
@@ -130,13 +130,23 @@ def _pokemon_descriptor(mon: dict[str, Any]) -> dict[str, Any]:
         and isinstance(stats.get("hp"), (int, float))
     ):
         descriptor["curHP"] = round(hp_fraction * stats["hp"])
+    elif hp_fraction is not None:
+        descriptor["hpFraction"] = hp_fraction
     return descriptor
 
 
-def _build_side(raw: dict[str, Any]) -> dict[str, Any]:
-    """Mapea side_conditions de poke-env a flags del Side del calc."""
+def _build_side(raw: dict[str, Any], *, include_hazards: bool) -> dict[str, Any]:
+    """Mapea side_conditions de poke-env a flags del Side del calc.
+
+    Los hazards (Stealth Rock, Spikes) solo se incluyen cuando
+    include_hazards=True (switch-in). En outgoing contra un rival ya
+    activo, los hazards se omiten: el activo ya los recibió al entrar.
+    """
     side: dict[str, Any] = {}
     for key, value in raw.items():
+        is_hazard = key in _HAZARD_KEYS
+        if is_hazard and not include_hazards:
+            continue
         if key in _SIDE_BOOL_MAP:
             side[_SIDE_BOOL_MAP[key]] = True
         elif key in _SIDE_INT_MAP:
@@ -145,8 +155,14 @@ def _build_side(raw: dict[str, Any]) -> dict[str, Any]:
     return side
 
 
-def _build_field(battle: dict[str, Any]) -> dict[str, Any] | None:
-    """Construye field descriptor desde battle_state.field, o None si vacío."""
+def _build_field(
+    battle: dict[str, Any], *, include_hazards: bool
+) -> dict[str, Any] | None:
+    """Construye field descriptor desde battle_state.field.
+
+    include_hazards controla si los hazards de entrada se incluyen en
+    el defenderSide (solo para switch-in, no para rival ya activo).
+    """
     field_raw = battle.get("field", {})
     if not isinstance(field_raw, dict):
         return None
@@ -176,9 +192,17 @@ def _build_field(battle: dict[str, Any]) -> dict[str, Any] | None:
                 break
         if "GRAVITY" in effects:
             field["isGravity"] = True
+        if "WONDER_ROOM" in effects:
+            field["isWonderRoom"] = True
+        if "MAGIC_ROOM" in effects:
+            field["isMagicRoom"] = True
 
-    attacker_side = _build_side(field_raw.get("my_side", {}))
-    defender_side = _build_side(field_raw.get("opponent_side", {}))
+    attacker_side = _build_side(
+        field_raw.get("my_side", {}), include_hazards=include_hazards
+    )
+    defender_side = _build_side(
+        field_raw.get("opponent_side", {}), include_hazards=include_hazards
+    )
     if attacker_side:
         field["attackerSide"] = attacker_side
     if defender_side:
@@ -187,45 +211,49 @@ def _build_field(battle: dict[str, Any]) -> dict[str, Any] | None:
     return field if field else None
 
 
-def _resolve_mega_species(
-    mon: dict[str, Any], context: dict[str, Any] | None, *, side: str
+def _resolve_mega(
+    mon: dict[str, Any], context: dict[str, Any] | None
 ) -> dict[str, Any]:
-    """Si el pokemon tiene una forma Mega disponible en el context, la usa."""
-    if context is None:
-        return _pokemon_descriptor(mon)
-    species = mon.get("species")
-    if not species:
-        return _pokemon_descriptor(mon)
-    own_context = context.get(side, [])
-    mon_entry = next(
-        (p for p in own_context if p.get("showdown_id") == species),
-        None,
-    )
-    if mon_entry is None:
-        return _pokemon_descriptor(mon)
-    base_species = mon_entry.get("base_species") or species
-    mega_entry = next(
-        (
-            p
-            for p in own_context
-            if isinstance(p, dict)
-            and isinstance(p.get("forme"), str)
-            and "Mega" in p["forme"]
-            and (p.get("base_species") or "") == base_species
-            and p.get("showdown_id") != species
-        ),
-        None,
-    )
-    if mega_entry is None:
-        return _pokemon_descriptor(mon)
+    """Resuelve la forma Mega desde context.mega_forms usando el item del activo.
+
+    Si action.mega=True, el item del pokemon activo (observable en
+    battle_state) se busca en context["mega_forms"], que retrieve_context
+    pobló batch desde la tabla items. mega_forms mapea item_id →
+    {mega_species, mega_ability, mega_evolves}. Si no hay item o no es
+    megastone, falla ruidosamente (LookupError).
+    """
+    item = mon.get("item")
+    if not isinstance(item, str) or not item or context is None:
+        raise LookupError("mega solicitada pero no hay item observable")
+
+    mega_forms = context.get("mega_forms", {})
+    if not isinstance(mega_forms, dict):
+        raise LookupError("context.mega_forms inválido")
+
+    mega_info = mega_forms.get(item)
+    if mega_info is None:
+        raise LookupError(f"item no es megastone o no existe para esta gen: {item}")
+
+    mega_species = mega_info.get("mega_species")
+    mega_ability = mega_info.get("mega_ability")
+    mega_evolves = mega_info.get("mega_evolves")
+
+    if not mega_species:
+        raise LookupError(f"resolved megastone sin especie: {item}")
+
+    if mega_evolves and _showdown_id(mega_evolves) != mon.get("species"):
+        raise LookupError("megaEvolve no corresponde a la especie del activo")
+
     descriptor = _pokemon_descriptor(mon)
-    descriptor["species"] = mega_entry["showdown_id"]
-    abilities = mega_entry.get("abilities", {})
-    if isinstance(abilities, dict):
-        primary = abilities.get("0")
-        if primary:
-            descriptor["ability"] = primary
+    descriptor["species"] = mega_species
+    if mega_ability:
+        descriptor["ability"] = mega_ability
     return descriptor
+
+
+def _showdown_id(value: str) -> str:
+    import re
+    return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
 def _request(
@@ -252,7 +280,49 @@ def _remaining_hp(result: CalcResult, fraction: float | None) -> float:
     return maximum * (fraction if fraction is not None else 1)
 
 
-def _rival_possible_moves(context: dict[str, Any] | None, rival_species: str) -> list[str]:
+def _is_calc_error(exc: Exception) -> bool:
+    """True si exc es un error semantico 4xx del calc (httpx.HTTPStatusError
+    con status 400). Falso para 5xx, timeouts, connect errors, JSON invalido,
+    bugs de programacion."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 400
+    return False
+
+
+def _calc_error_entry(exc: httpx.HTTPStatusError) -> dict[str, Any]:
+    """Estructura un error semantico 4xx del calc."""
+    entry: dict[str, Any] = {
+        "kind": "semantic_error",
+        "status": exc.response.status_code,
+    }
+    try:
+        body = exc.response.json()
+        entry["code"] = body.get("error", body.get("code", "invalid_request"))
+        entry["message"] = str(body.get("message", exc.response.text))
+    except Exception:
+        entry["code"] = "invalid_request"
+        entry["message"] = exc.response.text
+    return entry
+
+
+async def _do_calc(
+    calculator: DamageCalculator,
+    request: dict[str, Any],
+) -> CalcResult:
+    """Ejecuta una llamada al calc, propagando todo menos 4xx semantic errors."""
+    try:
+        return await calculator.calculate(request)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 400:
+            raise
+        raise
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError):
+        raise
+
+
+def _rival_possible_moves(
+    context: dict[str, Any] | None, rival_species: str
+) -> list[str]:
     if context is None:
         return []
     for mon in context.get("opponent", []):
@@ -270,8 +340,9 @@ async def calc_damage(
 ) -> dict[str, list[dict[str, Any]]]:
     """Calcula salidas disponibles; un matchup inválido queda diagnosticado.
 
-    Errores de infraestructura (ConnectError, Timeout) PROPAGAN ruidosamente.
-    Errores semánticos de una acción individual quedan diagnosticados por entry.
+    - 4xx semantico: capturado por accion con kind/code/status/message.
+    - 5xx, timeout, RequestError, JSON invalido: propagan ruidosamente.
+    - Errores de programacion (TypeError, etc.): propagan.
     """
     battle = state["battle_state"]
     me = battle.get("me", {})
@@ -284,24 +355,23 @@ async def calc_damage(
 
     gen = battle["gen"]
     context = state.get("context")
-    field = _build_field(battle)
 
     for action in battle.get("legal_actions", []):
         if action.get("kind") == "move":
             is_mega = action.get("mega") is True
             if is_mega:
-                attacker_desc = _resolve_mega_species(
-                    mine, context, side="own"
-                )
+                attacker_desc = _resolve_mega(mine, context)
             else:
                 attacker_desc = _pokemon_descriptor(mine)
             defender_desc = _pokemon_descriptor(rival)
+            # Outgoing: sin hazards en defenderSide (rival ya activo).
+            field = _build_field(battle, include_hazards=False)
             entry: dict[str, Any] = {
                 "action": dict(action),
                 "direction": "outgoing",
             }
             try:
-                result = await calculator.calculate(_request(
+                result = await _do_calc(calculator, _request(
                     gen=gen,
                     attacker=attacker_desc,
                     defender=defender_desc,
@@ -312,10 +382,11 @@ async def calc_damage(
                 entry["remaining_hp"] = _remaining_hp(
                     result, rival.get("hp_fraction")
                 )
-            except (httpx.ConnectError, httpx.TimeoutException) as exc:
-                raise
-            except Exception as exc:
-                entry["error"] = str(exc)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 400:
+                    entry["error"] = _calc_error_entry(exc)
+                else:
+                    raise
             damage.append(entry)
 
         elif action.get("kind") == "switch":
@@ -330,13 +401,15 @@ async def calc_damage(
                 continue
             attacker_desc = _pokemon_descriptor(rival)
             defender_desc = _pokemon_descriptor(candidate)
-            # Incoming: el rival ataca a nuestro candidato.
-            # El field se invierte: attackerSide = opponent_side, defenderSide = my_side.
+            # Incoming: el rival ataca a nuestro candidato que ENTRA.
+            # Hazards SI aplican (switch-in). El field se invierte:
+            # attackerSide = opponent_side, defenderSide = my_side.
+            base_field = _build_field(battle, include_hazards=True)
             incoming_field: dict[str, Any] | None = None
-            if field is not None:
-                incoming_field = dict(field)
-                attacker_side = field.get("defenderSide")
-                defender_side = field.get("attackerSide")
+            if base_field is not None:
+                incoming_field = dict(base_field)
+                attacker_side = base_field.get("defenderSide")
+                defender_side = base_field.get("attackerSide")
                 if attacker_side:
                     incoming_field["attackerSide"] = attacker_side
                 else:
@@ -346,25 +419,40 @@ async def calc_damage(
                 else:
                     incoming_field.pop("defenderSide", None)
 
+            # Union deduplicada: revelados + posibles adicionales.
+            # Revealed conserva categoria revealed; possible adicionales
+            # conservan possible=True.
             rival_moves = [
                 m["id"] for m in rival.get("moves", [])
                 if isinstance(m, dict) and m.get("id")
             ]
             rival_species = rival.get("species", "")
             possible_moves = _rival_possible_moves(context, rival_species)
-            use_possible = not rival_moves and bool(possible_moves)
-            move_ids = possible_moves if use_possible else rival_moves
 
-            for move_id in move_ids:
+            # Union deduplicada: revealed first, then possible not in revealed.
+            seen: set[str] = set()
+            move_entries: list[tuple[str, bool]] = []
+            for move_id in rival_moves:
+                if move_id not in seen:
+                    seen.add(move_id)
+                    move_entries.append((move_id, False))
+            for move_id in possible_moves:
+                if move_id not in seen:
+                    seen.add(move_id)
+                    move_entries.append((move_id, True))
+
+            for move_id, is_possible in move_entries:
                 entry = {
                     "action": dict(action),
                     "direction": "incoming",
                     "move_id": move_id,
                 }
-                if use_possible:
+                if is_possible:
                     entry["possible"] = True
+                else:
+                    entry["revealed"] = True
                 try:
-                    result = await calculator.calculate(_request(
+                    result = await _do_calc(calculator, _request(
                         gen=gen,
                         attacker=attacker_desc,
                         defender=defender_desc,
@@ -373,10 +461,11 @@ async def calc_damage(
                     ))
                     entry["result"] = result
                     entry["defender_max_hp"] = result["defender_hp"]["max"]
-                except (httpx.ConnectError, httpx.TimeoutException) as exc:
-                    raise
-                except Exception as exc:
-                    entry["error"] = str(exc)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code == 400:
+                        entry["error"] = _calc_error_entry(exc)
+                    else:
+                        raise
                 damage.append(entry)
     return {"damage": damage}
 

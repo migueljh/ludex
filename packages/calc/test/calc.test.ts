@@ -442,4 +442,90 @@ describe("runCalc: validacion de entrada", () => {
     });
     expect(r.max_damage).toBeGreaterThan(0);
   });
+
+  it("hpFraction materializa curHP desde la fraccion", () => {
+    const r = runCalc({
+      gen: 6,
+      attacker: { species: "Charizard", level: 50 },
+      defender: { species: "Charizard", level: 50, hpFraction: 0.5 },
+      move: { name: "Flamethrower" },
+    });
+    expect(r.defender_hp.cur).toBe(77);
+    expect(r.defender_hp.max).toBe(153);
+  });
+
+  it("hpFraction de 0.25 en nivel 100 Snorlax", () => {
+    const r = runCalc({
+      gen: 6,
+      attacker: { species: "Charizard", level: 100 },
+      defender: { species: "Snorlax", level: 100, hpFraction: 0.25 },
+      move: { name: "Flamethrower" },
+    });
+    expect(r.defender_hp.cur).toBe(115);
+    expect(r.defender_hp.max).toBe(461);
+  });
+
+  it("curHP explicito prevalece sobre hpFraction", () => {
+    const r = runCalc({
+      gen: 6,
+      attacker: { species: "Charizard", level: 50 },
+      defender: { species: "Charizard", level: 50, curHP: 50, hpFraction: 0.9 },
+      move: { name: "Flamethrower" },
+    });
+    expect(r.defender_hp.cur).toBe(50);
+  });
+
+  it("Wonder Room reduce dano fisico en gen 6", () => {
+    const control = runCalc({
+      gen: 6,
+      attacker: { species: "Machamp", level: 80, ability: "No Guard" },
+      defender: { species: "Blastoise", level: 80 },
+      move: { name: "Close Combat" },
+    });
+    const wonder = runCalc({
+      gen: 6,
+      attacker: { species: "Machamp", level: 80, ability: "No Guard" },
+      defender: { species: "Blastoise", level: 80 },
+      move: { name: "Close Combat" },
+      field: { isWonderRoom: true },
+    });
+    // Wonder Room intercambia Def y SpD: contra un defensor con Def > SpD
+    // (Blastoise Def 120 > SpD 115), el dano fisico baja.
+    expect(wonder.max_damage).toBeLessThan(control.max_damage);
+    expect(wonder.min_damage).toBeLessThan(control.min_damage);
+  });
+
+  it("Magic Room con item Choice Band reduce dano", () => {
+    const withItem = runCalc({
+      gen: 6,
+      attacker: { species: "Machamp", level: 80, ability: "No Guard", item: "Choice Band" },
+      defender: { species: "Blastoise", level: 80 },
+      move: { name: "Close Combat" },
+    });
+    const magicRoom = runCalc({
+      gen: 6,
+      attacker: { species: "Machamp", level: 80, ability: "No Guard", item: "Choice Band" },
+      defender: { species: "Blastoise", level: 80 },
+      move: { name: "Close Combat" },
+      field: { isMagicRoom: true },
+    });
+    expect(magicRoom.max_damage).toBeLessThan(withItem.min_damage);
+  });
+
+  it("Wonder Room y Magic Room se rechazan antes de gen 5", () => {
+    // Garchomp es gen 4: especie valida en gen 4 pero no antes.
+    expectError({
+      ...valid,
+      field: { isWonderRoom: true },
+      gen: 4,
+    }, "invalid_request", /isWonderRoom.*gen 4/);
+    // Usamos Snorlax (gen 1+) para que la especie exista en gen 3 tambien.
+    expectError({
+      gen: 3,
+      attacker: { species: "Snorlax" },
+      defender: { species: "Snorlax" },
+      move: { name: "Earthquake" },
+      field: { isMagicRoom: true },
+    }, "invalid_request", /isMagicRoom.*gen 3/);
+  });
 });

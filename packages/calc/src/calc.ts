@@ -96,6 +96,11 @@ export interface PokemonDescriptor {
   status?: StatusCondition;
   boosts?: Partial<Record<StatName, number>>;
   curHP?: number;
+  /** Fracción 0.0–1.0 del HP actual. Se usa cuando el caller no conoce
+   * maxHP pero sí la fracción: el servidor deriva maxHP desde la
+   * especie/nivel y materializa curHP antes de construir el Pokemon.
+   * Si curHP está presente, prevalece sobre hpFraction. */
+  hpFraction?: number;
   gender?: "M" | "F" | "N";
 }
 
@@ -111,6 +116,8 @@ export interface FieldDescriptor {
   weather?: (typeof WEATHERS)[number];
   terrain?: (typeof TERRAINS)[number];
   isGravity?: boolean;
+  isWonderRoom?: boolean;
+  isMagicRoom?: boolean;
   attackerSide?: SideDescriptor;
   defenderSide?: SideDescriptor;
 }
@@ -197,7 +204,7 @@ function buildPokemon(
   side: "attacker" | "defender",
 ): Pokemon {
   if (!isObj(raw)) fail("invalid_request", `${side} es requerido y debe ser un objeto`);
-  checkKeys(raw, ["species", "level", "nature", "evs", "ivs", "ability", "item", "status", "boosts", "curHP", "gender"], side);
+  checkKeys(raw, ["species", "level", "nature", "evs", "ivs", "ability", "item", "status", "boosts", "curHP", "hpFraction", "gender"], side);
 
   const speciesName = optString(raw.species, `${side}.species`);
   if (speciesName === undefined) fail("invalid_request", `${side}.species es requerido`);
@@ -244,11 +251,22 @@ function buildPokemon(
     fail("invalid_request", `${side}.gender debe ser 'M', 'F' o 'N'`);
   }
 
-  if (raw.curHP !== undefined && (typeof raw.curHP !== "number" || !Number.isFinite(raw.curHP) || raw.curHP < 0)) {
+if (raw.curHP !== undefined && (typeof raw.curHP !== "number" || !Number.isFinite(raw.curHP) || raw.curHP < 0)) {
     fail("invalid_request", `${side}.curHP debe ser un numero >= 0`);
   }
 
-  return new Pokemon(gen, species.name, {
+  // hpFraction: cuando el caller no conoce maxHP pero sí la fracción actual.
+  // Validamos que esté en [0, 1]; la materialización a curHP se hace después
+  // de crear el Pokemon, ya que maxHP depende de especie/nivel/nature/IVs.
+  let hpFraction: number | undefined;
+  if (raw.hpFraction !== undefined) {
+    if (typeof raw.hpFraction !== "number" || !Number.isFinite(raw.hpFraction) || raw.hpFraction < 0 || raw.hpFraction > 1) {
+      fail("invalid_request", `${side}.hpFraction debe ser un numero entre 0 y 1`);
+    }
+    hpFraction = raw.hpFraction;
+  }
+
+  const pokemon = new Pokemon(gen, species.name, {
     level,
     nature: nature?.name,
     evs: checkStatTable(raw.evs, `${side}.evs`, "evs"),
@@ -260,6 +278,18 @@ function buildPokemon(
     curHP: raw.curHP as number | undefined,
     gender: gender as PokemonDescriptor["gender"],
   });
+
+  // Materializar curHP desde hpFraction cuando curHP no se proveyó.
+  if (raw.curHP === undefined && hpFraction !== undefined) {
+    const maxHP = pokemon.maxHP();
+    if (maxHP > 0) {
+      const cur = Math.round(maxHP * hpFraction);
+      // curHP es un método que lee originalCurHP internamente.
+      (pokemon as any).originalCurHP = cur;
+    }
+  }
+
+  return pokemon;
 }
 
 function buildMove(gen: ReturnType<typeof Generations.get>, genNum: number, raw: unknown): Move {
@@ -294,7 +324,7 @@ function buildSide(raw: unknown, path: string): SideDescriptor | undefined {
 function buildField(raw: unknown, genNum: number): Field | undefined {
   if (raw === undefined) return undefined;
   if (!isObj(raw)) fail("invalid_request", "field debe ser un objeto");
-  checkKeys(raw, ["gameType", "weather", "terrain", "isGravity", "attackerSide", "defenderSide"], "field");
+  checkKeys(raw, ["gameType", "weather", "terrain", "isGravity", "isWonderRoom", "isMagicRoom", "attackerSide", "defenderSide"], "field");
 
   const gameType = optString(raw.gameType, "field.gameType");
   if (gameType !== undefined && !(GAME_TYPES as readonly string[]).includes(gameType)) {
@@ -324,11 +354,22 @@ function buildField(raw: unknown, genNum: number): Field | undefined {
 
   // Partial<State.Field> es el tipo exacto del constructor del paquete; los
   // strings ya pasaron la validacion contra su dominio.
+  const isWonderRoom = optBool(raw.isWonderRoom, "field.isWonderRoom");
+  const isMagicRoom = optBool(raw.isMagicRoom, "field.isMagicRoom");
+  // Wonder Room y Magic Room existen desde gen 5. Antes de eso el paquete
+  // los ignora en silencio (medido), asi que el contrato los rechaza
+  // para no devolver "sin efecto" disfrazado de "con efecto".
+  if ((isWonderRoom || isMagicRoom) && genNum < 5) {
+    fail("invalid_request",
+      `field.isWonderRoom/isMagicRoom no aplica en gen ${genNum}: el paquete ignora estas mechanics antes de gen 5`);
+  }
   const options: Partial<State.Field> = {
     gameType: gameType as State.Field["gameType"],
     weather: weather as State.Field["weather"],
     terrain: terrain as State.Field["terrain"],
     isGravity: optBool(raw.isGravity, "field.isGravity"),
+    isWonderRoom,
+    isMagicRoom,
     attackerSide: buildSide(raw.attackerSide, "field.attackerSide") as State.Side,
     defenderSide: buildSide(raw.defenderSide, "field.defenderSide") as State.Side,
   };
