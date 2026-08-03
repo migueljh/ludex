@@ -130,6 +130,23 @@ export interface CalcRequest {
   field?: FieldDescriptor;
 }
 
+/** Valores efectivos que @smogon/calc realmente uso al resolver el Pokemon,
+ * con sus defaults aplicados. El caller distingue observado vs asumido
+ * comparando contra lo que envio (ver D35). */
+export interface EffectivePokemon {
+  species: string;
+  level: number;
+  nature: string | null;
+  ability: string | null;
+  item: string | null;
+  evs: Partial<Record<StatName, number>>;
+  ivs: Partial<Record<StatName, number>>;
+  boosts: Partial<Record<StatName, number>>;
+  status: string;
+  curHP: number;
+  gender: string;
+}
+
 export interface CalcResponse {
   /** Un array de rolls por golpe: [[16 rolls]] normal, [[50]] daño fijo, [[0]] sin efecto, N arrays si multi-golpe. */
   damage_rolls: number[][];
@@ -142,6 +159,8 @@ export interface CalcResponse {
   ko_chance: { chance: number | undefined; n: number; text: string } | null;
   description: string;
   defender_hp: { cur: number; max: number };
+  /** Los valores efectivos (con defaults de calc) usados por lado. */
+  effective: { attacker: EffectivePokemon; defender: EffectivePokemon };
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
@@ -380,6 +399,22 @@ function buildField(raw: unknown, genNum: number): Field | undefined {
 const percent = (damage: number, maxHP: number): number =>
   maxHP <= 0 ? 0 : Math.floor((damage / maxHP) * 1000) / 10;
 
+function effectivePokemon(p: Pokemon): EffectivePokemon {
+  return {
+    species: p.species.name,
+    level: p.level,
+    nature: p.nature || null,
+    ability: p.ability || null,
+    item: p.item || null,
+    evs: { ...p.evs },
+    ivs: { ...p.ivs },
+    boosts: { ...p.boosts },
+    status: p.status || "",
+    curHP: p.curHP(),
+    gender: p.gender || "M",
+  };
+}
+
 export function runCalc(request: unknown): CalcResponse {
   if (!isObj(request)) fail("invalid_request", "el body debe ser un objeto {gen, attacker, defender, move, field?}");
   checkKeys(request, ["gen", "attacker", "defender", "move", "field"], "body");
@@ -397,9 +432,10 @@ export function runCalc(request: unknown): CalcResponse {
   // como 400 con el mensaje del paquete. Los TypeError son bugs (del paquete o
   // nuestros) y siguen yendo al 500 del server, logueados.
   let result: ReturnType<typeof calculate>;
+  let attacker: Pokemon;
   let defender: Pokemon;
   try {
-    const attacker = buildPokemon(gen, genNum, request.attacker, "attacker");
+    attacker = buildPokemon(gen, genNum, request.attacker, "attacker");
     defender = buildPokemon(gen, genNum, request.defender, "defender");
     const move = buildMove(gen, genNum, request.move);
     const field = buildField(request.field, genNum);
@@ -450,5 +486,6 @@ export function runCalc(request: unknown): CalcResponse {
     ko_chance: koChance,
     description,
     defender_hp: { cur: defender.curHP(), max: maxHP },
+    effective: { attacker: effectivePokemon(attacker), defender: effectivePokemon(defender) },
   };
 }

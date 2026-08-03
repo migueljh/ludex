@@ -529,3 +529,63 @@ describe("runCalc: validacion de entrada", () => {
     }, "invalid_request", /isMagicRoom.*gen 3/);
   });
 });
+
+describe("runCalc: valores efectivos y defaults asumidos (D35)", () => {
+  it("omisiones exponen los defaults que calc uso", () => {
+    const r = runCalc({
+      gen: 6,
+      attacker: { species: "Charizard" },
+      defender: { species: "Blastoise" },
+      move: { name: "Flamethrower" },
+    });
+    // level/nature/ability/evs/ivs omitidos -> defaults de calc (medido):
+    // level 100, nature Serious, ability primera de la especie, evs 0, ivs 31.
+    expect(r.effective.attacker).toMatchObject({
+      species: "Charizard",
+      level: 100,
+      nature: "Serious",
+      ability: "Blaze",
+      item: null,
+      evs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
+      ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
+      boosts: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
+      status: "",
+      gender: "M",
+    });
+    // Blastoise: ability primaria Torrent, maxHP 299 a nivel 100 (medido).
+    expect(r.effective.defender).toMatchObject({
+      species: "Blastoise",
+      level: 100,
+      ability: "Torrent",
+      item: null,
+      curHP: 299,
+    });
+  });
+
+  it("campos provistos se reflejan en effective sin default", () => {
+    const r = runCalc({
+      gen: 6,
+      attacker: { species: "Machamp", level: 80, ability: "No Guard", nature: "Adamant", evs: { atk: 252 }, item: "Choice Band" },
+      defender: { species: "Blastoise", level: 80 },
+      move: { name: "Close Combat" },
+    });
+    expect(r.effective.attacker).toMatchObject({
+      level: 80,
+      ability: "No Guard",
+      nature: "Adamant",
+      evs: { atk: 252 },
+      item: "Choice Band",
+    });
+  });
+
+  it("hpFraction se materializa en effective.defender.curHP", () => {
+    const r = runCalc({
+      gen: 6,
+      attacker: { species: "Pikachu", level: 80 },
+      defender: { species: "Blastoise", level: 80, hpFraction: 0.5 },
+      move: { name: "Thunderbolt" },
+    });
+    expect(r.effective.defender.curHP).toBe(121); // round(241 * 0.5)
+    expect(r.defender_hp.cur).toBe(121);
+  });
+});
