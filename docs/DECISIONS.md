@@ -1864,18 +1864,36 @@ paralelas al patrón ya existente de `types`/`ability`/`moves`:
 
 - **`unknown_pp_moves`** (`set[str]` de `move_id`): permanente, como
   `ability`. `register_move` la puebla cuando `pressure_on_us()` es
-  verdadero. Al principio de **cada** llamada a `project_observable_state`
-  (antes de procesar cualquier línea nueva del frame), se reaplica `pp =
-  None` sobre todo movimiento cuyo `id` esté marcado, sin importar qué
-  número traiga el snapshot fresco. Sobrevive cualquier cantidad de
-  switches ordinarios: `switch_out` nunca la toca.
+  verdadero **y el pokémon no está transformado en ese instante**. Sobrevive
+  cualquier cantidad de switches ordinarios: `switch_out` nunca la toca.
 - **`transform_unknown_pp_moves`**: temporal, como `types`/`moves` de un
-  Transform. Si el pokémon está transformado en el momento de marcar
-  (detectado por `"moves" in entry`, la misma señal que ya usa
-  `switch_out` para saber si hay un Transform activo), la marca va acá en
-  vez de en `unknown_pp_moves`, y `switch_out` la descarta junto con el
-  moveset copiado — para que un Transform posterior sobre un objetivo
-  distinto no herede una marca que no le corresponde.
+  Transform. Si el pokémon está transformado al marcar (detectado por
+  `"moves" in entry`, la misma señal que ya usa `switch_out` para saber si
+  hay un Transform activo), la marca va acá en vez de en
+  `unknown_pp_moves`, y `switch_out` la descarta junto con el moveset
+  copiado — para que un Transform posterior sobre un objetivo distinto no
+  herede una marca que no le corresponde.
+
+Al principio de **cada** llamada a `project_observable_state` (antes de
+procesar cualquier línea nueva del frame), se reaplica `pp = None` sobre
+los movimientos marcados, sin importar qué número traiga el snapshot
+fresco.
+
+**Corrección R1 (LINEAR_VERDICT MON-18, blocker L-01): las dos marcas son
+MUTUAMENTE EXCLUYENTES en la reaplicación, nunca se unen.** La entrega
+original unía `unknown_pp_moves | transform_unknown_pp_moves` sin condición.
+Tasos/Latwan reprodujeron el defecto: mientras `"moves" in entry` indica
+Transform activo, el moveset **visible** en `mon["moves"]` es el COPIADO,
+no el base — una marca permanente del base (de antes de transformarse)
+nombra un `move_id` que puede coincidir por casualidad con el copiado
+(mismo movimiento, p.ej. Scald, en el pokémon base y en el objetivo
+copiado), pero son instancias de PP **distintas**. Unir las dos marcas
+forzaba `pp=None` en un Scald recién copiado con PP real `5/5`. La
+reaplicación ahora es exclusiva: con `"moves" in entry` (Transform activo)
+sólo gobierna `transform_unknown_pp_moves`; sin Transform activo, sólo
+`unknown_pp_moves`. Al terminar el Transform (`switch_out` restaura el
+moveset base y descarta la marca temporal), la marca permanente vuelve a
+gobernar sobre el moveset base restaurado.
 
 **Aislamiento.** Por construcción: `persistent_state` ya está indexado por
 identidad canónica (`base_species`), así que dos rivales distintos con el
@@ -1888,16 +1906,31 @@ una property que siempre deriva del dex (`move.py:471-481`), nunca vuelve
 se tocó — el fix es enteramente interno a `project_observable_state`
 (reaplicación) y `register_move` (marca), ambos en `protocol.py`.
 
-**Verificado.** 5 tests nuevos en `test_protocol.py`: reaplicación con
-snapshot fresco e independiente (no encadenado) entre dos llamadas;
-persistencia a través de switch-out y switch-in ordinarios; aislamiento
-entre dos rivales con el mismo `move_id`; marca temporal de un Transform
-descartada al terminar y sin fuga a un Transform posterior distinto; y el
-contrapeso negativo — sin compartir el mismo `persistent_state` por
-`battle_tag` entre llamadas (como si el caller no reusara
-`self._temporary_state[tag]`), la marca se pierde y el PP numérico del
-snapshot fresco queda sin corregir, confirmando que la corrección depende
-de verdad de esa reutilización. Mutación: se retiró la reaplicación,
-2 de los 5 tests nuevos fallaron exactamente en la aserción de PP
-esperado; restaurada, vuelven a pasar junto con el resto de
-`test_protocol.py`/`test_client.py` (203/203).
+**Verificado.** 8 tests en `test_protocol.py` — todos con un snapshot
+fresco e independiente construido a mano por decisión (nunca la salida de
+la llamada anterior encadenada; R1 blocker L-02 encontró que la entrega
+original sí encadenaba en el test de Transform, contra lo que afirmaba el
+REVIEW PACKET, y fue reescrito): reaplicación con snapshot fresco entre dos
+llamadas; persistencia a través de switch-out y switch-in ordinarios;
+aislamiento entre dos rivales con el mismo `move_id`; marca temporal de un
+Transform descartada al terminar y sin fuga a un Transform posterior
+distinto; el contrapeso negativo — sin compartir el mismo
+`persistent_state` por `battle_tag`, la marca se pierde; la regresión
+exacta de L-01 — un Scald base marcado permanentemente no contamina un
+Scald copiado por Transform, y el Scald base vuelve a `null` al terminar el
+Transform; y el canario de orden (L-02) — un Transform en la misma llamada
+que trae un snapshot fresco numérico guarda en `persistent_state` el
+moveset base **ya corregido** a `null`, no el número crudo (mover la
+reaplicación después del loop de líneas lo pone rojo). Más 1 test en
+`test_client.py` que atraviesa dos resoluciones reales del mismo
+`battle_tag` vía `choose_move` y espía `project_observable_state` (sin
+tocar `client.py` productivo) para confirmar identidad (`is`) del mismo
+objeto `persistent_state` en ambas — falla si el caller dejara de reusar
+`self._temporary_state.setdefault(tag, {})`.
+
+Mutaciones dirigidas a los tres blockers de R1: unir las marcas sin
+condición (L-01), mover la reaplicación después del loop de líneas (L-02) y
+reemplazar `persistent_state` por un dict nuevo en `client.py` (L-03) — las
+tres, aplicadas y restauradas por separado, ponen rojo exactamente el test
+que cada una debía romper. Restauradas: 206/206 en
+`test_protocol.py`/`test_client.py`.

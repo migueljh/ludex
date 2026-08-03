@@ -740,6 +740,14 @@ def project_observable_state(
     cualquier cantidad de switches (como `ability`); `transform_unknown_pp_
     moves` es tan temporal como el moveset copiado y se descarta junto con
     el en `switch_out`, para no filtrarse a un Transform distinto.
+
+    Las dos marcas son MUTUAMENTE EXCLUYENTES en la reaplicacion, nunca se
+    unen (LINEAR_VERDICT MON-18 R1, L-01): mientras `"moves" in entry`
+    indique un Transform activo, el moveset VISIBLE es el copiado, no el
+    base, asi que solo `transform_unknown_pp_moves` puede gobernarlo -- una
+    marca permanente del base nombra un `move_id` que puede coincidir por
+    casualidad con el copiado, pero son instancias de PP distintas. Sin
+    Transform activo, solo `unknown_pp_moves` gobierna.
     """
     persistent_state = {} if persistent_state is None else persistent_state
     projected = {
@@ -1283,13 +1291,24 @@ def project_observable_state(
     # ANTES de procesar ninguna linea nueva de este frame, para que un uso
     # real dentro de esta misma llamada (`register_move`) pueda seguir
     # recalculando sobre la base correcta.
+    #
+    # `"moves" in entry` es la MISMA senal que ya usa `switch_out` para
+    # saber si hay un Transform activo ahora mismo: cuando existe, el
+    # moveset VISIBLE en `mon["moves"]` es el COPIADO, no el base, y una
+    # marca permanente del base (de antes del Transform) nombra un `move_id`
+    # que puede coincidir por casualidad con el copiado -- son instancias
+    # de PP distintas (LINEAR_VERDICT MON-18 R1, L-01). Mientras el
+    # Transform siga activo, solo se reaplica `transform_unknown_pp_moves`;
+    # sin Transform activo, solo `unknown_pp_moves` gobierna.
     for mon in team:
         identidad = canon(normalize_id(mon.get("species") or ""))
         entry = persistent_state.get(identidad)
         if not entry:
             continue
-        desconocidos = set(entry.get("unknown_pp_moves") or ()) | \
-            set(entry.get("transform_unknown_pp_moves") or ())
+        if "moves" in entry:
+            desconocidos = entry.get("transform_unknown_pp_moves") or ()
+        else:
+            desconocidos = entry.get("unknown_pp_moves") or ()
         if not desconocidos:
             continue
         for move in mon["moves"]:
