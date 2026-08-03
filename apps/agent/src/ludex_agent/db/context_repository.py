@@ -73,6 +73,23 @@ _MOVES_CONTEXT = text("""
     ORDER BY m.showdown_id
 """)
 
+_MEGA_FORMS = text("""
+    SELECT
+      i.showdown_id AS item_id,
+      i.properties->>'megaStone' AS mega_stone,
+      i.properties->>'megaEvolves' AS mega_evolves,
+      p.showdown_id AS mega_species,
+      p.abilities AS mega_abilities
+    FROM items i
+    LEFT JOIN pokemon p
+      ON p.gen_id = i.gen_id
+     AND p.showdown_id = lower(regexp_replace(
+           i.properties->>'megaStone', '[^A-Za-z0-9]', '', 'g'))
+    WHERE i.gen_id = :gen_id
+      AND i.showdown_id = ANY(CAST(:item_ids AS text[]))
+      AND i.properties ? 'megaStone'
+""")
+
 
 def _standalone_move(row: Any) -> dict[str, object]:
     return {
@@ -380,3 +397,68 @@ class PostgresContextRepository:
             move_id: by_id[move_id]
             for move_id in requested
         }
+
+    async def load_mega_forms(
+        self,
+        *,
+        gen_number: int,
+        item_ids: tuple[str, ...],
+    ) -> dict[str, dict[str, object]]:
+        """Resuelve batch de megastones a formas Mega, generation-scoped.
+
+        Para cada item_id (observable en battle_state), consulta la tabla
+        ``items`` por ``properties.megaStone`` y ``properties.megaEvolves``,
+        normaliza el megaStone a showdown_id del pokemon Mega, y consulta la
+        tabla ``pokemon`` por la abilities de esa Mega. Batch: una sola query
+        (join items + pokemon). Si un item no es megastone o la forma Mega no
+        existe para esa gen, simplemente no se incluye (quien llama puede
+        ruidosamente fallar si esperaba una resolución y no la hay).
+        """
+        requested = tuple(dict.fromkeys(item_ids))
+        if not requested:
+            return {}
+
+        factory = self._ensure_factory()
+        async with factory() as session:
+            generation = (
+                await session.execute(
+                    _GENERATION,
+                    {"gen_number": gen_number},
+                )
+            ).mappings().one_or_none()
+            if generation is None:
+                raise LookupError(f"generación no seedeada: {gen_number}")
+
+            rows = (
+                await session.execute(
+                    _MEGA_FORMS,
+                    {
+                        "gen_id": generation["id"],
+                        "item_ids": list(requested),
+                        "mega_species_id": "",
+                    },
+                )
+            ).mappings().all()
+
+        mega_by_item: dict[str, dict[str, object]] = {}
+        for row in rows:
+            mega_stone_name = row["mega_stone"]
+            if not isinstance(mega_stone_name, str):
+                continue
+            mega_species_id = row["mega_species"]
+            if not isinstance(mega_species_id, str) or not mega_species_id:
+                continue
+            abilities = row["mega_abilities"]
+            mega_by_item[row["item_id"]] = {
+                "mega_species": mega_species_id,
+                "mega_ability": (
+                    dict(abilities).get("0")
+                    if isinstance(abilities, dict)
+                    else None
+                ),
+                "mega_evolves": _showdown_id(row["mega_evolves"])
+                    if isinstance(row["mega_evolves"], str)
+                    else None,
+            }
+
+        return mega_by_item

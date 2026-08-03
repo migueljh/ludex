@@ -25,6 +25,13 @@ class ContextRepository(Protocol):
         move_ids: tuple[str, ...],
     ) -> dict[str, dict[str, object]]: ...
 
+    async def load_mega_forms(
+        self,
+        *,
+        gen_number: int,
+        item_ids: tuple[str, ...],
+    ) -> dict[str, dict[str, object]]: ...
+
 
 def _side_pokemon(side: object) -> list[dict[str, Any]]:
     if not isinstance(side, dict):
@@ -259,12 +266,30 @@ async def retrieve_context(
             "movimientos observados no seedeados: "
             + ", ".join(missing)
         )
+
+    # Resolver megastones: recoger items visibles del lado propio y
+    # rival, batch consultar la tabla items para obtener la forma Mega
+    # y su ability. El resultado entra en el contexto rico para que
+    # calc_damage lo use sin queries adicionales (D32 reserva context
+    # para calc).
+    mega_item_ids: list[str] = []
+    for side_name in ("me", "opponent"):
+        for mon in _side_pokemon(battle.get(side_name)):
+            item = mon.get("item")
+            if isinstance(item, str) and item:
+                mega_item_ids.append(item)
+    mega_forms = await repository.load_mega_forms(
+        gen_number=gen_number,
+        item_ids=tuple(mega_item_ids),
+    ) if mega_item_ids else {}
+
     context = {
         **battle_context,
         "observed_moves": {
             move_id: deepcopy(observed_moves[move_id])
             for move_id in observed_ids
         },
+        "mega_forms": mega_forms,
     }
     return {
         "context": context,

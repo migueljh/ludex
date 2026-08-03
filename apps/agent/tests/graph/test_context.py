@@ -343,6 +343,7 @@ async def test_retrieve_context_excluye_rival_no_revelado():
     assert result["context"] == {
         **battle_context,
         "observed_moves": {},
+        "mega_forms": {},
     }
     assert result["prompt_context"]["own"] == [{
         "species": "pikachu",

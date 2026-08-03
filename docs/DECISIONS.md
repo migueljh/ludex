@@ -1627,3 +1627,107 @@ se cambia `BattleRepository`; la PK `(trajectory_id, decision_index)` y el
 `finalize` existente son correctos porque ningún intento rechazado llega a esa
 tabla. Los tests controlados de Shadow Tag y `move 99` verifican protocolo,
 índices contiguos y reward sólo sobre filas resueltas.
+
+## D35 — el adaptador calc distingue observado/asumido, acota possible_moves y clasifica errores
+
+**Contexto.** F2-07 lleva el contexto observable de la batalla a `packages/calc`
+(servicio Node con `@smogon/calc@0.11.0`, D16). La primera entrega mapeó clima,
+terreno, pantallas, boosts, status, HP, Mega y hazards en la dirección general
+correcta, pero la revisión encontró cuatro huecos: (1) los defaults que calc
+aplica a campos omitidos se presentaban como datos ciertos; (2) los
+`possible_moves` del learnset del rival se calculaban todos secuencialmente sin
+medir costo ni reducir; (3) el error 400 se capturaba con un `except Exception`
+que absorbía JSON/shape inválido como si fuera semántico; y (4) los oráculos de
+integración construían `_request` a mano y reenviaban el mismo request, en vez
+de atravesar `calc_damage` con valores exactos.
+
+**Defaults expuestos, no ocultos.** `@smogon/calc` resuelve con defaults todo
+lo que el request omita (inspeccionado en el constructor de `Pokemon` del
+paquete): `level→100`, `nature→Serious`, `ability→abilities[0]` de la especie,
+`evs→0` (gen ≥ 3, 252 antes), `ivs→31`, `boosts→0`, `gender→M`, `status→""`,
+`item→null`, `curHP→maxHP`. El servicio ahora devuelve `effective.attacker` y
+`effective.defender` con esos valores efectivos; Python los compara contra lo
+que envió y clasifica cada matchup en `observed` (lo que la batalla expuso),
+`unknown` (lo que no expuso) y `assumed` (los defaults efectivos de calc). El
+fallback de movimiento no declara "KO garantizado" (`min_damage >= remaining`)
+si el resultado depende de ability/item/nature/EVs/IVs asumidos: bajo
+supuestos rankea por valor esperado, nunca como certeza. El fallback de switch
+es un minimax relativo sobre fracciones esperadas y expone las mismas
+`assumptions` por entry; no afirma certeza.
+
+**`possible_moves` acotado y medido.** El learnset del rival es un candidato,
+no evidencia (D31/D32). La unión revelados+posibles deduplica con revealed
+ganando y conserva procedencia (`revealed`/`possible`). Entre los posibles se
+excluye únicamente `category=status` (no calculan daño); el descriptor completo
+de cada posible —categoría incluida— viaja en el entry. Los matchups se
+calculan con concurrencia acotada (`asyncio.Semaphore(8)`) y orden
+determinista (`asyncio.gather` preserva el orden; los learnsets llegan
+ordenados por `showdown_id` desde la base). Después del cálculo se reduce por
+candidato a los top-3 posibles por daño máximo, preservando todos los
+revelados y los diagnósticos. `damage_metrics` reporta calls, bytes y latencia
+en mediana/p90/p99/máximo. `damage_metrics` se declara en el contrato
+`GraphState` y sobrevive al workflow productivo
+(`build_decision_graph(...).ainvoke` la conserva en la salida; StateGraph
+descarta los canales no declarados). No amplía persistencia. El
+`Semaphore(8)` tiene regresión propia: un fake bloqueante con 12 requests
+demuestra `max_in_flight == 8`, y con latencias invertidas (el que empieza
+tarde termina primero) se demuestra que el orden de salida sigue siendo el de
+entrada. Canario real sobre la base: Blastoise Gen 6 trae
+102 movimientos (29 status) → 73 requests no-status, y el máximo de latencia
+medido cabe holgado en el presupuesto de decisión de 240 s (D26): no se
+necesitó endpoint batch.
+
+**Taxonomía de errores.** El servicio responde `{"error":{"code":string,
+"message":string}}` (schema medido). Sólo un HTTP 400 con JSON y shape válidos
+se captura por acción (`CalcSemanticError` con `kind/code/status/message`).
+JSON inválido, shape inválido, 5xx, timeout, `RequestError` y errores de
+programación propagan (como `CalcProtocolError` u original). No queda
+`except Exception` amplio. El camino se prueba con `CalcClient` contra el
+servidor real y contra un stub HTTP real para los 400 malformados.
+
+**El HTTP 200 también se valida contra el shape completo.** El 200 no se
+acepta sólo por parsear JSON: `CalcClient` valida contra `CalcResponse`
+(calc.ts) los campos productivos (`damage_rolls`, `min/max_damage`,
+`min/max_percent`, `ko_chance`, `description`, `defender_hp`) y
+`effective.attacker/defender` con sus sub-campos. Un 200 con JSON válido pero
+shape ausente, parcial o con tipos inválidos propaga `CalcProtocolError` y
+nunca llega a `_attach_assumptions` (una respuesta parcial podía fabricar
+assumptions vacías y volver a habilitar certeza falsa). El contrato se
+rechaza en la frontera pública `CalcClient.calculate`, no en helpers
+internos. Precisión final medida contra `EffectivePokemon` (calc.ts):
+`nature`, `ability` e `item` aceptan `string|null` (el server emite `|| null`);
+`status` y `gender` son `string` obligatorios (el server emite `|| ""` y
+`|| "M"`), y `null` produce `CalcProtocolError`. `ko_chance.chance` es
+opcional —el server serializa `chance: number | undefined` y omite
+`undefined`— pero presente debe ser numérico: `chance=null` produce
+`CalcProtocolError`. Las únicas claves válidas de `evs`/`ivs`/`boosts` son
+`hp, atk, def, spa, spd, spe` (`STATS` de calc.ts); una clave ajena produce
+`CalcProtocolError`, conservando la validación de valores numéricos. Stubs
+HTTP de regresión cubren `effective` ausente y malformado, `status`/`gender`
+null, `chance` null, claves de stats ajenas, campos productivos faltantes y
+tipos inválidos, para attacker y defender.
+
+**Mega por el camino completo.** `retrieve_context` recopila los items visibles
+y `ContextRepository.load_mega_forms` resuelve en batch `items.megaStone`/
+`megaEvolves` → fila `pokemon` de la forma Mega, generation-scoped (D2/D32).
+`calc_damage` usa el item del activo; si `megaEvolves` no corresponde a la
+especie, el item no es megastone o la forma no existe para esa gen →
+`LookupError` ruidoso, nunca degradación a la forma base. Charizardite X/Y,
+Venusaur, piedra equivocada, item no-Mega y frontera de generación (gen 9 no
+tiene megas) están cubiertos por tests que atraviesan
+`retrieve_context → load_mega_forms → calc_damage`.
+
+**Hazards solo en switch-in.** Los hazards de entrada (`STEALTH_ROCK`, `SPIKES`)
+van en `defenderSide` únicamente para el candidato que entra (incoming); contra
+el rival ya activo (outgoing) se omiten, porque el activo ya los recibió al
+entrar y el paquete los descuenta del `ko_chance`. Verificado con el oráculo:
+Surf vs Charizard a 0.8 HP pasa de "guaranteed 2HKO" a "guaranteed OHKO after
+Stealth Rock" sólo en el switch-in.
+
+**Alcance y límites.** No se reimplementa la fórmula de daño en Python (D16).
+La taxonomía de errores distingue el 400 semántico del fallo de protocolo pero
+no subclasifica los 5xx (son infraestructura, punto). `possible_moves` reporta
+bytes del request, no de la respuesta. Los oráculos de integración dependen de
+que `packages/calc@0.11.0` no cambie los valores pineados (el canario los
+refija). D33/D34 quedan integrados por merge aditivo de
+`integration/phase-2-accepted`; D36/MON-10 no se toca.
