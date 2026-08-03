@@ -1648,22 +1648,34 @@ def test_pp_desconocido_de_un_transform_es_temporal_y_no_se_filtra_a_otro():
     """Un movimiento copiado por Transform con PP desconocido por Pressure
     necesita una marca SEPARADA y descartable: no puede quedar pegada a la
     identidad base (Ditto) para siempre, ni filtrarse a un Transform
-    DISTINTO que despues copie un movimiento con el mismo id."""
+    DISTINTO que despues copie un movimiento con el mismo id.
+
+    Reescrito tras LINEAR_VERDICT MON-18 R1 (L-02): CADA decision construye
+    su propio snapshot fresco e independiente a mano -- ninguna reutiliza
+    la salida de la llamada anterior como entrada de la siguiente. Solo
+    `memoria` (el mismo dict de `persistent_state`) cruza las cuatro
+    llamadas, exactamente como `client.py` reusa `self._temporary_state[tag]`."""
     memoria: dict[str, dict] = {}
     equipo_propio = [
-        {"species": "tentacruel", "active": True,
-         "types": ["WATER", "POISON"], "ability": "liquidooze",
+        {"species": "tentacruel", "types": ["WATER", "POISON"],
+         "ability": "liquidooze",
          "boosts": {"spa": 2, "atk": 0, "def": 0, "spd": 0, "spe": 0,
                     "evasion": 0, "accuracy": 0},
          "moves": [{"id": "scald", "pp": 20, "max_pp": 24}]},
-        {"species": "golbat", "active": False,
-         "types": ["POISON", "FLYING"], "ability": "infiltrator",
+        {"species": "golbat", "types": ["POISON", "FLYING"],
+         "ability": "infiltrator",
          "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
                     "evasion": 0, "accuracy": 0},
          "moves": [{"id": "scald", "pp": 24, "max_pp": 24}]},
-        {"species": "dusknoir", "active": False, "ability": "pressure"},
+        {"species": "dusknoir", "ability": "pressure"},
     ]
-    snapshot1 = _snapshot(gen=6, me={"pokemon": equipo_propio})
+
+    # Decision 1 (fresca): Ditto entra y se transforma en Tentacruel en la
+    # MISMA linea de narracion.
+    snapshot1 = _snapshot(gen=6, me={"pokemon": [
+        {**equipo_propio[0], "active": True},
+        equipo_propio[1], {**equipo_propio[2], "active": False},
+    ]})
     snapshot1["opponent"]["pokemon"] = []
     tras_transform = _proyectar([
         "|switch|p2a: Ditto|Ditto, L84|100/100",
@@ -1674,12 +1686,23 @@ def test_pp_desconocido_de_un_transform_es_temporal_y_no_se_filtra_a_otro():
     assert _por_especie(tras_transform)["ditto"]["moves"] == [
         {"id": "scald", "pp": 5, "max_pp": 5}]
 
-    # Ditto transformado usa Scald bajo Pressure PROPIO (Dusknoir activo).
-    snapshot2 = {**tras_transform, "me": {"pokemon": [
+    # Decision 2 (snapshot FRESCO e independiente, no `tras_transform`):
+    # asi luciria `serialize_battle` con Ditto YA transformado (poke-env
+    # trackea Imposter con su propio mecanismo) y Dusknoir activo con
+    # Pressure. Ditto usa el Scald COPIADO bajo Pressure propio.
+    snapshot2 = _snapshot(gen=6, me={"pokemon": [
+        equipo_propio[0], equipo_propio[1],
         {**equipo_propio[2], "active": True},
-        {**equipo_propio[0], "active": False},
-        equipo_propio[1],
-    ]}}
+    ]})
+    snapshot2["opponent"]["pokemon"] = [{
+        "species": "ditto", "hp_fraction": 1.0, "active": True,
+        "fainted": False, "status": None, "level": 84,
+        "item": "unknown_item", "ability": "liquidooze",
+        "types": ["WATER", "POISON"],
+        "boosts": {"atk": 0, "def": 0, "spa": 2, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [{"id": "scald", "pp": 5, "max_pp": 5}],
+    }]
     tras_uso = _proyectar(
         ["|move|p2a: Ditto|Scald|p1a: Dusknoir"],
         snapshot2, persistent_state=memoria,
@@ -1688,10 +1711,27 @@ def test_pp_desconocido_de_un_transform_es_temporal_y_no_se_filtra_a_otro():
         {"id": "scald", "pp": None, "max_pp": 5}]
     assert memoria["ditto"]["transform_unknown_pp_moves"] == {"scald"}
 
-    # Termina el Transform: Ditto sale del campo, se restaura "transform".
+    # Decision 3 (fresca): Ditto sale del campo -- el switch_out restaura
+    # el moveset BASE ("transform") desde `persistent_state`, sin importar
+    # que el snapshot fresco todavia muestre a Ditto transformado (poke-env
+    # puede no haber revertido su propio Move de `from_transform` a
+    # tiempo).
+    snapshot3 = _snapshot(gen=6, me={"pokemon": [
+        equipo_propio[0], equipo_propio[1],
+        {**equipo_propio[2], "active": True},
+    ]})
+    snapshot3["opponent"]["pokemon"] = [{
+        "species": "ditto", "hp_fraction": 1.0, "active": True,
+        "fainted": False, "status": None, "level": 84,
+        "item": "unknown_item", "ability": "liquidooze",
+        "types": ["WATER", "POISON"],
+        "boosts": {"atk": 0, "def": 0, "spa": 2, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [{"id": "scald", "pp": 5, "max_pp": 5}],
+    }]
     tras_switch_out = _proyectar([
         "|switch|p2a: Weezing|Weezing, L83, F|100/100",
-    ], tras_uso, persistent_state=memoria)
+    ], snapshot3, persistent_state=memoria)
     ditto2 = _por_especie(tras_switch_out)["ditto"]
     assert ditto2["moves"] == [{"id": "transform", "pp": 16, "max_pp": 16}]
     assert "transform_unknown_pp_moves" not in memoria.get("ditto", {}), (
@@ -1699,16 +1739,193 @@ def test_pp_desconocido_de_un_transform_es_temporal_y_no_se_filtra_a_otro():
         "restaurar el moveset base"
     )
 
-    # Ditto vuelve a entrar y se transforma en Golbat (tambien tiene
-    # Scald): no puede heredar la marca del Transform anterior.
+    # Decision 4 (fresca): Ditto vuelve a entrar y se transforma en Golbat
+    # (tambien tiene Scald): no puede heredar la marca del Transform
+    # anterior sobre Tentacruel.
+    snapshot4 = _snapshot(gen=6, me={"pokemon": equipo_propio})
+    snapshot4["opponent"]["pokemon"] = [{
+        "species": "ditto", "hp_fraction": 1.0, "active": False,
+        "fainted": False, "status": None, "level": 84,
+        "item": "unknown_item", "ability": None, "types": ["NORMAL"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [{"id": "transform", "pp": 16, "max_pp": 16}],
+    }]
     tras_transform2 = _proyectar([
         "|switch|p2a: Ditto|Ditto, L84|100/100",
         "|-transform|p2a: Ditto|p1a: Golbat|[from] ability: Imposter",
-    ], tras_switch_out, persistent_state=memoria)
+    ], snapshot4, persistent_state=memoria)
     assert _por_especie(tras_transform2)["ditto"]["moves"] == [
         {"id": "scald", "pp": 5, "max_pp": 5}], (
         "Scald copiado de Golbat no arranca en None: la marca del "
         "Transform anterior (sobre Tentacruel) ya se descarto"
+    )
+
+
+def test_transform_copia_scald_independiente_y_el_base_vuelve_a_null_al_salir():
+    """Regresion exacta del blocker L-01 (LINEAR_VERDICT MON-18 R1): un
+    Scald marcado permanentemente desconocido en el moveset BASE de Mew no
+    puede contaminar un Scald COPIADO por Transform -- son instancias de PP
+    distintas, aunque compartan `move_id` y el rival sea el mismo pokemon.
+    Cada decision usa un snapshot fresco e independiente."""
+    memoria: dict[str, dict] = {}
+
+    # Decision 1 (fresca): Mew BASE (sin transformar) usa Scald bajo
+    # Pressure propio -> marca permanente en `unknown_pp_moves`.
+    snapshot1 = _snapshot(gen=6, me={"pokemon": [
+        {"species": "dusknoir", "active": True, "ability": "pressure"},
+    ]})
+    snapshot1["opponent"]["pokemon"] = [{
+        "species": "mew", "hp_fraction": 1.0, "active": True,
+        "fainted": False, "status": None, "level": 80,
+        "item": "unknown_item", "ability": None, "types": ["PSYCHIC"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [],
+    }]
+    tras_uso = _proyectar(
+        ["|move|p2a: Mew|Scald|p1a: Dusknoir"],
+        snapshot1, persistent_state=memoria,
+    )
+    assert _por_especie(tras_uso)["mew"]["moves"] == [
+        {"id": "scald", "pp": None, "max_pp": 24}]
+    assert memoria == {"mew": {"unknown_pp_moves": {"scald"}}}
+
+    # Decision 2 (snapshot FRESCO e independiente, no `tras_uso`): Mew
+    # TODAVIA base -- poke-env ya "conto" su propio Scald sin saber de
+    # Pressure (14/24) -- y esta misma linea narra el Transform. La
+    # reaplicacion corre ANTES del loop de lineas: el moveset que
+    # `apply_transform` guarda para restaurar despues tiene que ser el 14
+    # YA corregido a None, no el numero crudo.
+    snapshot2 = _snapshot(gen=6, me={"pokemon": [
+        {"species": "tentacruel", "active": True,
+         "types": ["WATER", "POISON"], "ability": "liquidooze",
+         "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                    "evasion": 0, "accuracy": 0},
+         "moves": [{"id": "scald", "pp": 20, "max_pp": 24}]},
+    ]})
+    snapshot2["opponent"]["pokemon"] = [{
+        "species": "mew", "hp_fraction": 1.0, "active": True,
+        "fainted": False, "status": None, "level": 80,
+        "item": "unknown_item", "ability": None, "types": ["PSYCHIC"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [{"id": "scald", "pp": 14, "max_pp": 24}],
+    }]
+    # Sin sufijo Imposter a proposito: ese camino ademas agrega un move
+    # "transform" al moveset ANTES de guardarlo como base a restaurar
+    # (paridad con Ditto), lo que ensuciaria la aserción de abajo con una
+    # entrada ajena al PP que este test verifica.
+    tras_transform = _proyectar([
+        "|-transform|p2a: Mew|p1a: Tentacruel",
+    ], snapshot2, persistent_state=memoria)
+    mew_transformado = _por_especie(tras_transform)["mew"]
+    assert mew_transformado["moves"] == [
+        {"id": "scald", "pp": 5, "max_pp": 5}], (
+        "el Scald COPIADO (min(5,max_pp) por regla de Transform) es una "
+        "instancia distinta: no arranca en None por la marca permanente "
+        "del base"
+    )
+    assert memoria["mew"]["moves"] == [
+        {"id": "scald", "pp": None, "max_pp": 24}], (
+        "el moveset base guardado para restaurar tiene que ser el YA "
+        "corregido a None, no el 14 crudo del snapshot fresco"
+    )
+
+    # Decision 3 (fresca): Mew sigue transformado, sin ninguna linea nueva.
+    # Sin marca temporal todavia sobre el copiado -- tiene que seguir en
+    # 5/5, NUNCA en None por la marca permanente del base.
+    snapshot3 = _snapshot(gen=6, me={"pokemon": [
+        {"species": "tentacruel", "active": True,
+         "types": ["WATER", "POISON"], "ability": "liquidooze",
+         "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                    "evasion": 0, "accuracy": 0},
+         "moves": [{"id": "scald", "pp": 20, "max_pp": 24}]},
+    ]})
+    snapshot3["opponent"]["pokemon"] = [{
+        "species": "mew", "hp_fraction": 1.0, "active": True,
+        "fainted": False, "status": None, "level": 80,
+        "item": "unknown_item", "ability": "liquidooze",
+        "types": ["WATER", "POISON"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [{"id": "scald", "pp": 5, "max_pp": 5}],
+    }]
+    tras_espera = _proyectar([], snapshot3, persistent_state=memoria)
+    assert _por_especie(tras_espera)["mew"]["moves"] == [
+        {"id": "scald", "pp": 5, "max_pp": 5}], (
+        "sigue transformado: la marca permanente del base NO gobierna el "
+        "moveset copiado"
+    )
+
+    # Decision 4 (fresca): Mew sale del campo. El switch_out restaura el
+    # moveset BASE ya corregido a None -- la marca permanente vuelve a
+    # gobernar apenas el Transform termina.
+    snapshot4 = _snapshot(gen=6, me={"pokemon": [
+        {"species": "tentacruel", "active": True,
+         "types": ["WATER", "POISON"], "ability": "liquidooze",
+         "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                    "evasion": 0, "accuracy": 0},
+         "moves": [{"id": "scald", "pp": 20, "max_pp": 24}]},
+    ]})
+    snapshot4["opponent"]["pokemon"] = [{
+        "species": "mew", "hp_fraction": 1.0, "active": True,
+        "fainted": False, "status": None, "level": 80,
+        "item": "unknown_item", "ability": "liquidooze",
+        "types": ["WATER", "POISON"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [{"id": "scald", "pp": 5, "max_pp": 5}],
+    }]
+    tras_switch_out = _proyectar([
+        "|switch|p2a: Weezing|Weezing, L83, F|100/100",
+    ], snapshot4, persistent_state=memoria)
+    mew_fuera = _por_especie(tras_switch_out)["mew"]
+    assert mew_fuera["active"] is False
+    assert mew_fuera["moves"] == [
+        {"id": "scald", "pp": None, "max_pp": 24}], (
+        "al terminar el Transform, el Scald BASE vuelve a null: la marca "
+        "permanente vuelve a gobernar"
+    )
+    assert "moves" not in memoria.get("mew", {})
+    assert memoria["mew"]["unknown_pp_moves"] == {"scald"}
+
+
+def test_el_transform_guarda_el_moveset_base_ya_corregido_a_null():
+    """Canario de orden (LINEAR_VERDICT MON-18 R1, L-02 punto 2): la
+    reaplicacion tiene que correr ANTES de procesar lineas. Si un Transform
+    ocurre en la MISMA llamada que trae un snapshot fresco numerico para un
+    movimiento ya marcado permanentemente, `apply_transform` tiene que
+    guardar en `persistent_state[identidad]["moves"]` el moveset YA
+    corregido a `None` -- no el numero crudo del snapshot. Mover la
+    reaplicacion a DESPUES del loop de lineas pone este test rojo."""
+    memoria: dict[str, dict] = {"mew": {"unknown_pp_moves": {"scald"}}}
+    snapshot = _snapshot(gen=6, me={"pokemon": [
+        {"species": "tentacruel", "active": True,
+         "types": ["WATER", "POISON"], "ability": "liquidooze",
+         "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                    "evasion": 0, "accuracy": 0},
+         "moves": [{"id": "scald", "pp": 20, "max_pp": 24}]},
+    ]})
+    snapshot["opponent"]["pokemon"] = [{
+        "species": "mew", "hp_fraction": 1.0, "active": True,
+        "fainted": False, "status": None, "level": 80,
+        "item": "unknown_item", "ability": None, "types": ["PSYCHIC"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        # snapshot fresco numerico: poke-env "conto" 14, ciego a Pressure.
+        "moves": [{"id": "scald", "pp": 14, "max_pp": 24}],
+    }]
+    # Sin sufijo Imposter: ese camino agrega un move "transform" antes de
+    # guardar la base, lo que ensuciaria esta aserción con una entrada
+    # ajena al PP que el canario verifica.
+    _proyectar([
+        "|-transform|p2a: Mew|p1a: Tentacruel",
+    ], snapshot, persistent_state=memoria)
+    assert memoria["mew"]["moves"] == [
+        {"id": "scald", "pp": None, "max_pp": 24}], (
+        "el moveset base guardado para restaurar despues tiene que ser el "
+        "YA corregido (None), no el numero crudo del snapshot fresco"
     )
 
 
