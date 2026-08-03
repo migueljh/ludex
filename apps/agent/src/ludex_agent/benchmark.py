@@ -30,6 +30,10 @@ def wilson_interval(
     return center - margin, center + margin
 
 
+class BenchmarkDeadlineExceeded(Exception):
+    """El deadline propio de una batalla del benchmark venció."""
+
+
 @dataclass(frozen=True)
 class BenchmarkResult:
     requested: int
@@ -136,8 +140,19 @@ async def run_benchmark(
         for _ in range(n):
             known = set(agent.battles)
             if timeout is not None:
-                async with asyncio.timeout(timeout):
-                    await play_one()
+                timeout_ctx = None
+                try:
+                    async with asyncio.timeout(timeout) as timeout_ctx:
+                        await play_one()
+                except TimeoutError as exc:
+                    if (
+                        timeout_ctx is not None
+                        and timeout_ctx.expired()
+                    ):
+                        raise BenchmarkDeadlineExceeded(
+                            f"benchmark deadline exceeded after {timeout}s"
+                        ) from exc
+                    raise
             else:
                 await play_one()
             if persist:

@@ -20,7 +20,7 @@ from poke_env.player import (
     SimpleHeuristicsPlayer,
 )
 
-from .benchmark import BenchmarkResult, run_benchmark
+from .benchmark import BenchmarkDeadlineExceeded, BenchmarkResult, run_benchmark
 from .config import load_settings
 from .db.context_repository import PostgresContextRepository
 from .db.repository import BattleRepository
@@ -448,7 +448,7 @@ async def _benchmark_command(
                 on_progress=report_progress,
                 timeout=BATTLE_TIMEOUT_SECONDS,
             )
-        except ProviderError as exc:
+        except (ProviderError, BenchmarkDeadlineExceeded) as exc:
             completed = (
                 agent.n_won_battles + agent.n_lost_battles
                 + agent.n_tied_battles
