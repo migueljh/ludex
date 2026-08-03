@@ -158,11 +158,15 @@ class BattleRepository:
 
         F2-08 (MON-13): la metadata de la decision (rationale/confidence/
         alternatives/target/provider/model/latencia/usage) llega por parametro
-        y se actualiza con COALESCE en el DO UPDATE: re-persistir la MISMA
-        decision sin metadata (runner no cableado, D34) no puede borrar la
-        metadata de la accion ya resuelta. El diseño sigue siendo de una sola
-        fila por decision canonica; el intento rechazado por Showdown no
-        llega nunca a esta tabla (D34).
+        y en el DO UPDATE se reemplaza con EXCLUDED PURO, como grupo: la
+        re-persistencia de la misma decision es idempotente (misma metadata ->
+        mismos valores) y una re-persistencia explicita sin metadata deja las
+        11 columnas en NULL. Nunca se conserva un subconjunto anterior:
+        COALESCE podia actualizar `action_taken` pero retener
+        rationale/provider/model de una accion anterior, creando una fila
+        incoherente (correccion del TECH LEAD PARTIAL CHECKPOINT VERDICT).
+        El diseño sigue siendo de una sola fila por decision canonica; el
+        intento rechazado por Showdown no llega nunca a esta tabla (D34).
         """
         async with self.factory() as s:
             await s.execute(text("""
@@ -182,8 +186,7 @@ class BattleRepository:
                 -- dejar la version vieja con el estado nuevo hace que la fila
                 -- mienta sobre su propio formato. `reward` queda
                 -- deliberadamente afuera, para no pisar el que ya escribio
-                -- finalize(). La metadata nueva usa COALESCE: NULL nunca pisa
-                -- un valor ya persistido.
+                -- finalize().
                 ON CONFLICT (trajectory_id, decision_index) DO UPDATE
                   SET turn_number = EXCLUDED.turn_number,
                       state = EXCLUDED.state,
@@ -192,17 +195,17 @@ class BattleRepository:
                       action_taken = EXCLUDED.action_taken,
                       action_source = EXCLUDED.action_source,
                       action_path = EXCLUDED.action_path,
-                      rationale = COALESCE(EXCLUDED.rationale, trajectory_steps.rationale),
-                      target = COALESCE(EXCLUDED.target, trajectory_steps.target),
-                      confidence = COALESCE(EXCLUDED.confidence, trajectory_steps.confidence),
-                      alternatives = COALESCE(EXCLUDED.alternatives, trajectory_steps.alternatives),
-                      provider = COALESCE(EXCLUDED.provider, trajectory_steps.provider),
-                      model = COALESCE(EXCLUDED.model, trajectory_steps.model),
-                      decision_latency_ms = COALESCE(EXCLUDED.decision_latency_ms, trajectory_steps.decision_latency_ms),
-                      input_tokens = COALESCE(EXCLUDED.input_tokens, trajectory_steps.input_tokens),
-                      output_tokens = COALESCE(EXCLUDED.output_tokens, trajectory_steps.output_tokens),
-                      cached_input_tokens = COALESCE(EXCLUDED.cached_input_tokens, trajectory_steps.cached_input_tokens),
-                      reasoning_tokens = COALESCE(EXCLUDED.reasoning_tokens, trajectory_steps.reasoning_tokens)
+                      rationale = EXCLUDED.rationale,
+                      target = EXCLUDED.target,
+                      confidence = EXCLUDED.confidence,
+                      alternatives = EXCLUDED.alternatives,
+                      provider = EXCLUDED.provider,
+                      model = EXCLUDED.model,
+                      decision_latency_ms = EXCLUDED.decision_latency_ms,
+                      input_tokens = EXCLUDED.input_tokens,
+                      output_tokens = EXCLUDED.output_tokens,
+                      cached_input_tokens = EXCLUDED.cached_input_tokens,
+                      reasoning_tokens = EXCLUDED.reasoning_tokens
             """), {"tj": trajectory_id, "di": decision_index, "t": turn,
                    "st": json.dumps(state), "v": version, "la": json.dumps(legal),
                    "at": json.dumps(action) if action is not None else None,

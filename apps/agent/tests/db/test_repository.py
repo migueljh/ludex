@@ -529,26 +529,62 @@ async def test_dos_decisiones_mismo_turno_con_metadata_distinta_no_se_pisan(repo
     assert filas[1][3:6] == ("kimi", "kimi-k2.6", "segunda")
 
 
-async def test_repersistir_paso_sin_metadata_no_borra_la_existente(repo):
-    """Idempotencia: re-persistir la MISMA decision (mismo decision_index)
-    sin metadata (runner no cableado, D34 re-persistencia) no puede pisar la
-    metadata de la accion ya resuelta: COALESCE conserva."""
+async def test_repersistir_con_metadata_completa_es_idempotente(repo):
+    """Idempotencia (F2-08): re-persistir la MISMA decision con la metadata
+    completa produce la misma fila y los mismos valores: una sola fila, sin
+    duplicados y sin cambiar la metadata."""
+    tid = await _trajectory_test(repo)
+    for _ in range(2):
+        await repo.save_step(
+            tid, 0, 1, {"schema_version": 1}, 1, [], {"kind": "move", "id": "x"}, "agent",
+            action_path="llm", **_METADATA_COMPLETA,
+        )
+
+    async with repo.factory() as s:
+        filas = (await s.execute(text(
+            "SELECT provider, model, confidence, rationale FROM trajectory_steps "
+            "WHERE trajectory_id=:t"
+        ), {"t": tid})).all()
+        count = (await s.execute(text(
+            "SELECT count(*) FROM trajectory_steps WHERE trajectory_id=:t"
+        ), {"t": tid})).scalar_one()
+    assert count == 1
+    assert filas == [(
+        "open_code_zen", "minimax-m2.7", 0.9,
+        "corto y user-facing, nunca chain-of-thought",
+    )]
+
+
+async def test_repersistir_sin_metadata_nulifica_el_grupo_completo(repo):
+    """F2-08 (correccion del tech lead): la metadata se reemplaza COMO GRUPO
+    con EXCLUDED puro. Re-persistir la misma decision sin metadata deja las
+    11 columnas en NULL -- nunca se conserva un subconjunto anterior (COALESCE
+    podia actualizar action_taken pero retener rationale/provider/model de una
+    accion anterior). El canario: `action_taken` SI fue actualizado por la
+    re-persistencia."""
     tid = await _trajectory_test(repo)
     await repo.save_step(
         tid, 0, 1, {"schema_version": 1}, 1, [], {"kind": "move", "id": "x"}, "agent",
         action_path="llm", **_METADATA_COMPLETA,
     )
     await repo.save_step(
-        tid, 0, 1, {"schema_version": 1}, 1, [], {"kind": "move", "id": "x"}, "agent",
+        tid, 0, 1, {"schema_version": 1}, 1, [], {"kind": "switch", "species": "y"}, "agent",
         action_path="llm",
     )
 
     async with repo.factory() as s:
-        fila = (await s.execute(text(
-            "SELECT provider, model, confidence FROM trajectory_steps "
-            "WHERE trajectory_id=:t AND decision_index=0"
-        ), {"t": tid})).one()
-    assert fila == ("open_code_zen", "minimax-m2.7", 0.9)
+        fila = (await s.execute(text("""
+            SELECT action_taken, rationale, target, confidence, alternatives,
+                   provider, model, decision_latency_ms, input_tokens,
+                   output_tokens, cached_input_tokens, reasoning_tokens
+            FROM trajectory_steps WHERE trajectory_id=:t AND decision_index=0
+        """), {"t": tid})).one()
+    assert fila[0] == {"kind": "switch", "species": "y"}, (
+        "canario: la re-persistencia tiene que haber actualizado action_taken"
+    )
+    assert fila[1:] == (None,) * 11, (
+        "la re-persistencia sin metadata tiene que nulificar el grupo completo"
+    )
 
 
 async def test_historia_y_ruta_random_quedan_null(repo):
