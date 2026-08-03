@@ -1692,11 +1692,20 @@ acepta sólo por parsear JSON: `CalcClient` valida contra `CalcResponse`
 `effective.attacker/defender` con sus sub-campos. Un 200 con JSON válido pero
 shape ausente, parcial o con tipos inválidos propaga `CalcProtocolError` y
 nunca llega a `_attach_assumptions` (una respuesta parcial podía fabricar
-assumptions vacías y volver a habilitar certeza falsa). `ko_chance.chance` es
-opcional: el server serializa `chance: number | undefined` y omite `undefined`
-cuando el paquete no calcula la chance; `ko_chance.n` y `ko_chance.text` son
-obligatorios. Stubs HTTP de regresión cubren `effective` ausente y malformado,
-campos productivos faltantes y tipos inválidos.
+assumptions vacías y volver a habilitar certeza falsa). El contrato se
+rechaza en la frontera pública `CalcClient.calculate`, no en helpers
+internos. Precisión final medida contra `EffectivePokemon` (calc.ts):
+`nature`, `ability` e `item` aceptan `string|null` (el server emite `|| null`);
+`status` y `gender` son `string` obligatorios (el server emite `|| ""` y
+`|| "M"`), y `null` produce `CalcProtocolError`. `ko_chance.chance` es
+opcional —el server serializa `chance: number | undefined` y omite
+`undefined`— pero presente debe ser numérico: `chance=null` produce
+`CalcProtocolError`. Las únicas claves válidas de `evs`/`ivs`/`boosts` son
+`hp, atk, def, spa, spd, spe` (`STATS` de calc.ts); una clave ajena produce
+`CalcProtocolError`, conservando la validación de valores numéricos. Stubs
+HTTP de regresión cubren `effective` ausente y malformado, `status`/`gender`
+null, `chance` null, claves de stats ajenas, campos productivos faltantes y
+tipos inválidos, para attacker y defender.
 
 **Mega por el camino completo.** `retrieve_context` recopila los items visibles
 y `ContextRepository.load_mega_forms` resuelve en batch `items.megaStone`/
