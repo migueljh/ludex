@@ -138,27 +138,52 @@ class BattleRepository:
 
     async def save_step(self, trajectory_id: int, decision_index: int, turn: int,
                         state: dict, version: int, legal: list, action: dict | None,
-                        source: str, action_path: str | None = None) -> None:
+                        source: str, action_path: str | None = None,
+                        *, rationale: str | None = None,
+                        target: dict | None = None,
+                        confidence: float | None = None,
+                        alternatives: list | None = None,
+                        provider: str | None = None,
+                        model: str | None = None,
+                        decision_latency_ms: float | None = None,
+                        input_tokens: int | None = None,
+                        output_tokens: int | None = None,
+                        cached_input_tokens: int | None = None,
+                        reasoning_tokens: int | None = None) -> None:
         """D21 (C2): la clave es `(trajectory_id, decision_index)`.
 
         `decision_index` cuenta decisiones, no turnos, asi que un cambio
         forzado tras un debilitamiento (mismo `turn`, decision_index distinto)
         ya no se pisa. `turn_number` se actualiza como columna comun.
+
+        F2-08 (MON-13): la metadata de la decision (rationale/confidence/
+        alternatives/target/provider/model/latencia/usage) llega por parametro
+        y se actualiza con COALESCE en el DO UPDATE: re-persistir la MISMA
+        decision sin metadata (runner no cableado, D34) no puede borrar la
+        metadata de la accion ya resuelta. El diseño sigue siendo de una sola
+        fila por decision canonica; el intento rechazado por Showdown no
+        llega nunca a esta tabla (D34).
         """
         async with self.factory() as s:
             await s.execute(text("""
                 INSERT INTO trajectory_steps
                   (trajectory_id, decision_index, turn_number, state,
                    state_schema_version, legal_actions, action_taken, action_source,
-                   action_path)
+                   action_path, rationale, target, confidence, alternatives,
+                   provider, model, decision_latency_ms, input_tokens,
+                   output_tokens, cached_input_tokens, reasoning_tokens)
                 VALUES (:tj, :di, :t, CAST(:st AS jsonb), :v, CAST(:la AS jsonb),
-                        CAST(:at AS jsonb), CAST(:src AS action_source), :path)
+                        CAST(:at AS jsonb), CAST(:src AS action_source), :path,
+                        :rationale, CAST(:target AS jsonb), :confidence,
+                        CAST(:alt AS jsonb), :provider, :model, :latency_ms,
+                        :in_tok, :out_tok, :cached_tok, :reasoning_tok)
                 -- turn_number, state_schema_version y action_source TAMBIEN se
                 -- actualizan: si un paso se reescribe tras un bump de version,
                 -- dejar la version vieja con el estado nuevo hace que la fila
                 -- mienta sobre su propio formato. `reward` queda
                 -- deliberadamente afuera, para no pisar el que ya escribio
-                -- finalize().
+                -- finalize(). La metadata nueva usa COALESCE: NULL nunca pisa
+                -- un valor ya persistido.
                 ON CONFLICT (trajectory_id, decision_index) DO UPDATE
                   SET turn_number = EXCLUDED.turn_number,
                       state = EXCLUDED.state,
@@ -166,11 +191,31 @@ class BattleRepository:
                       legal_actions = EXCLUDED.legal_actions,
                       action_taken = EXCLUDED.action_taken,
                       action_source = EXCLUDED.action_source,
-                      action_path = EXCLUDED.action_path
+                      action_path = EXCLUDED.action_path,
+                      rationale = COALESCE(EXCLUDED.rationale, trajectory_steps.rationale),
+                      target = COALESCE(EXCLUDED.target, trajectory_steps.target),
+                      confidence = COALESCE(EXCLUDED.confidence, trajectory_steps.confidence),
+                      alternatives = COALESCE(EXCLUDED.alternatives, trajectory_steps.alternatives),
+                      provider = COALESCE(EXCLUDED.provider, trajectory_steps.provider),
+                      model = COALESCE(EXCLUDED.model, trajectory_steps.model),
+                      decision_latency_ms = COALESCE(EXCLUDED.decision_latency_ms, trajectory_steps.decision_latency_ms),
+                      input_tokens = COALESCE(EXCLUDED.input_tokens, trajectory_steps.input_tokens),
+                      output_tokens = COALESCE(EXCLUDED.output_tokens, trajectory_steps.output_tokens),
+                      cached_input_tokens = COALESCE(EXCLUDED.cached_input_tokens, trajectory_steps.cached_input_tokens),
+                      reasoning_tokens = COALESCE(EXCLUDED.reasoning_tokens, trajectory_steps.reasoning_tokens)
             """), {"tj": trajectory_id, "di": decision_index, "t": turn,
                    "st": json.dumps(state), "v": version, "la": json.dumps(legal),
                    "at": json.dumps(action) if action is not None else None,
-                   "src": source, "path": action_path})
+                   "src": source, "path": action_path,
+                   "rationale": rationale,
+                   "target": json.dumps(target) if target is not None else None,
+                   "confidence": confidence,
+                   "alt": json.dumps(alternatives) if alternatives is not None else None,
+                   "provider": provider, "model": model,
+                   "latency_ms": decision_latency_ms,
+                   "in_tok": input_tokens, "out_tok": output_tokens,
+                   "cached_tok": cached_input_tokens,
+                   "reasoning_tok": reasoning_tokens})
             await s.commit()
 
     async def finalize(self, trajectory_id: int, *, result: str,

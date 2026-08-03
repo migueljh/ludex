@@ -1845,3 +1845,59 @@ re-vincular a una reingesta futura de la misma batalla porque no hay forma
 de recalcular su fingerprint de apertura post-hoc. D33/D34/D35 quedan
 integrados por merge aditivo de `integration/phase-2-accepted`, sin
 reabrirse.
+
+## D37 — La metadata de decisión se persiste en `trajectory_steps` por envelope inmutable (F2-08/MON-13)
+
+**Contexto.** El dataset de entrenamiento necesitaba el contrato de decisión
+completo por `decision_index` —action, target, rationale breve, confidence,
+alternatives— más metadata de calidad ML: provider/model efectivos, latencia
+y usage. Nada de eso se persistía: `reasoning` se calculaba en el grafo y se
+descartaba, y provider/model vivían solo en los artefactos del benchmark.
+
+**Decisión.** 11 columnas nuevas en `trajectory_steps`, todas NULL en filas
+históricas y de ruta random (sin backfill, nunca se inventa provider/model):
+`rationale`, `target` jsonb, `confidence` double precision, `alternatives`
+jsonb, `provider`, `model`, `decision_latency_ms` y los cuatro tokens planos
+(`input/output/cached_input/reasoning_tokens`, el contrato fijo de
+`CompletionUsage`). Constraints: confidence NULL o [0,1]; co-ocurrencia
+`provider/model`; los cuatro tokens todos NULL o todos no-NULL, `>= 0`,
+`cached <= input`; latencia NULL o `>= 0`; `alternatives` array y `target`
+object cuando no-NULL.
+
+**Envelope inmutable por llamada, no `last_*`.** `DecisionProvider.complete`
+devuelve `CompletionEnvelope` (payload, provider efectivo, model efectivo,
+usage, latencia de esa llamada). El patrón `last_completion_info` quedó
+rechazado por el design verdict: es estado mutable compartido y cruza
+metadata entre decisiones concurrentes — reproducido en la demo
+`/tmp/demo_last_style.py`: la decisión lenta terminaba reportando el payload
+de una decisión vecina. Con el envelope, la metadata viaja en el valor de
+retorno y el cruce es imposible por construcción.
+
+**Semántica por decisión canónica.** provider/model son únicamente los de la
+respuesta LLM aceptada; en `fallback` quedan NULL (no se atribuye la acción
+determinista a un modelo) con `alternatives=[]` y un rationale determinista.
+El usage de la decisión suma las respuestas facturables del camino (retries
+semánticos incluidos; los de infraestructura no producen usage en el backend
+actual). `decision_latency_ms` va desde el primer intento LLM hasta la
+respuesta aceptada o el fallback. `target` es NULL válido y esperado en
+singles; un target no-NULL solo se acepta si la misma mascara legal expone
+targets, y mientras no los exponga se rechaza la respuesta (reintento
+semántico). Las alternatives atraviesan el mismo `normalize_action` +
+`validate_action` que la principal, deben ser únicas tras normalizar y
+distintas de la principal; `[]` es válido; cualquier violación consume el
+reintento semántico (D26). D34 sigue vinculante: solo persiste la metadata
+de la acción finalmente resuelta; una elección rechazada por Showdown no
+conserva metadata ejecutada.
+
+**Persistencia con COALESCE.** `save_step` actualiza la metadata nueva con
+`COALESCE(EXCLUDED.x, trajectory_steps.x)`: re-persistir la misma decisión
+sin metadata (runner no cableado) no borra la de la acción ya resuelta.
+`rationale` es el nombre canónico; `battle_turns.agent_reasoning` no se usa.
+
+**Alcance y límites.** Implementación parcial de F2-08: el cableado del
+`step` en `showdown/client.py` es territorio de MON-18 y queda pendiente de
+integración; hasta entonces las filas LLM se persisten con metadata NULL por
+la ruta vieja. La forma exacta de los targets de la mascara legal se definirá
+cuando una mascara los exponga (hoy la rechaza). Migración
+`20260803000001_trajectory_decision_metadata.sql` verificada up/down en una
+DB descartable; la DB compartida no fue migrada.

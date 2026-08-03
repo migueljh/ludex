@@ -366,12 +366,13 @@ def provider_smoke_command(
         provider, model, settings.llm_request_timeout_seconds, metrics
     )
     prompt = (
-        "Elegí exactamente una acción legal y respondé con action y un "
-        "reasoning breve. legal_actions="
+        "Elegí exactamente una acción legal y respondé con action, un "
+        "reasoning breve, confidence en [0,1] y alternatives (puede ser []). "
+        "legal_actions="
         '[{"kind":"move","id":"tackle"},{"kind":"switch","species":"pikachu"}]'
     )
     try:
-        payload = asyncio.run(selected.complete(
+        envelope = asyncio.run(selected.complete(
             prompt,
             deadline=time.monotonic() + settings.llm_request_timeout_seconds,
             turn_id=f"provider-smoke:{provider}:{model}",
@@ -380,7 +381,7 @@ def provider_smoke_command(
         typer.echo(f"ABORTED: {type(exc).__name__}: {exc}")
         raise typer.Exit(code=1) from None
     try:
-        parsed = DecisionResponse.model_validate(payload)
+        parsed = DecisionResponse.model_validate(envelope.payload)
     except (ValueError, TypeError):
         typer.echo("ABORTED: invalid model response")
         raise typer.Exit(code=1) from None

@@ -19,6 +19,17 @@ class GraphState(TypedDict, total=False):
     action: dict[str, Any]
     action_path: str
     reasoning: str
+    rationale: str
+    confidence: float | None
+    alternatives: list[dict[str, Any]]
+    target: dict[str, Any] | None
+    provider: str | None
+    model: str | None
+    decision_latency_ms: float
+    input_tokens: int | None
+    output_tokens: int | None
+    cached_input_tokens: int | None
+    reasoning_tokens: int | None
     turn_id: str
     deadline: float
 

@@ -84,6 +84,28 @@ class ProviderCompletion:
 
 
 @dataclass(frozen=True)
+class CompletionEnvelope:
+    """Respuesta de una llamada logica al proveedor, inmutable y autocontenida.
+
+    F2-08 (MON-13): `DecisionProvider.complete` devuelve un envelope por
+    llamada con el payload, el provider/model EFECTIVOS (quien respondio de
+    verdad, no quien se configuro) y la latencia de ESA llamada. Es la unica
+    via de que la metadata de la decision llegue a `decide`: el patron
+    rechazado `last_completion_info` (estado mutable compartido leido despues
+    del await) cruza metadata entre batallas concurrentes -- el runner juega
+    varias en paralelo en el mismo proceso, y la llamada lenta terminaria
+    reportando la metadata de la rapida (ver test_provider.py,
+    `test_envelopes_concurrentes_no_se_cruzan_metadata`).
+    """
+
+    payload: dict[str, Any]
+    provider: str
+    model: str
+    usage: CompletionUsage
+    latency_ms: float
+
+
+@dataclass(frozen=True)
 class ModelRoute:
     protocol: str
     temperature: float = 0.0
@@ -179,7 +201,7 @@ def provider_response_schema(response_schema: type) -> dict[str, Any]:
 class DecisionProvider(Protocol):
     async def complete(
         self, prompt: str, *, deadline: float, turn_id: str
-    ) -> dict[str, Any]: ...
+    ) -> CompletionEnvelope: ...
 
 
 class ProviderBackend(Protocol):
@@ -409,6 +431,7 @@ class KeyRotatingProvider:
         keys: Sequence[str],
         backend: ProviderBackend,
         *,
+        model: str | None = None,
         metrics: DecisionMetrics | None = None,
         transient_retries: int = 2,
         quota_cooldown_seconds: float = DEFAULT_QUOTA_COOLDOWN_SECONDS,
@@ -419,6 +442,11 @@ class KeyRotatingProvider:
         self.name = name
         self._keys = tuple(keys)
         self._backend = backend
+        # F2-08: el model configurado. El "model efectivo" del envelope es
+        # `usage.model` cuando el proveedor lo reporta (response_metadata),
+        # y cae a este configurado cuando no. Es el unico model conocido de
+        # la llamada; nunca se inventa otro.
+        self._model = model
         self._metrics = metrics or DecisionMetrics()
         self._transient_retries = transient_retries
         self._quota_cooldown_seconds = quota_cooldown_seconds
@@ -441,7 +469,8 @@ class KeyRotatingProvider:
 
     async def complete(
         self, prompt: str, *, deadline: float, turn_id: str
-    ) -> dict[str, Any]:
+    ) -> CompletionEnvelope:
+        started_at = self._clock()
         while True:
             now = self._clock()
             for key_index in range(len(self._keys)):
@@ -461,7 +490,18 @@ class KeyRotatingProvider:
                                 prompt, api_key=key, deadline=deadline
                             )
                         self._metrics.usage(completion.usage)
-                        return completion.payload
+                        # F2-08: el envelope se construye AQUI, con datos
+                        # locales de esta llamada, antes de cualquier punto de
+                        # suspension posterior. Ninguna lectura de estado
+                        # compartido entre llamadas: ver docstring de
+                        # CompletionEnvelope.
+                        return CompletionEnvelope(
+                            payload=completion.payload,
+                            provider=self.name,
+                            model=completion.usage.model or self._model,
+                            usage=completion.usage,
+                            latency_ms=(self._clock() - started_at) * 1000,
+                        )
                     except Exception as raw:
                         error = _classified(raw)
                         if isinstance(error, DecisionDeadlineExceeded):
@@ -530,9 +570,11 @@ class ProviderChain:
 
     async def complete(
         self, prompt: str, *, deadline: float, turn_id: str
-    ) -> dict[str, Any]:
+    ) -> CompletionEnvelope:
         for index, provider in enumerate(self._providers):
             try:
+                # F2-08: el envelope del provider que respondio ya trae su
+                # provider/model efectivos; el chain solo lo propaga.
                 return await provider.complete(
                     prompt, deadline=deadline, turn_id=turn_id
                 )
@@ -544,20 +586,44 @@ class ProviderChain:
 
 
 class FakeDecisionProvider:
+    """Provider de tests que devuelve un envelope por respuesta.
+
+    Acepta dicts (payload crudo), `ProviderCompletion` o `CompletionEnvelope`
+    ya armados; las respuestas llanas se envuelven con provider="fake" y
+    model="fake-model" para que los tests de `decide` verifiquen metadata sin
+    levantar un backend real.
+    """
+
     def __init__(self, responses: Sequence[dict[str, Any] | Exception]) -> None:
         self._responses = list(responses)
         self.prompts: list[str] = []
 
     async def complete(
         self, prompt: str, *, deadline: float, turn_id: str
-    ) -> dict[str, Any]:
+    ) -> CompletionEnvelope:
         if time.monotonic() >= deadline:
             raise DecisionDeadlineExceeded("decision deadline exhausted")
         self.prompts.append(prompt)
         response = self._responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return response
+        if isinstance(response, CompletionEnvelope):
+            return response
+        if isinstance(response, ProviderCompletion):
+            return CompletionEnvelope(
+                payload=response.payload,
+                provider="fake",
+                model=response.usage.model or "fake-model",
+                usage=response.usage,
+                latency_ms=0.0,
+            )
+        return CompletionEnvelope(
+            payload=response,
+            provider="fake",
+            model="fake-model",
+            usage=CompletionUsage(input_tokens=1, output_tokens=1),
+            latency_ms=0.0,
+        )
 
 
 class _LangChainBackend:
@@ -678,6 +744,7 @@ class GeminiDecisionProvider(KeyRotatingProvider):
                 kind="google", model=model, response_schema=response_schema,
                 timeout_seconds=timeout_seconds,
             ),
+            model=model,
             metrics=metrics,
         )
 
@@ -694,6 +761,7 @@ class OpenAICompatibleDecisionProvider(KeyRotatingProvider):
                 kind="openai", model=model, response_schema=response_schema,
                 timeout_seconds=timeout_seconds, base_url=base_url, route=route,
             ),
+            model=model,
             metrics=metrics,
         )
 
@@ -711,5 +779,6 @@ class AnthropicDecisionProvider(KeyRotatingProvider):
                 kind="anthropic", model=model, response_schema=response_schema,
                 timeout_seconds=timeout_seconds, base_url=base_url, route=route,
             ),
+            model=model,
             metrics=metrics,
         )
