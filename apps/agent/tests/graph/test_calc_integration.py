@@ -476,6 +476,68 @@ async def test_200_ko_chance_malformado_propaga():
             await _calc_damage_via(url)
 
 
+# --- L-01/T-04: la frontera pública CalcClient.calculate rechaza los valores
+# que el contrato CalcResponse (calc.ts) no permite. Stubs HTTP que atraviesan
+# calculate, no helpers internos; attacker y defender cubiertos por parámetro.
+
+
+async def _calc_200_via(base_url):
+    """Atraviesa la frontera pública CalcClient.calculate contra un stub."""
+    async with CalcClient(base_url, timeout_seconds=3) as calc:
+        return await calc.calculate({"gen": 6})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["attacker", "defender"])
+async def test_200_effective_status_null_propaga(side):
+    body = _valid_200()
+    entry = dict(body["effective"][side])
+    entry["status"] = None
+    body["effective"][side] = entry
+    with _stub_calc([(200, json.dumps(body).encode(), "application/json")]) as url:
+        with pytest.raises(
+            CalcProtocolError, match=f"effective.{side}.status inválido"
+        ):
+            await _calc_200_via(url)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["attacker", "defender"])
+async def test_200_effective_gender_null_propaga(side):
+    body = _valid_200()
+    entry = dict(body["effective"][side])
+    entry["gender"] = None
+    body["effective"][side] = entry
+    with _stub_calc([(200, json.dumps(body).encode(), "application/json")]) as url:
+        with pytest.raises(
+            CalcProtocolError, match=f"effective.{side}.gender inválido"
+        ):
+            await _calc_200_via(url)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["attacker", "defender"])
+async def test_200_effective_ivs_clave_ajena_propaga(side):
+    body = _valid_200()
+    entry = dict(body["effective"][side])
+    entry["ivs"] = {"not_a_stat": 31}
+    body["effective"][side] = entry
+    with _stub_calc([(200, json.dumps(body).encode(), "application/json")]) as url:
+        with pytest.raises(
+            CalcProtocolError, match=f"effective.{side}.ivs"
+        ):
+            await _calc_200_via(url)
+
+
+@pytest.mark.asyncio
+async def test_200_ko_chance_chance_null_propaga():
+    body = _valid_200()
+    body["ko_chance"]["chance"] = None
+    with _stub_calc([(200, json.dumps(body).encode(), "application/json")]) as url:
+        with pytest.raises(CalcProtocolError, match="ko_chance.chance"):
+            await _calc_200_via(url)
+
+
 # --- Contexto real: canario Blastoise Gen 6 (102 posibles, 29 status) ---
 
 

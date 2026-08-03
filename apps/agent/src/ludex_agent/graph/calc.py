@@ -133,6 +133,10 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+# Únicas claves válidas de evs/ivs/boosts (STATS de calc.ts).
+_VALID_STAT_KEYS = ("hp", "atk", "def", "spa", "spd", "spe")
+
+
 def _validate_effective_pokemon(value: Any, side: str) -> None:
     """Valida el shape de un lado de ``effective`` (medido contra el server)."""
     if not isinstance(value, dict):
@@ -145,15 +149,26 @@ def _validate_effective_pokemon(value: Any, side: str) -> None:
         raise CalcProtocolError(f"effective.{side} species/level inválidos")
     if not _is_number(value["curHP"]):
         raise CalcProtocolError(f"effective.{side}.curHP inválido")
-    for key in ("nature", "ability", "item", "status", "gender"):
+    # Contrato real (calc.ts EffectivePokemon): nature/ability/item son
+    # string|null (`|| null`); status y gender son string obligatorios
+    # (`|| ""` y `|| "M"`), nunca null.
+    for key in ("nature", "ability", "item"):
         if value[key] is not None and not isinstance(value[key], str):
+            raise CalcProtocolError(f"effective.{side}.{key} inválido")
+    for key in ("status", "gender"):
+        if not isinstance(value[key], str):
             raise CalcProtocolError(f"effective.{side}.{key} inválido")
     for key in ("evs", "ivs", "boosts"):
         table = value[key]
-        if not isinstance(table, dict) or not all(
-            _is_number(v) for v in table.values()
-        ):
+        if not isinstance(table, dict):
             raise CalcProtocolError(f"effective.{side}.{key} inválido")
+        for stat, stat_value in table.items():
+            if stat not in _VALID_STAT_KEYS:
+                raise CalcProtocolError(
+                    f"effective.{side}.{key}.{stat} inválido"
+                )
+            if not _is_number(stat_value):
+                raise CalcProtocolError(f"effective.{side}.{key} inválido")
 
 
 def _validate_calc_response(body: Any) -> CalcResult:
@@ -196,11 +211,9 @@ def _validate_calc_response(body: Any) -> CalcResult:
             ko_chance.get("text"), str
         ):
             raise CalcProtocolError("calc devolvió ko_chance inválido")
-        if (
-            "chance" in ko_chance
-            and ko_chance["chance"] is not None
-            and not _is_number(ko_chance["chance"])
-        ):
+        # `chance` es number o campo omitido (undefined no se serializa);
+        # presente debe ser numérico, null incluido es un fallo de protocolo.
+        if "chance" in ko_chance and not _is_number(ko_chance["chance"]):
             raise CalcProtocolError("calc devolvió ko_chance.chance inválido")
     if not isinstance(body["description"], str):
         raise CalcProtocolError("calc devolvió description inválido")
