@@ -4,6 +4,7 @@ import concurrent.futures
 import pytest
 
 from ludex_agent.benchmark import (
+    BenchmarkDeadlineExceeded,
     BenchmarkResult,
     run_benchmark,
     wilson_interval,
@@ -215,9 +216,10 @@ class _BackgroundFailureAgent(_ObservableAgent):
         self._exc = exc
 
     async def wait_for_background_failure(self):
+        """Imita producción: devuelve el objeto Exception, no lo lanza."""
         self.failure_started.set()
         try:
-            raise self._exc
+            return self._exc
         finally:
             self.failure_done.set()
 
@@ -255,8 +257,9 @@ async def test_deadline_propio_cancela_hijos():
 async def test_fallo_background_conserva_identidad():
     exc = TransientProviderError("provider transport failed")
     agent = _BackgroundFailureAgent(exc)
-    with pytest.raises(TransientProviderError, match="transport"):
+    with pytest.raises(TransientProviderError, match="transport") as caught:
         await run_benchmark(agent, object(), n=1)
+    assert caught.value is exc
     assert agent.battle_done.is_set()
     assert agent.battle_cancelled is True
 
@@ -267,9 +270,9 @@ async def test_timeouterror_background_no_se_confunde_con_deadline():
     sin ser re-emitido como timeout propio del benchmark."""
     exc = asyncio.TimeoutError("projection timed out")
     agent = _BackgroundFailureAgent(exc)
-    with pytest.raises(asyncio.TimeoutError, match="projection") as info:
+    with pytest.raises(asyncio.TimeoutError, match="projection") as caught:
         await run_benchmark(agent, object(), n=1, timeout=3600)
-    assert "benchmark deadline" not in str(info.value)
+    assert caught.value is exc
     assert agent.battle_done.is_set()
     assert agent.battle_cancelled is True
 
@@ -317,7 +320,7 @@ async def test_exito_con_shield_no_deja_hijos_pendientes():
 @pytest.mark.asyncio
 async def test_deadline_interno_cancela_hijos():
     agent = _ObservableAgent()
-    with pytest.raises(TimeoutError):
+    with pytest.raises(BenchmarkDeadlineExceeded, match="deadline exceeded"):
         await run_benchmark(agent, object(), n=1, timeout=0.01)
     await asyncio.wait_for(agent.battle_done.wait(), timeout=1)
     await asyncio.wait_for(agent.failure_done.wait(), timeout=1)

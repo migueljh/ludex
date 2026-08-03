@@ -8,6 +8,7 @@ demostrarse: I6 (empate) e I3 (perdida silenciosa de pasos).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 from decimal import Decimal
@@ -15,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 from ludex_agent import cli as cli_module
-from ludex_agent.benchmark import BenchmarkResult
+from ludex_agent.benchmark import BenchmarkDeadlineExceeded, BenchmarkResult
 from ludex_agent.graph.provider import FatalProviderError
 from typer.testing import CliRunner
 
@@ -603,3 +604,143 @@ async def test_play_deadline_real_retorna_vacio_y_limpia_hijas(monkeypatch):
         for task in child_tasks:
             task.cancel()
         await asyncio.gather(*child_tasks, return_exceptions=True)
+
+
+def _patch_benchmark_command_dependencies(monkeypatch, agent_type) -> None:
+    """Aísla `_benchmark_command` de red y Postgres manteniendo `run_benchmark`."""
+
+    class FakeRival:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+    class FakeProvider:
+        async def complete(self, prompt, *, deadline, turn_id):
+            return {"action": {"kind": "move", "id": "tackle"}}
+
+    class FakeCalcClient:
+        async def aclose(self):
+            pass
+
+    class FakeContextRepo:
+        async def aclose(self):
+            pass
+
+    class FakeEngine:
+        async def dispose(self):
+            pass
+
+    async def reachable(url):
+        pass
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_settings",
+        lambda: SimpleNamespace(
+            showdown_ws_url="ws://localhost:8100/showdown/websocket",
+            database_url="postgresql+asyncpg://x:x@localhost:15432/x",
+            llm_provider="fake",
+            llm_model="fake-model",
+            llm_request_timeout_seconds=10,
+            decision_budget_seconds=10,
+            bot_username="Bot",
+            showdown_battle_format="gen6randombattle",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module, "_check_showdown_reachable", reachable
+    )
+    monkeypatch.setattr(
+        cli_module, "local_server_configuration", lambda url: object()
+    )
+    monkeypatch.setattr(
+        cli_module, "_benchmark_provider", lambda *a, **k: FakeProvider()
+    )
+    monkeypatch.setattr(
+        cli_module, "CalcClient", lambda *a, **k: FakeCalcClient()
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "PostgresContextRepository",
+        lambda *a, **k: FakeContextRepo(),
+    )
+    monkeypatch.setattr(
+        cli_module, "build_decision_graph", lambda *a, **k: object()
+    )
+    monkeypatch.setattr(cli_module, "LudexPlayer", agent_type)
+    monkeypatch.setattr(cli_module, "RandomPlayer", FakeRival)
+    monkeypatch.setattr(cli_module, "MaxBasePowerPlayer", FakeRival)
+    monkeypatch.setattr(cli_module, "SimpleHeuristicsPlayer", FakeRival)
+    monkeypatch.setattr(cli_module, "make_engine", lambda url: FakeEngine())
+    monkeypatch.setattr(
+        cli_module, "session_factory", lambda engine: object()
+    )
+    monkeypatch.setattr(
+        cli_module, "BattleRepository", lambda factory: object()
+    )
+
+
+def test_benchmark_command_deadline_clasificado_y_escribe_final(
+    monkeypatch, tmp_path
+):
+    """El CLI pasa `BATTLE_TIMEOUT_SECONDS`, clasifica el deadline y escribe
+    snapshot/ledger final con progreso acumulado."""
+
+    class SlowAgent:
+        def __init__(self, **kwargs) -> None:
+            self.n_won_battles = 0
+            self.n_lost_battles = 0
+            self.n_tied_battles = 0
+            self.battles = {}
+
+        async def battle_against(self, rival, n_battles=1):
+            # Una batalla rapida, luego cuelga para que salte el deadline.
+            if len(self.battles) >= 1:
+                await asyncio.Event().wait()
+            self.battles[f"battle-{len(self.battles)}"] = object()
+            self.n_won_battles += 1
+
+        async def wait_for_background_failure(self):
+            await asyncio.Event().wait()
+
+    _patch_benchmark_command_dependencies(monkeypatch, SlowAgent)
+    monkeypatch.setattr(cli_module, "BATTLE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path)
+
+    ledger_path = tmp_path / "ledger.md"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark",
+            "--n", "3",
+            "--opponent", "random",
+            "--provider", "fake",
+            "--model", "fake-model",
+            "--run-id", "test-deadline",
+            "--ledger", str(ledger_path),
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "SHOWDOWN_WS_URL": "ws://localhost:8100/showdown/websocket",
+            "LUDEX_PROVIDER": "fake",
+            "LUDEX_MODEL": "fake-model",
+        },
+    )
+
+    assert result.exit_code == 1
+    assert "ABORTED: BenchmarkDeadlineExceeded" in result.stdout
+    assert "completed=1/3" in result.stdout
+
+    artifact = tmp_path / "test-deadline.json"
+    assert artifact.exists()
+    data = json.loads(artifact.read_text())
+    assert data["status"] == "aborted"
+    assert data["requested"] == 3
+    assert data["completed"] == 1
+    assert data["failure"].startswith("BenchmarkDeadlineExceeded")
+
+    assert ledger_path.exists()
+    ledger_text = ledger_path.read_text()
+    assert "test-deadline" in ledger_text
+    assert "1/3" in ledger_text
+    assert "1-0-0" in ledger_text
