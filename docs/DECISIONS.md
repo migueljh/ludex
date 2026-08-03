@@ -1731,3 +1731,117 @@ bytes del request, no de la respuesta. Los oráculos de integración dependen de
 que `packages/calc@0.11.0` no cambie los valores pineados (el canario los
 refija). D33/D34 quedan integrados por merge aditivo de
 `integration/phase-2-accepted`; D36/MON-10 no se toca.
+
+## D36 — `identity_key` (hash de apertura pública) reemplaza `battle_tag` como identidad persistida; unicidad por `(source, identity_key)`
+
+**Contexto.** `battle_tag` (`battle-<formato>-<N>`) no es un identificador
+global: `N` sale del contador del server de Showdown, que vive en
+`logs/lastbattle.txt` **dentro** del contenedor sin volumen. Un rebuild lo
+reinicia en 1 y reusa tags viejos para batallas completamente distintas. Con
+`UNIQUE(battle_tag)` como identidad, dos batallas genuinamente distintas que
+comparten tag, p1, p2 y format después de un restart se fusionaban en
+silencio: `battle_turns` y `trajectory_steps` de una sobreescribían a la
+otra, mientras `battles` seguía luciendo internamente consistente
+(reproducido en una transacción con rollback contra datos reales durante el
+diagnóstico).
+
+**`identity_key` sale de lo que el servidor narró, no de su contador.**
+`compute_opening_identity` (`showdown/protocol.py`) calcula
+`ps-open-v1:sha256:<64hex>` sobre el bloque de apertura **público** del
+turno 0 (las líneas allowlisted `t:`, `gametype`, `gen`, `tier`, `rule`,
+`teamsize`, `player`, `start`, `switch`; cualquier otra línea —`>tag`,
+`|init|`, `|title|`, `|j|`, `|request|` privado— se descarta por no figurar
+en el allowlist), normalizado línea por línea, en orden canónico, sin
+deduplicar y sin comparar por substring ni por concatenación. La única
+asimetría real entre p1 y p2 en ese bloque es el HP del `|switch|` inicial
+(Showdown manda el valor exacto al dueño y el porcentual al rival); ambos
+representan siempre el 100% al arrancar, así que normalizar ese token al
+sentinel `FULL` es lo que le da paridad a la clave entre los dos lados. Un
+switch inicial que no esté al 100% falla cerrado (`OpeningIdentityError`):
+en el turno de apertura eso nunca debería pasar, y forzar el sentinel de
+todos modos violaría D17.
+
+**La completitud se parametriza por gametype, no se fija a Singles.** El
+rol/slot esperado sale del conjunto canónico de roles que cada gametype
+exige (`singles`/`doubles`/`triples`: `{p1,p2}`; `multi`: `{p1,p2,p3,p4}`) y
+de la fórmula real de `Pokemon.getSlot()` del simulador vendorizado
+(`pokemon-showdown@0.11.10`, `sim/pokemon.ts:504-507`, versión pineada por
+D4): `positionOffset = floor(side.n / 2) * side.active.length`, letra =
+`'abcdef'[posición + positionOffset]`. Para singles/doubles/triples esto
+coincide con "cada rol usa sus propias letras", pero para `multi` no: p1/p2
+caen en `'a'` y p3/p4 en `'b'`, no una letra uniforme por rol. Dos rondas de
+revisión encontraron aperturas que producían una clave válida sin
+representar una apertura real: conteos de línea que cuadraban
+aritméticamente con un solo lado presente (dos `player|p1`, cero `p2`), y
+topologías con roles ajenos al gametype declarado (singles con p1+p3, multi
+sin p3/p4). Ambos casos ahora fallan cerrado porque `player`/`teamsize`/
+`switch` se validan como **conjuntos** exactos contra el rol canónico del
+gametype, no por conteo.
+
+**Unicidad por `(source, identity_key)`, no global.** Identidad y
+procedencia quedan separadas a propósito: un import y una grabación local no
+se fusionan mientras `source` siga gobernando qué entra a training.
+`battle_tag` deja de ser identidad y vuelve a ser la etiqueta de sala; sigue
+indexado como `(source, battle_tag)` porque se sigue consultando por tag
+(p.ej. re-persistencia desde el CLI).
+
+**Conflicto resuelto atómicamente en una sola sentencia, no con un SELECT
+previo.** La primera entrega comprobaba compatibilidad de
+p1/p2/format/played_by/winner con un `SELECT` separado antes del
+`INSERT ... ON CONFLICT`; una revisión (`LINEAR_VERDICT` L-01, CRÍTICO)
+reprodujo con dos conexiones reales forzadas a interlevar que ambas llamadas
+pasaban ese precheck antes de que cualquiera escribiera, dejando metadata y
+winners incompatibles sin excepción. La compatibilidad ahora vive
+enteramente en el `WHERE` de `_SAVE_BATTLE_SQL`: si metadata no coincide o
+hay dos winners conocidos distintos, el `WHERE` da falso, ni el `UPDATE` ni
+el `INSERT` ocurren, y `RETURNING` vuelve vacío — señal única e inequívoca
+para `BattleIdentityConflictError`. Postgres toma un lock exclusivo sobre la
+fila en conflicto desde que detecta la colisión de `(source, identity_key)`
+hasta el commit/rollback de esa transacción, serializando a cualquier
+escritor concurrente contra la misma `identity_key`. `winner` sólo avanza de
+`NULL` a conocido o repite el mismo valor; dos winners conocidos distintos
+nunca se pisan.
+
+**Migración y backfill.** `identity_key` se agrega como columna, se
+backfillea a `legacy:<battle_tag>` para las 552 filas históricas (triviales
+de no repetir porque `battle_tag` ya era global bajo el régimen viejo; sus
+`ProtocolRecorder` murieron con el proceso que las grabó, así que no pueden
+re-persistirse) y queda `NOT NULL`. Se elimina `UNIQUE(battle_tag)` y se
+agrega `UNIQUE(source, identity_key)`. Documentado explícitamente: las filas
+legacy **no** se deduplican contra una futura reingesta de la misma batalla.
+`migrate:down` hace preflight de `battle_tag` duplicados y aborta ruidoso
+con el esquema intacto si reintroducir `UNIQUE(battle_tag)` global sería
+inseguro, en vez de fallar a mitad de camino o elegir a mano qué fila
+borrar.
+
+**Verificación.** `test_protocol.py` cubre paridad p1/p2 con HP exacto vs.
+porcentual invertidos, orden de llegada irrelevante, no comparación por
+substring/concatenado, no deduplicación, aperturas incompletas y switches no
+íntegros al 100%, y las topologías por gametype (`test_singles_con_p1_y_p3_
+falla_cerrado`, `test_multi_sin_p3_p4_falla_cerrado`, `test_multi_con_
+topologia_incorrecta_falla_cerrado`, `test_multi_real_completo_pasa`).
+`test_repository.py` cubre conflicto de metadata y de winner
+(`test_conflicto_de_metadata_con_misma_identidad_revienta`,
+`test_conflicto_de_winner_conocido_distinto_revienta`), avance de winner
+NULL→conocido y repetición legítima, y la atomicidad real con dos conexiones
+bloqueantes (`test_dos_conexiones_reales_se_serializan_por_winner_
+incompatible`): se afirma positivamente que la segunda conexión queda
+bloqueada (`wait_for` con timeout real, no inferencia) antes de comprobar
+`RETURNING`. `test_models.py` compara constraints e índices reales contra
+`pg_indexes`/`information_schema`
+(`test_battles_constraints_e_indices_espejan_el_ddl`), no sólo tipos de
+columna. Cada arreglo se probó primero rojo contra el código pre-fix con la
+reproducción exacta de la revisión, y se restauró y reverificó verde
+después. Aplicado a la base real de Ludex tras un `pg_dump` con nombre;
+verificado además contra 2 batallas reales jugadas contra el Showdown local
+(sin restart).
+
+**Alcance y límites.** No se agrega migración para separar `battle_turns`/
+`trajectory_steps` de esta identidad: su clave sigue siendo
+`(trajectory_id, decision_index)` y ningún intento rechazado llega a esas
+tablas. Re-persistir la misma batalla usa la misma `identity_key` y es
+idempotente por diseño. Las filas legacy backfilleadas no se pueden
+re-vincular a una reingesta futura de la misma batalla porque no hay forma
+de recalcular su fingerprint de apertura post-hoc. D33/D34/D35 quedan
+integrados por merge aditivo de `integration/phase-2-accepted`, sin
+reabrirse.
