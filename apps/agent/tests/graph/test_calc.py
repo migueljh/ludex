@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from ludex_agent.graph.calc import (
@@ -539,6 +541,8 @@ async def test_magic_room_se_mapea_a_isMagicRoom():
 # --- L-01: observado / desconocido / asumido por matchup ---
 
 from ludex_agent.graph.calc import (
+    _concurrent_matchups,
+    _MAX_CONCURRENCY,
     _depends_on_assumptions,
     _matchup_assumptions,
     _reduce_incoming_batch,
@@ -595,6 +599,86 @@ def test_rank_move_fallback_no_claim_ko_bajo_supuestos():
 
 
 # --- L-02: possible_moves con categoría, dedupe, concurrencia, reducción ---
+
+
+class BlockingProbeCalculator:
+    """Fake bloqueante que mide la concurrencia real y el orden de finalización.
+
+    `calculate` duerme de forma que un request mantiene su slot del semáforo
+    ocupado, exponiendo `max_in_flight`. Con `inverted=True` el que EMPIEZA
+    tarde termina primero, para poder demostrar que el orden de salida sigue
+    siendo el de entrada (determinista) aunque el de finalización se invierta.
+    """
+
+    def __init__(self, *, total: int, inverted: bool = False) -> None:
+        self._total = total
+        self._inverted = inverted
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.start_order: list[str] = []
+        self.finish_order: list[str] = []
+
+    async def calculate(self, request):
+        move_id = request["move"]["name"]
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        index = len(self.start_order)
+        self.start_order.append(move_id)
+        # Latencia invertida: el último en empezar termina primero.
+        delay = (self._total - index) * 0.02 if self._inverted else 0.02
+        await asyncio.sleep(delay)
+        self.in_flight -= 1
+        self.finish_order.append(move_id)
+        return _result([[10, 20]], hp=200)
+
+
+@pytest.mark.asyncio
+async def test_semaphore_cota_max_in_flight_a_8_con_fake_bloqueante():
+    """T-03: con 12 requests y un fake bloqueante, max_in_flight debe ser 8."""
+    calculator = BlockingProbeCalculator(total=12)
+    battle = _battle()
+    battle["opponent"]["pokemon"][0]["moves"] = []
+    battle["legal_actions"] = [{"kind": "switch", "species": "charizard"}]
+    battle["me"]["pokemon"].append({
+        "species": "charizard", "level": 80, "active": False,
+        "hp_fraction": 1.0, "moves": [], "boosts": {},
+        "item": None, "ability": None, "status": None,
+    })
+    possible = [_move(f"move{i}", "Physical") for i in range(12)]
+    context = {
+        "own": [],
+        "opponent": [{"showdown_id": "blastoise", "moves": possible}],
+        "mega_forms": {},
+    }
+    update = await calc_damage(
+        {"battle_state": battle, "context": context}, calculator
+    )
+    assert len(calculator.start_order) == 12
+    assert calculator.max_in_flight == 8
+    assert update["damage_metrics"]["calls"] == 12
+
+
+@pytest.mark.asyncio
+async def test_semaphore_con_latencias_invertidas_preserva_orden_determinista():
+    """T-03: aunque el orden de finalización se invierta (el que empieza tarde
+    termina primero), el resultado conserva el orden de entrada."""
+    calculator = BlockingProbeCalculator(total=12, inverted=True)
+    entries = [{"move_id": f"move{i}"} for i in range(12)]
+    requests = [{"move": {"name": f"move{i}"}} for i in range(12)]
+    metrics = {"calls": 0, "bytes": 0, "latencies": []}
+    computed = await _concurrent_matchups(
+        calculator, list(zip(entries, requests)), metrics,
+        limit=_MAX_CONCURRENCY,
+    )
+    assert calculator.max_in_flight == 8
+    # Las latencias invertidas sí cambian el orden de finalización: el primer
+    # request en terminar no es el primero en empezar (move7, no move0).
+    assert calculator.finish_order != calculator.start_order
+    assert calculator.finish_order[0] != calculator.start_order[0]
+    assert [entry["move_id"] for entry in computed] == [
+        f"move{i}" for i in range(12)
+    ]
+    assert metrics["calls"] == 12
 
 
 def _move(id, category):
