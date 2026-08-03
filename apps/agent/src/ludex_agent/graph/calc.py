@@ -689,13 +689,9 @@ async def calc_damage(
                     entry["possible"] = True
                     if possible_desc is not None:
                         entry["descriptor"] = {
-                            key: possible_desc[key]
-                            for key in (
-                                "showdown_id", "name", "type", "category",
-                                "power", "power_kind", "accuracy", "pp",
-                                "priority", "target", "flags",
-                            )
-                            if key in possible_desc
+                            key: value
+                            for key, value in possible_desc.items()
+                            if key != "learn_methods"
                         }
                 else:
                     entry["revealed"] = True

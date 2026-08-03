@@ -416,6 +416,9 @@ async def test_canario_blastoise_gen6_102_posibles_29_status(calc_available):
     incoming = [e for e in update["damage"] if e["direction"] == "incoming"]
     assert len(incoming) == 3  # reduccion post-calculo: top-3 posibles
     assert all(e.get("possible") for e in incoming)
+    # El descriptor completo (categoria incluida) viaja con cada posible.
+    assert all(e["descriptor"]["category"] in {"Physical", "Special"}
+               for e in incoming)
     assert all(e["result"]["max_damage"] >= incoming[-1]["result"]["max_damage"]
                for e in incoming)
     assert metrics["latency_ms"] is not None
