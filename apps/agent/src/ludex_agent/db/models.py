@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import ARRAY, DateTime, ForeignKey, Numeric, Text, func
+from sqlalchemy import ARRAY, DateTime, ForeignKey, Index, Numeric, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import ENUM as PGEnum
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -28,9 +28,24 @@ ActionSource = PGEnum(name="action_source", create_type=False)
 
 
 class Battle(Base):
+    """D36 (MON-10/F2-03): `battle_tag` dejo de ser la identidad -- es la
+    etiqueta de sala del servidor de Showdown, y su contador se reusa tras un
+    restart. `identity_key` (`ps-open-v1:sha256:...`, hash del bloque de
+    apertura publico) es la identidad real; la unicidad es por
+    `(source, identity_key)`, no global, para que un import y una grabacion
+    local no se fusionen mientras `source` siga gobernando training.
+    """
+
     __tablename__ = "battles"
+    __table_args__ = (
+        UniqueConstraint(
+            "source", "identity_key", name="battles_source_identity_key_uniq"
+        ),
+        Index("battles_source_battle_tag_idx", "source", "battle_tag"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
-    battle_tag: Mapped[str] = mapped_column(Text, unique=True)
+    battle_tag: Mapped[str] = mapped_column(Text)
+    identity_key: Mapped[str] = mapped_column(Text)
     tournament_id: Mapped[int | None] = mapped_column(nullable=True)
     round_id: Mapped[int | None] = mapped_column(nullable=True)
     format: Mapped[str] = mapped_column(Text)

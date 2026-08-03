@@ -8,16 +8,18 @@ from typing import Any
 from sqlalchemy import text
 
 
-class BattleTagCollisionError(RuntimeError):
-    """I2: el mismo battle_tag ya existe con un p1/p2/format distinto.
+class BattleIdentityConflictError(RuntimeError):
+    """D36: la misma `identity_key` (bajo el mismo `source`) ya existe con
+    metadata incompatible.
 
-    `battle_tag` (`battle-<formato>-<N>`) viene del contador global del
-    servidor de Showdown, que vive en `logs/lastbattle.txt` DENTRO del
-    contenedor (sin volumen: no sobrevive a un rebuild). Si el contador
-    reinicia, un `battle_tag` viejo puede reusarse para una batalla
-    completamente distinta. Con upsert-only (D13, sin deletes) esto fusionaria
-    en silencio dos batallas distintas en una fila. Mejor fallar ruidoso que
-    fusionar callado.
+    `identity_key` es un hash del bloque de apertura PUBLICO de la batalla
+    (`ps-open-v1:sha256:...`, `compute_opening_identity`), no del
+    `battle_tag`: el tag es la etiqueta de sala del servidor y se reusa tras
+    un restart (D-3 del checkpoint de diagnostico), asi que ya NO puede ser
+    la identidad persistida. Dos batallas distintas nunca deberian colisionar
+    en la misma `identity_key` -- si lo hacen, o el fingerprint tiene una
+    colision real, o alguien esta re-persistiendo con metadata equivocada.
+    Mejor fallar ruidoso que fusionar callado.
     """
 
 
@@ -25,37 +27,51 @@ class BattleRepository:
     def __init__(self, factory: Any) -> None:
         self.factory = factory
 
-    async def save_battle(self, *, battle_tag: str, fmt: str, p1: str, p2: str,
-                          winner: str | None, source: str, played_by: str) -> int:
-        """Idempotente por battle_tag: reejecutar el runner no duplica.
+    async def save_battle(self, *, battle_tag: str, identity_key: str, fmt: str,
+                          p1: str, p2: str, winner: str | None, source: str,
+                          played_by: str) -> int:
+        """Idempotente por `(source, identity_key)`: reejecutar el runner no
+        duplica, y dos batallas distintas que comparten `battle_tag` (tag
+        reusado tras un restart de Showdown) ya no se fusionan.
 
-        I2: antes de upsertear, si el tag YA existe con otro p1/p2/format,
-        es una colision del contador de Showdown (dos batallas distintas
-        fusionandose), no una re-persistencia legitima. Se aborta ruidoso en
-        vez de pisar en silencio.
+        D36: antes de upsertear, si la `identity_key` YA existe bajo el mismo
+        `source` con otro p1/p2/format/played_by, es una colision real de la
+        identidad (o un error de quien llama), no una re-persistencia
+        legitima. El `winner` sigue una regla mas laxa a proposito: puede
+        avanzar de NULL a un valor conocido (la batalla termino DESPUES de
+        que se persistio parcialmente) o repetirse; dos ganadores conocidos
+        DISTINTOS para la misma identidad tambien es una colision.
         """
         async with self.factory() as s:
             existente = (await s.execute(text(
-                "SELECT p1, p2, format FROM battles WHERE battle_tag = :tag"
-            ), {"tag": battle_tag})).first()
-            if existente is not None and (
-                existente[0] != p1 or existente[1] != p2 or existente[2] != fmt
-            ):
-                raise BattleTagCollisionError(
-                    f"battle_tag {battle_tag!r} ya existe con p1={existente[0]!r} "
-                    f"p2={existente[1]!r} format={existente[2]!r}, distinto de la "
-                    f"batalla actual (p1={p1!r} p2={p2!r} format={fmt!r}). "
-                    "Probablemente el contador de Showdown reinicio (rebuild o "
-                    "--force-recreate sin volumen); persistir pisaria una batalla "
-                    "distinta bajo el mismo tag."
-                )
+                "SELECT p1, p2, format, played_by, winner FROM battles "
+                "WHERE source = CAST(:src AS battle_source) AND identity_key = :key"
+            ), {"src": source, "key": identity_key})).first()
+            if existente is not None:
+                if (existente[0] != p1 or existente[1] != p2
+                        or existente[2] != fmt or existente[3] != played_by):
+                    raise BattleIdentityConflictError(
+                        f"identity_key {identity_key!r} (source={source!r}) ya existe "
+                        f"con p1={existente[0]!r} p2={existente[1]!r} format={existente[2]!r} "
+                        f"played_by={existente[3]!r}, distinto de la batalla actual "
+                        f"(p1={p1!r} p2={p2!r} format={fmt!r} played_by={played_by!r})."
+                    )
+                if existente[4] is not None and winner is not None and existente[4] != winner:
+                    raise BattleIdentityConflictError(
+                        f"identity_key {identity_key!r} (source={source!r}) ya tiene "
+                        f"winner={existente[4]!r}; la nueva persistencia trae "
+                        f"winner={winner!r}: dos ganadores conocidos distintos para "
+                        "la misma identidad."
+                    )
             row = await s.execute(text("""
-                INSERT INTO battles (battle_tag, format, p1, p2, winner, played_by, source)
-                VALUES (:tag, :fmt, :p1, :p2, :w, CAST(:pb AS played_by_kind),
+                INSERT INTO battles (battle_tag, identity_key, format, p1, p2, winner,
+                                     played_by, source)
+                VALUES (:tag, :key, :fmt, :p1, :p2, :w, CAST(:pb AS played_by_kind),
                         CAST(:src AS battle_source))
-                ON CONFLICT (battle_tag) DO UPDATE SET winner = EXCLUDED.winner
+                ON CONFLICT (source, identity_key) DO UPDATE
+                  SET winner = COALESCE(EXCLUDED.winner, battles.winner)
                 RETURNING id
-            """), {"tag": battle_tag, "fmt": fmt, "p1": p1, "p2": p2,
+            """), {"tag": battle_tag, "key": identity_key, "fmt": fmt, "p1": p1, "p2": p2,
                    "w": winner, "pb": played_by, "src": source})
             await s.commit()
             return row.scalar_one()

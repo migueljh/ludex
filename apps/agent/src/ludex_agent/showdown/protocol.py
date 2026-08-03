@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
 import re
 import time
 from collections import defaultdict, deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -69,6 +71,160 @@ class ProtocolRecorder:
         llegada. Usado por `LudexPlayer` para corregir la etiqueta de turno
         de cada decision con un cursor que solo avanza (ver D20)."""
         return list(self._entries[index:])
+
+
+# ---------------------------------------------------------------------------
+# Identidad de apertura (MON-10/F2-03, D36)
+#
+# `battle_tag` (`battle-<formato>-<N>`) NO es un identificador global: `N` es
+# el contador del server de Showdown, que vive en `logs/lastbattle.txt`
+# DENTRO del contenedor sin volumen. Un rebuild lo reinicia en 1 y reusa
+# tags viejos para batallas completamente distintas. La identidad persistida
+# tiene que salir de lo que el servidor narro, no de ese contador.
+#
+# Fuente: bloque de apertura PUBLICO del turno 0 (las lineas que ambos lados
+# reciben). La unica asimetria real entre p1 y p2 en ese bloque es el HP del
+# `|switch|` inicial -- Showdown manda el valor EXACTO al dueno del mon y el
+# PORCENTUAL al rival (`getHealth.secret` vs `.shared`) -- y al arrancar la
+# batalla las dos formas representan siempre el 100%, asi que normalizarlas
+# al mismo sentinel es lo que le da paridad a la clave entre los dos lados.
+# ---------------------------------------------------------------------------
+
+OPENING_IDENTITY_VERSION = "ps-open-v1"
+
+# Etiquetas allowlisted del bloque de apertura (DESIGN VERDICT #2). Cualquier
+# otra linea (`>tag`, `|init|`, `|title|`, `|j|`, `|request|` privado, blancos)
+# se descarta sola por no figurar aca: no hace falta enumerarla.
+_OPENING_LABELS = frozenset({
+    "t:", "gametype", "gen", "tier", "rule", "teamsize", "player", "start", "switch",
+})
+
+# Activos por lado segun el gametype declarado (DESIGN VERDICT #3: la
+# completitud se parametriza por jugadores/gametype, nunca se fija "Singles").
+_ACTIVE_SLOTS_BY_GAMETYPE = {"singles": 1, "doubles": 2, "triples": 3, "multi": 1}
+
+_TAG_DOMAIN_RE = re.compile(r"-\d+$")
+_SWITCH_HP_RE = re.compile(r"^(\d+)/(\d+)$")
+
+
+class OpeningIdentityError(RuntimeError):
+    """La apertura publica no alcanza, o no cierra, para calcular una
+    identidad segura. Fallo CERRADO a proposito: mejor no persistir nada que
+    persistir con una clave que no representa de verdad a esta partida."""
+
+
+def _opening_label(line: str) -> str | None:
+    if not line.startswith("|"):
+        return None
+    parts = line.split("|")
+    return parts[1] if len(parts) > 1 and parts[1] else None
+
+
+def _normalize_switch_line(line: str) -> str:
+    """Reemplaza el token de HP del switch inicial por el sentinel `FULL`.
+
+    Falla cerrado si el switch NO esta al 100%: en el turno de apertura eso
+    es siempre cierto por regla del juego, asi que lo contrario significa que
+    esta funcion no entiende esta apertura, y forzar un sentinel de todos
+    modos iria contra D17 (fallar antes que inventar).
+    """
+    parts = line.split("|")
+    if len(parts) != 5:
+        raise OpeningIdentityError(f"switch inicial con forma inesperada: {line!r}")
+    match = _SWITCH_HP_RE.match(parts[4].strip())
+    if match is None:
+        raise OpeningIdentityError(f"switch inicial con HP no parseable: {line!r}")
+    current, total = int(match.group(1)), int(match.group(2))
+    if total == 0 or current != total:
+        raise OpeningIdentityError(f"switch inicial no esta al 100%: {line!r}")
+    parts[4] = "FULL"
+    return "|".join(parts)
+
+
+def _tag_domain(battle_tag: str) -> str:
+    """El dominio del tag SIN el contador del servidor: es justo el contador
+    el que se reutiliza tras un restart, asi que no puede formar parte de una
+    identidad pensada para sobrevivirlo."""
+    return _TAG_DOMAIN_RE.sub("", battle_tag.strip().lower())
+
+
+def _gametype_of(by_label: dict[str, list[str]]) -> str:
+    lines = by_label.get("gametype", [])
+    if len(lines) != 1:
+        raise OpeningIdentityError(
+            f"apertura incompleta: se esperaba exactamente una linea 'gametype', "
+            f"se vieron {len(lines)}"
+        )
+    parts = lines[0].split("|")
+    if len(parts) < 3 or not parts[2]:
+        raise OpeningIdentityError(f"linea 'gametype' sin valor: {lines[0]!r}")
+    return parts[2].strip().lower()
+
+
+def compute_opening_identity(battle_tag: str, opening_lines: Sequence[str]) -> str:
+    """`ps-open-v1:sha256:<64hex>` — la identidad persistida de una batalla.
+
+    El payload es el `battle_tag` normalizado como dominio (sin el contador)
+    mas las lineas allowlisted del bloque de apertura, normalizadas linea por
+    linea, ORDENADAS canonicamente y sin deduplicar (dos rules identicas
+    cuentan dos veces). Nunca se compara protocolo concatenado ni por
+    substring: cada linea es un elemento propio antes de unirse con '\\n'.
+    """
+    by_label: dict[str, list[str]] = defaultdict(list)
+    normalized: list[str] = []
+    for raw in opening_lines:
+        label = _opening_label(raw)
+        if label not in _OPENING_LABELS:
+            continue
+        line = raw.strip()
+        if label == "switch":
+            line = _normalize_switch_line(line)
+        by_label[label].append(line)
+        normalized.append(line)
+
+    # `t:` NO aparece una sola vez: medido contra batallas reales del corpus
+    # (battle-gen6randombattle-257, -271, -386), Showdown manda un `|t:|` con
+    # el intercambio inicial de info y OTRO justo antes de `|start|`. Exigir
+    # "exactamente 1" hacia fallar cerrado el 100% de las aperturas reales.
+    # `start` si es siempre exactamente 1 en la misma muestra.
+    for required in ("t:", "gen", "tier", "start"):
+        if len(by_label.get(required, [])) < 1:
+            raise OpeningIdentityError(f"apertura incompleta: falta '{required}'")
+    if len(by_label["start"]) != 1:
+        raise OpeningIdentityError(
+            "apertura incompleta: 'start' debe aparecer exactamente una vez"
+        )
+
+    gametype = _gametype_of(by_label)
+    slots = _ACTIVE_SLOTS_BY_GAMETYPE.get(gametype)
+    if slots is None:
+        raise OpeningIdentityError(
+            f"gametype desconocido, no se puede validar completitud: {gametype!r}"
+        )
+
+    n_players = len(by_label.get("player", []))
+    if n_players < 2:
+        raise OpeningIdentityError(
+            f"apertura incompleta: se esperaban al menos 2 lineas 'player', se vieron {n_players}"
+        )
+
+    n_teamsize = len(by_label.get("teamsize", []))
+    if n_teamsize != n_players:
+        raise OpeningIdentityError(
+            f"apertura incompleta: {n_players} jugadores pero {n_teamsize} 'teamsize'"
+        )
+
+    expected_switches = n_players * slots
+    n_switch = len(by_label.get("switch", []))
+    if n_switch != expected_switches:
+        raise OpeningIdentityError(
+            f"apertura incompleta: se esperaban {expected_switches} 'switch' iniciales "
+            f"({n_players} jugadores x {slots} activos de {gametype!r}), se vieron {n_switch}"
+        )
+
+    payload = "\n".join([f"domain:{_tag_domain(battle_tag)}", *sorted(normalized)])
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"{OPENING_IDENTITY_VERSION}:sha256:{digest}"
 
 
 # ---------------------------------------------------------------------------

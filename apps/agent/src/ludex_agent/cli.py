@@ -26,6 +26,7 @@ from .db.context_repository import PostgresContextRepository
 from .db.repository import BattleRepository
 from .db.session import make_engine, session_factory
 from .showdown.client import LudexPlayer, local_server_configuration
+from .showdown.protocol import compute_opening_identity
 from .graph.calc import CalcClient
 from .graph.decision import DecisionResponse
 from .graph.provider import (
@@ -237,11 +238,19 @@ async def _persist_one(
     if battle.finished:
         winner, result, reward = _battle_outcome(battle)
 
-    battle_id = await repo.save_battle(
-        battle_tag=tag, fmt=fmt, p1=p1, p2=p2, winner=winner,
-        source=source, played_by="bot",
-    )
+    # MON-10/F2-03 (D36): la identidad persistida sale del bloque de
+    # apertura PUBLICO (turno 0), no del battle_tag -- su contador se reusa
+    # tras un restart de Showdown. `compute_opening_identity` falla cerrado
+    # (`OpeningIdentityError`) si esa apertura no cierra; se propaga tal
+    # cual, antes de escribir nada, en vez de persistir con una identidad
+    # que no representa de verdad a esta partida.
     recorder = agent.recorders[tag]
+    identity_key = compute_opening_identity(tag, recorder.lines_for_turn(0))
+
+    battle_id = await repo.save_battle(
+        battle_tag=tag, identity_key=identity_key, fmt=fmt, p1=p1, p2=p2,
+        winner=winner, source=source, played_by="bot",
+    )
     for turn in recorder.turns():
         await repo.save_turn(battle_id, side, turn, recorder.lines_for_turn(turn))
 

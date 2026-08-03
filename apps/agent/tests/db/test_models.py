@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import UniqueConstraint, text
 from sqlalchemy.dialects import postgresql
 
 from ludex_agent.config import load_settings
@@ -139,5 +139,76 @@ async def test_action_path_es_text_nullable_con_dominio_acotado():
 
         assert column == ("YES", "text")
         assert all(value in definition for value in ("llm", "llm_retry", "fallback"))
+    finally:
+        await engine.dispose()
+
+
+async def test_battles_constraints_e_indices_espejan_el_ddl():
+    """D36: extiende la paridad esquema<->modelo a UNIQUE constraints e
+    indices, no solo columnas/tipos. Sin esto, `battle_tag: Mapped[str] =
+    mapped_column(Text, unique=True)` podia seguir diciendo `unique=True`
+    despues de que la migracion de battle_identity se lo sacara, y
+    `test_models_espeja_el_ddl_columna_por_columna` seguia en verde: nullability
+    y tipo no dicen nada sobre unicidad.
+    """
+    engine = make_engine(load_settings().database_url)
+    try:
+        async with session_factory(engine)() as s:
+            filas = (await s.execute(text("""
+                SELECT tc.constraint_name, kcu.column_name, kcu.ordinal_position
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                  ON kcu.constraint_name = tc.constraint_name
+                 AND kcu.table_schema = tc.table_schema
+                WHERE tc.table_schema = 'public' AND tc.table_name = 'battles'
+                  AND tc.constraint_type = 'UNIQUE'
+                ORDER BY tc.constraint_name, kcu.ordinal_position
+            """))).all()
+            constraints_db: dict[str, list[str]] = {}
+            for nombre, columna, _ in filas:
+                constraints_db.setdefault(nombre, []).append(columna)
+
+            indices_db = (await s.execute(text("""
+                SELECT indexname, indexdef FROM pg_indexes
+                WHERE schemaname = 'public' AND tablename = 'battles'
+            """))).all()
+            indexdefs_db = {nombre: definicion for nombre, definicion in indices_db}
+
+        table = models.Battle.__table__
+        constraints_modelo = [
+            c for c in table.constraints if isinstance(c, UniqueConstraint)
+        ]
+        assert constraints_modelo, "el modelo no declara ningun UniqueConstraint"
+        for constraint in constraints_modelo:
+            columnas_modelo = [c.name for c in constraint.columns]
+            assert constraint.name in constraints_db, (
+                f"falta en la DB el UNIQUE constraint {constraint.name!r} que "
+                f"models.py declara sobre {columnas_modelo}"
+            )
+            assert constraints_db[constraint.name] == columnas_modelo, (
+                f"{constraint.name}: columnas modelo={columnas_modelo} vs "
+                f"db={constraints_db[constraint.name]}"
+            )
+
+        assert table.indexes, "el modelo no declara ningun Index"
+        for index in table.indexes:
+            assert index.name in indexdefs_db, (
+                f"falta en la DB el indice {index.name!r} que models.py declara"
+            )
+            for column in index.columns:
+                assert column.name in indexdefs_db[index.name], (
+                    f"{index.name}: la DB no menciona la columna {column.name!r} "
+                    f"({indexdefs_db[index.name]!r})"
+                )
+
+        # Canario negativo (D36): la vieja UNIQUE global sobre `battle_tag`
+        # SOLA tiene que haber desaparecido -- es justo lo que esta migracion
+        # vino a sacar. Si siguiera ahi, dos batallas con el mismo tag y
+        # distinta identity_key no podrian coexistir y el arreglo no
+        # arreglaria nada, aunque el resto de este test pasara en verde.
+        assert "battles_battle_tag_key" not in constraints_db, (
+            "sigue existiendo UNIQUE(battle_tag) global: la migracion de "
+            "battle_identity no se aplico o no elimino esa constraint"
+        )
     finally:
         await engine.dispose()

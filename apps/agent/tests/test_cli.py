@@ -215,6 +215,30 @@ def test_benchmark_rechaza_modelo_sin_ruta_antes_de_llamarlo(monkeypatch):
         )
 
 
+def _record_valid_opening(player: LudexPlayer, tag: str) -> None:
+    """Alimenta al recorder REAL del player con una apertura publica valida.
+
+    MON-10/F2-03: `_persist_one` ahora calcula `identity_key` con
+    `compute_opening_identity` a partir de `recorders[tag].lines_for_turn(0)`
+    ANTES de llegar a nada de lo que estos tests ejercen (empate, slot
+    perdido, action_path). Sin una apertura valida, `_persist_one` fallaria
+    con `OpeningIdentityError` antes de que el test pueda verificar lo que le
+    importa. Ninguno de estos tests ejerce la identidad en si; solo necesitan
+    que exista.
+    """
+    lines = [
+        f">{tag}", "|init|battle", "|t:|1785186819", "|gametype|singles",
+        "|player|p1|Bot|101|", "|player|p2|Rival|102|",
+        "|teamsize|p1|6", "|teamsize|p2|6",
+        "|gen|6", "|tier|[Gen 6] Random Battle",
+        "|rule|HP Percentage Mod: HP is shown in percentages",
+        "|start",
+        "|switch|p1a: Furret|Furret, L93, F|309/309",
+        "|switch|p2a: Rival|Rival, L88, M|100/100",
+    ]
+    player.recorders[tag].record([line.split("|") for line in lines])
+
+
 class _FakeRepo:
     """Doble de `BattleRepository`: registra lo que se le pide grabar, sin
     tocar ninguna base."""
@@ -295,6 +319,7 @@ async def test_persist_one_graba_el_empate_sin_ganador_ni_reward_negativo():
     )
     player.battles[tag] = battle
     player.steps[tag] = []
+    _record_valid_opening(player, tag)
 
     repo = _FakeRepo()
     await _persist_one(player, repo, tag, "gen6randombattle", "test")
@@ -319,6 +344,7 @@ async def test_persist_one_falla_antes_de_escribir_si_hay_un_slot_none():
     )
     player.battles[tag] = battle
     player.steps[tag] = [None]
+    _record_valid_opening(player, tag)
 
     repo = _FakeRepo()
     with pytest.raises(RuntimeError, match=rf"{tag}.*0"):
@@ -343,6 +369,7 @@ async def test_persist_one_falla_antes_de_escribir_si_el_estado_es_none():
         "turn": 1, "decision_turn": 1, "state": None,
         "action_taken": {"kind": "move", "id": "tackle"},
     }]
+    _record_valid_opening(player, tag)
 
     repo = _FakeRepo()
     with pytest.raises(RuntimeError, match=rf"{tag}.*0"):
@@ -371,6 +398,7 @@ async def test_persist_one_no_escribe_parcialmente_antes_de_un_slot_perdido():
         },
         None,
     ]
+    _record_valid_opening(player, tag)
 
     repo = _FakeRepo()
     with pytest.raises(RuntimeError, match=rf"{tag}.*1"):
@@ -404,6 +432,7 @@ async def test_persist_one_reporta_indice_y_fase_de_un_rechazo_pendiente():
         step_index=0,
         step=None,
     )
+    _record_valid_opening(player, tag)
     repo = _FakeRepo()
 
     with pytest.raises(
@@ -431,6 +460,7 @@ async def test_persist_one_separa_action_path_de_action_source():
         "action_taken": {"kind": "move", "id": "tackle"},
         "action_path": "llm_retry",
     }]
+    _record_valid_opening(player, tag)
     repo = _FakeRepo()
 
     await _persist_one(player, repo, tag, "gen6randombattle", "test")

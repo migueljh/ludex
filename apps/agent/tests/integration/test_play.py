@@ -1091,7 +1091,8 @@ async def test_repersistir_la_misma_batalla_no_duplica(jugadas):
             # None aca borraria el ganador real de una batalla ya jugada. Este
             # test verifica idempotencia; no debe destruir el dato que verifica.
             fila = (await s.execute(text(
-                "SELECT id, format, p1, p2, winner FROM battles WHERE battle_tag = :t"),
+                "SELECT id, format, p1, p2, winner, identity_key FROM battles "
+                "WHERE battle_tag = :t AND source = 'test'"),
                 {"t": tag})).one()
 
         # Canario: sin esto la asercion de abajo se cumple sola cuando el
@@ -1099,8 +1100,11 @@ async def test_repersistir_la_misma_batalla_no_duplica(jugadas):
         # provocaba antes. Una batalla de `jugadas` termino: tiene ganador.
         assert fila[4] is not None, "la batalla recien jugada debe tener ganador"
 
+        # MON-10/F2-03 (D36): re-persistir la MISMA batalla usa su MISMA
+        # identity_key -- no se recalcula, se toma la que ya quedo grabada,
+        # tal como haria un reintento real del runner sobre el mismo tag.
         de_nuevo = await repo.save_battle(
-            battle_tag=tag, fmt=fila[1], p1=fila[2], p2=fila[3],
+            battle_tag=tag, identity_key=fila[5], fmt=fila[1], p1=fila[2], p2=fila[3],
             winner=fila[4], source="test", played_by="bot",
         )
 

@@ -5,6 +5,148 @@ def _split(raw: str) -> list[str]:
     return raw.split("|")
 
 
+# --- MON-10/F2-03: identidad de apertura (D36) -------------------------
+
+import pytest
+
+from ludex_agent.showdown.protocol import OpeningIdentityError, compute_opening_identity
+
+BATTLE_TAG = "battle-gen6randombattle-386"
+
+
+def _p1_opening(**overrides: list[str]) -> list[str]:
+    """Apertura tal como la ve p1: HP exacto de su propio activo, porcentual
+    del rival. Refleja la forma real observada en el corpus (turno 0 de
+    `battle-gen6randombattle-386`: rule/switch/switch mas cabecera)."""
+    lines = {
+        "t:": ["|t:|1785186819"],
+        "gametype": ["|gametype|singles"],
+        "player": ["|player|p1|LudexBot3682|101|", "|player|p2|Rival3682|102|"],
+        "teamsize": ["|teamsize|p1|6", "|teamsize|p2|6"],
+        "gen": ["|gen|6"],
+        "tier": ["|tier|[Gen 6] Random Battle"],
+        "rule": [
+            "|rule|HP Percentage Mod: HP is shown in percentages",
+            "|rule|Sleep Clause Mod: Limit one foe put to sleep",
+        ],
+        "start": ["|start"],
+        "switch": [
+            "|switch|p1a: Furret|Furret, L93, F|309/309",
+            "|switch|p2a: Lapras|Lapras, L88, M|100/100",
+        ],
+    }
+    lines.update(overrides)
+    noise = [
+        f">{BATTLE_TAG}",
+        "|init|battle",
+        "|title|LudexBot3682 vs. Rival3682",
+        "|j|☆LudexBot3682",
+        "",
+        "|request|",
+    ]
+    out: list[str] = list(noise)
+    for key in ("t:", "gametype", "player", "teamsize", "gen", "tier", "rule", "start", "switch"):
+        out.extend(lines[key])
+    return out
+
+
+def _p2_opening(**overrides: list[str]) -> list[str]:
+    """La MISMA batalla vista por p2: exacto/porcentual invertidos respecto
+    de `_p1_opening`. El resto del bloque es identico (es publico)."""
+    lines = {
+        "switch": [
+            "|switch|p1a: Furret|Furret, L93, F|100/100",
+            "|switch|p2a: Lapras|Lapras, L88, M|248/248",
+        ],
+    }
+    lines.update(overrides)
+    return _p1_opening(**lines)
+
+
+def test_paridad_p1_p2_hp_exacto_y_porcentual_invertidos_da_la_misma_clave():
+    assert compute_opening_identity(BATTLE_TAG, _p1_opening()) == \
+        compute_opening_identity(BATTLE_TAG, _p2_opening())
+
+
+def test_una_sola_linea_distinta_cambia_la_clave():
+    base = compute_opening_identity(BATTLE_TAG, _p1_opening())
+    otro_lead = compute_opening_identity(BATTLE_TAG, _p1_opening(switch=[
+        "|switch|p1a: Furret|Furret, L93, F|309/309",
+        "|switch|p2a: Dusknoir|Dusknoir, L84, M|100/100",
+    ]))
+    assert base != otro_lead
+
+
+def test_el_orden_de_llegada_no_importa():
+    p1 = _p1_opening()
+    shuffled = p1[len(p1) // 2:] + p1[:len(p1) // 2]
+    assert compute_opening_identity(BATTLE_TAG, p1) == \
+        compute_opening_identity(BATTLE_TAG, shuffled)
+
+
+def test_no_compara_por_substring_ni_concatenado():
+    # Concatenadas, "|rule|A" + "|rule|BC" == "|rule|AB" + "|rule|C". Como
+    # elementos de lista, con separador y ordenados, NO deben coincidir.
+    a = compute_opening_identity(BATTLE_TAG, _p1_opening(rule=["|rule|A", "|rule|BC"]))
+    b = compute_opening_identity(BATTLE_TAG, _p1_opening(rule=["|rule|AB", "|rule|C"]))
+    assert a != b
+
+
+def test_conserva_duplicados_no_los_deduplica():
+    dos = compute_opening_identity(BATTLE_TAG, _p1_opening(
+        rule=["|rule|HP Percentage Mod: HP is shown in percentages"] * 2,
+    ))
+    tres = compute_opening_identity(BATTLE_TAG, _p1_opening(
+        rule=["|rule|HP Percentage Mod: HP is shown in percentages"] * 3,
+    ))
+    assert dos != tres
+
+
+def test_el_contador_del_tag_no_participa_de_la_identidad():
+    # Es justo el numero que Showdown reutiliza tras un restart.
+    misma_apertura = _p1_opening()
+    assert compute_opening_identity("battle-gen6randombattle-1", misma_apertura) == \
+        compute_opening_identity("battle-gen6randombattle-9999", misma_apertura)
+
+
+def test_apertura_incompleta_falla_cerrado():
+    lines = [line for line in _p1_opening() if not line.startswith("|start")]
+    with pytest.raises(OpeningIdentityError):
+        compute_opening_identity(BATTLE_TAG, lines)
+
+
+def test_switch_inicial_no_full_falla_cerrado():
+    with pytest.raises(OpeningIdentityError):
+        compute_opening_identity(BATTLE_TAG, _p1_opening(switch=[
+            "|switch|p1a: Furret|Furret, L93, F|200/309",
+            "|switch|p2a: Lapras|Lapras, L88, M|100/100",
+        ]))
+
+
+def test_faltan_switches_para_el_gametype_declarado():
+    # Singles con 2 jugadores exige 2 switches iniciales, no 1.
+    with pytest.raises(OpeningIdentityError):
+        compute_opening_identity(BATTLE_TAG, _p1_opening(switch=[
+            "|switch|p1a: Furret|Furret, L93, F|309/309",
+        ]))
+
+
+def test_switches_de_dobles_se_validan_contra_el_gametype():
+    doubles = _p1_opening(gametype=["|gametype|doubles"], switch=[
+        "|switch|p1a: Furret|Furret, L93, F|309/309",
+        "|switch|p1b: Gengar|Gengar, L80, M|280/280",
+        "|switch|p2a: Lapras|Lapras, L88, M|100/100",
+        "|switch|p2b: Dusknoir|Dusknoir, L84, M|100/100",
+    ])
+    # No revienta: 2 jugadores x 2 activos de dobles = 4 switches, y hay 4.
+    compute_opening_identity(BATTLE_TAG, doubles)
+
+
+def test_gametype_desconocido_falla_cerrado():
+    with pytest.raises(OpeningIdentityError):
+        compute_opening_identity(BATTLE_TAG, _p1_opening(gametype=["|gametype|rotacion"]))
+
+
 def test_agrupa_las_lineas_por_turno():
     r = ProtocolRecorder()
     r.record([_split("|init|battle"), _split("|turn|1")])

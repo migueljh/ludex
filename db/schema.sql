@@ -134,7 +134,8 @@ CREATE TABLE public.battles (
     played_by public.played_by_kind NOT NULL,
     source public.battle_source NOT NULL,
     replay_url text,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    identity_key text NOT NULL
 );
 
 
@@ -559,19 +560,19 @@ ALTER TABLE ONLY public.battle_turns
 
 
 --
--- Name: battles battles_battle_tag_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.battles
-    ADD CONSTRAINT battles_battle_tag_key UNIQUE (battle_tag);
-
-
---
 -- Name: battles battles_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.battles
     ADD CONSTRAINT battles_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: battles battles_source_identity_key_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.battles
+    ADD CONSTRAINT battles_source_identity_key_uniq UNIQUE (source, identity_key);
 
 
 --
@@ -715,6 +716,13 @@ ALTER TABLE ONLY public.usage_stats
 --
 
 CREATE INDEX battles_created_at_idx ON public.battles USING btree (created_at DESC);
+
+
+--
+-- Name: battles_source_battle_tag_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX battles_source_battle_tag_idx ON public.battles USING btree (source, battle_tag);
 
 
 --
@@ -881,4 +889,5 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20260727000005'),
     ('20260727000006'),
     ('20260727000007'),
-    ('20260727000008');
+    ('20260727000008'),
+    ('20260729000001');
