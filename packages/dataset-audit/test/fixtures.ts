@@ -58,6 +58,17 @@ export function dexPokemon(): DexPokemon[] {
       gen: 6, showdownId: "dusknoir", baseSpecies: "dusknoir", forme: null,
       types: ["Ghost"], abilities: ["Pressure"],
     },
+    // Relic Song revierte al salir del campo (a diferencia de Mega, que
+    // persiste): la propia línea de switch-in vuelve a narrar "Meloetta",
+    // no "Meloetta-Pirouette" (MON-18 R3, D40).
+    {
+      gen: 6, showdownId: "meloetta", baseSpecies: "meloetta", forme: null,
+      types: ["Normal", "Psychic"], abilities: ["Serene Grace"],
+    },
+    {
+      gen: 6, showdownId: "meloettapirouette", baseSpecies: "meloetta", forme: "Pirouette",
+      types: ["Normal", "Fighting"], abilities: ["Serene Grace"],
+    },
   ];
 }
 

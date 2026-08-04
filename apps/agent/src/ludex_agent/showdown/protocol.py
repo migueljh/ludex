@@ -696,6 +696,19 @@ _MOVE_NOT_OWNED = frozenset({
     "[from] Magic Coat", "[from] Mirror Move",
 })
 
+# `-item` con estos sufijos narra una TRANSFERENCIA, no una revelacion simple:
+# el `ident` (parts[2]) es quien RECIBE el item, y `[of]` nombra a quien lo
+# PIERDE -- Showdown nunca manda una linea separada para el que pierde (D40,
+# T-01). Thief/Covet son movimientos; Pickpocket/Magician son abilities.
+_ITEM_TRANSFER_MOVES = frozenset({"Thief", "Covet"})
+_ITEM_TRANSFER_ABILITIES = frozenset({"Pickpocket", "Magician"})
+
+# Sentinel: "la clave 'item' de `persistent_state` estaba AUSENTE" antes de
+# la primera mutacion de la estancia activa (D40, T-02) -- distinto de que
+# estuviera PRESENTE con `None`. Un objeto propio, nunca `None` ni un string,
+# para que no colisione con ningun valor real de item.
+_NO_PRIOR_ITEM = object()
+
 
 def project_observable_state(
     snapshot: dict,
@@ -748,6 +761,16 @@ def project_observable_state(
     marca permanente del base nombra un `move_id` que puede coincidir por
     casualidad con el copiado, pero son instancias de PP distintas. Sin
     Transform activo, solo `unknown_pp_moves` gobierna.
+
+    `item` (D40) es la misma idea aplicada al item del rival: poke-env
+    corrompe `battle.opponent_team[...].item` entre una decision y la
+    siguiente tras un intercambio por Trick (confirmado en vivo, ver
+    ROOT-CAUSE CHECKPOINT R3), y sin memoria propia ese valor corrupto pisa
+    evidencia ya establecida. A diferencia de `types`/`moves`, no tiene
+    version temporal: Transform no copia item, asi que la marca es siempre
+    permanente para la identidad del propio tenedor. `value=None` (item
+    consumido/removido) es tan significativo como cualquier item real -- la
+    clave `"item"` queda presente con ese valor, nunca ausente.
     """
     persistent_state = {} if persistent_state is None else persistent_state
     projected = {
@@ -875,12 +898,18 @@ def project_observable_state(
         poke-env) tiene que sobrevivir para el PROXIMO override (otra
         Entrainment, otro Transform) -- por eso se lee (`peek`), nunca se
         descarta, aunque no haya ningun override activo ahora mismo.
+
+        `item_backup` (D40, T-02) se descarta SIN restaurar nada: un switch
+        ordinario (a diferencia de `|replace|`, ver `end_illusion`) confirma
+        que la identidad aparente era real, asi que cualquier item revelado
+        durante esta estancia queda permanente.
         """
         mon["active"] = False
         mon["boosts"] = _blank_boosts()
         identidad = canon(normalize_id(mon.get("species") or ""))
         entry = persistent_state.get(identidad)
         if entry is not None:
+            entry.pop("item_backup", None)
             if "types" in entry:
                 mon["types"] = list(entry.pop("types"))
             if "moves" in entry:
@@ -946,6 +975,15 @@ def project_observable_state(
             activa —lo que hacia la version anterior— le regalaba a Zoroark el
             item y la ability revelados del imitado, y borraba al imitado del
             equipo rival.
+
+        **Provenance del item (D40, T-02).** Cualquier item revelado
+        DURANTE esta estancia le pertenece al disfraz, no al imitado: antes
+        de que `switch_out` descarte el backup sin restaurar (lo que haria
+        si el disfraz nunca se hubiera roto), se restaura la memoria de
+        item que el imitado tenia ANTES de la primera mutacion de esta
+        estancia -- ausente, `None`, o un item -- y se limpia el sentinel
+        de `item_backup`. No hace falta nada simetrico para Zoroark (`real`):
+        nunca se le escribio item a partir del imitado.
         """
         illusioned = active()
         if illusioned is None:
@@ -953,6 +991,18 @@ def project_observable_state(
         if canon(normalize_id(illusioned.get("species") or "")) == canon(species):
             # poke-env corta en seco: `if illusionist_mon is illusioned`.
             return
+        identidad_imitado = canon(normalize_id(illusioned.get("species") or ""))
+        entry_imitado = persistent_state.get(identidad_imitado)
+        if entry_imitado is not None and "item_backup" in entry_imitado:
+            backup = entry_imitado.pop("item_backup")
+            if backup is _NO_PRIOR_ITEM:
+                entry_imitado.pop("item", None)
+                illusioned["item"] = "unknown_item"
+            else:
+                entry_imitado["item"] = backup
+                illusioned["item"] = backup
+            if not entry_imitado:
+                persistent_state.pop(identidad_imitado, None)
         real = find(species)
         if real is None:
             real = _new_mon(species, vocabulary)
@@ -1079,6 +1129,45 @@ def project_observable_state(
             persistent_state.setdefault(identidad, {}).setdefault("ability", actual)
         mon["ability"] = ability
 
+    def remember_item(mon: dict, value: str | None) -> None:
+        """Fija el item PUBLICAMENTE evidenciado del rival y lo memoriza en
+        `persistent_state` (D40): el `snapshot` de entrada es SIEMPRE fresco
+        (`serialize_battle`, nunca la proyeccion anterior) y poke-env
+        corrompe `battle.opponent_team[...].item` entre una decision y la
+        siguiente tras un intercambio por Trick -- confirmado en vivo
+        (`battle-gen6randombattle-2746`, ROOT-CAUSE CHECKPOINT R3). Sin esta
+        memoria, ese valor corrupto pisaria evidencia ya establecida sin que
+        ninguna linea nueva la pidiera; mismo patron que D37 ya resuelve
+        para el PP bajo Pressure.
+
+        `value=None` es tan significativo como cualquier item real (item
+        consumido o removido, `-enditem`): la clave `"item"` queda
+        PRESENTE con ese valor, nunca ausente -- de eso depende no
+        reescribir un `None` ya confirmado con un numero stale. Nunca se
+        llama con el sentinel inicial `unknown_item`: eso no es evidencia,
+        es su ausencia (D40, requisito 2).
+
+        **Provenance bajo Illusion (D40, T-02).** Esta identidad puede ser
+        el disfraz de un Zoroark: si la mutacion resulta ser evidencia
+        observada DURANTE un disfraz, `end_illusion` la revierte cuando el
+        `|replace|` la desenmascara. Por eso, en la PRIMERA mutacion de
+        `item` desde el ultimo switch-in de esta identidad (marcada por la
+        ausencia de `"item_backup"` en la entrada), se guarda el valor
+        ANTERIOR -- presente con un item, presente con `None`, o
+        `_NO_PRIOR_ITEM` si la clave no existia -- antes de pisarlo.
+        `switch_out` descarta ese backup sin restaurar nada (un switch
+        ordinario confirma que la identidad aparente era real); `end_
+        illusion` lo restaura antes de llamar a `switch_out`. Mutaciones
+        SIGUIENTES en la misma estancia no vuelven a tocar el backup: sólo
+        importa el estado anterior a la PRIMERA.
+        """
+        identidad = canon(normalize_id(mon.get("species") or ""))
+        entry = persistent_state.setdefault(identidad, {})
+        if "item_backup" not in entry:
+            entry["item_backup"] = entry.get("item", _NO_PRIOR_ITEM)
+        mon["item"] = value
+        entry["item"] = value
+
     def register_move(mon: dict, raw_move: str, *, use: bool) -> None:
         """Revela un movimiento del rival y descuenta su PP.
 
@@ -1169,7 +1258,7 @@ def project_observable_state(
                 item = normalize_id(parts[4].split("item:", 1)[-1])
                 current = mon.get("item")
                 if current is not None and "berry" not in item and "herb" not in item:
-                    mon["item"] = item
+                    remember_item(mon, item)
             elif len(parts) == 6 and parts[4].startswith("[from] ability:"):
                 ability = normalize_id(parts[4].split("ability:", 1)[-1])
                 if ability == "hospitality":
@@ -1186,11 +1275,11 @@ def project_observable_state(
         ):
             mon = _owner_of(parts[5].split("[of]", 1)[-1].strip())
             if mon is not None:
-                mon["item"] = normalize_id(parts[4].split("item:", 1)[-1])
+                remember_item(mon, normalize_id(parts[4].split("item:", 1)[-1]))
         elif len(parts) == 5 and parts[4].startswith("[from] item:"):
             mon = _owner_of(parts[2])
             if mon is not None:
-                mon["item"] = normalize_id(parts[4].split("item:", 1)[-1])
+                remember_item(mon, normalize_id(parts[4].split("item:", 1)[-1]))
         elif (
             len(parts) == 6
             and parts[4].startswith("[from] ability:")
@@ -1199,6 +1288,47 @@ def project_observable_state(
             mon = _owner_of(parts[5].split("[of]", 1)[-1].strip())
             if mon is not None:
                 mon["ability"] = normalize_id(parts[4].split("ability:", 1)[-1])
+
+    def apply_item_transfer_ownership(parts: list[str]) -> None:
+        """`-item|{receptor}|{item}|[from] move: Thief|[of] {victima}` (D40,
+        T-01): Thief/Covet (movimientos) y Pickpocket/Magician (abilities)
+        narran la transferencia en UNA sola linea, con `ident` (parts[2]) =
+        quien RECIBE el item. Showdown nunca manda una linea separada para
+        quien lo PIERDE -- esta es la unica evidencia. Se procesa ANTES del
+        filtro generico de ident, igual que `apply_damage_or_heal_
+        ownership`: si el receptor es nuestro lado, ese filtro descartaria
+        la linea completa antes de que nadie notara que el rival nombrado
+        por `[of]` se quedo sin item.
+
+        Cuando el receptor es el RIVAL (nos robo a nosotros), esta funcion
+        no hace nada: `_owner_of` sobre el `[of]` (que aca nombra a nuestro
+        lado) no resuelve a ningun mon, y el handler normal de `-item` --
+        alcanzable porque el ident YA es del rival -- cubre esa direccion
+        sin cambios (D40, T-01, requisito 4).
+
+        Symbiosis (la otra ability que transfiere items) exige un ALIADO
+        del mismo lado: es estructuralmente inalcanzable en singles, el
+        unico gametype que este proyector modela (`active_prefix` asume una
+        sola ranura activa por lado) y el unico que `apps/agent` juega en
+        la practica (`SHOWDOWN_BATTLE_FORMAT` por defecto es
+        `gen6randombattle`). No se implementa: seria logica muerta.
+        """
+        if len(parts) != 6 or not parts[5].startswith("[of]"):
+            return
+        prefix = parts[4]
+        if prefix.startswith("[from] move:"):
+            causa = prefix.split(":", 1)[-1].strip()
+            if causa not in _ITEM_TRANSFER_MOVES:
+                return
+        elif prefix.startswith("[from] ability:"):
+            causa = prefix.split(":", 1)[-1].strip()
+            if causa not in _ITEM_TRANSFER_ABILITIES:
+                return
+        else:
+            return
+        victima = _owner_of(parts[5].split("[of]", 1)[-1].strip())
+        if victima is not None:
+            remember_item(victima, None)
 
     def apply_move(parts: list[str]) -> None:
         """`|move|{side}a: X|Nombre|objetivo|sufijos...`.
@@ -1305,6 +1435,13 @@ def project_observable_state(
         entry = persistent_state.get(identidad)
         if not entry:
             continue
+        # D40: mismo mecanismo que el PP bajo Pressure, pero permanente (no
+        # hay analogo "temporal por Transform" -- Transform no copia item).
+        # Reaplicado ANTES de procesar ninguna linea nueva del frame para
+        # que una revelacion real dentro de esta misma llamada pueda seguir
+        # reemplazandolo (D40, requisito 5).
+        if "item" in entry:
+            mon["item"] = entry["item"]
         if "moves" in entry:
             desconocidos = entry.get("transform_unknown_pp_moves") or ()
         else:
@@ -1401,6 +1538,13 @@ def project_observable_state(
             # retraso-en-uno que F2-01 existe para eliminar, ahora en
             # `item`/`ability` en vez de en la identidad del activo.
             apply_damage_or_heal_ownership(parts, heal=(tag == "-heal"))
+        if tag == "-item" and len(parts) > 3:
+            # D40 (T-01): mismo motivo que arriba -- una transferencia por
+            # Thief/Covet/Pickpocket/Magician nombra como `ident` a quien
+            # RECIBE el item, que puede ser nuestro propio lado. El filtro
+            # generico de mas abajo descartaria la linea antes de que nadie
+            # notara que el rival, nombrado por `[of]`, se quedo sin item.
+            apply_item_transfer_ownership(parts)
         if len(parts) < 3:
             continue
         ident = parts[2]
@@ -1493,11 +1637,11 @@ def project_observable_state(
         elif tag == "-item" and len(parts) > 3:
             mon = active()
             if mon is not None:
-                mon["item"] = normalize_id(parts[3])
+                remember_item(mon, normalize_id(parts[3]))
         elif tag == "-enditem":
             mon = active()
             if mon is not None:
-                mon["item"] = None
+                remember_item(mon, None)
         elif tag == "-ability" and len(parts) > 3:
             mon = active()
             if mon is not None:

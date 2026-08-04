@@ -2012,28 +2012,179 @@ DB descartable; la DB compartida no fue migrada.
 
 **Benchmark pinneado y auditado.** El benchmark fija provider/model al inicio (D28) y usa `PinnedResolver(..., enforce_pin=True)`: un auditor envuelve el provider y verifica que cada envelope efectivo coincida con el pin; cualquier mezcla lanza `ProviderMixError` y aborta la corrida. Env bootstrap: el benchmark NO consulta la DB.
 
-**Adapter de ejecución explícito.** `execute_action` en `showdown/client.py`
-traduce el `action` del grafo al `BattleOrder` del mapa capturado. NO es un
-nodo LangGraph y no puede serlo: el mapa accion→`BattleOrder` se captura
-síncrono antes del primer await (D31/D22 — la disciplina que garantiza
-`action_taken in legal_actions` por construcción) y poke-env exige el
-`BattleOrder` como retorno de `choose_move`; el grafo corre después de awaits.
-La correspondencia grafo→poke-env queda cerrada por el adapter fuera del
-grafo, con equivalencia end-to-end probada (`test_el_caller_ejecuta_despues_de_decide_en_orden`, orden `resolve_provider → parse_state → retrieve_context → calc_damage → decide → execute`). El orden de nodos está fijado por tests de workflow y del caller (mutación del orden puesta roja y restaurada).
+**Adapter de ejecución explícito y cableado real.** `execute_action` en
+`graph/execute.py` (módulo PURO, sin poke-env) traduce el `action` del grafo
+al `BattleOrder` del mapa capturado. NO es un nodo LangGraph y no puede
+serlo: el mapa accion→`BattleOrder` se captura síncrono antes del primer
+await (D31/D22 — la disciplina que garantiza `action_taken in
+legal_actions` por construcción) y poke-env exige el `BattleOrder` como
+retorno de `choose_move`; el grafo corre después de awaits. La
+correspondencia grafo→poke-env queda cerrada por el adapter fuera del
+grafo: `run_graph` en `showdown/client.py` llama `execute_action(action,
+action_orders)` sobre el resultado del grafo y convierte `None` (fuera de
+la máscara capturada) en `RuntimeError`. El cableado quedó estacionado
+durante la ventana en que `client.py` era territorio de MON-18 y se
+completó en la integración final (MON-18 liberado, ver D40): la
+equivalencia end-to-end se prueba en `test_el_caller_ejecuta_despues_de_
+decide_en_orden` (orden `resolve_provider → parse_state →
+retrieve_context → calc_damage → decide → execute`); el test que rompe el
+cableado (quitar la llamada a `execute_action` de `run_graph`) se pone en
+rojo y se restaura.
 
-**Cableado del adapter PENDIENTE (actualización de territorio, MON-18
-reabierta).** El contrato del adapter vive en `graph/execute.py` (módulo
-PURO, sin poke-env; equivalencia probada en `tests/graph/test_execute.py`),
-pero la llamada real dentro de `run_graph` (`showdown/client.py`) quedó
-REVERTIDA y pendiente: `client.py` y sus tests de flujo son territorio de
-MON-18 hasta nueva liberación de Latwan. La aceptación end-to-end dentro de
-`choose_move` NO está cerrada y no se simula: se verifica en la integración
-final cuando MON-18 libere el archivo. Mientras tanto el flujo de
-`run_graph` conserva la traducción inline de la base (`action_orders.get(
-tuple(sorted(action.items())))`).
+**Metadata por decisión desde el envelope del grafo.** Las 11 claves de
+metadata de la decisión (`rationale`, `confidence`, `alternatives`,
+`target`, `provider`, `model`, `decision_latency_ms`, `input_tokens`,
+`output_tokens`, `cached_input_tokens`, `reasoning_tokens`) llegan al
+`step` canónico SOLO desde el resultado de `decide` (que sale del
+`CompletionEnvelope` inmutable de D38, nunca de estado compartido
+`last_*`), en los DOS caminos: éxito LLM y fallback determinista usan la
+MISMA frontera (`run_graph` copia el resultado del grafo al step; la ruta
+random queda NULL). El test que reutiliza metadata de una decisión
+anterior (patrón `last_completion_info` de D38) cruza las 11 claves entre
+dos decisiones del mismo tag y se pone en rojo.
 
 **Catálogo OpenCode Zen no hardcodeado.** `agent provider-init` puebla `providers` desde el catálogo de config (bootstrap) y, para open_code_zen con clave y base URL presentes, sincroniza `models` resolviendo el endpoint `/models` (shape OpenAI-compatible asumido, `{"data": [{"id": ...}]}`; un shape inválido falla ruidoso — límite documentado: se verificó el formato del gateway contra el contrato OpenAI-compatible, no contra una key real en esta rebanada). `agent model-set` fija la selección activa. Sin PATCH endpoint ni UI (fase 3/4).
 
 **Excepción de cliente documentada.** No se usa `init_chat_model` de LangChain: el contrato real necesita opciones por proveedor (timeout, `thinking`/`max_tokens`, structured output) que esa API no expone sin ramas; se conservan los clientes especializados (`_LangChainBackend` por kind) construidos por `default_provider_factory` desde la fila de la DB.
 
 **Alcance y límites.** El camino LLM vivo de esta fase es el benchmark (pinneado); el resolver por turno queda probado a nivel workflow/caller y listo para fase 3 (HITL), donde el grafo jugará batallas largas con cambio de modelo entre turnos. `ProviderChain` queda como API para el caso interactivo multi-proveedor (hoy el benchmark la usa con un solo provider). D37 (MON-18) y D38 (MON-13) se conservan íntegras.
+
+## D40 — el item del rival vive en `persistent_state`; el auditor reevalúa el dex en cada switch-in (MON-18 R3)
+
+**Contexto.** El ROOT-CAUSE CHECKPOINT R3 confirmó, en vivo
+(`battle-gen6randombattle-2746`, y previamente medido en
+`battles.id=2782/2787`), que `poke-env` 0.15.0 corrompe
+`battle.opponent_team[...].item` entre una decisión y la siguiente después
+de un intercambio por Trick: el valor corrupto es exactamente el item que
+NUESTRO propio activo recibió en el mismo canje. Como `client.py` arma el
+`snapshot` de cada decisión fresco desde `serialize_battle(battle)` (nunca
+encadena la proyección anterior, D31), ese valor corrupto pisa evidencia
+pública ya establecida sin que ninguna línea nueva la pida. El item se
+autocorrige por casualidad cuando el ítem verdadero genera una línea pasiva
+propia (Life Orb, Leftovers) en la MISMA llamada, pero queda corrupto para
+siempre cuando no la genera (Choice Scarf/Band/Specs) — exactamente el
+patrón medido en `battles.id=2782` (Purugly) y `2787` (Alakazam).
+
+Por separado, el mismo CHECKPOINT clasificó el hallazgo de `types` sobre
+Meloetta en `battles.id=2787` como un **falso positivo del auditor**, no un
+defecto del recorder: Relic Song revierte la forma de Meloetta al salir del
+campo (a diferencia de Mega, que persiste), y la línea de switch-in que
+revierte narra el MISMO `details` que la primera vez que entró. La fila
+persistida por `apps/agent` ya era correcta.
+
+**Decisión — item (`apps/agent/src/ludex_agent/showdown/protocol.py`).**
+Mismo patrón arquitectónico que D37 para el PP bajo Pressure, pero
+permanente (Transform no copia item, así que no hace falta la variante
+temporal): `remember_item(mon, value)` fija el item Y lo memoriza en
+`persistent_state[identidad]["item"]` desde las cuatro rutas públicas ya
+existentes que lo revelan (`-item`, `-enditem`, daño/heal propio por item vía
+`apply_damage_or_heal_ownership`), y esa memoria se reaplica al principio de
+CADA llamada, antes de procesar cualquier línea nueva del frame — igual que
+`unknown_pp_moves`. `value=None` (item consumido/removido) es tan
+significativo como cualquier item real: la clave `"item"` queda presente con
+ese valor, nunca ausente, y nunca se escribe con el sentinel inicial
+`unknown_item` (eso no es evidencia, es su ausencia). No hace falta código
+específico de Trick: toda revelación de item, sea cual sea su origen, ya
+pasaba por esas cuatro rutas, y las cuatro ya estaban correctamente
+delimitadas por lado (nunca escriben sobre el equipo propio).
+
+**Decisión — types/Meloetta (`packages/dataset-audit/src/projection.ts`).**
+`updateFromDetails` cortaba en `details === mon.lastDetails` antes de
+reevaluar el dex — el mismo corte que trae `Pokemon._update_from_details`
+de poke-env (`pokemon.py:669-714`), que el auditor reproduce a propósito.
+La condición se angosta, no se elimina: además de comparar `details`, ahora
+exige `mon.formeId === mon.species` (ninguna forma temporal activa) para
+saltarse la reevaluación. Un Mega que sale y vuelve nunca pasaba por este
+camino para empezar — su switch-in narra un `details` DISTINTO
+("Charizard-Mega-X..." vs "Charizard...") porque la forma persiste — así que
+la corrección no lo afecta.
+
+**Tests.** `apps/agent/tests/showdown/test_protocol.py`: reproducción
+determinista de `battles.id=2782` con las líneas reales de sus turnos 1-2 y
+un snapshot fresco que trae el valor corrupto medido en vivo (canario de
+boundary: cruza dos llamadas de `project_observable_state` con sólo
+`persistent_state` en común, igual que D37); contrapeso Life Orb (la
+revelación pasiva también escribe en memoria y también sobrevive un
+snapshot fresco corrupto); `-enditem` persiste `None` y sobrevive un
+snapshot fresco; evidencia nueva reemplaza memoria anterior (`None` o item
+distinto); sobrevive un switch ordinario; dos identidades no se contaminan;
+una línea del lado propio no contamina memoria rival (ya pasaba antes del
+fix, sirve de sentinela — mismo patrón que el contrapeso negativo de D37).
+`packages/dataset-audit/test/projection.test.ts`: switch-in con el mismo
+`details` que uno anterior revierte una forma temporal; contrapeso Mega
+(persiste, ya pasaba y sigue pasando). Tres mutaciones dirigidas sobre el
+item (retirar la reaplicación, retirar la persistencia de `-enditem`,
+permitir que una línea propia escriba memoria rival) y una sobre Meloetta
+(restaurar el corte defectuoso), cada una puesta en rojo exactamente el test
+esperado y restaurada.
+
+**Alcance.** Cero cambios en `showdown/client.py` ni `cli.py` (confirmado
+por `git diff --stat` vacío en ambos rangos). D37 y D38 quedan intactos. No
+se tocó ninguna fila de la DB compartida.
+
+### R4 — transferencia de item y provenance bajo Illusion
+
+La revisión de R3 encontró dos blockers sobre el mismo mecanismo de D40,
+ambos exclusivos de `apps/agent/src/ludex_agent/showdown/protocol.py`
+(`packages/dataset-audit` no se tocó esta ronda).
+
+**T-01 — transferencia de item hacia nuestro lado dejaba al rival con
+memoria stale.** `-item|p1a: X|Item|[from] move: Thief|[of] p2a: Y` narra
+la transferencia en UNA sola línea: el `ident` (parts[2]) es quien RECIBE
+el item -- nuestro propio activo -- y `[of]` nombra a quien lo pierde.
+Showdown nunca manda una línea separada para el que pierde. El filtro
+genérico de `ident` descartaba la línea completa antes de que ningún
+handler notara que el rival se quedó sin item, y su entrada en
+`persistent_state` seguía diciendo el item VIEJO para siempre.
+`apply_item_transfer_ownership` corre antes del filtro genérico -- mismo
+patrón que `apply_damage_or_heal_ownership` -- y limpia (`remember_item(...,
+None)`) al rival nombrado por `[of]` cuando la causa es Thief/Covet
+(movimientos) o Pickpocket/Magician (abilities). Cuando el receptor es el
+RIVAL (nos robó a nosotros), la función es un no-op: el `[of]` nombra a
+nuestro lado, que `_owner_of` nunca resuelve, y el handler normal de
+`-item` (ya alcanzable porque el `ident` es del rival) cubre esa dirección
+sin cambios. Symbiosis no se implementa: exige un aliado del mismo lado,
+estructuralmente inalcanzable en singles -- el único gametype que este
+proyector modela (`active_prefix` asume una sola ranura activa por lado) y
+el único que juega `apps/agent` en la práctica.
+
+**T-02 — un item revelado durante Illusion quedaba pegado al imitado para
+siempre.** La memoria de D40 no distinguía "evidencia sobre esta
+identidad" de "evidencia observada mientras Zoroark la usaba de disfraz".
+`remember_item` ahora guarda, en la PRIMERA mutación de `item` desde el
+último switch-in de una identidad (marcada por la ausencia de la clave
+`item_backup`), el valor ANTERIOR -- ausente (sentinel `_NO_PRIOR_ITEM`),
+`None`, o un item -- antes de pisarlo. Dos desenlaces posibles para esa
+estancia:
+
+- **Switch-out ordinario** (`switch_out`): descarta el backup SIN
+  restaurar nada. Un switch normal confirma que la identidad aparente era
+  real, así que el item nuevo queda permanente.
+- **`|replace|` (Illusion se rompe)** (`end_illusion`): restaura la memoria
+  de item que el imitado tenía ANTES de la primera mutación de la
+  estancia, justo antes de delegar en `switch_out` -- si no había memoria
+  previa, la clave `item` vuelve a quedar AUSENTE, nunca `None` (son
+  estados distintos: "sin evidencia" vs. "confirmado sin item"). Zoroark
+  nunca se siembra a partir del imitado, política fail-closed ya existente
+  desde antes de D40: sigue `unknown_item` salvo evidencia independiente.
+  Sólo las claves `item`/`item_backup` se tocan; `ability`, `types`,
+  `moves` y las marcas de PP sobreviven intactas.
+
+**Tests.** Parametrizado sobre Thief/Covet/Pickpocket/Magician (con un
+item rival previamente memorizado, la línea de adquisición hacia p1, y un
+snapshot fresco posterior que sigue mostrando `None`); contrapeso de la
+dirección donde el rival adquiere; aislamiento entre identidades. Para
+Illusion: flujo completo con item previo conocido (revelación durante el
+disfraz, una llamada fresca intermedia, `|replace|`, recuperación del item
+previo, Zoroark sin heredarlo, un switch-in posterior del imitado que
+tampoco hereda el item de Zoroark, y otras claves de `persistent_state`
+intactas); memoria previa ausente vuelve a clave ausente, no a `None`;
+switch ordinario confirma el item nuevo y descarta el backup. Cuatro
+mutaciones dirigidas (retirar el manejo pre-filtro de T-01; omitir la
+restauración en `replace`; tratar "ausente" como `None`; limpiar todo el
+`entry` y perder `ability`), cada una puesta en rojo exactamente el test
+esperado y restaurada.
+
+**Alcance (R4).** Cero cambios en `showdown/client.py`, `cli.py` y
+`packages/dataset-audit` (código ya aceptado, sin tocar esta ronda). D37 y
+D38 siguen intactos. No se tocó ninguna fila de la DB compartida.
