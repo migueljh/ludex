@@ -84,8 +84,8 @@ def test_true_ids_distintos_y_claves_desconocidas_siguen_siendo_estrictos():
 async def test_dos_respuestas_ilegales_usan_fallback_y_corrigen_prompt():
     metrics = DecisionMetrics()
     provider = FakeDecisionProvider([
-        {"action": {"kind": "move", "id": "illegal"}, "reasoning": "a"},
-        {"action": {"kind": "switch", "species": "missing"}, "reasoning": "b"},
+        {"action": {"kind": "move", "id": "illegal"}, "rationale": "a"},
+        {"action": {"kind": "switch", "species": "missing"}, "rationale": "b"},
     ])
 
     result = await decide(_state(), provider, metrics)
@@ -101,10 +101,10 @@ async def test_dos_respuestas_ilegales_usan_fallback_y_corrigen_prompt():
 async def test_segunda_respuesta_legal_registra_llm_retry():
     metrics = DecisionMetrics()
     provider = FakeDecisionProvider([
-        {"action": {"kind": "move", "id": "illegal"}, "reasoning": "a"},
+        {"action": {"kind": "move", "id": "illegal"}, "rationale": "a"},
         {
             "action": {"kind": "move", "id": "thunderbolt"},
-            "reasoning": "b",
+            "rationale": "b",
             "confidence": 0.8,
             "alternatives": [],
         },
@@ -145,7 +145,7 @@ async def test_infraestructura_no_gasta_reintento_semantico_ni_hace_fallback(fai
         failure,
         {
             "action": {"kind": "move", "id": "thunderbolt"},
-            "reasoning": "ok",
+            "rationale": "ok",
             "confidence": 0.8,
             "alternatives": [],
         },
@@ -183,7 +183,7 @@ def _respuesta_completa(**overrides):
     payload = {
         "action": {"kind": "move", "id": "thunderbolt"},
         "target": None,
-        "reasoning": "brief rationale",
+        "rationale": "brief rationale",
         "confidence": 0.9,
         "alternatives": [],
     }
@@ -205,7 +205,7 @@ def test_confidence_obligatoria_para_respuesta_llm():
 
 
 def test_faltan_campos_obligatorios_rechazada():
-    for campo in ("action", "reasoning", "alternatives"):
+    for campo in ("action", "rationale", "alternatives"):
         payload = _respuesta_completa()
         del payload[campo]
         with pytest.raises(ValidationError):
@@ -328,7 +328,7 @@ async def test_respuesta_llm_aceptada_expone_metadata_completa():
             alternatives=[
                 {"kind": "move", "id": "icebeam", "mega": True},
             ],
-            reasoning="corto y user-facing",
+            rationale="corto y user-facing",
         ),
     ])
 
@@ -340,6 +340,9 @@ async def test_respuesta_llm_aceptada_expone_metadata_completa():
         {"kind": "move", "id": "icebeam", "mega": True},
     ]
     assert result["rationale"] == "corto y user-facing"
+    # Alias interno para consumidores que ya leian `reasoning`: deriva del
+    # rationale validado; nunca forma parte del schema del proveedor.
+    assert result["reasoning"] == "corto y user-facing"
     assert result["provider"] == "fake"
     assert result["model"] == "fake-model"
     assert result["decision_latency_ms"] >= 0
@@ -347,6 +350,38 @@ async def test_respuesta_llm_aceptada_expone_metadata_completa():
     assert result["output_tokens"] == 1
     assert result["cached_input_tokens"] == 0
     assert result["reasoning_tokens"] == 0
+
+
+# --- L-01 (R1): rationale es el campo canonico del contrato --------------
+
+def test_payload_completo_con_rationale_se_acepta():
+    """Canario de L-01: el schema productivo acepta el contrato canonico con
+    `rationale` y rechaza `reasoning` (extra_forbidden)."""
+    payload = _respuesta_completa(rationale="breve y user-facing")
+    parsed = DecisionResponse.model_validate(payload)
+    assert parsed.rationale == "breve y user-facing"
+
+
+def test_payload_con_solo_reasoning_se_rechaza_por_missing_y_extra():
+    """Un proveedor que emita `reasoning` en vez de `rationale` viola el
+    contrato de dos formas: falta el campo canonico y sobra el alias
+    (extra_forbidden, D38: el alias nunca viaja en el schema)."""
+    payload = {
+        "action": {"kind": "move", "id": "thunderbolt"},
+        "target": None,
+        "reasoning": "breve",
+        "confidence": 0.8,
+        "alternatives": [],
+    }
+    with pytest.raises(ValidationError) as exc_info:
+        DecisionResponse.model_validate(payload)
+
+    errores = {
+        (error["loc"][0] if error["loc"] else None, error["type"])
+        for error in exc_info.value.errors()
+    }
+    assert ("rationale", "missing") in errores, errores
+    assert ("reasoning", "extra_forbidden") in errores, errores
 
 
 @pytest.mark.asyncio

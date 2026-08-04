@@ -53,7 +53,7 @@ class DecisionResponse(BaseModel):
 
     action: DecisionAction
     target: DecisionTarget | None = None
-    reasoning: str
+    rationale: str
     confidence: float
     alternatives: list[DecisionAction]
 
@@ -163,10 +163,10 @@ def _prompt(
     }
     instructions = (
         "Elegí exactamente una acción de legal_actions. Respondé con action, "
-        "un reasoning breve (sin cadena de razonamiento), confidence en [0,1] "
-        "y alternatives (puede ser []). target solo si la máscara lo expone. "
-        "Ausente y false son equivalentes únicamente para los flags de "
-        "mecánicas especiales."
+        "un rationale breve (user-facing, sin cadena de razonamiento), "
+        "confidence en [0,1] y alternatives (puede ser []). target solo si la "
+        "máscara lo expone. Ausente y false son equivalentes únicamente para "
+        "los flags de mecánicas especiales."
     )
     if previous_error:
         instructions += (
@@ -237,8 +237,12 @@ async def decide(
             return {
                 "action": action,
                 "action_path": "llm" if semantic_attempt == 0 else "llm_retry",
-                "reasoning": parsed.reasoning,
-                "rationale": parsed.reasoning,
+                # `rationale` es el campo canonico (design verdict F2-08). El
+                # alias `reasoning` NO forma parte del schema del proveedor:
+                # es solo para los consumidores internos que ya lo leen
+                # (run_graph en client.py), derivado del rationale validado.
+                "rationale": parsed.rationale,
+                "reasoning": parsed.rationale,
                 "confidence": parsed.confidence,
                 "alternatives": alternatives,
                 "target": target,
@@ -255,11 +259,12 @@ async def decide(
             previous_error = str(exc)
 
     metrics.fallback(turn_id)
+    fallback_rationale = "deterministic fallback after two invalid model responses"
     return {
         "action": _fallback(state),
         "action_path": "fallback",
-        "reasoning": "deterministic fallback after two invalid model responses",
-        "rationale": "deterministic fallback after two invalid model responses",
+        "rationale": fallback_rationale,
+        "reasoning": fallback_rationale,
         "confidence": None,
         "alternatives": [],
         "target": None,

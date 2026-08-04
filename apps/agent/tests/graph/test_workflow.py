@@ -70,7 +70,7 @@ async def test_grafo_ejecuta_todos_los_nodos_en_orden_y_devuelve_contexto():
             return CompletionEnvelope(
                 payload={
                     "action": {"kind": "move", "id": "tackle"},
-                    "reasoning": "legal",
+                    "rationale": "legal",
                     "confidence": 0.9,
                     "alternatives": [],
                 },
@@ -237,7 +237,7 @@ async def test_calc_damage_recibe_contexto_rico_no_prompt_context(monkeypatch):
             return CompletionEnvelope(
                 payload={
                     "action": {"kind": "switch", "species": "pikachu"},
-                    "reasoning": "legal",
+                    "rationale": "legal",
                     "confidence": 0.8,
                     "alternatives": [],
                 },
@@ -314,7 +314,7 @@ async def test_grafo_conserva_damage_metrics_en_la_salida():
             return CompletionEnvelope(
                 payload={
                     "action": {"kind": "move", "id": "tackle"},
-                    "reasoning": "legal",
+                    "rationale": "legal",
                     "confidence": 0.9,
                     "alternatives": [],
                 },

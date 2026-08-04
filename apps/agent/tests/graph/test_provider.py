@@ -806,58 +806,64 @@ async def test_envelope_latencia_mide_la_llamada_con_reloj_inyectable():
 
 
 async def test_envelopes_concurrentes_no_se_cruzan_metadata():
-    """El runner ejecuta batallas CONCURRENTES: dos decisiones en paralelo
-    dentro del mismo proceso. Cada envelope tiene que traer la metadata de SU
-    propia llamada.
+    """El runner ejecuta batallas CONCURRENTES sobre UNA SOLA instancia de
+    `KeyRotatingProvider` compartida: dos decisiones en paralelo dentro del
+    mismo proceso llaman al MISMO provider. Cada envelope tiene que traer la
+    metadata de SU propia llamada.
 
-    El patron rechazado `last_*` (estado mutable compartido leido despues del
-    await) cruza metadata: la llamada lenta termina despues que la rapida y el
-    consumidor lee la del vecino. Aca el envelope se construye DENTRO de
-    `complete`, con datos locales de esa llamada, y no hay ninguna lectura
-    posterior de estado compartido: si alguien reintroduce `last_*`, la llamada
-    lenta deja de poder responder por su propia metadata y este test lo
-    detecta."""
+    El patron rechazado `last_*` (estado mutable por instancia leido despues
+    de un await) cruza metadata: la llamada lenta queda suspendida, la rapida
+    completa primero y, cuando la lenta se reanuda, lee el estado del vecino.
+    Aca el envelope se construye DENTRO de `complete`, con datos locales de
+    esa llamada, y no hay ninguna lectura posterior de estado compartido: la
+    mutacion `last_*` por instancia pone este test rojo por payload/model
+    cruzados (verificacion de la revision R1)."""
     started = asyncio.Event()
     release_first = asyncio.Event()
 
-    class GatedBackend:
-        def __init__(self, payload, gate=None):
-            self.payload = payload
-            self.gate = gate
+    class PromptGatedBackend:
+        """Un unico backend bloqueante que distingue prompt A y B: A queda
+        suspendida hasta que el test la libera; B completa de una."""
 
         async def complete(self, prompt, *, api_key, deadline):
-            if self.gate is not None:
-                self.gate.set()
+            if prompt == "prompt A":
+                started.set()
                 await release_first.wait()
+                return ProviderCompletion(
+                    payload={"turn": "A"},
+                    usage=CompletionUsage(
+                        input_tokens=1, output_tokens=1, model="gemini-2.5-flash",
+                    ),
+                )
             return ProviderCompletion(
-                payload=self.payload,
-                usage=CompletionUsage(input_tokens=1, output_tokens=1),
+                payload={"turn": "B"},
+                usage=CompletionUsage(
+                    input_tokens=2, output_tokens=2, model="kimi-k2.6",
+                ),
             )
 
-    lento = KeyRotatingProvider(
-        "google", ("k-a",), GatedBackend({"turn": "a"}, gate=started),
-        model="gemini-2.5-flash",
-    )
-    rapido = KeyRotatingProvider(
-        "kimi", ("k-b",), GatedBackend({"turn": "b"}), model="kimi-k2.6",
+    provider = KeyRotatingProvider(
+        "google", ("k-a",), PromptGatedBackend(), model="gemini-2.5-flash",
     )
 
-    task_a = asyncio.create_task(lento.complete(
-        "prompt a", deadline=time.monotonic() + 5, turn_id="battle:a:1"
+    deadline = time.monotonic() + 5
+    task_a = asyncio.create_task(provider.complete(
+        "prompt A", deadline=deadline, turn_id="battle:a:1"
     ))
-    await started.wait()
-    task_b = asyncio.create_task(rapido.complete(
-        "prompt b", deadline=time.monotonic() + 5, turn_id="battle:b:1"
+    await started.wait()          # A suspendida dentro del backend
+    task_b = asyncio.create_task(provider.complete(
+        "prompt B", deadline=deadline, turn_id="battle:b:1"
     ))
-    envelope_b = await task_b
-    release_first.set()
+    envelope_b = await task_b     # B termina primero
+    release_first.set()           # A se reanuda y completa despues
     envelope_a = await task_a
 
-    assert envelope_a.payload == {"turn": "a"}
+    # Asserts independientes por decision: payload, provider, model y usage.
+    assert envelope_a.payload == {"turn": "A"}
     assert envelope_a.provider == "google"
     assert envelope_a.model == "gemini-2.5-flash"
     assert envelope_a.usage.input_tokens == 1
-    assert envelope_b.payload == {"turn": "b"}
-    assert envelope_b.provider == "kimi"
+    assert envelope_b.payload == {"turn": "B"}
+    assert envelope_b.provider == "google"
     assert envelope_b.model == "kimi-k2.6"
-    assert envelope_b.usage.input_tokens == 1
+    assert envelope_b.usage.input_tokens == 2

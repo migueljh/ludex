@@ -1499,7 +1499,8 @@ async def test_retry_graph_reemplaza_accion_path_y_reasoning_del_rechazado():
     player.ps_client.websocket = websocket
     rechazado = _reservar_choice(player, tag, rqid=4, move_id="tackle")
     rechazado["action_path"] = "REJECTED_PATH"
-    rechazado["reasoning"] = "REJECTED_REASONING"
+    rechazado["rationale"] = "REJECTED_RATIONALE"
+    rechazado["reasoning"] = "REJECTED_RATIONALE"
     await _enviar(player, tag, "/choose move tackle")
     player._last_projection[tag] = {
         "turn": 3,
@@ -1523,7 +1524,8 @@ async def test_retry_graph_reemplaza_accion_path_y_reasoning_del_rechazado():
             return {
                 "action": {"kind": "move", "id": "struggle"},
                 "action_path": "fallback",
-                "reasoning": "FRESH_REASONING",
+                "rationale": "FRESH_RATIONALE",
+                "reasoning": "FRESH_RATIONALE",
             }
 
     player.decision_graph = RetryGraph()
@@ -1537,9 +1539,10 @@ async def test_retry_graph_reemplaza_accion_path_y_reasoning_del_rechazado():
     final = player.steps[tag][0]
     assert final is not rechazado
     assert final["action_path"] == "fallback"
-    assert final["reasoning"] == "FRESH_REASONING"
+    assert final["rationale"] == "FRESH_RATIONALE"
+    assert final["reasoning"] == "FRESH_RATIONALE"
     assert "REJECTED_PATH" not in repr(final)
-    assert "REJECTED_REASONING" not in repr(final)
+    assert "REJECTED_RATIONALE" not in repr(final)
     assert player.rejected_choice_count == 1
 
 
@@ -1916,6 +1919,9 @@ async def test_el_step_hereda_la_metadata_completa_del_resultado_del_grafo():
     assert step["action_taken"] == {"kind": "move", "id": "tackle"}
     assert step["action_path"] == "llm"
     assert step["rationale"] == "breve y user-facing"
+    # Alias interno derivado del rationale validado (L-01): el step lo lleva
+    # como `reasoning` solo para los consumidores que ya lo leian.
+    assert step["reasoning"] == "breve y user-facing"
     assert step["confidence"] == 0.87
     assert step["alternatives"] == [{"kind": "move", "id": "meteormash"}]
     assert step["target"] is None

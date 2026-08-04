@@ -381,7 +381,7 @@ def provider_smoke_command(
     )
     prompt = (
         "Elegí exactamente una acción legal y respondé con action, un "
-        "reasoning breve, confidence en [0,1] y alternatives (puede ser []). "
+        "rationale breve, confidence en [0,1] y alternatives (puede ser []). "
         "legal_actions="
         '[{"kind":"move","id":"tackle"},{"kind":"switch","species":"pikachu"}]'
     )

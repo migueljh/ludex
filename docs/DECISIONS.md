@@ -1964,7 +1964,13 @@ retorno y el cruce es imposible por construcción.
 **Semántica por decisión canónica.** provider/model son únicamente los de la
 respuesta LLM aceptada; en `fallback` quedan NULL (no se atribuye la acción
 determinista a un modelo) con `alternatives=[]` y un rationale determinista.
-El usage de la decisión suma las respuestas facturables del camino (retries
+`rationale` es el campo CANÓNICO del schema productivo y del prompt (L-01 de
+la revisión R1): el payload del proveedor se rechaza si emite `reasoning` en
+su lugar (missing rationale + extra_forbidden). El alias interno `reasoning`
+en el resultado de `decide` solo existe para consumidores que ya lo leían
+(run_graph) y se deriva del rationale ya validado; nunca forma parte del
+schema enviado al proveedor. El usage de la decisión suma las respuestas
+facturables del camino (retries
 semánticos incluidos; los de infraestructura no producen usage en el backend
 actual). `decision_latency_ms` va desde el primer intento LLM hasta la
 respuesta aceptada o el fallback. `target` es NULL válido y esperado en
