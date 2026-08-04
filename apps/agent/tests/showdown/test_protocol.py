@@ -2474,3 +2474,87 @@ def test_una_linea_item_del_lado_propio_no_contamina_la_memoria_rival():
     )
     assert _por_especie(out)["ludicolo"]["item"] == "unknown_item"
     assert memoria == {}, "una linea del lado propio no puede sembrar memoria del rival"
+
+
+# ---------------------------------------------------------------------------
+# D40 T-01 (MON-18 R4): transferencia de item (Thief/Covet/Pickpocket/
+# Magician) hacia nuestro lado deja al rival sin item.
+#
+# `-item|p1a: Tentacruel|Leftovers|[from] move: Thief|[of] p2a: Ludicolo`:
+# el `ident` (parts[2]) es quien RECIBE el item -- nuestro propio activo --
+# y `[of]` nombra a quien lo pierde. Showdown nunca manda una linea `-item`
+# ni `-enditem` separada para el que pierde: esta linea es la UNICA
+# evidencia. El filtro generico de ident descartaba la linea completa antes
+# de llegar a ningun handler, porque el ident nombra a nuestro lado -- la
+# memoria del rival quedaba con el valor VIEJO para siempre.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("suffix", [
+    "[from] move: Thief",
+    "[from] move: Covet",
+    "[from] ability: Pickpocket",
+    "[from] ability: Magician",
+])
+def test_transferencia_de_item_hacia_nuestro_lado_limpia_al_rival(suffix):
+    memoria: dict[str, dict] = {}
+    snapshot1 = _snapshot(gen=6)
+    snapshot1["opponent"]["pokemon"][0]["item"] = "unknown_item"
+    _proyectar(
+        ["|-item|p2a: Ludicolo|Life Orb|[from] move: Trick"],
+        snapshot1, persistent_state=memoria,
+    )
+    assert memoria == {"ludicolo": {"item": "lifeorb"}}
+
+    snapshot2 = _snapshot(gen=6)
+    snapshot2["opponent"]["pokemon"][0]["item"] = "lifeorb"
+    tras_robo = _proyectar(
+        [f"|-item|p1a: Tentacruel|Leftovers|{suffix}|[of] p2a: Ludicolo"],
+        snapshot2, persistent_state=memoria,
+    )
+    assert _por_especie(tras_robo)["ludicolo"]["item"] is None
+    assert memoria["ludicolo"]["item"] is None
+
+    # Snapshot fresco: poke-env todavia cree que Ludicolo tiene lifeorb (no
+    # se entera de que lo perdio) -- la memoria tiene que sostener el None.
+    snapshot3 = _snapshot(gen=6)
+    snapshot3["opponent"]["pokemon"][0]["item"] = "lifeorb"
+    tras_snapshot_stale = _proyectar([], snapshot3, persistent_state=memoria)
+    assert _por_especie(tras_snapshot_stale)["ludicolo"]["item"] is None
+
+
+def test_transferencia_de_item_desde_nuestro_lado_actualiza_al_rival():
+    """Contrapeso: cuando el RIVAL es quien adquiere nuestro item, el
+    `ident` de la linea YA es el rival -- el handler normal de `-item`
+    (tras el filtro generico) sigue cubriendo esta direccion sin cambios."""
+    memoria: dict[str, dict] = {}
+    snapshot = _snapshot(gen=6)
+    snapshot["opponent"]["pokemon"][0]["item"] = "unknown_item"
+    out = _proyectar(
+        ["|-item|p2a: Ludicolo|Leftovers|[from] move: Thief|[of] p1a: Tentacruel"],
+        snapshot, persistent_state=memoria,
+    )
+    assert _por_especie(out)["ludicolo"]["item"] == "leftovers"
+    assert memoria == {"ludicolo": {"item": "leftovers"}}
+
+
+def test_transferencia_de_item_no_contamina_otra_identidad_rival():
+    memoria: dict[str, dict] = {}
+    snapshot = _snapshot(gen=6)
+    snapshot["opponent"]["pokemon"][0]["item"] = "lifeorb"
+    snapshot["opponent"]["pokemon"].append({
+        "species": "weezing", "hp_fraction": 1.0, "active": False,
+        "fainted": False, "status": None, "level": 83,
+        "item": "leftovers", "ability": "levitate", "types": ["POISON"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [],
+    })
+    out = _proyectar(
+        ["|-item|p1a: Tentacruel|Life Orb|[from] move: Thief|[of] p2a: Ludicolo"],
+        snapshot, persistent_state=memoria,
+    )
+    por = _por_especie(out)
+    assert por["ludicolo"]["item"] is None
+    assert por["weezing"]["item"] == "leftovers", "Weezing no debe verse afectado"
+    assert "weezing" not in memoria
