@@ -181,9 +181,21 @@ def test_provider_smoke_sanitiza_fallo_sin_traceback_ni_clave(monkeypatch):
 
 
 def test_provider_smoke_sanitiza_respuesta_semanticamente_invalida(monkeypatch):
+    from ludex_agent.graph.provider import (
+        CompletionEnvelope,
+        CompletionUsage,
+    )
+
     class InvalidProvider:
         async def complete(self, prompt, *, deadline, turn_id):
-            return {"_invalid_response": "contenido privado del modelo"}
+            # El contrato F2-08: complete devuelve un envelope; el payload
+            # con shape invalido se rechaza en la validacion semantica.
+            return CompletionEnvelope(
+                payload={"_invalid_response": "contenido privado del modelo"},
+                provider="fake", model="fake-model",
+                usage=CompletionUsage(input_tokens=0, output_tokens=0),
+                latency_ms=0.0,
+            )
 
     monkeypatch.setattr(
         "ludex_agent.cli._benchmark_provider",
@@ -467,7 +479,22 @@ async def test_persist_one_separa_action_path_de_action_source():
     await _persist_one(player, repo, tag, "gen6randombattle", "test")
 
     assert repo.saved_steps[0][-1] == "agent"
-    assert repo.saved_step_kwargs[0] == {"action_path": "llm_retry"}
+    # El cableado F2-08/F2-09: `_persist_one` pasa las 11 columnas de
+    # metadata del step; un step sin metadata (ruta random/historica) las
+    # deja en None -- jamas se inventan provider/model.
+    kwargs = repo.saved_step_kwargs[0]
+    assert kwargs["action_path"] == "llm_retry"
+    assert kwargs["rationale"] is None
+    assert kwargs["confidence"] is None
+    assert kwargs["alternatives"] is None
+    assert kwargs["target"] is None
+    assert kwargs["provider"] is None
+    assert kwargs["model"] is None
+    assert kwargs["decision_latency_ms"] is None
+    assert kwargs["input_tokens"] is None
+    assert kwargs["output_tokens"] is None
+    assert kwargs["cached_input_tokens"] is None
+    assert kwargs["reasoning_tokens"] is None
 
 
 def _patch_play_dependencies(monkeypatch, agent_type) -> None:

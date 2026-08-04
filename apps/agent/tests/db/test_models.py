@@ -42,6 +42,9 @@ _TIPOS_CONOCIDOS = {
     # F2-08: `double precision` (confidence, decision_latency_ms) es la
     # sintaxis del DDL; `float8` es el udt_name real de Postgres.
     "DOUBLE PRECISION": ("double precision", "float8"),
+    # F2-09: `boolean` (enabled/is_default) compila a BOOLEAN en SQLAlchemy;
+    # el udt_name real de Postgres es `bool`.
+    "BOOLEAN": ("boolean", "bool"),
 }
 
 
@@ -115,8 +118,10 @@ async def test_models_espeja_el_ddl_columna_por_columna():
             # Canario: sin esto, una `Base.metadata` vacia (o un typo que
             # deje `tables` sin nada) pasaria en verde sin haber comparado
             # una sola columna.
-            assert tablas_comparadas == 4, (
-                f"se esperaban 4 tablas mapeadas, se compararon {tablas_comparadas}"
+            assert tablas_comparadas == 7, (
+                f"se esperaban 7 tablas mapeadas (battles, battle_turns, "
+                f"trajectories, trajectory_steps + providers, models, "
+                f"settings de F2-09), se compararon {tablas_comparadas}"
             )
             assert columnas_comparadas > 0, "no se comparo ninguna columna"
     finally:
