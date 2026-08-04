@@ -6,11 +6,14 @@ import { INVARIANTS, OPPONENT_FIELDS } from "../src/types.js";
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 const tsxCli = fileURLToPath(new URL("../node_modules/tsx/dist/cli.mjs", import.meta.url));
 
-function run(args: string[]): { status: number | null; stdout: string; stderr: string } {
+function run(
+  args: string[],
+  extraEnv: Record<string, string> = {},
+): { status: number | null; stdout: string; stderr: string } {
   const result = spawnSync(process.execPath, [tsxCli, "src/cli.ts", ...args], {
     cwd: packageRoot,
     encoding: "utf8",
-    env: process.env,
+    env: { ...process.env, ...extraEnv },
     maxBuffer: 64 * 1024 * 1024,
   });
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
@@ -52,5 +55,17 @@ describe("dataset-audit CLI", () => {
     const result = run(["auditar"]);
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("Uso:");
+  }, 120_000);
+
+  it("sale con código distinto de cero si no puede resolver el vocabulario cosmético (MON-11)", () => {
+    // Extremo a extremo: sin un dex real (LUDEX_SHOWDOWN_DEX_DIR apuntando
+    // a la nada), el proceso completo tiene que terminar con error
+    // explícito, nunca con "0 alias cosméticos" y un veredicto silencioso.
+    const result = run(
+      ["audit", "--scope", "training"],
+      { LUDEX_SHOWDOWN_DEX_DIR: "/no/existe/este/directorio/mon11" },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/no se encontr[oó] el dex local de poke-env/i);
   }, 120_000);
 });

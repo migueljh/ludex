@@ -10,13 +10,22 @@ import { parseScope, SCOPE_RULES } from "../src/scope.js";
 import { SCOPES } from "../src/types.js";
 
 /** Pool falso que cuenta llamadas y devuelve `rows` fabricadas. Existe para
- * que el canario de conteo de queries no dependa de Postgres. */
+ * que el canario de conteo de queries no dependa de Postgres.
+ *
+ * `gen_number: 6` en cada fila (MON-11): este canario sólo verifica
+ * CANTIDAD de queries, no contenido, pero `loadDataset` deriva de
+ * `trajectories[].gen` qué generaciones pedirle a `loadCosmeticAliases` --
+ * que desde MON-11 falla cerrado si no encuentra un pokedex real para la
+ * generación pedida (nunca degrada a cero alias). Una fila `{}` sin
+ * `gen_number` pedía la generación `undefined`, que ningún pokedex real
+ * puede satisfacer. 6 es una generación real que sí tiene pokedex
+ * empaquetado. */
 function countingPool(rowsPerQuery: number): { pool: Queryable; calls: string[] } {
   const calls: string[] = [];
   const pool: Queryable = {
     query: async (text: string) => {
       calls.push(text);
-      return { rows: Array.from({ length: rowsPerQuery }, () => ({})) };
+      return { rows: Array.from({ length: rowsPerQuery }, () => ({ gen_number: 6 })) };
     },
   };
   return { pool, calls };
