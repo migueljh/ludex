@@ -338,14 +338,31 @@ export class BattleProjection {
     this.touch();
   }
 
-  /** `_update_from_details` (`pokemon.py:669-714`), corte temprano incluido. */
+  /** `_update_from_details` (`pokemon.py:669-714`), corte temprano incluido
+   * -- con una condición angosta de más (D40, MON-18 R3).
+   *
+   * Relic Song revierte a Meloetta a su forma base al salir del campo, a
+   * diferencia de Mega (que persiste): la línea de switch-in que revierte
+   * narra el MISMO `details` ("Meloetta, L82") que la primera vez que
+   * entró. El corte original sólo miraba si `details` había cambiado, así
+   * que nunca volvía a llamar a `updateFromPokedex` -- `formeId`/`dexEntry`
+   * quedaban pegados en la forma temporal (Pirouette) para siempre, aunque
+   * el propio protocolo ya haya revertido. `mon.formeId !== mon.species`
+   * es la señal barata de "hay una forma temporal activa ahora mismo" (la
+   * misma que usa `isFormeChangeForme`): sólo en ESE caso el corte no
+   * alcanza y hay que reevaluar el dex igual, sin tocar el corte para el
+   * caso general (un Mega que switchea afuera y vuelve narra un `details`
+   * DISTINTO -- "Charizard-Mega-X..." vs "Charizard..." -- así que nunca
+   * pasaba por acá para empezar). */
   private updateFromDetails(mon: MonState, details: string): void {
-    if (details === mon.lastDetails) return;
+    if (details === mon.lastDetails && mon.formeId === mon.species) return;
     mon.lastDetails = details;
     const parsed = parseDetails(details);
     if (parsed === undefined) return;
     mon.level = parsed.level;
-    if (parsed.species !== mon.species) this.updateFromPokedex(mon, parsed.species, true);
+    if (parsed.species !== mon.species || mon.formeId !== parsed.species) {
+      this.updateFromPokedex(mon, parsed.species, true);
+    }
     this.touch();
   }
 
