@@ -38,10 +38,20 @@ export interface CosmeticAlias {
 
 export interface CosmeticSource {
   aliases: CosmeticAlias[];
-  /** De dónde salió. `undefined` = no se pudo leer, y entonces todo alias
-   * cosmético falla cerrado. */
-  directory: string | undefined;
+  /** De dónde salió. Siempre definido: `loadCosmeticAliases` NUNCA devuelve
+   * un resultado degradado -- si no puede resolver el vocabulario completo,
+   * lanza `CosmeticVocabularyError` en vez de volver con `undefined`/vacío
+   * (MON-11, ver D33 y el CHECKPOINT de MON-18: un auditor sin este dex
+   * clasificaba 170 especies reales como falsos positivos). */
+  directory: string;
 }
+
+/** Lanzada cuando el vocabulario cosmético no se puede resolver por completo:
+ * falta `.venv`/el dex empaquetado, falta el pokedex de alguna generación
+ * pedida, el JSON es inválido, o el resultado quedaría en cero alias. Nunca
+ * se degrada en silencio a una tabla vacía -- eso es exactamente lo que
+ * produjo 170 falsos positivos de especie en el diagnóstico de MON-11. */
+export class CosmeticVocabularyError extends Error {}
 
 /** Dónde vive el dex empaquetado. `LUDEX_SHOWDOWN_DEX_DIR` lo sobreescribe. */
 function candidateDirectories(): string[] {
@@ -65,19 +75,44 @@ interface PokedexEntry {
   cosmeticFormes?: unknown;
 }
 
-/** Los alias cosméticos de las generaciones pedidas. */
+/** Los alias cosméticos de las generaciones pedidas.
+ *
+ * Falla CERRADO en cada punto donde antes se degradaba en silencio a una
+ * tabla vacía (MON-11): directorio del dex no encontrado, pokedex faltante
+ * para alguna generación pedida, JSON inválido, o cero alias resultantes
+ * pese a haber generaciones pedidas. Con `gens` vacío (dataset sin filas)
+ * sólo se valida que el directorio exista -- no hay generación cuyo
+ * pokedex deba estar presente.
+ */
 export function loadCosmeticAliases(gens: Iterable<number>): CosmeticSource {
   const directory = candidateDirectories().find((candidate) => existsSync(candidate));
-  if (directory === undefined) return { aliases: [], directory: undefined };
+  if (directory === undefined) {
+    throw new CosmeticVocabularyError(
+      "No se encontró el dex local de poke-env para resolver alias cosméticos (D32). " +
+      "Se probó apps/agent/.venv/lib/*/site-packages/poke_env/data/static/pokedex " +
+      "(o $LUDEX_SHOWDOWN_DEX_DIR, si está seteada) y no existe ninguno de los dos. " +
+      "Corré `uv sync` en apps/agent, o seteá LUDEX_SHOWDOWN_DEX_DIR. El auditor NUNCA " +
+      "degrada a cero alias: una forma cosmética sin resolver pasa como especie " +
+      "desconocida y contamina cada violación de esa fila.",
+    );
+  }
+  const gensRequested = [...new Set(gens)];
   const aliases: CosmeticAlias[] = [];
-  for (const gen of new Set(gens)) {
+  const missingPokedex: number[] = [];
+  for (const gen of gensRequested) {
     const file = join(directory, `gen${gen}pokedex.json`);
-    if (!existsSync(file)) continue;
+    if (!existsSync(file)) {
+      missingPokedex.push(gen);
+      continue;
+    }
     let parsed: Record<string, PokedexEntry>;
     try {
       parsed = JSON.parse(readFileSync(file, "utf8")) as Record<string, PokedexEntry>;
-    } catch {
-      continue;
+    } catch (cause) {
+      throw new CosmeticVocabularyError(
+        `El pokedex de gen ${gen} en ${file} no es JSON válido: ` +
+        `${cause instanceof Error ? cause.message : String(cause)}`,
+      );
     }
     for (const [baseId, entry] of Object.entries(parsed)) {
       const formes = entry?.cosmeticFormes;
@@ -89,6 +124,20 @@ export function loadCosmeticAliases(gens: Iterable<number>): CosmeticSource {
         aliases.push({ gen, aliasId, baseId: normalizeProtocolText(baseId) });
       }
     }
+  }
+  if (missingPokedex.length > 0) {
+    throw new CosmeticVocabularyError(
+      `Falta el pokedex empaquetado para gen ${missingPokedex.join(", ")} en ${directory}. ` +
+      "El auditor no puede resolver formas cosméticas de esas generaciones sin él.",
+    );
+  }
+  if (gensRequested.length > 0 && aliases.length === 0) {
+    throw new CosmeticVocabularyError(
+      `El dex en ${directory} no produjo ningún alias cosmético para gen ` +
+      `${gensRequested.join(", ")}. Todas las generaciones que este proyecto audita ` +
+      "tienen al menos una forma cosmética real (D32); cero alias significa un dex " +
+      "vacío o corrupto, no un dato legítimo -- nunca se sigue en silencio.",
+    );
   }
   return { aliases, directory };
 }
