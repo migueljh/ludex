@@ -748,6 +748,16 @@ def project_observable_state(
     marca permanente del base nombra un `move_id` que puede coincidir por
     casualidad con el copiado, pero son instancias de PP distintas. Sin
     Transform activo, solo `unknown_pp_moves` gobierna.
+
+    `item` (D40) es la misma idea aplicada al item del rival: poke-env
+    corrompe `battle.opponent_team[...].item` entre una decision y la
+    siguiente tras un intercambio por Trick (confirmado en vivo, ver
+    ROOT-CAUSE CHECKPOINT R3), y sin memoria propia ese valor corrupto pisa
+    evidencia ya establecida. A diferencia de `types`/`moves`, no tiene
+    version temporal: Transform no copia item, asi que la marca es siempre
+    permanente para la identidad del propio tenedor. `value=None` (item
+    consumido/removido) es tan significativo como cualquier item real -- la
+    clave `"item"` queda presente con ese valor, nunca ausente.
     """
     persistent_state = {} if persistent_state is None else persistent_state
     projected = {
@@ -1079,6 +1089,28 @@ def project_observable_state(
             persistent_state.setdefault(identidad, {}).setdefault("ability", actual)
         mon["ability"] = ability
 
+    def remember_item(mon: dict, value: str | None) -> None:
+        """Fija el item PUBLICAMENTE evidenciado del rival y lo memoriza en
+        `persistent_state` (D40): el `snapshot` de entrada es SIEMPRE fresco
+        (`serialize_battle`, nunca la proyeccion anterior) y poke-env
+        corrompe `battle.opponent_team[...].item` entre una decision y la
+        siguiente tras un intercambio por Trick -- confirmado en vivo
+        (`battle-gen6randombattle-2746`, ROOT-CAUSE CHECKPOINT R3). Sin esta
+        memoria, ese valor corrupto pisaria evidencia ya establecida sin que
+        ninguna linea nueva la pidiera; mismo patron que D37 ya resuelve
+        para el PP bajo Pressure.
+
+        `value=None` es tan significativo como cualquier item real (item
+        consumido o removido, `-enditem`): la clave `"item"` queda
+        PRESENTE con ese valor, nunca ausente -- de eso depende no
+        reescribir un `None` ya confirmado con un numero stale. Nunca se
+        llama con el sentinel inicial `unknown_item`: eso no es evidencia,
+        es su ausencia (D40, requisito 2).
+        """
+        mon["item"] = value
+        identidad = canon(normalize_id(mon.get("species") or ""))
+        persistent_state.setdefault(identidad, {})["item"] = value
+
     def register_move(mon: dict, raw_move: str, *, use: bool) -> None:
         """Revela un movimiento del rival y descuenta su PP.
 
@@ -1169,7 +1201,7 @@ def project_observable_state(
                 item = normalize_id(parts[4].split("item:", 1)[-1])
                 current = mon.get("item")
                 if current is not None and "berry" not in item and "herb" not in item:
-                    mon["item"] = item
+                    remember_item(mon, item)
             elif len(parts) == 6 and parts[4].startswith("[from] ability:"):
                 ability = normalize_id(parts[4].split("ability:", 1)[-1])
                 if ability == "hospitality":
@@ -1186,11 +1218,11 @@ def project_observable_state(
         ):
             mon = _owner_of(parts[5].split("[of]", 1)[-1].strip())
             if mon is not None:
-                mon["item"] = normalize_id(parts[4].split("item:", 1)[-1])
+                remember_item(mon, normalize_id(parts[4].split("item:", 1)[-1]))
         elif len(parts) == 5 and parts[4].startswith("[from] item:"):
             mon = _owner_of(parts[2])
             if mon is not None:
-                mon["item"] = normalize_id(parts[4].split("item:", 1)[-1])
+                remember_item(mon, normalize_id(parts[4].split("item:", 1)[-1]))
         elif (
             len(parts) == 6
             and parts[4].startswith("[from] ability:")
@@ -1305,6 +1337,13 @@ def project_observable_state(
         entry = persistent_state.get(identidad)
         if not entry:
             continue
+        # D40: mismo mecanismo que el PP bajo Pressure, pero permanente (no
+        # hay analogo "temporal por Transform" -- Transform no copia item).
+        # Reaplicado ANTES de procesar ninguna linea nueva del frame para
+        # que una revelacion real dentro de esta misma llamada pueda seguir
+        # reemplazandolo (D40, requisito 5).
+        if "item" in entry:
+            mon["item"] = entry["item"]
         if "moves" in entry:
             desconocidos = entry.get("transform_unknown_pp_moves") or ()
         else:
@@ -1493,11 +1532,11 @@ def project_observable_state(
         elif tag == "-item" and len(parts) > 3:
             mon = active()
             if mon is not None:
-                mon["item"] = normalize_id(parts[3])
+                remember_item(mon, normalize_id(parts[3]))
         elif tag == "-enditem":
             mon = active()
             if mon is not None:
-                mon["item"] = None
+                remember_item(mon, None)
         elif tag == "-ability" and len(parts) > 3:
             mon = active()
             if mon is not None:
