@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from collections.abc import Mapping, Sequence
@@ -16,6 +17,8 @@ import httpx
 from anthropic import APIConnectionError as AnthropicAPIConnectionError
 from openai import APIConnectionError as OpenAIAPIConnectionError
 from pydantic import ValidationError
+
+from .. import config as _config
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +57,18 @@ class ProviderPoolExhausted(ProviderError):
 
 class DecisionDeadlineExceeded(ProviderError):
     pass
+
+
+class ProviderSelectionError(ProviderError):
+    """F2-09 (MON-14): no se pudo resolver la seleccion activa de
+    provider/model (DB sin seleccion ni bootstrap, provider inexistente o
+    deshabilitado, sin claves en el entorno)."""
+
+
+class ProviderMixError(ProviderError):
+    """F2-09 (MON-14): el benchmark fijo provider/model al inicio y una
+    respuesta efectiva difirio del pin: la corrida debe abortar, jamas
+    mezclar mediciones."""
 
 
 @dataclass(frozen=True)
@@ -782,3 +797,215 @@ class AnthropicDecisionProvider(KeyRotatingProvider):
             model=model,
             metrics=metrics,
         )
+
+
+# --- F2-09 (MON-14): resolucion de provider/model por decision -------------
+
+# kind de cada proveedor del catalogo: el backend concreto que lo construye.
+_PROVIDER_KINDS = {
+    "google": "google",
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "kimi": "openai",
+    "open_code_zen": "openai",
+}
+
+
+@dataclass(frozen=True)
+class ResolvedProvider:
+    """La seleccion activa resuelta para UNA decision: nombres + instancia."""
+
+    provider_name: str
+    model_id: str
+    provider: DecisionProvider
+
+
+class ProviderResolver:
+    """Resuelve provider/model activos POR DECISION desde la DB (F2-09).
+
+    La seleccion activa se consulta en CADA `resolve()` — nunca se cachea:
+    cambiar el modelo activo entre dos invocaciones del mismo grafo surte
+    efecto sin recompilar ni reiniciar la batalla. Lo unico cacheado es la
+    INSTANCIA del provider por `(provider_name, model_id)`: el cooldown de
+    claves (D30) y los reintentos de infraestructura viven en la instancia y
+    deben sobrevivir entre turnos del mismo modelo.
+
+    El env es bootstrap: si la DB no tiene seleccion activa, se usa la
+    seleccion de configuracion; la DB gobierna cuando existe.
+    """
+
+    def __init__(
+        self,
+        repository: Any,
+        *,
+        provider_factory: Callable[..., DecisionProvider] | None = None,
+        metrics: DecisionMetrics | None = None,
+        request_timeout_seconds: float = 30.0,
+        routes: Mapping[tuple[str, str], ModelRoute] | None = None,
+        environ: Mapping[str, str] | None = None,
+        bootstrap: Any | None = None,
+    ) -> None:
+        self._repository = repository
+        self._factory = provider_factory or default_provider_factory
+        self._metrics = metrics or DecisionMetrics()
+        self._request_timeout_seconds = request_timeout_seconds
+        self._routes = routes if routes is not None else load_model_routes()
+        self._environ = os.environ if environ is None else environ
+        self._bootstrap = bootstrap
+        self._instances: dict[tuple[str, str], DecisionProvider] = {}
+
+    async def resolve(self) -> ResolvedProvider:
+        selection = await self._repository.active_selection()
+        if selection is None:
+            selection = self._bootstrap
+        if selection is None:
+            raise ProviderSelectionError(
+                "no hay seleccion activa de modelo en la DB ni bootstrap de "
+                "configuracion"
+            )
+        row = await self._repository.provider(selection.provider_name)
+        if row is None or not row.enabled:
+            raise ProviderSelectionError(
+                f"provider {selection.provider_name!r} no existe o esta "
+                "deshabilitado en la DB"
+            )
+        key = (selection.provider_name, selection.model_id)
+        provider = self._instances.get(key)
+        if provider is None:
+            provider = self._factory(
+                selection.provider_name,
+                selection.model_id,
+                base_url=row.base_url,
+                api_key_env=row.api_key_env,
+                metrics=self._metrics,
+                timeout_seconds=self._request_timeout_seconds,
+                routes=self._routes,
+                environ=self._environ,
+            )
+            self._instances[key] = provider
+        return ResolvedProvider(selection.provider_name, selection.model_id, provider)
+
+
+def default_provider_factory(
+    name: str,
+    model_id: str,
+    *,
+    base_url: str | None,
+    api_key_env: str,
+    metrics: DecisionMetrics,
+    timeout_seconds: float,
+    routes: Mapping[tuple[str, str], ModelRoute],
+    environ: Mapping[str, str],
+) -> DecisionProvider:
+    """Construye el DecisionProvider de la seleccion activa desde la fila de
+    la DB.
+
+    El backend (google/anthropic/openai-compatible) se deriva del nombre del
+    proveedor contra el catalogo de config. La API key se lee del ENTORNO por
+    el NOMBRE guardado en la DB — nunca hay valores de claves en la DB, en
+    logs ni en snapshots. Los pools y aliases de google derivan del catalogo
+    (igual que el bootstrap de env). Excepcion documentada (D39): no se usa
+    `init_chat_model` de LangChain porque el contrato real necesita opciones
+    por proveedor (timeout, thinking/max_tokens, structured output) que esa
+    API no expone sin ramas.
+    """
+    from .decision import DecisionResponse  # evita el ciclo decision<->provider
+
+    kind = _PROVIDER_KINDS.get(name)
+    if kind is None:
+        raise ProviderSelectionError(
+            f"proveedor sin backend registrado en el catalogo: {name!r}"
+        )
+    primary_env, pool_env, _ = _config._PROVIDERS.get(name, (api_key_env, None, None))
+    keys_env = api_key_env or primary_env
+    aliases = (
+        (("GOOGLE_API_KEY", "GOOGLE_API_KEYS"),)
+        if name == "google" else ()
+    )
+    keys = provider_keys(environ, keys_env, pool_env, aliases=aliases)
+    if not keys:
+        raise ProviderSelectionError(
+            f"sin claves configuradas para {name!r}: falta la variable "
+            f"de entorno {keys_env!r}"
+        )
+    route = (
+        model_route(routes, name, model_id)
+        if name in {"kimi", "open_code_zen"} else None
+    )
+    if kind == "google":
+        return GeminiDecisionProvider(
+            keys, model=model_id, response_schema=DecisionResponse,
+            timeout_seconds=timeout_seconds, metrics=metrics,
+        )
+    if kind == "anthropic":
+        return AnthropicDecisionProvider(
+            keys, name=name, model=model_id, base_url=base_url,
+            response_schema=DecisionResponse, timeout_seconds=timeout_seconds,
+            metrics=metrics, route=route,
+        )
+    if route is not None and route.protocol == "messages":
+        return AnthropicDecisionProvider(
+            keys, name=name, model=model_id, base_url=base_url,
+            response_schema=DecisionResponse, timeout_seconds=timeout_seconds,
+            metrics=metrics, route=route,
+        )
+    if route is not None and route.protocol == "responses":
+        raise ProviderSelectionError(
+            f"{name}/{model_id}: protocolo responses todavia no implementado"
+        )
+    return OpenAICompatibleDecisionProvider(
+        name, keys, model=model_id, base_url=base_url,
+        response_schema=DecisionResponse, timeout_seconds=timeout_seconds,
+        metrics=metrics, route=route,
+    )
+
+
+class _PinnedAuditor:
+    """Envuelve un provider y audita cada envelope contra el pin: una
+    respuesta efectiva con provider/model distintos aborta (mezcla)."""
+
+    def __init__(self, inner: DecisionProvider, pin: tuple[str, str]) -> None:
+        self._inner = inner
+        self._pin = pin
+
+    async def complete(
+        self, prompt: str, *, deadline: float, turn_id: str
+    ) -> CompletionEnvelope:
+        envelope = await self._inner.complete(
+            prompt, deadline=deadline, turn_id=turn_id
+        )
+        effective = (envelope.provider, envelope.model)
+        if effective != self._pin:
+            raise ProviderMixError(
+                f"provider/model mezclado en la corrida: pin {self._pin!r} "
+                f"pero la respuesta efectiva fue {effective!r}"
+            )
+        return envelope
+
+
+class PinnedResolver:
+    """Fija provider/model para un contexto que lo exige (benchmark, tests).
+
+    Con `enforce_pin=True` audita cada envelope: si la metadata efectiva
+    difiere del pin, `ProviderMixError` aborta la corrida (D28/F2-09: el
+    benchmark fija provider y modelo al inicio y jamas los mezcla).
+    """
+
+    def __init__(
+        self,
+        provider: DecisionProvider,
+        provider_name: str,
+        model_id: str,
+        *,
+        enforce_pin: bool = False,
+    ) -> None:
+        self._provider = provider
+        self._provider_name = provider_name
+        self._model_id = model_id
+        self._enforce_pin = enforce_pin
+
+    async def resolve(self) -> ResolvedProvider:
+        inner: DecisionProvider = self._provider
+        if self._enforce_pin:
+            inner = _PinnedAuditor(inner, (self._provider_name, self._model_id))
+        return ResolvedProvider(self._provider_name, self._model_id, inner)
