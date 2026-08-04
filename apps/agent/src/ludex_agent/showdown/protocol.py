@@ -898,12 +898,18 @@ def project_observable_state(
         poke-env) tiene que sobrevivir para el PROXIMO override (otra
         Entrainment, otro Transform) -- por eso se lee (`peek`), nunca se
         descarta, aunque no haya ningun override activo ahora mismo.
+
+        `item_backup` (D40, T-02) se descarta SIN restaurar nada: un switch
+        ordinario (a diferencia de `|replace|`, ver `end_illusion`) confirma
+        que la identidad aparente era real, asi que cualquier item revelado
+        durante esta estancia queda permanente.
         """
         mon["active"] = False
         mon["boosts"] = _blank_boosts()
         identidad = canon(normalize_id(mon.get("species") or ""))
         entry = persistent_state.get(identidad)
         if entry is not None:
+            entry.pop("item_backup", None)
             if "types" in entry:
                 mon["types"] = list(entry.pop("types"))
             if "moves" in entry:
@@ -969,6 +975,15 @@ def project_observable_state(
             activa —lo que hacia la version anterior— le regalaba a Zoroark el
             item y la ability revelados del imitado, y borraba al imitado del
             equipo rival.
+
+        **Provenance del item (D40, T-02).** Cualquier item revelado
+        DURANTE esta estancia le pertenece al disfraz, no al imitado: antes
+        de que `switch_out` descarte el backup sin restaurar (lo que haria
+        si el disfraz nunca se hubiera roto), se restaura la memoria de
+        item que el imitado tenia ANTES de la primera mutacion de esta
+        estancia -- ausente, `None`, o un item -- y se limpia el sentinel
+        de `item_backup`. No hace falta nada simetrico para Zoroark (`real`):
+        nunca se le escribio item a partir del imitado.
         """
         illusioned = active()
         if illusioned is None:
@@ -976,6 +991,18 @@ def project_observable_state(
         if canon(normalize_id(illusioned.get("species") or "")) == canon(species):
             # poke-env corta en seco: `if illusionist_mon is illusioned`.
             return
+        identidad_imitado = canon(normalize_id(illusioned.get("species") or ""))
+        entry_imitado = persistent_state.get(identidad_imitado)
+        if entry_imitado is not None and "item_backup" in entry_imitado:
+            backup = entry_imitado.pop("item_backup")
+            if backup is _NO_PRIOR_ITEM:
+                entry_imitado.pop("item", None)
+                illusioned["item"] = "unknown_item"
+            else:
+                entry_imitado["item"] = backup
+                illusioned["item"] = backup
+            if not entry_imitado:
+                persistent_state.pop(identidad_imitado, None)
         real = find(species)
         if real is None:
             real = _new_mon(species, vocabulary)
@@ -1119,10 +1146,27 @@ def project_observable_state(
         reescribir un `None` ya confirmado con un numero stale. Nunca se
         llama con el sentinel inicial `unknown_item`: eso no es evidencia,
         es su ausencia (D40, requisito 2).
+
+        **Provenance bajo Illusion (D40, T-02).** Esta identidad puede ser
+        el disfraz de un Zoroark: si la mutacion resulta ser evidencia
+        observada DURANTE un disfraz, `end_illusion` la revierte cuando el
+        `|replace|` la desenmascara. Por eso, en la PRIMERA mutacion de
+        `item` desde el ultimo switch-in de esta identidad (marcada por la
+        ausencia de `"item_backup"` en la entrada), se guarda el valor
+        ANTERIOR -- presente con un item, presente con `None`, o
+        `_NO_PRIOR_ITEM` si la clave no existia -- antes de pisarlo.
+        `switch_out` descarta ese backup sin restaurar nada (un switch
+        ordinario confirma que la identidad aparente era real); `end_
+        illusion` lo restaura antes de llamar a `switch_out`. Mutaciones
+        SIGUIENTES en la misma estancia no vuelven a tocar el backup: sólo
+        importa el estado anterior a la PRIMERA.
         """
-        mon["item"] = value
         identidad = canon(normalize_id(mon.get("species") or ""))
-        persistent_state.setdefault(identidad, {})["item"] = value
+        entry = persistent_state.setdefault(identidad, {})
+        if "item_backup" not in entry:
+            entry["item_backup"] = entry.get("item", _NO_PRIOR_ITEM)
+        mon["item"] = value
+        entry["item"] = value
 
     def register_move(mon: dict, raw_move: str, *, use: bool) -> None:
         """Revela un movimiento del rival y descuenta su PP.

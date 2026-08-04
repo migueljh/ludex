@@ -2300,7 +2300,7 @@ def test_item_revelado_por_trick_sobrevive_snapshot_fresco_corrupto():
     ]
     tras_trick = _proyectar(turno1, snapshot1, persistent_state=memoria)
     assert _por_especie(tras_trick)["purugly"]["item"] == "choicescarf"
-    assert memoria == {"purugly": {"item": "choicescarf"}}
+    assert memoria["purugly"]["item"] == "choicescarf"
 
     # Snapshot FRESCO e independiente para el turno 2, tal como lo entregaria
     # `serialize_battle` en produccion: SIN ninguna linea `-item` nueva,
@@ -2337,7 +2337,7 @@ def test_reveal_pasivo_de_item_actualiza_la_memoria_y_tambien_sobrevive():
         snapshot1, persistent_state=memoria,
     )
     assert _por_especie(tras_dano)["ludicolo"]["item"] == "lifeorb"
-    assert memoria == {"ludicolo": {"item": "lifeorb"}}
+    assert memoria["ludicolo"]["item"] == "lifeorb"
 
     snapshot2 = _snapshot(gen=6)
     snapshot2["opponent"]["pokemon"][0]["item"] = "choicescarf"
@@ -2355,7 +2355,7 @@ def test_enditem_persiste_none_y_sobrevive_snapshot_fresco():
         ["|-enditem|p2a: Ludicolo|Sitrus Berry"], snapshot1, persistent_state=memoria,
     )
     assert _por_especie(tras_consumo)["ludicolo"]["item"] is None
-    assert memoria == {"ludicolo": {"item": None}}
+    assert memoria["ludicolo"]["item"] is None
     assert "ludicolo" in memoria and "item" in memoria["ludicolo"], (
         "la clave 'item' tiene que estar PRESENTE, no ausente"
     )
@@ -2378,7 +2378,7 @@ def test_adquisicion_posterior_reemplaza_la_memoria_anterior():
     _proyectar(
         ["|-enditem|p2a: Ludicolo|Sitrus Berry"], snapshot1, persistent_state=memoria,
     )
-    assert memoria == {"ludicolo": {"item": None}}
+    assert memoria["ludicolo"]["item"] is None
 
     snapshot2 = _snapshot(gen=6)
     tras_adquisicion = _proyectar(
@@ -2386,7 +2386,7 @@ def test_adquisicion_posterior_reemplaza_la_memoria_anterior():
         snapshot2, persistent_state=memoria,
     )
     assert _por_especie(tras_adquisicion)["ludicolo"]["item"] == "leftovers"
-    assert memoria == {"ludicolo": {"item": "leftovers"}}
+    assert memoria["ludicolo"]["item"] == "leftovers"
 
 
 def test_item_del_rival_sobrevive_un_switch():
@@ -2397,7 +2397,7 @@ def test_item_del_rival_sobrevive_un_switch():
         ["|-item|p2a: Ludicolo|Life Orb|[from] move: Trick"],
         snapshot1, persistent_state=memoria,
     )
-    assert memoria == {"ludicolo": {"item": "lifeorb"}}
+    assert memoria["ludicolo"]["item"] == "lifeorb"
 
     mandibuzz_entrando = {
         "species": "mandibuzz", "hp_fraction": 1.0, "active": True,
@@ -2457,7 +2457,7 @@ def test_dos_identidades_de_item_no_se_contaminan():
     assert por_especie["weezing"]["item"] == "unknown_item", (
         "el item de Weezing no debe verse afectado: identidad distinta"
     )
-    assert memoria == {"ludicolo": {"item": "lifeorb"}}
+    assert memoria["ludicolo"]["item"] == "lifeorb"
 
 
 def test_una_linea_item_del_lado_propio_no_contamina_la_memoria_rival():
@@ -2504,7 +2504,7 @@ def test_transferencia_de_item_hacia_nuestro_lado_limpia_al_rival(suffix):
         ["|-item|p2a: Ludicolo|Life Orb|[from] move: Trick"],
         snapshot1, persistent_state=memoria,
     )
-    assert memoria == {"ludicolo": {"item": "lifeorb"}}
+    assert memoria["ludicolo"]["item"] == "lifeorb"
 
     snapshot2 = _snapshot(gen=6)
     snapshot2["opponent"]["pokemon"][0]["item"] = "lifeorb"
@@ -2535,7 +2535,7 @@ def test_transferencia_de_item_desde_nuestro_lado_actualiza_al_rival():
         snapshot, persistent_state=memoria,
     )
     assert _por_especie(out)["ludicolo"]["item"] == "leftovers"
-    assert memoria == {"ludicolo": {"item": "leftovers"}}
+    assert memoria["ludicolo"]["item"] == "leftovers"
 
 
 def test_transferencia_de_item_no_contamina_otra_identidad_rival():
@@ -2692,10 +2692,13 @@ def test_illusion_backup_un_switch_ordinario_confirma_el_item_nuevo():
     )
     assert memoria["mandibuzz"]["item"] == "lifeorb"
 
+    # Mandibuzz sigue activo en el snapshot (todavia no se proceso ningun
+    # switch): es la linea `|switch|` la que dispara `switch_out` sobre
+    # quien este activo AHORA, no un flag pre-armado a mano.
     snapshot2 = _snapshot(gen=6)
     snapshot2["opponent"]["pokemon"] = [
-        _mandibuzz_rival(item="lifeorb", active=False),
-        {"species": "weezing", "hp_fraction": 1.0, "active": True,
+        _mandibuzz_rival(item="lifeorb", active=True),
+        {"species": "weezing", "hp_fraction": 1.0, "active": False,
          "fainted": False, "status": None, "level": 83,
          "item": "unknown_item", "ability": "levitate", "types": ["POISON"],
          "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
