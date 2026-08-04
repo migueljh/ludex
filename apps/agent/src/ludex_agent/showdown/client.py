@@ -610,27 +610,6 @@ def _find_action_line(
     return respaldo
 
 
-def execute_action(
-    action: dict[str, Any], action_orders: dict[tuple[tuple[str, Any], ...], Any]
-) -> Any:
-    """Adapter explicito del resultado del grafo a la ejecucion de poke-env
-    (F2-09/MON-14).
-
-    Traduce el `action` canonico del grafo al `BattleOrder` capturado en
-    `choose_move`; devuelve `None` si el action no esta en el mapa (fuera de
-    la mascara capturada), y el caller lo convierte en RuntimeError.
-
-    NO puede ser un nodo LangGraph: el mapa accion->BattleOrder se captura
-    SINCRONO antes del primer await (D31/D22, la disciplina que garantiza
-    `action_taken in legal_actions` por construccion) y poke-env exige el
-    `BattleOrder` como retorno de `choose_move`; el grafo corre despues de
-    awaits. Este adapter cierra la correspondencia grafo->poke-env fuera del
-    grafo; la equivalencia end-to-end se prueba en test_client
-    (`test_el_caller_ejecuta_despues_de_decide_en_orden`). Ver D39.
-    """
-    return action_orders.get(tuple(sorted(action.items())))
-
-
 class LudexPlayer(RandomPlayer):
     """RandomPlayer que captura protocolo crudo y estado por turno.
 
@@ -1344,9 +1323,7 @@ class LudexPlayer(RandomPlayer):
             }
             result = await self.decision_graph.ainvoke(graph_input)
             action = result["action"]
-            # F2-09: adapter explicito del resultado del grafo a la ejecucion
-            # de poke-env (ver docstring de execute_action).
-            order = execute_action(action, action_orders)
+            order = action_orders.get(tuple(sorted(action.items())))
             if order is None:
                 raise RuntimeError(
                     f"decision graph returned action outside captured mask: {action!r}"

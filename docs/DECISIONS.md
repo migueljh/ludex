@@ -2012,7 +2012,25 @@ DB descartable; la DB compartida no fue migrada.
 
 **Benchmark pinneado y auditado.** El benchmark fija provider/model al inicio (D28) y usa `PinnedResolver(..., enforce_pin=True)`: un auditor envuelve el provider y verifica que cada envelope efectivo coincida con el pin; cualquier mezcla lanza `ProviderMixError` y aborta la corrida. Env bootstrap: el benchmark NO consulta la DB.
 
-**Adapter de ejecución explícito.** `execute_action` en `showdown/client.py` traduce el `action` del grafo al `BattleOrder` del mapa capturado. NO es un nodo LangGraph y no puede serlo: el mapa accion→`BattleOrder` se captura síncrono antes del primer await (D31/D22 — la disciplina que garantiza `action_taken in legal_actions` por construcción) y poke-env exige el `BattleOrder` como retorno de `choose_move`; el grafo corre después de awaits. La correspondencia grafo→poke-env queda cerrada por el adapter fuera del grafo, con equivalencia end-to-end probada (`test_el_caller_ejecuta_despues_de_decide_en_orden`, orden `resolve_provider → parse_state → retrieve_context → calc_damage → decide → execute`). El orden de nodos está fijado por tests de workflow y del caller (mutación del orden puesta roja y restaurada).
+**Adapter de ejecución explícito.** `execute_action` en `showdown/client.py`
+traduce el `action` del grafo al `BattleOrder` del mapa capturado. NO es un
+nodo LangGraph y no puede serlo: el mapa accion→`BattleOrder` se captura
+síncrono antes del primer await (D31/D22 — la disciplina que garantiza
+`action_taken in legal_actions` por construcción) y poke-env exige el
+`BattleOrder` como retorno de `choose_move`; el grafo corre después de awaits.
+La correspondencia grafo→poke-env queda cerrada por el adapter fuera del
+grafo, con equivalencia end-to-end probada (`test_el_caller_ejecuta_despues_de_decide_en_orden`, orden `resolve_provider → parse_state → retrieve_context → calc_damage → decide → execute`). El orden de nodos está fijado por tests de workflow y del caller (mutación del orden puesta roja y restaurada).
+
+**Cableado del adapter PENDIENTE (actualización de territorio, MON-18
+reabierta).** El contrato del adapter vive en `graph/execute.py` (módulo
+PURO, sin poke-env; equivalencia probada en `tests/graph/test_execute.py`),
+pero la llamada real dentro de `run_graph` (`showdown/client.py`) quedó
+REVERTIDA y pendiente: `client.py` y sus tests de flujo son territorio de
+MON-18 hasta nueva liberación de Latwan. La aceptación end-to-end dentro de
+`choose_move` NO está cerrada y no se simula: se verifica en la integración
+final cuando MON-18 libere el archivo. Mientras tanto el flujo de
+`run_graph` conserva la traducción inline de la base (`action_orders.get(
+tuple(sorted(action.items())))`).
 
 **Catálogo OpenCode Zen no hardcodeado.** `agent provider-init` puebla `providers` desde el catálogo de config (bootstrap) y, para open_code_zen con clave y base URL presentes, sincroniza `models` resolviendo el endpoint `/models` (shape OpenAI-compatible asumido, `{"data": [{"id": ...}]}`; un shape inválido falla ruidoso — límite documentado: se verificó el formato del gateway contra el contrato OpenAI-compatible, no contra una key real en esta rebanada). `agent model-set` fija la selección activa. Sin PATCH endpoint ni UI (fase 3/4).
 
