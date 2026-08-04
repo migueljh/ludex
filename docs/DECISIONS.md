@@ -1999,3 +1999,76 @@ quedan NULL. La forma exacta de los targets de la mascara legal se definirá
 cuando una mascara los exponga (hoy la rechaza). Migración
 `20260803000001_trajectory_decision_metadata.sql` verificada up/down en una
 DB descartable; la DB compartida no fue migrada.
+
+## D40 — el item del rival vive en `persistent_state`; el auditor reevalúa el dex en cada switch-in (MON-18 R3)
+
+**Contexto.** El ROOT-CAUSE CHECKPOINT R3 confirmó, en vivo
+(`battle-gen6randombattle-2746`, y previamente medido en
+`battles.id=2782/2787`), que `poke-env` 0.15.0 corrompe
+`battle.opponent_team[...].item` entre una decisión y la siguiente después
+de un intercambio por Trick: el valor corrupto es exactamente el item que
+NUESTRO propio activo recibió en el mismo canje. Como `client.py` arma el
+`snapshot` de cada decisión fresco desde `serialize_battle(battle)` (nunca
+encadena la proyección anterior, D31), ese valor corrupto pisa evidencia
+pública ya establecida sin que ninguna línea nueva la pida. El item se
+autocorrige por casualidad cuando el ítem verdadero genera una línea pasiva
+propia (Life Orb, Leftovers) en la MISMA llamada, pero queda corrupto para
+siempre cuando no la genera (Choice Scarf/Band/Specs) — exactamente el
+patrón medido en `battles.id=2782` (Purugly) y `2787` (Alakazam).
+
+Por separado, el mismo CHECKPOINT clasificó el hallazgo de `types` sobre
+Meloetta en `battles.id=2787` como un **falso positivo del auditor**, no un
+defecto del recorder: Relic Song revierte la forma de Meloetta al salir del
+campo (a diferencia de Mega, que persiste), y la línea de switch-in que
+revierte narra el MISMO `details` que la primera vez que entró. La fila
+persistida por `apps/agent` ya era correcta.
+
+**Decisión — item (`apps/agent/src/ludex_agent/showdown/protocol.py`).**
+Mismo patrón arquitectónico que D37 para el PP bajo Pressure, pero
+permanente (Transform no copia item, así que no hace falta la variante
+temporal): `remember_item(mon, value)` fija el item Y lo memoriza en
+`persistent_state[identidad]["item"]` desde las cuatro rutas públicas ya
+existentes que lo revelan (`-item`, `-enditem`, daño/heal propio por item vía
+`apply_damage_or_heal_ownership`), y esa memoria se reaplica al principio de
+CADA llamada, antes de procesar cualquier línea nueva del frame — igual que
+`unknown_pp_moves`. `value=None` (item consumido/removido) es tan
+significativo como cualquier item real: la clave `"item"` queda presente con
+ese valor, nunca ausente, y nunca se escribe con el sentinel inicial
+`unknown_item` (eso no es evidencia, es su ausencia). No hace falta código
+específico de Trick: toda revelación de item, sea cual sea su origen, ya
+pasaba por esas cuatro rutas, y las cuatro ya estaban correctamente
+delimitadas por lado (nunca escriben sobre el equipo propio).
+
+**Decisión — types/Meloetta (`packages/dataset-audit/src/projection.ts`).**
+`updateFromDetails` cortaba en `details === mon.lastDetails` antes de
+reevaluar el dex — el mismo corte que trae `Pokemon._update_from_details`
+de poke-env (`pokemon.py:669-714`), que el auditor reproduce a propósito.
+La condición se angosta, no se elimina: además de comparar `details`, ahora
+exige `mon.formeId === mon.species` (ninguna forma temporal activa) para
+saltarse la reevaluación. Un Mega que sale y vuelve nunca pasaba por este
+camino para empezar — su switch-in narra un `details` DISTINTO
+("Charizard-Mega-X..." vs "Charizard...") porque la forma persiste — así que
+la corrección no lo afecta.
+
+**Tests.** `apps/agent/tests/showdown/test_protocol.py`: reproducción
+determinista de `battles.id=2782` con las líneas reales de sus turnos 1-2 y
+un snapshot fresco que trae el valor corrupto medido en vivo (canario de
+boundary: cruza dos llamadas de `project_observable_state` con sólo
+`persistent_state` en común, igual que D37); contrapeso Life Orb (la
+revelación pasiva también escribe en memoria y también sobrevive un
+snapshot fresco corrupto); `-enditem` persiste `None` y sobrevive un
+snapshot fresco; evidencia nueva reemplaza memoria anterior (`None` o item
+distinto); sobrevive un switch ordinario; dos identidades no se contaminan;
+una línea del lado propio no contamina memoria rival (ya pasaba antes del
+fix, sirve de sentinela — mismo patrón que el contrapeso negativo de D37).
+`packages/dataset-audit/test/projection.test.ts`: switch-in con el mismo
+`details` que uno anterior revierte una forma temporal; contrapeso Mega
+(persiste, ya pasaba y sigue pasando). Tres mutaciones dirigidas sobre el
+item (retirar la reaplicación, retirar la persistencia de `-enditem`,
+permitir que una línea propia escriba memoria rival) y una sobre Meloetta
+(restaurar el corte defectuoso), cada una puesta en rojo exactamente el test
+esperado y restaurada.
+
+**Alcance.** Cero cambios en `showdown/client.py` ni `cli.py` (confirmado
+por `git diff --stat` vacío en ambos rangos). D37 y D38 quedan intactos. No
+se tocó ninguna fila de la DB compartida.
