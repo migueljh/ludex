@@ -1993,4 +1993,3 @@ quedan NULL. La forma exacta de los targets de la mascara legal se definirá
 cuando una mascara los exponga (hoy la rechaza). Migración
 `20260803000001_trajectory_decision_metadata.sql` verificada up/down en una
 DB descartable; la DB compartida no fue migrada.
-
