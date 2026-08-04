@@ -1934,3 +1934,208 @@ reemplazar `persistent_state` por un dict nuevo en `client.py` (L-03) — las
 tres, aplicadas y restauradas por separado, ponen rojo exactamente el test
 que cada una debía romper. Restauradas: 206/206 en
 `test_protocol.py`/`test_client.py`.
+## D38 — la metadata de decisión se persiste en `trajectory_steps` por envelope inmutable (F2-08/MON-13)
+
+**Contexto.** El dataset de entrenamiento necesitaba el contrato de decisión
+completo por `decision_index` —action, target, rationale breve, confidence,
+alternatives— más metadata de calidad ML: provider/model efectivos, latencia
+y usage. Nada de eso se persistía: `reasoning` se calculaba en el grafo y se
+descartaba, y provider/model vivían solo en los artefactos del benchmark.
+
+**Decisión.** 11 columnas nuevas en `trajectory_steps`, todas NULL en filas
+históricas y de ruta random (sin backfill, nunca se inventa provider/model):
+`rationale`, `target` jsonb, `confidence` double precision, `alternatives`
+jsonb, `provider`, `model`, `decision_latency_ms` y los cuatro tokens planos
+(`input/output/cached_input/reasoning_tokens`, el contrato fijo de
+`CompletionUsage`). Constraints: confidence NULL o [0,1]; co-ocurrencia
+`provider/model`; los cuatro tokens todos NULL o todos no-NULL, `>= 0`,
+`cached <= input`; latencia NULL o `>= 0`; `alternatives` array y `target`
+object cuando no-NULL.
+
+**Envelope inmutable por llamada, no `last_*`.** `DecisionProvider.complete`
+devuelve `CompletionEnvelope` (payload, provider efectivo, model efectivo,
+usage, latencia de esa llamada). El patrón `last_completion_info` quedó
+rechazado por el design verdict: es estado mutable compartido y cruza
+metadata entre decisiones concurrentes — reproducido en la demo
+`/tmp/demo_last_style.py`: la decisión lenta terminaba reportando el payload
+de una decisión vecina. Con el envelope, la metadata viaja en el valor de
+retorno y el cruce es imposible por construcción.
+
+**Semántica por decisión canónica.** provider/model son únicamente los de la
+respuesta LLM aceptada; en `fallback` quedan NULL (no se atribuye la acción
+determinista a un modelo) con `alternatives=[]` y un rationale determinista.
+`rationale` es el campo CANÓNICO del schema productivo y del prompt (L-01 de
+la revisión R1): el payload del proveedor se rechaza si emite `reasoning` en
+su lugar (missing rationale + extra_forbidden). El alias interno `reasoning`
+en el resultado de `decide` solo existe para consumidores que ya lo leían
+(run_graph) y se deriva del rationale ya validado; nunca forma parte del
+schema enviado al proveedor. El usage de la decisión suma las respuestas
+facturables del camino (retries
+semánticos incluidos; los de infraestructura no producen usage en el backend
+actual). `decision_latency_ms` va desde el primer intento LLM hasta la
+respuesta aceptada o el fallback. `target` es NULL válido y esperado en
+singles; un target no-NULL solo se acepta si la misma mascara legal expone
+targets, y mientras no los exponga se rechaza la respuesta (reintento
+semántico). Las alternatives atraviesan el mismo `normalize_action` +
+`validate_action` que la principal, deben ser únicas tras normalizar y
+distintas de la principal; `[]` es válido; cualquier violación consume el
+reintento semántico (D26). D34 sigue vinculante: solo persiste la metadata
+de la acción finalmente resuelta; una elección rechazada por Showdown no
+conserva metadata ejecutada.
+
+**Persistencia con EXCLUDED puro, como grupo.** `save_step` reemplaza las 11
+columnas de metadata con `EXCLUDED` puro en el DO UPDATE (corrección del
+TECH LEAD PARTIAL CHECKPOINT VERDICT: COALESCE podía actualizar
+`action_taken` pero retener rationale/provider/model de una acción anterior,
+creando una fila incoherente). Re-persistir la misma decisión es idempotente
+(misma metadata -> mismos valores); una re-persistencia explícita sin
+metadata deja el grupo completo en NULL. `rationale` es el nombre canónico;
+`battle_turns.agent_reasoning` no se usa.
+
+**Cableado del caller (integración MON-18).** `run_graph` en `client.py`
+copia la metadata del resultado del grafo al `step` canónico y
+`_persist_one` (cli.py) la pasa a `save_step`. La ruta random y la historia
+quedan NULL. La forma exacta de los targets de la mascara legal se definirá
+cuando una mascara los exponga (hoy la rechaza). Migración
+`20260803000001_trajectory_decision_metadata.sql` verificada up/down en una
+DB descartable; la DB compartida no fue migrada.
+
+## D40 — el item del rival vive en `persistent_state`; el auditor reevalúa el dex en cada switch-in (MON-18 R3)
+
+**Contexto.** El ROOT-CAUSE CHECKPOINT R3 confirmó, en vivo
+(`battle-gen6randombattle-2746`, y previamente medido en
+`battles.id=2782/2787`), que `poke-env` 0.15.0 corrompe
+`battle.opponent_team[...].item` entre una decisión y la siguiente después
+de un intercambio por Trick: el valor corrupto es exactamente el item que
+NUESTRO propio activo recibió en el mismo canje. Como `client.py` arma el
+`snapshot` de cada decisión fresco desde `serialize_battle(battle)` (nunca
+encadena la proyección anterior, D31), ese valor corrupto pisa evidencia
+pública ya establecida sin que ninguna línea nueva la pida. El item se
+autocorrige por casualidad cuando el ítem verdadero genera una línea pasiva
+propia (Life Orb, Leftovers) en la MISMA llamada, pero queda corrupto para
+siempre cuando no la genera (Choice Scarf/Band/Specs) — exactamente el
+patrón medido en `battles.id=2782` (Purugly) y `2787` (Alakazam).
+
+Por separado, el mismo CHECKPOINT clasificó el hallazgo de `types` sobre
+Meloetta en `battles.id=2787` como un **falso positivo del auditor**, no un
+defecto del recorder: Relic Song revierte la forma de Meloetta al salir del
+campo (a diferencia de Mega, que persiste), y la línea de switch-in que
+revierte narra el MISMO `details` que la primera vez que entró. La fila
+persistida por `apps/agent` ya era correcta.
+
+**Decisión — item (`apps/agent/src/ludex_agent/showdown/protocol.py`).**
+Mismo patrón arquitectónico que D37 para el PP bajo Pressure, pero
+permanente (Transform no copia item, así que no hace falta la variante
+temporal): `remember_item(mon, value)` fija el item Y lo memoriza en
+`persistent_state[identidad]["item"]` desde las cuatro rutas públicas ya
+existentes que lo revelan (`-item`, `-enditem`, daño/heal propio por item vía
+`apply_damage_or_heal_ownership`), y esa memoria se reaplica al principio de
+CADA llamada, antes de procesar cualquier línea nueva del frame — igual que
+`unknown_pp_moves`. `value=None` (item consumido/removido) es tan
+significativo como cualquier item real: la clave `"item"` queda presente con
+ese valor, nunca ausente, y nunca se escribe con el sentinel inicial
+`unknown_item` (eso no es evidencia, es su ausencia). No hace falta código
+específico de Trick: toda revelación de item, sea cual sea su origen, ya
+pasaba por esas cuatro rutas, y las cuatro ya estaban correctamente
+delimitadas por lado (nunca escriben sobre el equipo propio).
+
+**Decisión — types/Meloetta (`packages/dataset-audit/src/projection.ts`).**
+`updateFromDetails` cortaba en `details === mon.lastDetails` antes de
+reevaluar el dex — el mismo corte que trae `Pokemon._update_from_details`
+de poke-env (`pokemon.py:669-714`), que el auditor reproduce a propósito.
+La condición se angosta, no se elimina: además de comparar `details`, ahora
+exige `mon.formeId === mon.species` (ninguna forma temporal activa) para
+saltarse la reevaluación. Un Mega que sale y vuelve nunca pasaba por este
+camino para empezar — su switch-in narra un `details` DISTINTO
+("Charizard-Mega-X..." vs "Charizard...") porque la forma persiste — así que
+la corrección no lo afecta.
+
+**Tests.** `apps/agent/tests/showdown/test_protocol.py`: reproducción
+determinista de `battles.id=2782` con las líneas reales de sus turnos 1-2 y
+un snapshot fresco que trae el valor corrupto medido en vivo (canario de
+boundary: cruza dos llamadas de `project_observable_state` con sólo
+`persistent_state` en común, igual que D37); contrapeso Life Orb (la
+revelación pasiva también escribe en memoria y también sobrevive un
+snapshot fresco corrupto); `-enditem` persiste `None` y sobrevive un
+snapshot fresco; evidencia nueva reemplaza memoria anterior (`None` o item
+distinto); sobrevive un switch ordinario; dos identidades no se contaminan;
+una línea del lado propio no contamina memoria rival (ya pasaba antes del
+fix, sirve de sentinela — mismo patrón que el contrapeso negativo de D37).
+`packages/dataset-audit/test/projection.test.ts`: switch-in con el mismo
+`details` que uno anterior revierte una forma temporal; contrapeso Mega
+(persiste, ya pasaba y sigue pasando). Tres mutaciones dirigidas sobre el
+item (retirar la reaplicación, retirar la persistencia de `-enditem`,
+permitir que una línea propia escriba memoria rival) y una sobre Meloetta
+(restaurar el corte defectuoso), cada una puesta en rojo exactamente el test
+esperado y restaurada.
+
+**Alcance.** Cero cambios en `showdown/client.py` ni `cli.py` (confirmado
+por `git diff --stat` vacío en ambos rangos). D37 y D38 quedan intactos. No
+se tocó ninguna fila de la DB compartida.
+
+### R4 — transferencia de item y provenance bajo Illusion
+
+La revisión de R3 encontró dos blockers sobre el mismo mecanismo de D40,
+ambos exclusivos de `apps/agent/src/ludex_agent/showdown/protocol.py`
+(`packages/dataset-audit` no se tocó esta ronda).
+
+**T-01 — transferencia de item hacia nuestro lado dejaba al rival con
+memoria stale.** `-item|p1a: X|Item|[from] move: Thief|[of] p2a: Y` narra
+la transferencia en UNA sola línea: el `ident` (parts[2]) es quien RECIBE
+el item -- nuestro propio activo -- y `[of]` nombra a quien lo pierde.
+Showdown nunca manda una línea separada para el que pierde. El filtro
+genérico de `ident` descartaba la línea completa antes de que ningún
+handler notara que el rival se quedó sin item, y su entrada en
+`persistent_state` seguía diciendo el item VIEJO para siempre.
+`apply_item_transfer_ownership` corre antes del filtro genérico -- mismo
+patrón que `apply_damage_or_heal_ownership` -- y limpia (`remember_item(...,
+None)`) al rival nombrado por `[of]` cuando la causa es Thief/Covet
+(movimientos) o Pickpocket/Magician (abilities). Cuando el receptor es el
+RIVAL (nos robó a nosotros), la función es un no-op: el `[of]` nombra a
+nuestro lado, que `_owner_of` nunca resuelve, y el handler normal de
+`-item` (ya alcanzable porque el `ident` es del rival) cubre esa dirección
+sin cambios. Symbiosis no se implementa: exige un aliado del mismo lado,
+estructuralmente inalcanzable en singles -- el único gametype que este
+proyector modela (`active_prefix` asume una sola ranura activa por lado) y
+el único que juega `apps/agent` en la práctica.
+
+**T-02 — un item revelado durante Illusion quedaba pegado al imitado para
+siempre.** La memoria de D40 no distinguía "evidencia sobre esta
+identidad" de "evidencia observada mientras Zoroark la usaba de disfraz".
+`remember_item` ahora guarda, en la PRIMERA mutación de `item` desde el
+último switch-in de una identidad (marcada por la ausencia de la clave
+`item_backup`), el valor ANTERIOR -- ausente (sentinel `_NO_PRIOR_ITEM`),
+`None`, o un item -- antes de pisarlo. Dos desenlaces posibles para esa
+estancia:
+
+- **Switch-out ordinario** (`switch_out`): descarta el backup SIN
+  restaurar nada. Un switch normal confirma que la identidad aparente era
+  real, así que el item nuevo queda permanente.
+- **`|replace|` (Illusion se rompe)** (`end_illusion`): restaura la memoria
+  de item que el imitado tenía ANTES de la primera mutación de la
+  estancia, justo antes de delegar en `switch_out` -- si no había memoria
+  previa, la clave `item` vuelve a quedar AUSENTE, nunca `None` (son
+  estados distintos: "sin evidencia" vs. "confirmado sin item"). Zoroark
+  nunca se siembra a partir del imitado, política fail-closed ya existente
+  desde antes de D40: sigue `unknown_item` salvo evidencia independiente.
+  Sólo las claves `item`/`item_backup` se tocan; `ability`, `types`,
+  `moves` y las marcas de PP sobreviven intactas.
+
+**Tests.** Parametrizado sobre Thief/Covet/Pickpocket/Magician (con un
+item rival previamente memorizado, la línea de adquisición hacia p1, y un
+snapshot fresco posterior que sigue mostrando `None`); contrapeso de la
+dirección donde el rival adquiere; aislamiento entre identidades. Para
+Illusion: flujo completo con item previo conocido (revelación durante el
+disfraz, una llamada fresca intermedia, `|replace|`, recuperación del item
+previo, Zoroark sin heredarlo, un switch-in posterior del imitado que
+tampoco hereda el item de Zoroark, y otras claves de `persistent_state`
+intactas); memoria previa ausente vuelve a clave ausente, no a `None`;
+switch ordinario confirma el item nuevo y descarta el backup. Cuatro
+mutaciones dirigidas (retirar el manejo pre-filtro de T-01; omitir la
+restauración en `replace`; tratar "ausente" como `None`; limpiar todo el
+`entry` y perder `ability`), cada una puesta en rojo exactamente el test
+esperado y restaurada.
+
+**Alcance (R4).** Cero cambios en `showdown/client.py`, `cli.py` y
+`packages/dataset-audit` (código ya aceptado, sin tocar esta ronda). D37 y
+D38 siguen intactos. No se tocó ninguna fila de la DB compartida.

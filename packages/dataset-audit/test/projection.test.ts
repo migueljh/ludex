@@ -78,6 +78,46 @@ describe("identidad y forma", () => {
   it("un details sin token L sí significa 100 (Showdown lo omite)", () => {
     expect(mon(project(["|switch|p2a: Lapras|Lapras, F|100/100"]), "p2:lapras").level).toBe(100);
   });
+
+  it("una forma temporal se revierte al volver a entrar con el MISMO details (D40, MON-18 R3)", () => {
+    // Reproducción de `battle-gen6randombattle-2719`/`battles.id=2787`:
+    // Meloetta usa Relic Song (`-formechange` a Pirouette), sale del campo y
+    // vuelve a entrar con el MISMO string de `details` ("Meloetta, L82")
+    // que la primera vez que entró -- Relic Song revierte al salir, a
+    // diferencia de Mega. Bug real (falso positivo del auditor): `updateFrom
+    // Details` cortaba en `details === mon.lastDetails` ANTES de reevaluar
+    // el dex, así que `formeId`/`dexEntry` quedaban pegados en Pirouette
+    // (Fighting) para siempre, aunque el propio switch-in ya diga
+    // "Meloetta" (Aria, Psychic) -- exactamente lo que el protocolo público
+    // confirma. La fila persistida por el recorder ya decía Psychic; era el
+    // auditor el que reportaba una violación que no existía.
+    const projection = project([
+      "|switch|p2a: Meloetta|Meloetta, L82|100/100",
+      "|move|p2a: Meloetta|Relic Song|p1a: Gengar",
+      "|-formechange|p2a: Meloetta|Meloetta-Pirouette|[msg]",
+      SWITCH_OPP, // saca a Meloetta del campo (switch_out)
+      "|switch|p2a: Meloetta|Meloetta, L82|53/100", // MISMO details que el primer switch-in
+    ]);
+    const meloetta = mon(projection, "p2:meloetta");
+    expect(typesOf(meloetta)).toEqual(["NORMAL", "PSYCHIC"]);
+  });
+
+  it("contrapeso: una Mega que switchea afuera y vuelve SIGUE siendo Mega", () => {
+    // A diferencia de Relic Song, Mega Evolution persiste el resto de la
+    // batalla: la línea real de switch-in tras salir y volver narra
+    // "Charizard-Mega-X", un `details` DISTINTO al de la primera entrada
+    // ("Charizard, L79, M") -- por eso el corte de `updateFromDetails` nunca
+    // aplicó acá, y el arreglo de D40 no puede convertir esto en un
+    // falso negativo.
+    const projection = project([
+      "|switch|p2a: Charizard|Charizard, L79, M|100/100",
+      "|detailschange|p2a: Charizard|Charizard-Mega-X, L79, M",
+      SWITCH_OPP, // saca al Mega del campo
+      "|switch|p2a: Charizard|Charizard-Mega-X, L79, M|100/100",
+    ]);
+    const charizard = mon(projection, "p2:charizard");
+    expect(typesOf(charizard)).toEqual(["FIRE", "DRAGON"]);
+  });
 });
 
 describe("HP, status y desmayo", () => {

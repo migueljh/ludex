@@ -438,3 +438,330 @@ async def test_identity_key_es_unica_y_no_nula_en_todo_el_corpus():
         assert duplicadas == 0, f"{duplicadas} pares (source, identity_key) duplicados"
     finally:
         await engine.dispose()
+
+
+# --- F2-08 (MON-13): metadata de decision en trajectory_steps ------------
+
+_METADATA_COMPLETA = dict(
+    rationale="corto y user-facing, nunca chain-of-thought",
+    target={"kind": "active_opponent", "id": "eevee"},
+    confidence=0.9,
+    alternatives=[{"kind": "move", "id": "x"}],
+    provider="open_code_zen",
+    model="minimax-m2.7",
+    decision_latency_ms=123.4,
+    input_tokens=10,
+    output_tokens=5,
+    cached_input_tokens=2,
+    reasoning_tokens=1,
+)
+
+
+async def _trajectory_test(repo) -> int:
+    bid = await repo.save_battle(
+        battle_tag="battle-test-metadata", identity_key=_identity("battle-test-metadata"),
+        fmt="gen6randombattle", p1="A", p2="B", winner=None, source=SOURCE,
+        played_by="bot",
+    )
+    # La DB de tests puede no tener el seed: `save_trajectory` resuelve la
+    # generacion contra `generations`, que en una base vacia no devuelve fila.
+    async with repo.factory() as s:
+        await s.execute(text(
+            "INSERT INTO generations (gen_number, label) VALUES (6, 'XY/ORAS') "
+            "ON CONFLICT (gen_number) DO NOTHING"
+        ))
+        await s.commit()
+    return await repo.save_trajectory(
+        bid, gen_number=6, fmt="gen6randombattle", player_side="p1"
+    )
+
+
+async def test_save_step_persiste_metadata_completa(repo):
+    tid = await _trajectory_test(repo)
+    await repo.save_step(
+        tid, 0, 1, {"schema_version": 1}, 1,
+        [{"kind": "move", "id": "x"}], {"kind": "move", "id": "x"}, "agent",
+        action_path="llm", **_METADATA_COMPLETA,
+    )
+
+    async with repo.factory() as s:
+        fila = (await s.execute(text("""
+            SELECT rationale, target, confidence, alternatives, provider, model,
+                   decision_latency_ms, input_tokens, output_tokens,
+                   cached_input_tokens, reasoning_tokens
+            FROM trajectory_steps WHERE trajectory_id=:t AND decision_index=0
+        """), {"t": tid})).one()
+    assert fila[0] == _METADATA_COMPLETA["rationale"]
+    assert fila[1] == _METADATA_COMPLETA["target"]
+    assert float(fila[2]) == _METADATA_COMPLETA["confidence"]
+    assert fila[3] == _METADATA_COMPLETA["alternatives"]
+    assert fila[4] == _METADATA_COMPLETA["provider"]
+    assert fila[5] == _METADATA_COMPLETA["model"]
+    assert float(fila[6]) == _METADATA_COMPLETA["decision_latency_ms"]
+    assert fila[7:11] == (
+        10, 5, 2, 1,
+    )
+
+
+async def test_dos_decisiones_mismo_turno_con_metadata_distinta_no_se_pisan(repo):
+    tid = await _trajectory_test(repo)
+    await repo.save_step(
+        tid, 0, 3, {"paso": 0}, 1, [], {"kind": "move", "id": "tackle"}, "agent",
+        action_path="llm", confidence=0.9, alternatives=[], provider="google",
+        model="gemini-2.5-flash", rationale="primera",
+        input_tokens=1, output_tokens=1, cached_input_tokens=0, reasoning_tokens=0,
+    )
+    await repo.save_step(
+        tid, 1, 3, {"paso": 1}, 1, [], {"kind": "switch", "species": "y"}, "agent",
+        action_path="llm_retry", confidence=0.4, alternatives=[], provider="kimi",
+        model="kimi-k2.6", rationale="segunda",
+        input_tokens=2, output_tokens=2, cached_input_tokens=0, reasoning_tokens=0,
+    )
+
+    async with repo.factory() as s:
+        filas = (await s.execute(text("""
+            SELECT decision_index, turn_number, confidence, provider, model, rationale
+            FROM trajectory_steps WHERE trajectory_id=:t ORDER BY decision_index
+        """), {"t": tid})).all()
+    assert [(f[0], f[1]) for f in filas] == [(0, 3), (1, 3)]
+    assert float(filas[0][2]) == 0.9 and float(filas[1][2]) == 0.4
+    assert filas[0][3:6] == ("google", "gemini-2.5-flash", "primera")
+    assert filas[1][3:6] == ("kimi", "kimi-k2.6", "segunda")
+
+
+async def test_repersistir_con_metadata_completa_es_idempotente(repo):
+    """Idempotencia (F2-08): re-persistir la MISMA decision con la metadata
+    completa produce la misma fila y los mismos valores: una sola fila, sin
+    duplicados y sin cambiar la metadata."""
+    tid = await _trajectory_test(repo)
+    for _ in range(2):
+        await repo.save_step(
+            tid, 0, 1, {"schema_version": 1}, 1, [], {"kind": "move", "id": "x"}, "agent",
+            action_path="llm", **_METADATA_COMPLETA,
+        )
+
+    async with repo.factory() as s:
+        filas = (await s.execute(text(
+            "SELECT provider, model, confidence, rationale FROM trajectory_steps "
+            "WHERE trajectory_id=:t"
+        ), {"t": tid})).all()
+        count = (await s.execute(text(
+            "SELECT count(*) FROM trajectory_steps WHERE trajectory_id=:t"
+        ), {"t": tid})).scalar_one()
+    assert count == 1
+    assert filas == [(
+        "open_code_zen", "minimax-m2.7", 0.9,
+        "corto y user-facing, nunca chain-of-thought",
+    )]
+
+
+async def test_repersistir_sin_metadata_nulifica_el_grupo_completo(repo):
+    """F2-08 (correccion del tech lead): la metadata se reemplaza COMO GRUPO
+    con EXCLUDED puro. Re-persistir la misma decision sin metadata deja las
+    11 columnas en NULL -- nunca se conserva un subconjunto anterior (COALESCE
+    podia actualizar action_taken pero retener rationale/provider/model de una
+    accion anterior). El canario: `action_taken` SI fue actualizado por la
+    re-persistencia."""
+    tid = await _trajectory_test(repo)
+    await repo.save_step(
+        tid, 0, 1, {"schema_version": 1}, 1, [], {"kind": "move", "id": "x"}, "agent",
+        action_path="llm", **_METADATA_COMPLETA,
+    )
+    await repo.save_step(
+        tid, 0, 1, {"schema_version": 1}, 1, [], {"kind": "switch", "species": "y"}, "agent",
+        action_path="llm",
+    )
+
+    async with repo.factory() as s:
+        fila = (await s.execute(text("""
+            SELECT action_taken, rationale, target, confidence, alternatives,
+                   provider, model, decision_latency_ms, input_tokens,
+                   output_tokens, cached_input_tokens, reasoning_tokens
+            FROM trajectory_steps WHERE trajectory_id=:t AND decision_index=0
+        """), {"t": tid})).one()
+    assert fila[0] == {"kind": "switch", "species": "y"}, (
+        "canario: la re-persistencia tiene que haber actualizado action_taken"
+    )
+    assert fila[1:] == (None,) * 11, (
+        "la re-persistencia sin metadata tiene que nulificar el grupo completo"
+    )
+
+
+async def test_historia_y_ruta_random_quedan_null(repo):
+    tid = await _trajectory_test(repo)
+    await repo.save_step(
+        tid, 0, 1, {}, 1, [], None, "agent",
+    )
+
+    async with repo.factory() as s:
+        fila = (await s.execute(text("""
+            SELECT rationale, target, confidence, alternatives, provider, model,
+                   decision_latency_ms, input_tokens, output_tokens,
+                   cached_input_tokens, reasoning_tokens
+            FROM trajectory_steps WHERE trajectory_id=:t AND decision_index=0
+        """), {"t": tid})).one()
+    assert fila == (None,) * 11
+
+
+async def test_fallback_con_usage_persiste_sin_violar_co_ocurrencia(repo):
+    """Prueba focal de persistencia del flujo F2-08: un fallback con llamadas
+    LLM facturables tiene provider/model/confidence NULL pero tokens y
+    latencia no-NULL -- la co-ocurrencia del CHECK es entre provider/model y
+    entre los cuatro tokens, NO entre provider y tokens (design verdict)."""
+    tid = await _trajectory_test(repo)
+    await repo.save_step(
+        tid, 0, 1, {}, 1, [], {"kind": "move", "id": "tackle"}, "agent",
+        action_path="fallback",
+        rationale="deterministic fallback after two invalid model responses",
+        target=None,
+        confidence=None,
+        alternatives=[],
+        provider=None,
+        model=None,
+        decision_latency_ms=250.0,
+        input_tokens=2,
+        output_tokens=2,
+        cached_input_tokens=0,
+        reasoning_tokens=0,
+    )
+
+    async with repo.factory() as s:
+        fila = (await s.execute(text("""
+            SELECT rationale, target, confidence, alternatives, provider, model,
+                   decision_latency_ms, input_tokens, output_tokens,
+                   cached_input_tokens, reasoning_tokens
+            FROM trajectory_steps WHERE trajectory_id=:t AND decision_index=0
+        """), {"t": tid})).one()
+    assert fila[0] == "deterministic fallback after two invalid model responses"
+    assert fila[1] is None          # target
+    assert fila[2] is None          # confidence
+    assert fila[3] == []            # alternatives
+    assert fila[4] is None          # provider
+    assert fila[5] is None          # model
+    assert float(fila[6]) == 250.0  # decision_latency_ms
+    assert fila[7:11] == (2, 2, 0, 0)
+
+
+async def test_confidence_fuera_de_rango_viola_check(repo):
+    tid = await _trajectory_test(repo)
+    with pytest.raises(DBAPIError, match="trajectory_steps_confidence_check") as exc:
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO trajectory_steps
+                  (trajectory_id, decision_index, turn_number, state,
+                   state_schema_version, legal_actions, action_source, confidence)
+                VALUES (:t, 0, 1, '{}', 1, '[]', 'agent', 1.5)
+            """), {"t": tid})
+    assert exc.value.orig.sqlstate == "23514"
+
+
+async def test_provider_sin_model_viola_co_ocurrencia(repo):
+    tid = await _trajectory_test(repo)
+    with pytest.raises(
+        DBAPIError, match="trajectory_steps_provider_model_coherence_check"
+    ) as exc:
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO trajectory_steps
+                  (trajectory_id, decision_index, turn_number, state,
+                   state_schema_version, legal_actions, action_source, provider)
+                VALUES (:t, 0, 1, '{}', 1, '[]', 'agent', 'google')
+            """), {"t": tid})
+    assert exc.value.orig.sqlstate == "23514"
+
+
+async def test_tokens_parciales_violan_co_ocurrencia_de_usage(repo):
+    tid = await _trajectory_test(repo)
+    with pytest.raises(
+        DBAPIError, match="trajectory_steps_usage_coherence_check"
+    ) as exc:
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO trajectory_steps
+                  (trajectory_id, decision_index, turn_number, state,
+                   state_schema_version, legal_actions, action_source,
+                   input_tokens, output_tokens, cached_input_tokens)
+                VALUES (:t, 0, 1, '{}', 1, '[]', 'agent', 10, 5, 2)
+            """), {"t": tid})
+    assert exc.value.orig.sqlstate == "23514"
+
+
+async def test_cached_mayor_que_input_viola_check(repo):
+    tid = await _trajectory_test(repo)
+    with pytest.raises(
+        DBAPIError, match="trajectory_steps_cached_input_tokens_check"
+    ) as exc:
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO trajectory_steps
+                  (trajectory_id, decision_index, turn_number, state,
+                   state_schema_version, legal_actions, action_source,
+                   input_tokens, output_tokens, cached_input_tokens, reasoning_tokens)
+                VALUES (:t, 0, 1, '{}', 1, '[]', 'agent', 5, 5, 6, 0)
+            """), {"t": tid})
+    assert exc.value.orig.sqlstate == "23514"
+
+
+async def test_output_tokens_negativo_viola_check(repo):
+    """El borrador del design verdict tenia el CHECK de `output_tokens`
+    apuntando a `input_tokens`: con input_tokens=5 valido, un output=-1
+    pasaba. Este test exige el CHECK corregido."""
+    tid = await _trajectory_test(repo)
+    with pytest.raises(
+        DBAPIError, match="trajectory_steps_output_tokens_nonnegative_check"
+    ) as exc:
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO trajectory_steps
+                  (trajectory_id, decision_index, turn_number, state,
+                   state_schema_version, legal_actions, action_source,
+                   input_tokens, output_tokens, cached_input_tokens, reasoning_tokens)
+                VALUES (:t, 0, 1, '{}', 1, '[]', 'agent', 5, -1, 0, 0)
+            """), {"t": tid})
+    assert exc.value.orig.sqlstate == "23514"
+
+
+async def test_latencia_negativa_viola_check(repo):
+    tid = await _trajectory_test(repo)
+    with pytest.raises(
+        DBAPIError, match="trajectory_steps_latency_check"
+    ) as exc:
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO trajectory_steps
+                  (trajectory_id, decision_index, turn_number, state,
+                   state_schema_version, legal_actions, action_source,
+                   decision_latency_ms)
+                VALUES (:t, 0, 1, '{}', 1, '[]', 'agent', -1)
+            """), {"t": tid})
+    assert exc.value.orig.sqlstate == "23514"
+
+
+async def test_alternatives_no_array_viola_check(repo):
+    tid = await _trajectory_test(repo)
+    with pytest.raises(
+        DBAPIError, match="trajectory_steps_alternatives_type_check"
+    ) as exc:
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO trajectory_steps
+                  (trajectory_id, decision_index, turn_number, state,
+                   state_schema_version, legal_actions, action_source, alternatives)
+                VALUES (:t, 0, 1, '{}', 1, '[]', 'agent', '{"a": 1}')
+            """), {"t": tid})
+    assert exc.value.orig.sqlstate == "23514"
+
+
+async def test_target_no_object_viola_check(repo):
+    tid = await _trajectory_test(repo)
+    with pytest.raises(
+        DBAPIError, match="trajectory_steps_target_type_check"
+    ) as exc:
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO trajectory_steps
+                  (trajectory_id, decision_index, turn_number, state,
+                   state_schema_version, legal_actions, action_source, target)
+                VALUES (:t, 0, 1, '{}', 1, '[]', 'agent', '["slot"]')
+            """), {"t": tid})
+    assert exc.value.orig.sqlstate == "23514"

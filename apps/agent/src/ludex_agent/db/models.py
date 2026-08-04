@@ -8,7 +8,17 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import ARRAY, DateTime, ForeignKey, Index, Numeric, Text, UniqueConstraint, func
+from sqlalchemy import (
+    ARRAY,
+    DateTime,
+    Double,
+    ForeignKey,
+    Index,
+    Numeric,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import ENUM as PGEnum
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -110,4 +120,23 @@ class TrajectoryStep(Base):
     action_taken: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     action_source: Mapped[str] = mapped_column(ActionSource)
     action_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # F2-08 (MON-13): metadata de la decision completa y de calidad ML.
+    # NULL en filas historicas/random; los CHECKs de la migracion protegen
+    # confidence [0,1], co-ocurrencia provider/model y de los cuatro tokens,
+    # cached <= input y tipos JSONB de target/alternatives.
+    rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(
+        Double, nullable=True
+    )
+    alternatives: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    provider: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decision_latency_ms: Mapped[float | None] = mapped_column(
+        Double, nullable=True
+    )
+    input_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    cached_input_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    reasoning_tokens: Mapped[int | None] = mapped_column(nullable=True)
     reward: Mapped[float | None] = mapped_column(Numeric, nullable=True)

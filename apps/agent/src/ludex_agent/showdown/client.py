@@ -1331,6 +1331,20 @@ class LudexPlayer(RandomPlayer):
             step["action_taken"] = action
             step["action_path"] = result["action_path"]
             step["reasoning"] = result.get("reasoning")
+            # F2-08 (D38): metadata de la decision canónica, desde el resultado
+            # del grafo (que sale del envelope de la llamada LLM aceptada,
+            # nunca de estado compartido) hasta el step que persiste
+            # `_persist_one`. La ruta random no pasa por aca y queda NULL.
+            # El resultado del grafo SIEMPRE trae estas claves (decide las
+            # emite en ambos caminos, llm y fallback); `get` con default None
+            # protege a un grafo fake que no las conozca.
+            for key in (
+                "rationale", "confidence", "alternatives", "target",
+                "provider", "model", "decision_latency_ms",
+                "input_tokens", "output_tokens", "cached_input_tokens",
+                "reasoning_tokens",
+            ):
+                step[key] = result.get(key)
             return order
 
         return run_graph()

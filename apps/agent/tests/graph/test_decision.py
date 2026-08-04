@@ -1,9 +1,17 @@
 import time
 
 import pytest
+from pydantic import ValidationError
 
-from ludex_agent.graph.decision import decide, normalize_action, validate_action
+from ludex_agent.graph.decision import (
+    DecisionAction,
+    DecisionResponse,
+    decide,
+    normalize_action,
+    validate_action,
+)
 from ludex_agent.graph.provider import (
+    CompletionEnvelope,
     CompletionUsage,
     DecisionMetrics,
     FakeDecisionProvider,
@@ -76,8 +84,8 @@ def test_true_ids_distintos_y_claves_desconocidas_siguen_siendo_estrictos():
 async def test_dos_respuestas_ilegales_usan_fallback_y_corrigen_prompt():
     metrics = DecisionMetrics()
     provider = FakeDecisionProvider([
-        {"action": {"kind": "move", "id": "illegal"}, "reasoning": "a"},
-        {"action": {"kind": "switch", "species": "missing"}, "reasoning": "b"},
+        {"action": {"kind": "move", "id": "illegal"}, "rationale": "a"},
+        {"action": {"kind": "switch", "species": "missing"}, "rationale": "b"},
     ])
 
     result = await decide(_state(), provider, metrics)
@@ -93,8 +101,13 @@ async def test_dos_respuestas_ilegales_usan_fallback_y_corrigen_prompt():
 async def test_segunda_respuesta_legal_registra_llm_retry():
     metrics = DecisionMetrics()
     provider = FakeDecisionProvider([
-        {"action": {"kind": "move", "id": "illegal"}, "reasoning": "a"},
-        {"action": {"kind": "move", "id": "thunderbolt"}, "reasoning": "b"},
+        {"action": {"kind": "move", "id": "illegal"}, "rationale": "a"},
+        {
+            "action": {"kind": "move", "id": "thunderbolt"},
+            "rationale": "b",
+            "confidence": 0.8,
+            "alternatives": [],
+        },
     ])
 
     result = await decide(_state(), provider, metrics)
@@ -118,7 +131,9 @@ class ScriptedBackend:
             raise value
         return ProviderCompletion(
             payload=value,
-            usage=CompletionUsage(input_tokens=1, output_tokens=1),
+            usage=CompletionUsage(
+                input_tokens=1, output_tokens=1, model="fake-model"
+            ),
         )
 
 
@@ -128,7 +143,12 @@ async def test_infraestructura_no_gasta_reintento_semantico_ni_hace_fallback(fai
     metrics = DecisionMetrics()
     backend = ScriptedBackend([
         failure,
-        {"action": {"kind": "move", "id": "thunderbolt"}, "reasoning": "ok"},
+        {
+            "action": {"kind": "move", "id": "thunderbolt"},
+            "rationale": "ok",
+            "confidence": 0.8,
+            "alternatives": [],
+        },
     ])
     keys = ("a", "b") if isinstance(failure, QuotaExceeded) else ("a",)
     provider = KeyRotatingProvider(
@@ -154,3 +174,266 @@ async def test_pool_agotado_propaga_y_nunca_cae_en_fallback():
     with pytest.raises(ProviderPoolExhausted):
         await decide(_state(), provider, metrics)
     assert metrics.snapshot()["turns_fallback"] == 0
+
+
+# --- F2-08 (MON-13): contrato completo de decision -------------------------
+
+
+def _respuesta_completa(**overrides):
+    payload = {
+        "action": {"kind": "move", "id": "thunderbolt"},
+        "target": None,
+        "rationale": "brief rationale",
+        "confidence": 0.9,
+        "alternatives": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_confidence_fuera_de_rango_es_rechazada():
+    for valor in (1.5, -0.1, 1.0000001):
+        with pytest.raises(ValidationError):
+            DecisionResponse.model_validate(_respuesta_completa(confidence=valor))
+
+
+def test_confidence_obligatoria_para_respuesta_llm():
+    payload = _respuesta_completa()
+    del payload["confidence"]
+    with pytest.raises(ValidationError):
+        DecisionResponse.model_validate(payload)
+
+
+def test_faltan_campos_obligatorios_rechazada():
+    for campo in ("action", "rationale", "alternatives"):
+        payload = _respuesta_completa()
+        del payload[campo]
+        with pytest.raises(ValidationError):
+            DecisionResponse.model_validate(payload)
+
+
+def test_alternatives_vacias_es_valido():
+    parsed = DecisionResponse.model_validate(_respuesta_completa())
+    assert parsed.alternatives == []
+    assert parsed.target is None
+
+
+def test_target_null_en_singles_es_valido_y_esperado():
+    parsed = DecisionResponse.model_validate(_respuesta_completa(target=None))
+    assert parsed.target is None
+
+
+def test_target_con_esquema_invalido_rechazado():
+    with pytest.raises(ValidationError):
+        DecisionResponse.model_validate(_respuesta_completa(target={"kind": "zzz"}))
+
+
+@pytest.mark.asyncio
+async def test_target_no_nulo_sin_targets_en_mask_consume_reintento():
+    """Mientras la mascara legal no exponga targets explicitos, un target
+    no-NULL es una respuesta invalida: consume el reintento semantico."""
+    metrics = DecisionMetrics()
+    provider = FakeDecisionProvider([
+        _respuesta_completa(
+            target={"kind": "active_opponent", "id": "eevee"},
+        ),
+        _respuesta_completa(),
+    ])
+
+    result = await decide(_state(), provider, metrics)
+
+    assert result["action_path"] == "llm_retry"
+    assert result["target"] is None
+    assert metrics.snapshot()["turns_model_invalid"] == 1
+
+
+@pytest.mark.asyncio
+async def test_alternativa_ilegal_consume_reintento_semantico():
+    metrics = DecisionMetrics()
+    provider = FakeDecisionProvider([
+        _respuesta_completa(alternatives=[
+            {"kind": "switch", "species": "missing"},
+        ]),
+        _respuesta_completa(),
+    ])
+
+    result = await decide(_state(), provider, metrics)
+
+    assert result["action_path"] == "llm_retry"
+    assert result["alternatives"] == []
+    assert metrics.snapshot()["turns_model_invalid"] == 1
+
+
+@pytest.mark.asyncio
+async def test_alternativas_duplicadas_tras_normalizacion_consume_reintento():
+    metrics = DecisionMetrics()
+    provider = FakeDecisionProvider([
+        _respuesta_completa(alternatives=[
+            {"kind": "move", "id": "icebeam", "mega": True},
+            {"kind": "move", "id": "icebeam", "mega": True},
+        ]),
+        _respuesta_completa(),
+    ])
+
+    result = await decide(_state(), provider, metrics)
+
+    assert result["action_path"] == "llm_retry"
+    assert metrics.snapshot()["turns_model_invalid"] == 1
+
+
+@pytest.mark.asyncio
+async def test_alternativa_que_repite_la_principal_consume_reintento():
+    metrics = DecisionMetrics()
+    provider = FakeDecisionProvider([
+        _respuesta_completa(alternatives=[
+            {"kind": "move", "id": "thunderbolt"},
+        ]),
+        _respuesta_completa(),
+    ])
+
+    result = await decide(_state(), provider, metrics)
+
+    assert result["action_path"] == "llm_retry"
+    assert metrics.snapshot()["turns_model_invalid"] == 1
+
+
+@pytest.mark.asyncio
+async def test_dos_respuestas_invalidas_por_alternativas_usan_fallback():
+    metrics = DecisionMetrics()
+    provider = FakeDecisionProvider([
+        _respuesta_completa(alternatives=[
+            {"kind": "move", "id": "missing"},
+        ]),
+        _respuesta_completa(alternatives=[
+            {"kind": "switch", "species": "missing"},
+        ]),
+    ])
+
+    result = await decide(_state(), provider, metrics)
+
+    assert result["action_path"] == "fallback"
+    assert result["confidence"] is None
+    assert result["provider"] is None
+    assert result["model"] is None
+    assert result["alternatives"] == []
+    assert metrics.snapshot()["turns_fallback"] == 1
+
+
+@pytest.mark.asyncio
+async def test_respuesta_llm_aceptada_expone_metadata_completa():
+    metrics = DecisionMetrics()
+    provider = FakeDecisionProvider([
+        _respuesta_completa(
+            confidence=0.7,
+            alternatives=[
+                {"kind": "move", "id": "icebeam", "mega": True},
+            ],
+            rationale="corto y user-facing",
+        ),
+    ])
+
+    result = await decide(_state(), provider, metrics)
+
+    assert result["action_path"] == "llm"
+    assert result["confidence"] == 0.7
+    assert result["alternatives"] == [
+        {"kind": "move", "id": "icebeam", "mega": True},
+    ]
+    assert result["rationale"] == "corto y user-facing"
+    # Alias interno para consumidores que ya leian `reasoning`: deriva del
+    # rationale validado; nunca forma parte del schema del proveedor.
+    assert result["reasoning"] == "corto y user-facing"
+    assert result["provider"] == "fake"
+    assert result["model"] == "fake-model"
+    assert result["decision_latency_ms"] >= 0
+    assert result["input_tokens"] == 1
+    assert result["output_tokens"] == 1
+    assert result["cached_input_tokens"] == 0
+    assert result["reasoning_tokens"] == 0
+
+
+# --- L-01 (R1): rationale es el campo canonico del contrato --------------
+
+def test_payload_completo_con_rationale_se_acepta():
+    """Canario de L-01: el schema productivo acepta el contrato canonico con
+    `rationale` y rechaza `reasoning` (extra_forbidden)."""
+    payload = _respuesta_completa(rationale="breve y user-facing")
+    parsed = DecisionResponse.model_validate(payload)
+    assert parsed.rationale == "breve y user-facing"
+
+
+def test_payload_con_solo_reasoning_se_rechaza_por_missing_y_extra():
+    """Un proveedor que emita `reasoning` en vez de `rationale` viola el
+    contrato de dos formas: falta el campo canonico y sobra el alias
+    (extra_forbidden, D38: el alias nunca viaja en el schema)."""
+    payload = {
+        "action": {"kind": "move", "id": "thunderbolt"},
+        "target": None,
+        "reasoning": "breve",
+        "confidence": 0.8,
+        "alternatives": [],
+    }
+    with pytest.raises(ValidationError) as exc_info:
+        DecisionResponse.model_validate(payload)
+
+    errores = {
+        (error["loc"][0] if error["loc"] else None, error["type"])
+        for error in exc_info.value.errors()
+    }
+    assert ("rationale", "missing") in errores, errores
+    assert ("reasoning", "extra_forbidden") in errores, errores
+
+
+@pytest.mark.asyncio
+async def test_usage_acumula_las_respuestas_facturables_del_camino():
+    metrics = DecisionMetrics()
+    provider = FakeDecisionProvider([
+        _respuesta_completa(alternatives=[
+            {"kind": "move", "id": "missing"},
+        ]),
+        _respuesta_completa(),
+    ])
+
+    result = await decide(_state(), provider, metrics)
+
+    assert result["action_path"] == "llm_retry"
+    # Las DOS respuestas facturables del camino se suman: la invalida y la
+    # aceptada (cada una aporta 1 token por categoria en FakeDecisionProvider).
+    assert result["input_tokens"] == 2
+    assert result["output_tokens"] == 2
+
+
+@pytest.mark.asyncio
+async def test_fallback_sin_llamadas_no_inventa_usage_ni_latencia_modelo():
+    """Fallback por dos respuestas invalidas SI registro llamadas facturables:
+    usage y latency existen, pero provider/model/confidence nunca se atribuyen
+    a un modelo. El caso de zero usage (fallback sin llamadas) se cubre en la
+    ruta random, fuera del contrato LLM."""
+
+    class FailingProvider:
+        def __init__(self):
+            self.prompts = []
+
+        async def complete(self, prompt, *, deadline, turn_id):
+            self.prompts.append(prompt)
+            return CompletionEnvelope(
+                payload={"_invalid_response": "no json"},
+                provider="fake", model="fake-model",
+                usage=CompletionUsage(input_tokens=0, output_tokens=0),
+                latency_ms=0.0,
+            )
+
+    metrics = DecisionMetrics()
+    provider = FailingProvider()
+
+    result = await decide(_state(), provider, metrics)
+
+    assert result["action_path"] == "fallback"
+    assert result["provider"] is None
+    assert result["model"] is None
+    assert result["confidence"] is None
+    assert result["alternatives"] == []
+    assert result["rationale"]
+    assert result["decision_latency_ms"] >= 0
+    assert result["input_tokens"] == 0
+    assert result["output_tokens"] == 0

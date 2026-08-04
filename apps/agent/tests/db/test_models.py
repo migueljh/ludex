@@ -39,6 +39,9 @@ _TIPOS_CONOCIDOS = {
     "TEXT[]": ("ARRAY", "_text"),
     "TIMESTAMP WITH TIME ZONE": ("timestamp with time zone", "timestamptz"),
     "TIMESTAMP WITHOUT TIME ZONE": ("timestamp without time zone", "timestamp"),
+    # F2-08: `double precision` (confidence, decision_latency_ms) es la
+    # sintaxis del DDL; `float8` es el udt_name real de Postgres.
+    "DOUBLE PRECISION": ("double precision", "float8"),
 }
 
 
@@ -212,3 +215,80 @@ async def test_battles_constraints_e_indices_espejan_el_ddl():
         )
     finally:
         await engine.dispose()
+
+
+async def test_trajectory_steps_metadata_constraints_espejan_el_ddl():
+    """F2-08: los CHECK de la migracion de metadata de decision existen, se
+    llaman como el codigo espera (los tests de repository matchean por nombre)
+    y su definicion expresa las reglas vinculantes del design verdict:
+    confidence en [0,1], co-ocurrencia provider/model, co-ocurrencia de los
+    cuatro tokens, cached <= input, latency >= 0 y tipos JSONB."""
+    engine = make_engine(load_settings().database_url)
+    try:
+        async with session_factory(engine)() as s:
+            filas = (await s.execute(text("""
+                SELECT conname, pg_get_constraintdef(oid)
+                FROM pg_constraint
+                WHERE conrelid = 'trajectory_steps'::regclass
+                  AND contype = 'c'
+                ORDER BY conname
+            """))).all()
+        definiciones = dict(filas)
+    finally:
+        await engine.dispose()
+
+    esperados: dict[str, list[str]] = {
+        "trajectory_steps_confidence_check": [
+            "confidence IS NULL", "confidence >= (0)::double precision",
+            "confidence <= (1)::double precision",
+        ],
+        "trajectory_steps_provider_model_coherence_check": [
+            "provider IS NULL", "model IS NULL",
+        ],
+        "trajectory_steps_usage_coherence_check": [
+            "input_tokens IS NULL", "output_tokens IS NULL",
+            "cached_input_tokens IS NULL", "reasoning_tokens IS NULL",
+            "input_tokens IS NOT NULL", "reasoning_tokens IS NOT NULL",
+        ],
+        "trajectory_steps_input_tokens_nonnegative_check": [
+            "input_tokens IS NULL", "input_tokens >= 0",
+        ],
+        "trajectory_steps_output_tokens_nonnegative_check": [
+            "output_tokens IS NULL", "output_tokens >= 0",
+        ],
+        "trajectory_steps_cached_input_tokens_nonnegative_check": [
+            "cached_input_tokens IS NULL", "cached_input_tokens >= 0",
+        ],
+        "trajectory_steps_reasoning_tokens_nonnegative_check": [
+            "reasoning_tokens IS NULL", "reasoning_tokens >= 0",
+        ],
+        "trajectory_steps_cached_input_tokens_check": [
+            "cached_input_tokens <= input_tokens",
+        ],
+        "trajectory_steps_latency_check": [
+            "decision_latency_ms IS NULL", "decision_latency_ms >= (0)::double precision",
+        ],
+        "trajectory_steps_alternatives_type_check": [
+            "jsonb_typeof(alternatives) = 'array'::text",
+        ],
+        "trajectory_steps_target_type_check": [
+            "jsonb_typeof(target) = 'object'::text",
+        ],
+    }
+    for nombre, fragmentos in esperados.items():
+        assert nombre in definiciones, (
+            f"falta el CHECK {nombre!r} en trajectory_steps: "
+            f"la migracion F2-08 no se aplico o cambio el nombre"
+        )
+        for fragmento in fragmentos:
+            assert fragmento in definiciones[nombre], (
+                f"{nombre}: la definicion real no expresa la regla "
+                f"{fragmento!r}: {definiciones[nombre]!r}"
+            )
+
+    # Canario del typo del borrador: el CHECK de `output_tokens` NO puede
+    # referenciar `input_tokens` (el borrador del design verdict comprobaba
+    # input_tokens en el constraint de output).
+    assert "input_tokens" not in definiciones[
+        "trajectory_steps_output_tokens_nonnegative_check"
+    ], "el CHECK de output_tokens referencia input_tokens: typo del borrador"
