@@ -456,6 +456,64 @@ async def test_reintento_sin_proyeccion_previa_falla_ruidosamente():
     assert player.steps[tag] == []
 
 
+# --- MON-18/D37, LINEAR_VERDICT R1 L-03: el diseño de la marca de PP bajo
+# Pressure depende de que dos resoluciones del MISMO battle_tag reusen el
+# MISMO objeto `persistent_state` (`self._temporary_state.setdefault(tag,
+# {})`, sin tocar). Un contrapeso que arme dos dicts manuales y los pase a
+# `project_observable_state` directamente no prueba esto: seguiria en
+# verde aunque el caller real dejara de reutilizar el dict. Este test
+# atraviesa el flujo publico real (`choose_move`) dos veces para el mismo
+# tag y espia `project_observable_state` (sin modificar produccion) para
+# capturar el objeto que RECIBE en cada llamada.
+
+
+async def test_dos_resoluciones_del_mismo_battle_tag_comparten_persistent_state():
+    tag = "battle-persistent-identity"
+    capturados: list[dict] = []
+    real = client_module.project_observable_state
+
+    def espia(*args, **kwargs):
+        capturados.append(kwargs["persistent_state"])
+        return real(*args, **kwargs)
+
+    class FakeMove:
+        id = "tackle"
+
+    battle = _fake_battle(battle_tag=tag, available_moves=[FakeMove()])
+    player = _player(decision_graph=None)
+
+    with patch.object(client_module, "project_observable_state", espia), \
+         patch.object(
+             client_module, "serialize_battle",
+             lambda b: {
+                 "turn": b.turn,
+                 "opponent": {"pokemon": []},
+                 "field": {"weather": {}, "field_effects": {},
+                           "my_side": {}, "opponent_side": {}},
+                 "legal_actions": [{"kind": "move", "id": "tackle"}],
+             },
+         ), patch.object(
+             client_module.RandomPlayer, "choose_move",
+             lambda self, b: FakeOrder(mid="tackle"),
+         ):
+        pending1 = player.choose_move(battle)
+        await player.frame_inbox.publish(tag, ("|upkeep",))
+        await pending1
+        player._resolve_pending_choice(tag)
+
+        pending2 = player.choose_move(battle)
+        await player.frame_inbox.publish(tag, ("|upkeep",))
+        await pending2
+
+    assert len(capturados) == 2
+    assert capturados[0] is capturados[1], (
+        "las dos resoluciones del mismo battle_tag tienen que compartir el "
+        "MISMO objeto persistent_state -- si el caller reemplazara "
+        "setdefault(tag, {}) por un dict nuevo en cada llamada, esto "
+        "fallaria aunque cada resolucion individual siguiera viendose bien"
+    )
+
+
 async def _noop_async(self, split_messages):
     return None
 
