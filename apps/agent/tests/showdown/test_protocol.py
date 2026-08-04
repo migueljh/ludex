@@ -397,6 +397,7 @@ class FakeVocabulary:
         "cameruptmega": ["FIRE", "GROUND"],
         "weezing": ["POISON"],
         "xatu": ["PSYCHIC", "FLYING"],
+        "purugly": ["NORMAL"],
     }
     # `baseSpecies` del dex, ya normalizado. Es lo que usa
     # `Pokemon.identifies_as` (`pokemon.py:435-438`) para decidir si dos
@@ -2240,3 +2241,236 @@ def test_transform_de_un_nombre_no_resoluble_falla_cerrado():
             "|switch|p2a: Ditto|Ditto, L84|100/100",
             "|-transform|p2a: Ditto|p1a: NoExiste|[from] ability: Imposter",
         ], snapshot)
+
+
+# ---------------------------------------------------------------------------
+# D40 (MON-18 R3): item del rival, persistente entre decisiones.
+#
+# ROOT-CAUSE CHECKPOINT: poke-env corrompe `battle.opponent_team[...].item`
+# entre una decision y la siguiente cuando el item vino de un intercambio por
+# Trick -- confirmado en vivo (`battle-gen6randombattle-2746`), y medido en
+# produccion sobre `battles.id=2782/2787`. El `snapshot` que entra a cada
+# llamada es SIEMPRE fresco (`serialize_battle`, nunca la proyeccion
+# anterior), asi que sin memoria propia ese valor corrupto pisa la evidencia
+# ya establecida sin que ninguna linea nueva la pida -- el mismo patron
+# arquitectonico que D37 ya resuelve para el PP bajo Pressure.
+#
+# Cada prueba construye el "snapshot fresco" de la SEGUNDA decision A MANO,
+# nunca encadenando la salida de la primera: es exactamente asi como luce en
+# produccion (D37 ya establecio este patron) y es lo que prueba que la
+# memoria, no una casualidad de la linea, es lo que sostiene el valor.
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_purugly():
+    """Estado real persistido para `battles.id=2782`
+    (`battle-gen6randombattle-2714`), decision_index=0 -- antes de que el
+    turno 1 (el Trick) se procese. Verificado por `SELECT` contra Postgres,
+    no inventado."""
+    snapshot = _snapshot(gen=6)
+    snapshot["me"] = {"pokemon": [{"species": "gothitelle", "active": True}]}
+    snapshot["opponent"]["pokemon"] = [{
+        "species": "purugly", "hp_fraction": 1.0, "active": True,
+        "fainted": False, "status": None, "level": 88,
+        "item": "unknown_item", "ability": None, "types": ["NORMAL"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [],
+    }]
+    return snapshot
+
+
+def test_item_revelado_por_trick_sobrevive_snapshot_fresco_corrupto():
+    """Reproduccion determinista de `battle-gen6randombattle-2714`
+    (`battles.id=2782`) con las lineas REALES de sus turnos 1 y 2
+    (`battle_turns.protocol_lines`, ambas preservadas en Postgres). Es el
+    canario de boundary: cruza dos llamadas independientes de
+    `project_observable_state` con SOLO `persistent_state` en comun -- la
+    misma frontera que atraviesa `client.py` entre dos decisiones reales.
+    """
+    memoria: dict[str, dict] = {}
+    snapshot1 = _snapshot_purugly()
+    turno1 = [
+        "|move|p1a: Gothitelle|Trick|p2a: Purugly",
+        "|-activate|p1a: Gothitelle|move: Trick|[of] p2a: Purugly",
+        "|-item|p2a: Purugly|Choice Scarf|[from] move: Trick",
+        "|-item|p1a: Gothitelle|Silk Scarf|[from] move: Trick",
+        "|move|p2a: Purugly|Return|p1a: Gothitelle",
+        "|-damage|p1a: Gothitelle|179/269",
+    ]
+    tras_trick = _proyectar(turno1, snapshot1, persistent_state=memoria)
+    assert _por_especie(tras_trick)["purugly"]["item"] == "choicescarf"
+    assert memoria == {"purugly": {"item": "choicescarf"}}
+
+    # Snapshot FRESCO e independiente para el turno 2, tal como lo entregaria
+    # `serialize_battle` en produccion: SIN ninguna linea `-item` nueva,
+    # poke-env ya trae "silkscarf" -- el item que Gothitelle recibio en el
+    # MISMO Trick (valor medido en vivo, no inventado; ver CHECKPOINT).
+    snapshot2 = _snapshot_purugly()
+    snapshot2["opponent"]["pokemon"][0]["item"] = "silkscarf"
+    snapshot2["opponent"]["pokemon"][0]["moves"] = [
+        {"id": "return", "pp": 31, "max_pp": 32}]
+    turno2 = [
+        "|switch|p1a: Noctowl|Noctowl, L95, M|344/344",
+        "|move|p2a: Purugly|Return|p1a: Noctowl",
+        "|-damage|p1a: Noctowl|194/344",
+        "|-heal|p1a: Noctowl|215/344|[from] item: Leftovers",
+    ]
+    tras_snapshot_corrupto = _proyectar(turno2, snapshot2, persistent_state=memoria)
+    assert _por_especie(tras_snapshot_corrupto)["purugly"]["item"] == "choicescarf", (
+        "el snapshot fresco trae silkscarf sin ninguna linea -item nueva; "
+        "persistent_state tiene que forzarlo de nuevo a choicescarf"
+    )
+
+
+def test_reveal_pasivo_de_item_actualiza_la_memoria_y_tambien_sobrevive():
+    """Contrapeso Life Orb: aunque el item verdadero SI genere una linea
+    pasiva (daño propio), esa confirmacion tiene que escribir en
+    `persistent_state` -- no solo en el dict de esta llamada -- para que la
+    PROXIMA decision, con snapshot fresco y SIN esa linea, siga sosteniendo
+    el valor solo con memoria."""
+    memoria: dict[str, dict] = {}
+    snapshot1 = _snapshot(gen=6)
+    snapshot1["opponent"]["pokemon"][0]["item"] = "unknown_item"
+    tras_dano = _proyectar(
+        ["|-damage|p2a: Ludicolo|91/100|[from] item: Life Orb"],
+        snapshot1, persistent_state=memoria,
+    )
+    assert _por_especie(tras_dano)["ludicolo"]["item"] == "lifeorb"
+    assert memoria == {"ludicolo": {"item": "lifeorb"}}
+
+    snapshot2 = _snapshot(gen=6)
+    snapshot2["opponent"]["pokemon"][0]["item"] = "choicescarf"
+    tras_snapshot_corrupto = _proyectar([], snapshot2, persistent_state=memoria)
+    assert _por_especie(tras_snapshot_corrupto)["ludicolo"]["item"] == "lifeorb"
+
+
+def test_enditem_persiste_none_y_sobrevive_snapshot_fresco():
+    """`None` es un valor SIGNIFICATIVO (requisito 3 del DESIGN VERDICT): la
+    clave tiene que quedar PRESENTE con valor `None`, no ausente."""
+    memoria: dict[str, dict] = {}
+    snapshot1 = _snapshot(gen=6)
+    snapshot1["opponent"]["pokemon"][0]["item"] = "sitrusberry"
+    tras_consumo = _proyectar(
+        ["|-enditem|p2a: Ludicolo|Sitrus Berry"], snapshot1, persistent_state=memoria,
+    )
+    assert _por_especie(tras_consumo)["ludicolo"]["item"] is None
+    assert memoria == {"ludicolo": {"item": None}}
+    assert "ludicolo" in memoria and "item" in memoria["ludicolo"], (
+        "la clave 'item' tiene que estar PRESENTE, no ausente"
+    )
+
+    # Snapshot fresco que trae de vuelta un item numerico -- no puede pisar
+    # el `None` ya confirmado.
+    snapshot2 = _snapshot(gen=6)
+    snapshot2["opponent"]["pokemon"][0]["item"] = "sitrusberry"
+    tras_snapshot_corrupto = _proyectar([], snapshot2, persistent_state=memoria)
+    assert _por_especie(tras_snapshot_corrupto)["ludicolo"]["item"] is None
+
+
+def test_adquisicion_posterior_reemplaza_la_memoria_anterior():
+    """Requisito 5 del DESIGN VERDICT: evidencia nueva del frame actual
+    SIEMPRE reemplaza lo que la memoria tenia antes, sea `None` (consumido) o
+    un item distinto."""
+    memoria: dict[str, dict] = {}
+    snapshot1 = _snapshot(gen=6)
+    snapshot1["opponent"]["pokemon"][0]["item"] = "sitrusberry"
+    _proyectar(
+        ["|-enditem|p2a: Ludicolo|Sitrus Berry"], snapshot1, persistent_state=memoria,
+    )
+    assert memoria == {"ludicolo": {"item": None}}
+
+    snapshot2 = _snapshot(gen=6)
+    tras_adquisicion = _proyectar(
+        ["|-item|p2a: Ludicolo|Leftovers|[from] move: Trick"],
+        snapshot2, persistent_state=memoria,
+    )
+    assert _por_especie(tras_adquisicion)["ludicolo"]["item"] == "leftovers"
+    assert memoria == {"ludicolo": {"item": "leftovers"}}
+
+
+def test_item_del_rival_sobrevive_un_switch():
+    memoria: dict[str, dict] = {}
+    snapshot1 = _snapshot(gen=6)
+    snapshot1["opponent"]["pokemon"][0]["item"] = "unknown_item"
+    _proyectar(
+        ["|-item|p2a: Ludicolo|Life Orb|[from] move: Trick"],
+        snapshot1, persistent_state=memoria,
+    )
+    assert memoria == {"ludicolo": {"item": "lifeorb"}}
+
+    mandibuzz_entrando = {
+        "species": "mandibuzz", "hp_fraction": 1.0, "active": True,
+        "fainted": False, "status": None, "level": 84,
+        "item": "unknown_item", "ability": None, "types": ["DARK", "FLYING"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [],
+    }
+    snapshot2 = _snapshot(gen=6)
+    snapshot2["opponent"]["pokemon"][0]["active"] = False
+    snapshot2["opponent"]["pokemon"][0]["item"] = "choicescarf"  # snapshot fresco corrupto
+    snapshot2["opponent"]["pokemon"].append(dict(mandibuzz_entrando))
+    tras_switch_out = _proyectar(
+        ["|switch|p2a: Mandibuzz|Mandibuzz, L84, F|100/100"],
+        snapshot2, persistent_state=memoria,
+    )
+    ludicolo_fuera = _por_especie(tras_switch_out)["ludicolo"]
+    assert ludicolo_fuera["active"] is False
+    assert ludicolo_fuera["item"] == "lifeorb"
+
+    snapshot3 = _snapshot(gen=6)
+    snapshot3["opponent"]["pokemon"][0]["active"] = False
+    snapshot3["opponent"]["pokemon"][0]["item"] = "choicescarf"
+    snapshot3["opponent"]["pokemon"].append({**mandibuzz_entrando, "active": True})
+    tras_switch_in = _proyectar(
+        ["|switch|p2a: Ludicolo|Ludicolo, L88, F|100/100"],
+        snapshot3, persistent_state=memoria,
+    )
+    ludicolo_dentro = _por_especie(tras_switch_in)["ludicolo"]
+    assert ludicolo_dentro["active"] is True
+    assert ludicolo_dentro["item"] == "lifeorb", (
+        "la marca sobrevive el switch-out Y el switch-in"
+    )
+
+
+def test_dos_identidades_de_item_no_se_contaminan():
+    """Aislamiento por identidad canonica: que Ludicolo tenga Life Orb
+    conocido no puede afectar el item de un Weezing distinto."""
+    memoria: dict[str, dict] = {}
+    snapshot = _snapshot(gen=6)
+    snapshot["opponent"]["pokemon"][0]["item"] = "unknown_item"
+    snapshot["opponent"]["pokemon"].append({
+        "species": "weezing", "hp_fraction": 1.0, "active": False,
+        "fainted": False, "status": None, "level": 83,
+        "item": "unknown_item", "ability": "levitate", "types": ["POISON"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [],
+    })
+    out = _proyectar(
+        ["|-item|p2a: Ludicolo|Life Orb|[from] move: Trick"],
+        snapshot, persistent_state=memoria,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["item"] == "lifeorb"
+    assert por_especie["weezing"]["item"] == "unknown_item", (
+        "el item de Weezing no debe verse afectado: identidad distinta"
+    )
+    assert memoria == {"ludicolo": {"item": "lifeorb"}}
+
+
+def test_una_linea_item_del_lado_propio_no_contamina_la_memoria_rival():
+    """Guarda de mutacion: una linea `-item` que nombra a NUESTRO activo
+    (`p1a:`) nunca puede sembrar `persistent_state` de ningun rival. Ya pasa
+    hoy por el filtro generico de ident (mismo patron que el contrapeso
+    negativo de D37, `test_sin_reusar_el_persistent_state_por_battle_tag_
+    se_pierde_la_marca`: sirve de sentinela para la mutacion 3."""
+    memoria: dict[str, dict] = {}
+    snapshot = _snapshot(gen=6)
+    out = _proyectar(
+        ["|-item|p1a: Tentacruel|Choice Scarf|[from] move: Trick"],
+        snapshot, persistent_state=memoria,
+    )
+    assert _por_especie(out)["ludicolo"]["item"] == "unknown_item"
+    assert memoria == {}, "una linea del lado propio no puede sembrar memoria del rival"
