@@ -4,6 +4,7 @@ import time
 import pytest
 
 from ludex_agent.graph.provider import DecisionMetrics
+from ludex_agent.graph.provider import CompletionEnvelope, CompletionUsage
 from ludex_agent.graph.workflow import build_decision_graph
 
 
@@ -66,10 +67,17 @@ async def test_grafo_ejecuta_todos_los_nodos_en_orden_y_devuelve_contexto():
                     },
                 },
             }
-            return {
-                "action": {"kind": "move", "id": "tackle"},
-                "reasoning": "legal",
-            }
+            return CompletionEnvelope(
+                payload={
+                    "action": {"kind": "move", "id": "tackle"},
+                    "rationale": "legal",
+                    "confidence": 0.9,
+                    "alternatives": [],
+                },
+                provider="fake", model="fake-model",
+                usage=CompletionUsage(input_tokens=0, output_tokens=0),
+                latency_ms=0.0,
+            )
 
     class Repository:
         async def load_battle_context(
@@ -226,10 +234,17 @@ async def test_calc_damage_recibe_contexto_rico_no_prompt_context(monkeypatch):
 
     class Provider:
         async def complete(self, prompt, *, deadline, turn_id):
-            return {
-                "action": {"kind": "switch", "species": "pikachu"},
-                "reasoning": "legal",
-            }
+            return CompletionEnvelope(
+                payload={
+                    "action": {"kind": "switch", "species": "pikachu"},
+                    "rationale": "legal",
+                    "confidence": 0.8,
+                    "alternatives": [],
+                },
+                provider="fake", model="fake-model",
+                usage=CompletionUsage(input_tokens=0, output_tokens=0),
+                latency_ms=0.0,
+            )
 
     graph = build_decision_graph(
         object(),
@@ -296,10 +311,17 @@ async def test_grafo_conserva_damage_metrics_en_la_salida():
 
     class Provider:
         async def complete(self, prompt, *, deadline, turn_id):
-            return {
-                "action": {"kind": "move", "id": "tackle"},
-                "reasoning": "legal",
-            }
+            return CompletionEnvelope(
+                payload={
+                    "action": {"kind": "move", "id": "tackle"},
+                    "rationale": "legal",
+                    "confidence": 0.9,
+                    "alternatives": [],
+                },
+                provider="fake", model="fake-model",
+                usage=CompletionUsage(input_tokens=0, output_tokens=0),
+                latency_ms=0.0,
+            )
 
     class Repository:
         async def load_battle_context(

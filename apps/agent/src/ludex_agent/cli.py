@@ -279,6 +279,20 @@ async def _persist_one(
             traj, decision_index, step["turn"], step["state"], STATE_SCHEMA_VERSION,
             step["state"]["legal_actions"], step["action_taken"], "agent",
             action_path=step.get("action_path"),
+            # F2-08 (D38): la metadata de la decision canónica viaja del step
+            # a la fila. La ruta random no setea estas claves: `get` devuelve
+            # None y la fila queda NULL, coherente con la historia.
+            rationale=step.get("rationale"),
+            target=step.get("target"),
+            confidence=step.get("confidence"),
+            alternatives=step.get("alternatives"),
+            provider=step.get("provider"),
+            model=step.get("model"),
+            decision_latency_ms=step.get("decision_latency_ms"),
+            input_tokens=step.get("input_tokens"),
+            output_tokens=step.get("output_tokens"),
+            cached_input_tokens=step.get("cached_input_tokens"),
+            reasoning_tokens=step.get("reasoning_tokens"),
         )
     if battle.finished:
         await repo.finalize(traj, result=result, reward=reward)
@@ -366,12 +380,13 @@ def provider_smoke_command(
         provider, model, settings.llm_request_timeout_seconds, metrics
     )
     prompt = (
-        "Elegí exactamente una acción legal y respondé con action y un "
-        "reasoning breve. legal_actions="
+        "Elegí exactamente una acción legal y respondé con action, un "
+        "rationale breve, confidence en [0,1] y alternatives (puede ser []). "
+        "legal_actions="
         '[{"kind":"move","id":"tackle"},{"kind":"switch","species":"pikachu"}]'
     )
     try:
-        payload = asyncio.run(selected.complete(
+        envelope = asyncio.run(selected.complete(
             prompt,
             deadline=time.monotonic() + settings.llm_request_timeout_seconds,
             turn_id=f"provider-smoke:{provider}:{model}",
@@ -380,7 +395,7 @@ def provider_smoke_command(
         typer.echo(f"ABORTED: {type(exc).__name__}: {exc}")
         raise typer.Exit(code=1) from None
     try:
-        parsed = DecisionResponse.model_validate(payload)
+        parsed = DecisionResponse.model_validate(envelope.payload)
     except (ValueError, TypeError):
         typer.echo("ABORTED: invalid model response")
         raise typer.Exit(code=1) from None

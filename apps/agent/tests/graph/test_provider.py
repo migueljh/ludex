@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from dataclasses import FrozenInstanceError
 
 import httpx
 import pytest
@@ -9,6 +10,7 @@ from openai import APITimeoutError as OpenAIAPITimeoutError
 from pydantic import BaseModel, Field, ValidationError
 
 from ludex_agent.graph.provider import (
+    CompletionEnvelope,
     CompletionUsage,
     DecisionDeadlineExceeded,
     DecisionMetrics,
@@ -248,7 +250,7 @@ async def test_429_rota_clave_y_repite_exactamente_el_mismo_prompt():
     result = await provider.complete("mismo prompt", deadline=time.monotonic() + 1,
                                      turn_id="battle:1")
 
-    assert result == {"ok": True}
+    assert result.payload == {"ok": True}
     assert backend.calls == [("mismo prompt", "key-a"), ("mismo prompt", "key-b")]
     assert metrics.snapshot()["key_rotations"] == 1
     assert metrics.snapshot()["turns_quota_affected"] == 1
@@ -272,12 +274,12 @@ async def test_usage_se_suma_desde_cada_respuesta_exitosa():
         "open_code_zen", ("key-a",), backend, metrics=metrics
     )
 
-    assert await provider.complete(
+    assert (await provider.complete(
         "turno 1", deadline=time.monotonic() + 1, turn_id="battle:1"
-    ) == {"turn": 1}
-    assert await provider.complete(
+    )).payload == {"turn": 1}
+    assert (await provider.complete(
         "turno 2", deadline=time.monotonic() + 1, turn_id="battle:2"
-    ) == {"turn": 2}
+    )).payload == {"turn": 2}
 
     snapshot = metrics.snapshot()
     assert snapshot["calls_total"] == 2
@@ -303,7 +305,7 @@ async def test_429_envuelto_por_langchain_tambien_rota_la_clave():
         "mismo prompt", deadline=time.monotonic() + 1, turn_id="battle:wrapped"
     )
 
-    assert result == {"ok": True}
+    assert result.payload == {"ok": True}
     assert backend.calls == [
         ("mismo prompt", "key-a"),
         ("mismo prompt", "key-b"),
@@ -331,8 +333,8 @@ async def test_clave_agotada_no_se_vuelve_a_probar_en_turnos_siguientes():
         "turno 2", deadline=time.monotonic() + 1, turn_id="battle:2"
     )
 
-    assert first == {"turn": 1}
-    assert second == {"turn": 2}
+    assert first.payload == {"turn": 1}
+    assert second.payload == {"turn": 2}
     assert backend.calls == [
         ("turno 1", "key-a"),
         ("turno 1", "key-b"),
@@ -382,8 +384,8 @@ async def test_clave_enfriada_no_se_reintenta_antes_de_que_expire_el_enfriamient
         "turno 2", deadline=time.monotonic() + 1, turn_id="battle:2"
     )
 
-    assert first == {"turn": 1}
-    assert second == {"turn": 2}
+    assert first.payload == {"turn": 1}
+    assert second.payload == {"turn": 2}
     assert backend.calls == [
         ("turno 1", "key-a"),
         ("turno 1", "key-b"),
@@ -420,7 +422,7 @@ async def test_clave_enfriada_vuelve_a_estar_disponible_tras_el_enfriamiento():
         "turno 2", deadline=time.monotonic() + 1, turn_id="battle:2"
     )
 
-    assert second == {"turn": 2}
+    assert second.payload == {"turn": 2}
     assert backend.calls == [
         ("turno 1", "key-a"),
         ("turno 1", "key-b"),
@@ -448,7 +450,7 @@ async def test_todas_las_claves_enfriando_espera_si_el_deadline_alcanza():
         "p", deadline=time.monotonic() + 2, turn_id="t"
     )
 
-    assert result == {"ok": True}
+    assert result.payload == {"ok": True}
     assert backend.calls == [("p", "key-a"), ("p", "key-b"), ("p", "key-a")]
 
 
@@ -542,8 +544,8 @@ async def test_cadena_cambia_proveedor_solo_en_juego():
     play = ProviderChain(
         [exhausted, alternate], allow_cross_provider=True, metrics=metrics
     )
-    assert await play.complete("p", deadline=time.monotonic() + 1,
-                               turn_id="battle:4") == {"provider": "kimi"}
+    assert (await play.complete("p", deadline=time.monotonic() + 1,
+                                turn_id="battle:4")).payload == {"provider": "kimi"}
     assert metrics.snapshot()["provider_switches"] == 1
 
     benchmark = ProviderChain(
@@ -697,9 +699,9 @@ async def test_timeout_asyncio_se_clasifica_como_transitorio():
     provider = KeyRotatingProvider(
         "google", ("a",), backend, transient_retries=1
     )
-    assert await provider.complete(
+    assert (await provider.complete(
         "p", deadline=time.monotonic() + 1, turn_id="t"
-    ) == {"ok": True}
+    )).payload == {"ok": True}
 
 
 @pytest.mark.asyncio
@@ -729,10 +731,139 @@ async def test_timeout_de_sdk_se_reintenta_como_infraestructura(timeout_error):
         "mismo prompt", deadline=time.monotonic() + 1, turn_id="battle:9"
     )
 
-    assert result == {"ok": True}
+    assert result.payload == {"ok": True}
     assert backend.calls == [
         ("mismo prompt", "a"),
         ("mismo prompt", "a"),
     ]
     assert metrics.snapshot()["turns_transient_affected"] == 1
     assert metrics.snapshot()["calls_total"] == 1
+
+
+# --- F2-08 (MON-13): envelope inmutable por llamada ------------------------
+
+
+async def test_complete_devuelve_envelope_inmutable_y_completo():
+    usage = CompletionUsage(
+        input_tokens=10, output_tokens=5, cached_input_tokens=2,
+        reasoning_tokens=1, model="minimax-m2.7",
+    )
+    backend = ScriptedBackend([
+        ProviderCompletion(payload={"action": "x"}, usage=usage),
+    ])
+    provider = KeyRotatingProvider(
+        "open_code_zen", ("k",), backend, model="minimax-m2.7"
+    )
+
+    envelope = await provider.complete(
+        "p", deadline=time.monotonic() + 1, turn_id="battle:1"
+    )
+
+    assert envelope.payload == {"action": "x"}
+    assert envelope.provider == "open_code_zen"
+    # El model efectivo reportado por el proveedor gana sobre el configurado.
+    assert envelope.model == "minimax-m2.7"
+    assert envelope.usage is usage
+    assert envelope.latency_ms >= 0
+    with pytest.raises(FrozenInstanceError):
+        envelope.payload = {}  # type: ignore[misc]
+
+
+async def test_envelope_model_efectivo_cae_al_configurado_sin_reporte():
+    backend = ScriptedBackend([{"ok": True}])
+    provider = KeyRotatingProvider(
+        "google", ("k",), backend, model="gemini-2.5-flash"
+    )
+
+    envelope = await provider.complete(
+        "p", deadline=time.monotonic() + 1, turn_id="battle:2"
+    )
+
+    assert envelope.provider == "google"
+    assert envelope.model == "gemini-2.5-flash"
+
+
+async def test_envelope_latencia_mide_la_llamada_con_reloj_inyectable():
+    clock = FakeClock(start=1000.0)
+
+    class AdvancingBackend:
+        async def complete(self, prompt, *, api_key, deadline):
+            clock.advance(0.25)
+            return ProviderCompletion(
+                payload={"ok": True},
+                usage=CompletionUsage(input_tokens=0, output_tokens=0),
+            )
+
+    provider = KeyRotatingProvider(
+        "google", ("k",), AdvancingBackend(), model="m", clock=clock
+    )
+
+    envelope = await provider.complete(
+        "p", deadline=time.monotonic() + 1, turn_id="battle:3"
+    )
+
+    assert envelope.latency_ms == 250.0
+
+
+async def test_envelopes_concurrentes_no_se_cruzan_metadata():
+    """El runner ejecuta batallas CONCURRENTES sobre UNA SOLA instancia de
+    `KeyRotatingProvider` compartida: dos decisiones en paralelo dentro del
+    mismo proceso llaman al MISMO provider. Cada envelope tiene que traer la
+    metadata de SU propia llamada.
+
+    El patron rechazado `last_*` (estado mutable por instancia leido despues
+    de un await) cruza metadata: la llamada lenta queda suspendida, la rapida
+    completa primero y, cuando la lenta se reanuda, lee el estado del vecino.
+    Aca el envelope se construye DENTRO de `complete`, con datos locales de
+    esa llamada, y no hay ninguna lectura posterior de estado compartido: la
+    mutacion `last_*` por instancia pone este test rojo por payload/model
+    cruzados (verificacion de la revision R1)."""
+    started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class PromptGatedBackend:
+        """Un unico backend bloqueante que distingue prompt A y B: A queda
+        suspendida hasta que el test la libera; B completa de una."""
+
+        async def complete(self, prompt, *, api_key, deadline):
+            if prompt == "prompt A":
+                started.set()
+                await release_first.wait()
+                return ProviderCompletion(
+                    payload={"turn": "A"},
+                    usage=CompletionUsage(
+                        input_tokens=1, output_tokens=1, model="gemini-2.5-flash",
+                    ),
+                )
+            return ProviderCompletion(
+                payload={"turn": "B"},
+                usage=CompletionUsage(
+                    input_tokens=2, output_tokens=2, model="kimi-k2.6",
+                ),
+            )
+
+    provider = KeyRotatingProvider(
+        "google", ("k-a",), PromptGatedBackend(), model="gemini-2.5-flash",
+    )
+
+    deadline = time.monotonic() + 5
+    task_a = asyncio.create_task(provider.complete(
+        "prompt A", deadline=deadline, turn_id="battle:a:1"
+    ))
+    await started.wait()          # A suspendida dentro del backend
+    task_b = asyncio.create_task(provider.complete(
+        "prompt B", deadline=deadline, turn_id="battle:b:1"
+    ))
+    envelope_b = await task_b     # B termina primero
+    release_first.set()           # A se reanuda y completa despues
+    envelope_a = await task_a
+
+    # Asserts independientes por decision: payload, provider, model y usage.
+    assert envelope_a.payload == {"turn": "A"}
+    assert envelope_a.provider == "google"
+    assert envelope_a.model == "gemini-2.5-flash"
+    assert envelope_a.usage.input_tokens == 1
+    assert envelope_b.payload == {"turn": "B"}
+    assert envelope_b.provider == "google"
+    assert envelope_b.model == "kimi-k2.6"
+    assert envelope_b.usage.input_tokens == 2

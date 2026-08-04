@@ -422,7 +422,29 @@ CREATE TABLE public.trajectory_steps (
     reward numeric,
     decision_index integer NOT NULL,
     action_path text,
-    CONSTRAINT trajectory_steps_action_path_check CHECK ((action_path = ANY (ARRAY['llm'::text, 'llm_retry'::text, 'fallback'::text])))
+    rationale text,
+    target jsonb,
+    confidence double precision,
+    alternatives jsonb,
+    provider text,
+    model text,
+    decision_latency_ms double precision,
+    input_tokens integer,
+    output_tokens integer,
+    cached_input_tokens integer,
+    reasoning_tokens integer,
+    CONSTRAINT trajectory_steps_action_path_check CHECK ((action_path = ANY (ARRAY['llm'::text, 'llm_retry'::text, 'fallback'::text]))),
+    CONSTRAINT trajectory_steps_alternatives_type_check CHECK (((alternatives IS NULL) OR (jsonb_typeof(alternatives) = 'array'::text))),
+    CONSTRAINT trajectory_steps_cached_input_tokens_check CHECK (((cached_input_tokens IS NULL) OR (cached_input_tokens <= input_tokens))),
+    CONSTRAINT trajectory_steps_cached_input_tokens_nonnegative_check CHECK (((cached_input_tokens IS NULL) OR (cached_input_tokens >= 0))),
+    CONSTRAINT trajectory_steps_confidence_check CHECK (((confidence IS NULL) OR ((confidence >= (0)::double precision) AND (confidence <= (1)::double precision)))),
+    CONSTRAINT trajectory_steps_input_tokens_nonnegative_check CHECK (((input_tokens IS NULL) OR (input_tokens >= 0))),
+    CONSTRAINT trajectory_steps_latency_check CHECK (((decision_latency_ms IS NULL) OR (decision_latency_ms >= (0)::double precision))),
+    CONSTRAINT trajectory_steps_output_tokens_nonnegative_check CHECK (((output_tokens IS NULL) OR (output_tokens >= 0))),
+    CONSTRAINT trajectory_steps_provider_model_coherence_check CHECK (((provider IS NULL) = (model IS NULL))),
+    CONSTRAINT trajectory_steps_reasoning_tokens_nonnegative_check CHECK (((reasoning_tokens IS NULL) OR (reasoning_tokens >= 0))),
+    CONSTRAINT trajectory_steps_target_type_check CHECK (((target IS NULL) OR (jsonb_typeof(target) = 'object'::text))),
+    CONSTRAINT trajectory_steps_usage_coherence_check CHECK ((((input_tokens IS NULL) AND (output_tokens IS NULL) AND (cached_input_tokens IS NULL) AND (reasoning_tokens IS NULL)) OR ((input_tokens IS NOT NULL) AND (output_tokens IS NOT NULL) AND (cached_input_tokens IS NOT NULL) AND (reasoning_tokens IS NOT NULL))))
 );
 
 
@@ -890,4 +912,5 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20260727000006'),
     ('20260727000007'),
     ('20260727000008'),
-    ('20260729000001');
+    ('20260729000001'),
+    ('20260803000001');

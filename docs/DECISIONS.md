@@ -1934,3 +1934,68 @@ reemplazar `persistent_state` por un dict nuevo en `client.py` (L-03) — las
 tres, aplicadas y restauradas por separado, ponen rojo exactamente el test
 que cada una debía romper. Restauradas: 206/206 en
 `test_protocol.py`/`test_client.py`.
+## D38 — la metadata de decisión se persiste en `trajectory_steps` por envelope inmutable (F2-08/MON-13)
+
+**Contexto.** El dataset de entrenamiento necesitaba el contrato de decisión
+completo por `decision_index` —action, target, rationale breve, confidence,
+alternatives— más metadata de calidad ML: provider/model efectivos, latencia
+y usage. Nada de eso se persistía: `reasoning` se calculaba en el grafo y se
+descartaba, y provider/model vivían solo en los artefactos del benchmark.
+
+**Decisión.** 11 columnas nuevas en `trajectory_steps`, todas NULL en filas
+históricas y de ruta random (sin backfill, nunca se inventa provider/model):
+`rationale`, `target` jsonb, `confidence` double precision, `alternatives`
+jsonb, `provider`, `model`, `decision_latency_ms` y los cuatro tokens planos
+(`input/output/cached_input/reasoning_tokens`, el contrato fijo de
+`CompletionUsage`). Constraints: confidence NULL o [0,1]; co-ocurrencia
+`provider/model`; los cuatro tokens todos NULL o todos no-NULL, `>= 0`,
+`cached <= input`; latencia NULL o `>= 0`; `alternatives` array y `target`
+object cuando no-NULL.
+
+**Envelope inmutable por llamada, no `last_*`.** `DecisionProvider.complete`
+devuelve `CompletionEnvelope` (payload, provider efectivo, model efectivo,
+usage, latencia de esa llamada). El patrón `last_completion_info` quedó
+rechazado por el design verdict: es estado mutable compartido y cruza
+metadata entre decisiones concurrentes — reproducido en la demo
+`/tmp/demo_last_style.py`: la decisión lenta terminaba reportando el payload
+de una decisión vecina. Con el envelope, la metadata viaja en el valor de
+retorno y el cruce es imposible por construcción.
+
+**Semántica por decisión canónica.** provider/model son únicamente los de la
+respuesta LLM aceptada; en `fallback` quedan NULL (no se atribuye la acción
+determinista a un modelo) con `alternatives=[]` y un rationale determinista.
+`rationale` es el campo CANÓNICO del schema productivo y del prompt (L-01 de
+la revisión R1): el payload del proveedor se rechaza si emite `reasoning` en
+su lugar (missing rationale + extra_forbidden). El alias interno `reasoning`
+en el resultado de `decide` solo existe para consumidores que ya lo leían
+(run_graph) y se deriva del rationale ya validado; nunca forma parte del
+schema enviado al proveedor. El usage de la decisión suma las respuestas
+facturables del camino (retries
+semánticos incluidos; los de infraestructura no producen usage en el backend
+actual). `decision_latency_ms` va desde el primer intento LLM hasta la
+respuesta aceptada o el fallback. `target` es NULL válido y esperado en
+singles; un target no-NULL solo se acepta si la misma mascara legal expone
+targets, y mientras no los exponga se rechaza la respuesta (reintento
+semántico). Las alternatives atraviesan el mismo `normalize_action` +
+`validate_action` que la principal, deben ser únicas tras normalizar y
+distintas de la principal; `[]` es válido; cualquier violación consume el
+reintento semántico (D26). D34 sigue vinculante: solo persiste la metadata
+de la acción finalmente resuelta; una elección rechazada por Showdown no
+conserva metadata ejecutada.
+
+**Persistencia con EXCLUDED puro, como grupo.** `save_step` reemplaza las 11
+columnas de metadata con `EXCLUDED` puro en el DO UPDATE (corrección del
+TECH LEAD PARTIAL CHECKPOINT VERDICT: COALESCE podía actualizar
+`action_taken` pero retener rationale/provider/model de una acción anterior,
+creando una fila incoherente). Re-persistir la misma decisión es idempotente
+(misma metadata -> mismos valores); una re-persistencia explícita sin
+metadata deja el grupo completo en NULL. `rationale` es el nombre canónico;
+`battle_turns.agent_reasoning` no se usa.
+
+**Cableado del caller (integración MON-18).** `run_graph` en `client.py`
+copia la metadata del resultado del grafo al `step` canónico y
+`_persist_one` (cli.py) la pasa a `save_step`. La ruta random y la historia
+quedan NULL. La forma exacta de los targets de la mascara legal se definirá
+cuando una mascara los exponga (hoy la rechaza). Migración
+`20260803000001_trajectory_decision_metadata.sql` verificada up/down en una
+DB descartable; la DB compartida no fue migrada.
