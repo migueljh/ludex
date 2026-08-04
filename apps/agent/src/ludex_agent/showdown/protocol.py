@@ -696,6 +696,19 @@ _MOVE_NOT_OWNED = frozenset({
     "[from] Magic Coat", "[from] Mirror Move",
 })
 
+# `-item` con estos sufijos narra una TRANSFERENCIA, no una revelacion simple:
+# el `ident` (parts[2]) es quien RECIBE el item, y `[of]` nombra a quien lo
+# PIERDE -- Showdown nunca manda una linea separada para el que pierde (D40,
+# T-01). Thief/Covet son movimientos; Pickpocket/Magician son abilities.
+_ITEM_TRANSFER_MOVES = frozenset({"Thief", "Covet"})
+_ITEM_TRANSFER_ABILITIES = frozenset({"Pickpocket", "Magician"})
+
+# Sentinel: "la clave 'item' de `persistent_state` estaba AUSENTE" antes de
+# la primera mutacion de la estancia activa (D40, T-02) -- distinto de que
+# estuviera PRESENTE con `None`. Un objeto propio, nunca `None` ni un string,
+# para que no colisione con ningun valor real de item.
+_NO_PRIOR_ITEM = object()
+
 
 def project_observable_state(
     snapshot: dict,
@@ -1232,6 +1245,47 @@ def project_observable_state(
             if mon is not None:
                 mon["ability"] = normalize_id(parts[4].split("ability:", 1)[-1])
 
+    def apply_item_transfer_ownership(parts: list[str]) -> None:
+        """`-item|{receptor}|{item}|[from] move: Thief|[of] {victima}` (D40,
+        T-01): Thief/Covet (movimientos) y Pickpocket/Magician (abilities)
+        narran la transferencia en UNA sola linea, con `ident` (parts[2]) =
+        quien RECIBE el item. Showdown nunca manda una linea separada para
+        quien lo PIERDE -- esta es la unica evidencia. Se procesa ANTES del
+        filtro generico de ident, igual que `apply_damage_or_heal_
+        ownership`: si el receptor es nuestro lado, ese filtro descartaria
+        la linea completa antes de que nadie notara que el rival nombrado
+        por `[of]` se quedo sin item.
+
+        Cuando el receptor es el RIVAL (nos robo a nosotros), esta funcion
+        no hace nada: `_owner_of` sobre el `[of]` (que aca nombra a nuestro
+        lado) no resuelve a ningun mon, y el handler normal de `-item` --
+        alcanzable porque el ident YA es del rival -- cubre esa direccion
+        sin cambios (D40, T-01, requisito 4).
+
+        Symbiosis (la otra ability que transfiere items) exige un ALIADO
+        del mismo lado: es estructuralmente inalcanzable en singles, el
+        unico gametype que este proyector modela (`active_prefix` asume una
+        sola ranura activa por lado) y el unico que `apps/agent` juega en
+        la practica (`SHOWDOWN_BATTLE_FORMAT` por defecto es
+        `gen6randombattle`). No se implementa: seria logica muerta.
+        """
+        if len(parts) != 6 or not parts[5].startswith("[of]"):
+            return
+        prefix = parts[4]
+        if prefix.startswith("[from] move:"):
+            causa = prefix.split(":", 1)[-1].strip()
+            if causa not in _ITEM_TRANSFER_MOVES:
+                return
+        elif prefix.startswith("[from] ability:"):
+            causa = prefix.split(":", 1)[-1].strip()
+            if causa not in _ITEM_TRANSFER_ABILITIES:
+                return
+        else:
+            return
+        victima = _owner_of(parts[5].split("[of]", 1)[-1].strip())
+        if victima is not None:
+            remember_item(victima, None)
+
     def apply_move(parts: list[str]) -> None:
         """`|move|{side}a: X|Nombre|objetivo|sufijos...`.
 
@@ -1440,6 +1494,13 @@ def project_observable_state(
             # retraso-en-uno que F2-01 existe para eliminar, ahora en
             # `item`/`ability` en vez de en la identidad del activo.
             apply_damage_or_heal_ownership(parts, heal=(tag == "-heal"))
+        if tag == "-item" and len(parts) > 3:
+            # D40 (T-01): mismo motivo que arriba -- una transferencia por
+            # Thief/Covet/Pickpocket/Magician nombra como `ident` a quien
+            # RECIBE el item, que puede ser nuestro propio lado. El filtro
+            # generico de mas abajo descartaria la linea antes de que nadie
+            # notara que el rival, nombrado por `[of]`, se quedo sin item.
+            apply_item_transfer_ownership(parts)
         if len(parts) < 3:
             continue
         ident = parts[2]
