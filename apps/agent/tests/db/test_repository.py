@@ -603,6 +603,45 @@ async def test_historia_y_ruta_random_quedan_null(repo):
     assert fila == (None,) * 11
 
 
+async def test_fallback_con_usage_persiste_sin_violar_co_ocurrencia(repo):
+    """Prueba focal de persistencia del flujo F2-08: un fallback con llamadas
+    LLM facturables tiene provider/model/confidence NULL pero tokens y
+    latencia no-NULL -- la co-ocurrencia del CHECK es entre provider/model y
+    entre los cuatro tokens, NO entre provider y tokens (design verdict)."""
+    tid = await _trajectory_test(repo)
+    await repo.save_step(
+        tid, 0, 1, {}, 1, [], {"kind": "move", "id": "tackle"}, "agent",
+        action_path="fallback",
+        rationale="deterministic fallback after two invalid model responses",
+        target=None,
+        confidence=None,
+        alternatives=[],
+        provider=None,
+        model=None,
+        decision_latency_ms=250.0,
+        input_tokens=2,
+        output_tokens=2,
+        cached_input_tokens=0,
+        reasoning_tokens=0,
+    )
+
+    async with repo.factory() as s:
+        fila = (await s.execute(text("""
+            SELECT rationale, target, confidence, alternatives, provider, model,
+                   decision_latency_ms, input_tokens, output_tokens,
+                   cached_input_tokens, reasoning_tokens
+            FROM trajectory_steps WHERE trajectory_id=:t AND decision_index=0
+        """), {"t": tid})).one()
+    assert fila[0] == "deterministic fallback after two invalid model responses"
+    assert fila[1] is None          # target
+    assert fila[2] is None          # confidence
+    assert fila[3] == []            # alternatives
+    assert fila[4] is None          # provider
+    assert fila[5] is None          # model
+    assert float(fila[6]) == 250.0  # decision_latency_ms
+    assert fila[7:11] == (2, 2, 0, 0)
+
+
 async def test_confidence_fuera_de_rango_viola_check(repo):
     tid = await _trajectory_test(repo)
     with pytest.raises(DBAPIError, match="trajectory_steps_confidence_check") as exc:

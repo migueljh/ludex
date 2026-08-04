@@ -1865,3 +1865,141 @@ async def test_la_mascara_capturada_no_cambia_por_la_espera():
             continue
         assert paso["state"]["legal_actions"] == paso["legal_actions"]
         assert paso["action_taken"] in paso["legal_actions"]
+
+
+# --- F2-08 (MON-13/D38): cableado de metadata del resultado del grafo al
+# step canonico -----------------------------------------------------------
+
+async def test_el_step_hereda_la_metadata_completa_del_resultado_del_grafo():
+    """El caller real (`run_graph` dentro de `choose_move`) copia la metadata
+    de la decision del resultado del grafo al step canonico: rationale,
+    confidence, alternatives, target, provider/model efectivos, latencia y
+    usage. Esa metadata viaja despues a `save_step` (cli._persist_one)."""
+    tag = "battle-graph-metadata"
+    move = SimpleNamespace(id="tackle")
+    battle = _fake_battle(turn=1, battle_tag=tag, available_moves=[move])
+
+    class MetadataGraph:
+        async def ainvoke(self, graph_input):
+            return {
+                "action": {"kind": "move", "id": "tackle"},
+                "action_path": "llm",
+                "reasoning": "breve y user-facing",
+                "rationale": "breve y user-facing",
+                "confidence": 0.87,
+                "alternatives": [{"kind": "move", "id": "meteormash"}],
+                "target": None,
+                "provider": "open_code_zen",
+                "model": "minimax-m2.7",
+                "decision_latency_ms": 123.4,
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cached_input_tokens": 2,
+                "reasoning_tokens": 1,
+            }
+
+    player = _player(decision_graph=MetadataGraph(), decision_budget_seconds=5)
+    with patch.object(
+        client_module, "serialize_battle",
+        lambda b: {
+            "turn": 1, "opponent": {"pokemon": []},
+            "field": {"weather": {}, "field_effects": {},
+                      "my_side": {}, "opponent_side": {}},
+            "legal_actions": [{"kind": "move", "id": "tackle"}],
+        },
+    ):
+        pending = player.choose_move(battle)
+        await player.frame_inbox.publish(tag, ("|upkeep",))
+        await pending
+
+    step = player.steps[tag][0]
+    assert step["action_taken"] == {"kind": "move", "id": "tackle"}
+    assert step["action_path"] == "llm"
+    assert step["rationale"] == "breve y user-facing"
+    assert step["confidence"] == 0.87
+    assert step["alternatives"] == [{"kind": "move", "id": "meteormash"}]
+    assert step["target"] is None
+    assert step["provider"] == "open_code_zen"
+    assert step["model"] == "minimax-m2.7"
+    assert step["decision_latency_ms"] == 123.4
+    assert step["input_tokens"] == 10
+    assert step["output_tokens"] == 5
+    assert step["cached_input_tokens"] == 2
+    assert step["reasoning_tokens"] == 1
+
+
+async def test_el_step_de_fallback_no_atribuye_metadata_a_un_modelo():
+    """Un fallback (dos respuestas invalidas) deja provider/model/confidence
+    en None, alternatives en [] y un rationale determinista; usage y latencia
+    pueden existir si hubo llamadas LLM."""
+    tag = "battle-graph-fallback"
+    move = SimpleNamespace(id="tackle")
+    battle = _fake_battle(turn=1, battle_tag=tag, available_moves=[move])
+
+    class FallbackGraph:
+        async def ainvoke(self, graph_input):
+            return {
+                "action": {"kind": "move", "id": "tackle"},
+                "action_path": "fallback",
+                "reasoning": "deterministic fallback after two invalid model responses",
+                "rationale": "deterministic fallback after two invalid model responses",
+                "confidence": None,
+                "alternatives": [],
+                "target": None,
+                "provider": None,
+                "model": None,
+                "decision_latency_ms": 250.0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_input_tokens": 0,
+                "reasoning_tokens": 0,
+            }
+
+    player = _player(decision_graph=FallbackGraph(), decision_budget_seconds=5)
+    with patch.object(
+        client_module, "serialize_battle",
+        lambda b: {
+            "turn": 1, "opponent": {"pokemon": []},
+            "field": {"weather": {}, "field_effects": {},
+                      "my_side": {}, "opponent_side": {}},
+            "legal_actions": [{"kind": "move", "id": "tackle"}],
+        },
+    ):
+        pending = player.choose_move(battle)
+        await player.frame_inbox.publish(tag, ("|upkeep",))
+        await pending
+
+    step = player.steps[tag][0]
+    assert step["action_path"] == "fallback"
+    assert step["provider"] is None
+    assert step["model"] is None
+    assert step["confidence"] is None
+    assert step["alternatives"] == []
+    assert step["target"] is None
+    assert step["rationale"]
+    assert step["decision_latency_ms"] == 250.0
+    assert step["input_tokens"] == 0
+
+
+def test_la_ruta_random_no_deja_metadata_en_el_step():
+    """La ruta random no setea las claves de metadata: el step no las
+    contiene y `_persist_one` (via `step.get`) persistira NULL, coherente
+    con la historia."""
+    player = _player()
+    tag = "battle-x-1"
+    battle = _fake_battle(battle_tag=tag, available_moves=[SimpleNamespace(id="tackle")])
+
+    with patch.object(
+        client_module.RandomPlayer, "choose_move",
+        lambda self, b: FakeOrder(mid="tackle"),
+    ):
+        _descartar(player.choose_move(battle))
+
+    step = player.steps[tag][0]
+    for key in (
+        "rationale", "confidence", "alternatives", "target", "provider",
+        "model", "decision_latency_ms", "input_tokens", "output_tokens",
+        "cached_input_tokens", "reasoning_tokens",
+    ):
+        assert key not in step, f"la ruta random no debe setear {key!r}"
+        assert step.get(key) is None

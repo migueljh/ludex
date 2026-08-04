@@ -279,6 +279,20 @@ async def _persist_one(
             traj, decision_index, step["turn"], step["state"], STATE_SCHEMA_VERSION,
             step["state"]["legal_actions"], step["action_taken"], "agent",
             action_path=step.get("action_path"),
+            # F2-08 (D38): la metadata de la decision canónica viaja del step
+            # a la fila. La ruta random no setea estas claves: `get` devuelve
+            # None y la fila queda NULL, coherente con la historia.
+            rationale=step.get("rationale"),
+            target=step.get("target"),
+            confidence=step.get("confidence"),
+            alternatives=step.get("alternatives"),
+            provider=step.get("provider"),
+            model=step.get("model"),
+            decision_latency_ms=step.get("decision_latency_ms"),
+            input_tokens=step.get("input_tokens"),
+            output_tokens=step.get("output_tokens"),
+            cached_input_tokens=step.get("cached_input_tokens"),
+            reasoning_tokens=step.get("reasoning_tokens"),
         )
     if battle.finished:
         await repo.finalize(traj, result=result, reward=reward)
