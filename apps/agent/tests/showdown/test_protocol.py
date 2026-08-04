@@ -2558,3 +2558,152 @@ def test_transferencia_de_item_no_contamina_otra_identidad_rival():
     assert por["ludicolo"]["item"] is None
     assert por["weezing"]["item"] == "leftovers", "Weezing no debe verse afectado"
     assert "weezing" not in memoria
+
+
+# ---------------------------------------------------------------------------
+# D40 T-02 (MON-18 R4): provenance del item bajo Illusion.
+#
+# La memoria de D40 no distingue "evidencia sobre esta identidad" de
+# "evidencia observada mientras otro pokemon la usaba de disfraz". Sin esta
+# correccion, un item revelado mientras Zoroark imita a Mandibuzz queda
+# pegado a la entrada de Mandibuzz para siempre, incluso despues de que el
+# `|replace|` confirme que era Zoroark todo el tiempo.
+# ---------------------------------------------------------------------------
+
+
+def _mandibuzz_rival(item="unknown_item", active=True):
+    return {
+        "species": "mandibuzz", "hp_fraction": 1.0, "active": active,
+        "fainted": False, "status": None, "level": 84,
+        "item": item, "ability": None, "types": ["DARK", "FLYING"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [],
+    }
+
+
+def _zoroark_rival(item="unknown_item", active=True):
+    return {
+        "species": "zoroark", "hp_fraction": 1.0, "active": active,
+        "fainted": False, "status": None, "level": 84,
+        "item": item, "ability": "illusion", "types": ["DARK"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [],
+    }
+
+
+def test_illusion_restaura_el_item_previo_del_imitado_al_romperse():
+    """Mandibuzz ya tenia `leftovers` conocido; mientras Zoroark lo imita,
+    se revela `lifeorb` (en realidad el item de Zoroark); al romperse la
+    Illusion, Mandibuzz tiene que recuperar `leftovers` -- no quedarse con
+    `lifeorb` ni pasarselo a Zoroark. Otras claves de `persistent_state`
+    (`ability`) no pueden perderse en el proceso."""
+    memoria: dict[str, dict] = {"mandibuzz": {"item": "leftovers", "ability": "overcoat"}}
+    snapshot1 = _snapshot(gen=6)
+    snapshot1["opponent"]["pokemon"] = [_mandibuzz_rival(item="leftovers")]
+    tras_reveal = _proyectar(
+        ["|-item|p2a: Mandibuzz|Life Orb|[from] move: Trick"],
+        snapshot1, persistent_state=memoria,
+    )
+    assert _por_especie(tras_reveal)["mandibuzz"]["item"] == "lifeorb"
+    assert memoria["mandibuzz"]["item"] == "lifeorb"
+
+    # Llamada fresca intermedia, sin nueva evidencia de item: el backup
+    # tiene que sobrevivir el snapshot fresco, igual que la memoria misma.
+    snapshot2 = _snapshot(gen=6)
+    snapshot2["opponent"]["pokemon"] = [_mandibuzz_rival(item="lifeorb")]
+    tras_intermedia = _proyectar([], snapshot2, persistent_state=memoria)
+    assert _por_especie(tras_intermedia)["mandibuzz"]["item"] == "lifeorb"
+
+    # La Illusion se rompe: Zoroark era el disfrazado.
+    snapshot3 = _snapshot(gen=6)
+    snapshot3["opponent"]["pokemon"] = [_mandibuzz_rival(item="lifeorb")]
+    tras_replace = _proyectar(
+        ["|replace|p2a: Zoroark|Zoroark, L84, M"],
+        snapshot3, persistent_state=memoria,
+    )
+    por = _por_especie(tras_replace)
+    assert por["mandibuzz"]["item"] == "leftovers", (
+        "recupera el item previo, no el revelado durante el disfraz"
+    )
+    assert por["zoroark"]["item"] == "unknown_item", (
+        "Zoroark no hereda el item observado durante Illusion"
+    )
+    assert memoria["mandibuzz"]["item"] == "leftovers"
+    assert "item_backup" not in memoria["mandibuzz"]
+    assert memoria["mandibuzz"]["ability"] == "overcoat", (
+        "otras claves de persistent_state (ability, types, moves, PP) no "
+        "pueden perderse al restaurar el item"
+    )
+
+    # Mandibuzz (el real) switchea despues: tiene que seguir mostrando
+    # `leftovers`, nunca el item de Zoroark, aunque el snapshot fresco
+    # todavia diga `lifeorb`.
+    snapshot4 = _snapshot(gen=6)
+    snapshot4["opponent"]["pokemon"] = [
+        _mandibuzz_rival(item="lifeorb", active=False),
+        _zoroark_rival(active=True),
+    ]
+    tras_switch = _proyectar(
+        ["|switch|p2a: Mandibuzz|Mandibuzz, L84, F|100/100"],
+        snapshot4, persistent_state=memoria,
+    )
+    assert _por_especie(tras_switch)["mandibuzz"]["item"] == "leftovers"
+
+
+def test_illusion_sin_memoria_previa_vuelve_a_clave_ausente_al_romperse():
+    """Si antes del disfraz no habia NINGUNA evidencia sobre Mandibuzz, tras
+    el `replace` la clave `item` tiene que quedar AUSENTE -- no `None`, que
+    significaria 'confirmado sin item'."""
+    memoria: dict[str, dict] = {}
+    snapshot1 = _snapshot(gen=6)
+    snapshot1["opponent"]["pokemon"] = [_mandibuzz_rival(item="unknown_item")]
+    _proyectar(
+        ["|-item|p2a: Mandibuzz|Life Orb|[from] move: Trick"],
+        snapshot1, persistent_state=memoria,
+    )
+    assert memoria["mandibuzz"]["item"] == "lifeorb"
+
+    snapshot2 = _snapshot(gen=6)
+    snapshot2["opponent"]["pokemon"] = [_mandibuzz_rival(item="lifeorb")]
+    tras_replace = _proyectar(
+        ["|replace|p2a: Zoroark|Zoroark, L84, M"],
+        snapshot2, persistent_state=memoria,
+    )
+    por = _por_especie(tras_replace)
+    assert por["mandibuzz"]["item"] == "unknown_item"
+    assert "item" not in memoria.get("mandibuzz", {}), (
+        "sin memoria previa, tras el replace la clave 'item' debe quedar "
+        "AUSENTE, no None"
+    )
+
+
+def test_illusion_backup_un_switch_ordinario_confirma_el_item_nuevo():
+    """Si el disfraz nunca se rompe (sale del campo con un switch normal,
+    no un `replace`), la identidad aparente queda confirmada: el item
+    nuevo es permanente y el backup se descarta."""
+    memoria: dict[str, dict] = {"mandibuzz": {"item": "leftovers"}}
+    snapshot1 = _snapshot(gen=6)
+    snapshot1["opponent"]["pokemon"] = [_mandibuzz_rival(item="leftovers")]
+    _proyectar(
+        ["|-item|p2a: Mandibuzz|Life Orb|[from] move: Trick"],
+        snapshot1, persistent_state=memoria,
+    )
+    assert memoria["mandibuzz"]["item"] == "lifeorb"
+
+    snapshot2 = _snapshot(gen=6)
+    snapshot2["opponent"]["pokemon"] = [
+        _mandibuzz_rival(item="lifeorb", active=False),
+        {"species": "weezing", "hp_fraction": 1.0, "active": True,
+         "fainted": False, "status": None, "level": 83,
+         "item": "unknown_item", "ability": "levitate", "types": ["POISON"],
+         "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                    "evasion": 0, "accuracy": 0}, "moves": []},
+    ]
+    out = _proyectar(
+        ["|switch|p2a: Weezing|Weezing, L83, F|100/100"],
+        snapshot2, persistent_state=memoria,
+    )
+    assert _por_especie(out)["mandibuzz"]["item"] == "lifeorb"
+    assert "item_backup" not in memoria["mandibuzz"]
