@@ -2072,3 +2072,70 @@ esperado y restaurada.
 **Alcance.** Cero cambios en `showdown/client.py` ni `cli.py` (confirmado
 por `git diff --stat` vacío en ambos rangos). D37 y D38 quedan intactos. No
 se tocó ninguna fila de la DB compartida.
+
+### R4 — transferencia de item y provenance bajo Illusion
+
+La revisión de R3 encontró dos blockers sobre el mismo mecanismo de D40,
+ambos exclusivos de `apps/agent/src/ludex_agent/showdown/protocol.py`
+(`packages/dataset-audit` no se tocó esta ronda).
+
+**T-01 — transferencia de item hacia nuestro lado dejaba al rival con
+memoria stale.** `-item|p1a: X|Item|[from] move: Thief|[of] p2a: Y` narra
+la transferencia en UNA sola línea: el `ident` (parts[2]) es quien RECIBE
+el item -- nuestro propio activo -- y `[of]` nombra a quien lo pierde.
+Showdown nunca manda una línea separada para el que pierde. El filtro
+genérico de `ident` descartaba la línea completa antes de que ningún
+handler notara que el rival se quedó sin item, y su entrada en
+`persistent_state` seguía diciendo el item VIEJO para siempre.
+`apply_item_transfer_ownership` corre antes del filtro genérico -- mismo
+patrón que `apply_damage_or_heal_ownership` -- y limpia (`remember_item(...,
+None)`) al rival nombrado por `[of]` cuando la causa es Thief/Covet
+(movimientos) o Pickpocket/Magician (abilities). Cuando el receptor es el
+RIVAL (nos robó a nosotros), la función es un no-op: el `[of]` nombra a
+nuestro lado, que `_owner_of` nunca resuelve, y el handler normal de
+`-item` (ya alcanzable porque el `ident` es del rival) cubre esa dirección
+sin cambios. Symbiosis no se implementa: exige un aliado del mismo lado,
+estructuralmente inalcanzable en singles -- el único gametype que este
+proyector modela (`active_prefix` asume una sola ranura activa por lado) y
+el único que juega `apps/agent` en la práctica.
+
+**T-02 — un item revelado durante Illusion quedaba pegado al imitado para
+siempre.** La memoria de D40 no distinguía "evidencia sobre esta
+identidad" de "evidencia observada mientras Zoroark la usaba de disfraz".
+`remember_item` ahora guarda, en la PRIMERA mutación de `item` desde el
+último switch-in de una identidad (marcada por la ausencia de la clave
+`item_backup`), el valor ANTERIOR -- ausente (sentinel `_NO_PRIOR_ITEM`),
+`None`, o un item -- antes de pisarlo. Dos desenlaces posibles para esa
+estancia:
+
+- **Switch-out ordinario** (`switch_out`): descarta el backup SIN
+  restaurar nada. Un switch normal confirma que la identidad aparente era
+  real, así que el item nuevo queda permanente.
+- **`|replace|` (Illusion se rompe)** (`end_illusion`): restaura la memoria
+  de item que el imitado tenía ANTES de la primera mutación de la
+  estancia, justo antes de delegar en `switch_out` -- si no había memoria
+  previa, la clave `item` vuelve a quedar AUSENTE, nunca `None` (son
+  estados distintos: "sin evidencia" vs. "confirmado sin item"). Zoroark
+  nunca se siembra a partir del imitado, política fail-closed ya existente
+  desde antes de D40: sigue `unknown_item` salvo evidencia independiente.
+  Sólo las claves `item`/`item_backup` se tocan; `ability`, `types`,
+  `moves` y las marcas de PP sobreviven intactas.
+
+**Tests.** Parametrizado sobre Thief/Covet/Pickpocket/Magician (con un
+item rival previamente memorizado, la línea de adquisición hacia p1, y un
+snapshot fresco posterior que sigue mostrando `None`); contrapeso de la
+dirección donde el rival adquiere; aislamiento entre identidades. Para
+Illusion: flujo completo con item previo conocido (revelación durante el
+disfraz, una llamada fresca intermedia, `|replace|`, recuperación del item
+previo, Zoroark sin heredarlo, un switch-in posterior del imitado que
+tampoco hereda el item de Zoroark, y otras claves de `persistent_state`
+intactas); memoria previa ausente vuelve a clave ausente, no a `None`;
+switch ordinario confirma el item nuevo y descarta el backup. Cuatro
+mutaciones dirigidas (retirar el manejo pre-filtro de T-01; omitir la
+restauración en `replace`; tratar "ausente" como `None`; limpiar todo el
+`entry` y perder `ability`), cada una puesta en rojo exactamente el test
+esperado y restaurada.
+
+**Alcance (R4).** Cero cambios en `showdown/client.py`, `cli.py` y
+`packages/dataset-audit` (código ya aceptado, sin tocar esta ronda). D37 y
+D38 siguen intactos. No se tocó ninguna fila de la DB compartida.
