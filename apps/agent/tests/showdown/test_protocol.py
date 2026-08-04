@@ -2679,6 +2679,55 @@ def test_illusion_sin_memoria_previa_vuelve_a_clave_ausente_al_romperse():
     )
 
 
+def test_illusion_item_none_previo_se_restaura_como_none_no_ausente():
+    """T-03 (LINEAR_VERDICT R4): falta un canario para el TERCER estado de
+    memoria previa -- clave `item` PRESENTE con valor `None` (p.ej. un
+    `-enditem` anterior ya habia confirmado que Mandibuzz no tenia item).
+    Los tests existentes sólo cubrian item concreto y clave ausente; una
+    mutación que colapsara `None` en ausencia (`entry.get("item") or
+    _NO_PRIOR_ITEM`, donde `None` es falsy) pasaria esos dos sin problema y
+    seguiria corrompiendo este tercer caso -- exactamente lo que este test
+    existe para impedir."""
+    memoria: dict[str, dict] = {"mandibuzz": {"item": None, "ability": "overcoat"}}
+    assert "item" in memoria["mandibuzz"], "arranca con la clave PRESENTE, no ausente"
+
+    snapshot1 = _snapshot(gen=6)
+    snapshot1["opponent"]["pokemon"] = [_mandibuzz_rival(item="unknown_item")]
+    tras_reveal = _proyectar(
+        ["|-item|p2a: Mandibuzz|Life Orb|[from] move: Trick"],
+        snapshot1, persistent_state=memoria,
+    )
+    assert _por_especie(tras_reveal)["mandibuzz"]["item"] == "lifeorb"
+    assert memoria["mandibuzz"]["item"] == "lifeorb"
+
+    # Llamada fresca e independiente, sin nueva evidencia de item.
+    snapshot2 = _snapshot(gen=6)
+    snapshot2["opponent"]["pokemon"] = [_mandibuzz_rival(item="lifeorb")]
+    tras_intermedia = _proyectar([], snapshot2, persistent_state=memoria)
+    assert _por_especie(tras_intermedia)["mandibuzz"]["item"] == "lifeorb"
+
+    # La Illusion se rompe.
+    snapshot3 = _snapshot(gen=6)
+    snapshot3["opponent"]["pokemon"] = [_mandibuzz_rival(item="lifeorb")]
+    tras_replace = _proyectar(
+        ["|replace|p2a: Zoroark|Zoroark, L84, M"],
+        snapshot3, persistent_state=memoria,
+    )
+    por = _por_especie(tras_replace)
+    assert por["mandibuzz"]["item"] is None, (
+        "recupera el None previo, no el lifeorb revelado durante el disfraz"
+    )
+    assert "item" in memoria["mandibuzz"], (
+        "la clave 'item' tiene que seguir PRESENTE con None -- no "
+        "desaparecer como si nunca hubiera habido evidencia"
+    )
+    assert memoria["mandibuzz"]["item"] is None
+    assert "item_backup" not in memoria["mandibuzz"]
+    assert memoria["mandibuzz"]["ability"] == "overcoat", (
+        "otras claves de persistent_state no pueden perderse al restaurar"
+    )
+
+
 def test_illusion_backup_un_switch_ordinario_confirma_el_item_nuevo():
     """Si el disfraz nunca se rompe (sale del campo con un switch normal,
     no un `replace`), la identidad aparente queda confirmada: el item
