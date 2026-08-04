@@ -1906,7 +1906,7 @@ una property que siempre deriva del dex (`move.py:471-481`), nunca vuelve
 se tocó — el fix es enteramente interno a `project_observable_state`
 (reaplicación) y `register_move` (marca), ambos en `protocol.py`.
 
-**Verificado.** 8 tests en `test_protocol.py` — todos con un snapshot
+**Verificado.** 7 tests en `test_protocol.py` — todos con un snapshot
 fresco e independiente construido a mano por decisión (nunca la salida de
 la llamada anterior encadenada; R1 blocker L-02 encontró que la entrega
 original sí encadenaba en el test de Transform, contra lo que afirmaba el
