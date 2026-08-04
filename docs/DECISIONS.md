@@ -1846,7 +1846,95 @@ de recalcular su fingerprint de apertura post-hoc. D33/D34/D35 quedan
 integrados por merge aditivo de `integration/phase-2-accepted`, sin
 reabrirse.
 
-## D37 — La metadata de decisión se persiste en `trajectory_steps` por envelope inmutable (F2-08/MON-13)
+## D37 — el PP indeterminable por Pressure se marca en `persistent_state`, no en el snapshot de una sola llamada
+
+**Contexto.** MON-18 diagnosticó por eliminación (`FINAL ROOT-CAUSE
+CHECKPOINT`, MON-18) que el PP de un movimiento rival marcado `null` por
+Pressure (D-existente, `register_move`/`pressure_on_us`) reaparecía como
+número en la decisión siguiente sin que el rival volviera a usar ese
+movimiento. Causa: `client.py` construye el `snapshot` de **cada** llamada
+a `project_observable_state` fresco desde `serialize_battle(battle)`
+(nunca encadena la proyección anterior — `client.py:1185/1390`), y
+`serializer.py::_moves` lee `mv.current_pp` directo del objeto `Move` de
+poke-env, que cuenta su propio PP sin saber de Pressure. El `None` de
+`register_move` sólo vivía dentro de la llamada que lo produjo.
+
+**Solución.** `persistent_state[identidad]` gana dos claves nuevas,
+paralelas al patrón ya existente de `types`/`ability`/`moves`:
+
+- **`unknown_pp_moves`** (`set[str]` de `move_id`): permanente, como
+  `ability`. `register_move` la puebla cuando `pressure_on_us()` es
+  verdadero **y el pokémon no está transformado en ese instante**. Sobrevive
+  cualquier cantidad de switches ordinarios: `switch_out` nunca la toca.
+- **`transform_unknown_pp_moves`**: temporal, como `types`/`moves` de un
+  Transform. Si el pokémon está transformado al marcar (detectado por
+  `"moves" in entry`, la misma señal que ya usa `switch_out` para saber si
+  hay un Transform activo), la marca va acá en vez de en
+  `unknown_pp_moves`, y `switch_out` la descarta junto con el moveset
+  copiado — para que un Transform posterior sobre un objetivo distinto no
+  herede una marca que no le corresponde.
+
+Al principio de **cada** llamada a `project_observable_state` (antes de
+procesar cualquier línea nueva del frame), se reaplica `pp = None` sobre
+los movimientos marcados, sin importar qué número traiga el snapshot
+fresco.
+
+**Corrección R1 (LINEAR_VERDICT MON-18, blocker L-01): las dos marcas son
+MUTUAMENTE EXCLUYENTES en la reaplicación, nunca se unen.** La entrega
+original unía `unknown_pp_moves | transform_unknown_pp_moves` sin condición.
+Tasos/Latwan reprodujeron el defecto: mientras `"moves" in entry` indica
+Transform activo, el moveset **visible** en `mon["moves"]` es el COPIADO,
+no el base — una marca permanente del base (de antes de transformarse)
+nombra un `move_id` que puede coincidir por casualidad con el copiado
+(mismo movimiento, p.ej. Scald, en el pokémon base y en el objetivo
+copiado), pero son instancias de PP **distintas**. Unir las dos marcas
+forzaba `pp=None` en un Scald recién copiado con PP real `5/5`. La
+reaplicación ahora es exclusiva: con `"moves" in entry` (Transform activo)
+sólo gobierna `transform_unknown_pp_moves`; sin Transform activo, sólo
+`unknown_pp_moves`. Al terminar el Transform (`switch_out` restaura el
+moveset base y descarta la marca temporal), la marca permanente vuelve a
+gobernar sobre el moveset base restaurado.
+
+**Aislamiento.** Por construcción: `persistent_state` ya está indexado por
+identidad canónica (`base_species`), así que dos rivales distintos con el
+mismo `move_id` nunca comparten marca. Dentro de una identidad, la marca es
+un conjunto de `move_id`, no una bandera global del pokémon.
+
+**Lo que NO cambia.** `max_pp` no participa: `Move.max_pp` en poke-env es
+una property que siempre deriva del dex (`move.py:471-481`), nunca vuelve
+`None` por sí sola, así que no hay nada que reaplicar ahí. `client.py` no
+se tocó — el fix es enteramente interno a `project_observable_state`
+(reaplicación) y `register_move` (marca), ambos en `protocol.py`.
+
+**Verificado.** 7 tests en `test_protocol.py` — todos con un snapshot
+fresco e independiente construido a mano por decisión (nunca la salida de
+la llamada anterior encadenada; R1 blocker L-02 encontró que la entrega
+original sí encadenaba en el test de Transform, contra lo que afirmaba el
+REVIEW PACKET, y fue reescrito): reaplicación con snapshot fresco entre dos
+llamadas; persistencia a través de switch-out y switch-in ordinarios;
+aislamiento entre dos rivales con el mismo `move_id`; marca temporal de un
+Transform descartada al terminar y sin fuga a un Transform posterior
+distinto; el contrapeso negativo — sin compartir el mismo
+`persistent_state` por `battle_tag`, la marca se pierde; la regresión
+exacta de L-01 — un Scald base marcado permanentemente no contamina un
+Scald copiado por Transform, y el Scald base vuelve a `null` al terminar el
+Transform; y el canario de orden (L-02) — un Transform en la misma llamada
+que trae un snapshot fresco numérico guarda en `persistent_state` el
+moveset base **ya corregido** a `null`, no el número crudo (mover la
+reaplicación después del loop de líneas lo pone rojo). Más 1 test en
+`test_client.py` que atraviesa dos resoluciones reales del mismo
+`battle_tag` vía `choose_move` y espía `project_observable_state` (sin
+tocar `client.py` productivo) para confirmar identidad (`is`) del mismo
+objeto `persistent_state` en ambas — falla si el caller dejara de reusar
+`self._temporary_state.setdefault(tag, {})`.
+
+Mutaciones dirigidas a los tres blockers de R1: unir las marcas sin
+condición (L-01), mover la reaplicación después del loop de líneas (L-02) y
+reemplazar `persistent_state` por un dict nuevo en `client.py` (L-03) — las
+tres, aplicadas y restauradas por separado, ponen rojo exactamente el test
+que cada una debía romper. Restauradas: 206/206 en
+`test_protocol.py`/`test_client.py`.
+## D38 — la metadata de decisión se persiste en `trajectory_steps` por envelope inmutable (F2-08/MON-13)
 
 **Contexto.** El dataset de entrenamiento necesitaba el contrato de decisión
 completo por `decision_index` —action, target, rationale breve, confidence,
@@ -1889,15 +1977,20 @@ reintento semántico (D26). D34 sigue vinculante: solo persiste la metadata
 de la acción finalmente resuelta; una elección rechazada por Showdown no
 conserva metadata ejecutada.
 
-**Persistencia con COALESCE.** `save_step` actualiza la metadata nueva con
-`COALESCE(EXCLUDED.x, trajectory_steps.x)`: re-persistir la misma decisión
-sin metadata (runner no cableado) no borra la de la acción ya resuelta.
-`rationale` es el nombre canónico; `battle_turns.agent_reasoning` no se usa.
+**Persistencia con EXCLUDED puro, como grupo.** `save_step` reemplaza las 11
+columnas de metadata con `EXCLUDED` puro en el DO UPDATE (corrección del
+TECH LEAD PARTIAL CHECKPOINT VERDICT: COALESCE podía actualizar
+`action_taken` pero retener rationale/provider/model de una acción anterior,
+creando una fila incoherente). Re-persistir la misma decisión es idempotente
+(misma metadata -> mismos valores); una re-persistencia explícita sin
+metadata deja el grupo completo en NULL. `rationale` es el nombre canónico;
+`battle_turns.agent_reasoning` no se usa.
 
-**Alcance y límites.** Implementación parcial de F2-08: el cableado del
-`step` en `showdown/client.py` es territorio de MON-18 y queda pendiente de
-integración; hasta entonces las filas LLM se persisten con metadata NULL por
-la ruta vieja. La forma exacta de los targets de la mascara legal se definirá
+**Cableado del caller (integración MON-18).** `run_graph` en `client.py`
+copia la metadata del resultado del grafo al `step` canónico y
+`_persist_one` (cli.py) la pasa a `save_step`. La ruta random y la historia
+quedan NULL. La forma exacta de los targets de la mascara legal se definirá
 cuando una mascara los exponga (hoy la rechaza). Migración
 `20260803000001_trajectory_decision_metadata.sql` verificada up/down en una
 DB descartable; la DB compartida no fue migrada.
+

@@ -730,6 +730,24 @@ def project_observable_state(
     ability/moveset propios de un Transform tan pronto la decision que los
     aplico terminaba. El caller (`client.py`) le pasa un dict por
     `battle_tag`, vivo mientras dura la batalla.
+
+    `unknown_pp_moves`/`transform_unknown_pp_moves` (D37) son la misma idea
+    aplicada al PP bajo Pressure: `register_move` marca ahi el `move_id`
+    cuando pone `pp=None`, y esta funcion lo reaplica al principio de CADA
+    llamada, porque el `snapshot` de entrada es fresco (el PP que cuenta
+    poke-env, ciego a Pressure) y sin la marca ese numero pisaria el `None`
+    sin que ninguna linea nueva lo pidiera. `unknown_pp_moves` sobrevive
+    cualquier cantidad de switches (como `ability`); `transform_unknown_pp_
+    moves` es tan temporal como el moveset copiado y se descarta junto con
+    el en `switch_out`, para no filtrarse a un Transform distinto.
+
+    Las dos marcas son MUTUAMENTE EXCLUYENTES en la reaplicacion, nunca se
+    unen (LINEAR_VERDICT MON-18 R1, L-01): mientras `"moves" in entry`
+    indique un Transform activo, el moveset VISIBLE es el copiado, no el
+    base, asi que solo `transform_unknown_pp_moves` puede gobernarlo -- una
+    marca permanente del base nombra un `move_id` que puede coincidir por
+    casualidad con el copiado, pero son instancias de PP distintas. Sin
+    Transform activo, solo `unknown_pp_moves` gobierna.
     """
     persistent_state = {} if persistent_state is None else persistent_state
     projected = {
@@ -867,6 +885,14 @@ def project_observable_state(
                 mon["types"] = list(entry.pop("types"))
             if "moves" in entry:
                 mon["moves"] = [dict(m) for m in entry.pop("moves")]
+                # D37: la marca de PP desconocido de un Transform es tan
+                # temporal como el moveset que restaura -- se descarta con
+                # el, para no filtrarse al PROXIMO Transform de esta misma
+                # identidad. `unknown_pp_moves` (Pressure sobre un
+                # movimiento propio del pokemon, no copiado) es la
+                # excepcion: esa SI sobrevive cualquier cantidad de
+                # switches, por eso no se toca aca.
+                entry.pop("transform_unknown_pp_moves", None)
             if "ability" in entry:
                 mon["ability"] = entry["ability"]
             if not entry:
@@ -1083,6 +1109,20 @@ def project_observable_state(
             # `Move.use` descuenta 2 con Pressure (`move.py:123-127`) y la regla
             # exacta depende del objetivo. Antes que errar por uno, null.
             existing["pp"] = None
+            # D37: sin esta marca, la proxima llamada reconstruye
+            # `mon["moves"]` desde un snapshot fresco (el PP que cuenta
+            # poke-env, ciego a Pressure) y ese numero pisaria el `None` sin
+            # que ninguna linea nueva lo pidiera. `persistent_state` es lo
+            # unico que sobrevive entre llamadas (ver docstring del modulo).
+            identidad = canon(normalize_id(mon.get("species") or ""))
+            entry = persistent_state.setdefault(identidad, {})
+            if "moves" in entry:
+                # Transformado ahora mismo: la marca es tan temporal como el
+                # moveset copiado -- se descarta junto con el en
+                # `switch_out`, para no filtrarse a un Transform distinto.
+                entry.setdefault("transform_unknown_pp_moves", set()).add(move_id)
+            else:
+                entry.setdefault("unknown_pp_moves", set()).add(move_id)
             return
         pp = existing.get("pp")
         existing["pp"] = pp - 1 if isinstance(pp, int) and pp > 0 else None
@@ -1242,6 +1282,38 @@ def project_observable_state(
         forme_ability = vocabulary.forme_change_ability(forme)
         if forme_ability is not None:
             mon["ability"] = forme_ability
+
+    # D37: `persistent_state` es la UNICA memoria entre llamadas; el
+    # `snapshot` de ESTA llamada llega fresco de `serialize_battle` (nunca
+    # es la proyeccion anterior encadenada) y puede traer un PP numerico
+    # para un movimiento que ya marcamos como indeterminable por Pressure
+    # -- poke-env cuenta su propio PP sin saber de Pressure. Se reaplica
+    # ANTES de procesar ninguna linea nueva de este frame, para que un uso
+    # real dentro de esta misma llamada (`register_move`) pueda seguir
+    # recalculando sobre la base correcta.
+    #
+    # `"moves" in entry` es la MISMA senal que ya usa `switch_out` para
+    # saber si hay un Transform activo ahora mismo: cuando existe, el
+    # moveset VISIBLE en `mon["moves"]` es el COPIADO, no el base, y una
+    # marca permanente del base (de antes del Transform) nombra un `move_id`
+    # que puede coincidir por casualidad con el copiado -- son instancias
+    # de PP distintas (LINEAR_VERDICT MON-18 R1, L-01). Mientras el
+    # Transform siga activo, solo se reaplica `transform_unknown_pp_moves`;
+    # sin Transform activo, solo `unknown_pp_moves` gobierna.
+    for mon in team:
+        identidad = canon(normalize_id(mon.get("species") or ""))
+        entry = persistent_state.get(identidad)
+        if not entry:
+            continue
+        if "moves" in entry:
+            desconocidos = entry.get("transform_unknown_pp_moves") or ()
+        else:
+            desconocidos = entry.get("unknown_pp_moves") or ()
+        if not desconocidos:
+            continue
+        for move in mon["moves"]:
+            if move.get("id") in desconocidos:
+                move["pp"] = None
 
     for line in lines:
         parts = line.split("|")
