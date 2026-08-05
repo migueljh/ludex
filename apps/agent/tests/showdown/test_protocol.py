@@ -1260,7 +1260,12 @@ def test_transform_sobrevive_a_la_decision_y_se_limpia_en_otra_llamada():
     # `types`/`moves` se consumieron (evento puntual); `ability` PERSISTE a
     # proposito -- es la base para el PROXIMO override, igual que `_ability`
     # nunca se olvida en poke-env aunque el pokemon salga del campo.
-    assert memoria == {"ditto": {"ability": "imposter"}}
+    # `canonical_types` (D41) queda sembrada para ambas identidades: cada
+    # una paso por `switch_in` en algun momento de esta secuencia.
+    assert memoria == {
+        "ditto": {"ability": "imposter", "canonical_types": ["NORMAL"]},
+        "weezing": {"canonical_types": ["POISON"]},
+    }
 
 
 def test_una_mega_conserva_sus_tipos_al_salir_en_otra_llamada():
@@ -1287,9 +1292,13 @@ def test_una_mega_conserva_sus_tipos_al_salir_en_otra_llamada():
         "los tipos de la Mega son persistentes: switch_out no los resetea "
         "al dex de la especie base"
     )
-    # Sin ningun typechange/Transform de por medio, no hay nada que
-    # restaurar: la memoria no tiene entrada para Charizard.
-    assert memoria == {}
+    # Sin ningun typechange/Transform de por medio, no hay backup temporal
+    # que restaurar. `canonical_types` (D41) SI queda sembrada para las dos
+    # identidades que pasaron por `switch_in`.
+    assert memoria == {
+        "charizard": {"canonical_types": ["FIRE", "DRAGON"]},
+        "weezing": {"canonical_types": ["POISON"]},
+    }
 
 
 def test_un_typechange_temporal_si_se_revierte_al_salir_en_otra_llamada():
@@ -1313,7 +1322,14 @@ def test_un_typechange_temporal_si_se_revierte_al_salir_en_otra_llamada():
         "el typechange de Protean SI se revierte: es temporal, a diferencia "
         "de los tipos de una Mega"
     )
-    assert memoria == {}
+    # El backup temporal se consumio al restaurar (switch_out de Ludicolo,
+    # disparado por el switch de Mandibuzz); `canonical_types` (D41) queda
+    # sembrada para las dos identidades que volvieron a pasar por
+    # `switch_in` en esta secuencia.
+    assert memoria == {
+        "ludicolo": {"canonical_types": ["WATER", "GRASS"]},
+        "mandibuzz": {"canonical_types": ["DARK", "FLYING"]},
+    }
 
 
 def test_la_primera_ability_revelada_se_persiste_sin_sembrar_memoria():
@@ -1334,7 +1350,13 @@ def test_la_primera_ability_revelada_se_persiste_sin_sembrar_memoria():
         "|switch|p2a: Ludicolo|Ludicolo, L88, F|100/100",
     ], tras_ability, persistent_state=memoria)
     assert _por_especie(tras_switch)["ludicolo"]["ability"] == "swiftswim"
-    assert memoria == {}, "primera revelacion: nada que restaurar, sin seed"
+    # La ability no siembra memoria (nada que restaurar), pero los dos
+    # switch_in de esta secuencia si escriben `canonical_types` (D41) para
+    # sus respectivas identidades.
+    assert memoria == {
+        "ludicolo": {"canonical_types": ["WATER", "GRASS"]},
+        "mandibuzz": {"canonical_types": ["DARK", "FLYING"]},
+    }
 
 
 def _snapshot_weezing():
@@ -1374,8 +1396,13 @@ def test_finding2_ability_ya_conocida_es_temporal_y_se_restaura_en_otra_llamada(
     assert weezing["active"] is False
     assert weezing["ability"] == "levitate", "vuelve a la base tras el switch-out"
     # `ability` PERSISTE en la memoria (a diferencia de types/moves): es la
-    # base para el PROXIMO override, no un registro de un solo uso.
-    assert memoria == {"weezing": {"ability": "levitate"}}
+    # base para el PROXIMO override, no un registro de un solo uso. El
+    # switch_in de Mandibuzz en esta segunda llamada tambien siembra su
+    # propio `canonical_types` (D41).
+    assert memoria == {
+        "weezing": {"ability": "levitate"},
+        "mandibuzz": {"canonical_types": ["DARK", "FLYING"]},
+    }
 
 
 def test_finding2_trace_real_copia_temporal_y_restaura_trace_como_base():
@@ -2861,7 +2888,7 @@ def test_meloetta_relic_song_revierte_tras_switch_out_con_snapshot_fresco():
     # tiene que sostenerse sola mientras el override sigue activo (el
     # snapshot fresco de abajo deliberadamente NO confirma Pirouette).
     snapshot3 = _snapshot(gen=6)
-    snapshot3["opponent"]["pokemon"] = [_meloetta_rival(["NORMAL", "PSYCHIC"], active=True)]
+    snapshot3["opponent"]["pokemon"] = [_meloetta_rival(["NORMAL", "FIGHTING"], active=True)]
     tras_intermedia = _proyectar([], snapshot3, persistent_state=memoria)
     assert _por_especie(tras_intermedia)["meloetta"]["types"] == ["NORMAL", "FIGHTING"], (
         "Pirouette tiene que sostenerse mientras el override sigue activo"
