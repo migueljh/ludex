@@ -228,6 +228,116 @@ def test_benchmark_rechaza_modelo_sin_ruta_antes_de_llamarlo(monkeypatch):
         )
 
 
+# --- L-01 (MON-14 R2): model-set usa la frontera unica de validacion -------
+
+
+class _FakeModelRepo:
+    """Doble del ModelRepository para model-set: replica la frontera
+    fail-closed (provider/model habilitados) y registra lo que se pide
+    fijar. `provider()`/`list_models()` existen solo para que una regresion
+    a la validacion vieja (existencia sin enabled) quede al descubierto: el
+    CLI llamaria `set_active` sobre un modelo disabled y el test se pone
+    rojo."""
+
+    def __init__(self, factory):
+        self.active = ("google", "gemini-2.5-flash")
+        self.enabled_models = {
+            ("google", "gemini-2.5-flash"): True,
+            ("google", "gemini-2.5-pro"): False,
+        }
+        self.enabled_providers = {"google": True, "off-provider": False}
+
+    async def validate_selection(self, provider, model):
+        from ludex_agent.db.model_repository import ModelSelectionError
+
+        if not self.enabled_providers.get(provider):
+            raise ModelSelectionError(
+                f"provider {provider!r} no existe o esta deshabilitado en la DB"
+            )
+        if not self.enabled_models.get((provider, model)):
+            raise ModelSelectionError(
+                f"model {model!r} no existe o esta deshabilitado para "
+                f"{provider!r} en la DB"
+            )
+
+    async def set_active(self, provider, model):
+        self.active = (provider, model)
+
+    async def provider(self, name):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            name=name, enabled=self.enabled_providers.get(name, False)
+        )
+
+    async def list_models(self, provider_name=None):
+        from types import SimpleNamespace
+
+        return [
+            SimpleNamespace(provider_name=p, model_id=m)
+            for (p, m) in self.enabled_models
+        ]
+
+
+def _invoke_model_set(monkeypatch, repo, *args):
+    from ludex_agent import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "ModelRepository", lambda factory: repo)
+    runner = CliRunner()
+    return runner.invoke(
+        app, ["model-set", "--provider", args[0], "--model", args[1]],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "SHOWDOWN_WS_URL": "ws://localhost:8100/showdown/websocket",
+        },
+    )
+
+
+def test_model_set_rechaza_modelo_disabled_sin_tocar_settings(monkeypatch):
+    """L-01: model-set no puede fijar un modelo deshabilitado; el valor
+    anterior de la seleccion queda intacto (set_active nunca se llama)."""
+    repo = _FakeModelRepo(None)
+    result = _invoke_model_set(monkeypatch, repo, "google", "gemini-2.5-pro")
+
+    assert result.exit_code != 0
+    assert "deshabilitado" in result.output
+    assert repo.active == ("google", "gemini-2.5-flash"), (
+        "el rechazo no puede alterar la seleccion anterior"
+    )
+
+
+def test_model_set_rechaza_provider_disabled(monkeypatch):
+    repo = _FakeModelRepo(None)
+    result = _invoke_model_set(monkeypatch, repo, "off-provider", "cualquiera")
+
+    assert result.exit_code != 0
+    assert "deshabilitado" in result.output
+    assert repo.active == ("google", "gemini-2.5-flash")
+
+
+def test_model_set_rechaza_provider_y_modelo_inexistentes(monkeypatch):
+    repo = _FakeModelRepo(None)
+
+    r1 = _invoke_model_set(monkeypatch, repo, "no-existe", "modelo-x")
+    assert r1.exit_code != 0
+    assert "no existe" in r1.output
+    assert repo.active == ("google", "gemini-2.5-flash")
+
+    r2 = _invoke_model_set(monkeypatch, repo, "google", "modelo-no-seedeado")
+    assert r2.exit_code != 0
+    assert "no existe" in r2.output
+    assert repo.active == ("google", "gemini-2.5-flash")
+
+
+def test_model_set_valido_fija_la_seleccion(monkeypatch):
+    repo = _FakeModelRepo(None)
+    result = _invoke_model_set(monkeypatch, repo, "google", "gemini-2.5-flash")
+
+    assert result.exit_code == 0
+    assert "activo=google/gemini-2.5-flash" in result.output
+    assert repo.active == ("google", "gemini-2.5-flash")
+
+
 def _record_valid_opening(player: LudexPlayer, tag: str) -> None:
     """Alimenta al recorder REAL del player con una apertura publica valida.
 

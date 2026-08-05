@@ -155,10 +155,18 @@ class Provider(Base):
 
 
 class Model(Base):
+    """F2-09 (MON-14): catalogo de modelos por provider. L-02 (R2): el ORM
+    espeja el DDL aprobado: FK a `providers.id` con `ON DELETE CASCADE` y
+    UNIQUE compuesto `(provider_id, model_id)` -- si una migracion los
+    cambiara, `tests/db/test_models.py` se pone rojo."""
+
     __tablename__ = "models"
+    __table_args__ = (
+        UniqueConstraint("provider_id", "model_id"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     provider_id: Mapped[int] = mapped_column(
-        ForeignKey("providers.id"), nullable=False
+        ForeignKey("providers.id", ondelete="CASCADE"), nullable=False
     )
     model_id: Mapped[str] = mapped_column(Text)
     label: Mapped[str] = mapped_column(Text)

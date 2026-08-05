@@ -23,7 +23,7 @@ from poke_env.player import (
 from .benchmark import BenchmarkDeadlineExceeded, BenchmarkResult, run_benchmark
 from .config import PROVIDER_CATALOG, load_settings
 from .db.context_repository import PostgresContextRepository
-from .db.model_repository import ModelRepository
+from .db.model_repository import ModelRepository, ModelSelectionError
 from .db.repository import BattleRepository
 from .db.session import make_engine, session_factory
 from .showdown.client import LudexPlayer, local_server_configuration
@@ -525,18 +525,13 @@ def model_set_command(
     repo = ModelRepository(session_factory(engine))
 
     async def run() -> None:
-        if await repo.provider(provider) is None:
-            raise typer.BadParameter(
-                f"provider {provider!r} no existe en la DB; correr `agent provider-init`"
-            )
-        if not any(
-            m.provider_name == provider and m.model_id == model
-            for m in await repo.list_models(provider)
-        ):
-            raise typer.BadParameter(
-                f"model {model!r} no existe para {provider!r}; "
-                "sincronizar el catalogo con `agent provider-init`"
-            )
+        # L-01 (R2): la frontera unica de validacion. Un provider o model
+        # inexistente o deshabilitado rechaza el comando ANTES de escribir
+        # nada en settings.
+        try:
+            await repo.validate_selection(provider, model)
+        except ModelSelectionError as exc:
+            raise typer.BadParameter(str(exc))
         await repo.set_active(provider, model)
         typer.echo(f"activo={provider}/{model}")
 

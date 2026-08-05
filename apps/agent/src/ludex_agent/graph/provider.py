@@ -19,6 +19,7 @@ from openai import APIConnectionError as OpenAIAPIConnectionError
 from pydantic import ValidationError
 
 from .. import config as _config
+from ..db.model_repository import ModelSelectionError
 
 logger = logging.getLogger(__name__)
 
@@ -856,6 +857,7 @@ class ProviderResolver:
 
     async def resolve(self) -> ResolvedProvider:
         selection = await self._repository.active_selection()
+        from_db = selection is not None
         if selection is None:
             selection = self._bootstrap
         if selection is None:
@@ -863,12 +865,26 @@ class ProviderResolver:
                 "no hay seleccion activa de modelo en la DB ni bootstrap de "
                 "configuracion"
             )
-        row = await self._repository.provider(selection.provider_name)
-        if row is None or not row.enabled:
-            raise ProviderSelectionError(
-                f"provider {selection.provider_name!r} no existe o esta "
-                "deshabilitado en la DB"
-            )
+        if from_db:
+            # L-01 (R2): fail-closed. La seleccion de la DB (settings o
+            # default) se valida contra la frontera unica antes de construir
+            # nada: un modelo inexistente o deshabilitado es un error, NUNCA
+            # un motivo para caer silenciosamente al bootstrap o al default.
+            # El bootstrap de env no se valida contra la DB: es el ultimo
+            # recurso y no depende de ella (la factory ya valida claves).
+            try:
+                row = await self._repository.validate_selection(
+                    selection.provider_name, selection.model_id
+                )
+            except ModelSelectionError as exc:
+                raise ProviderSelectionError(str(exc)) from exc
+        else:
+            row = await self._repository.provider(selection.provider_name)
+            if row is None or not row.enabled:
+                raise ProviderSelectionError(
+                    f"provider {selection.provider_name!r} no existe o esta "
+                    "deshabilitado en la DB"
+                )
         key = (selection.provider_name, selection.model_id)
         provider = self._instances.get(key)
         if provider is None:

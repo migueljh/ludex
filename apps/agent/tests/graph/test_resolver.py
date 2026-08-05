@@ -9,7 +9,11 @@ import time
 
 import pytest
 
-from ludex_agent.db.model_repository import ProviderModel, ProviderRow
+from ludex_agent.db.model_repository import (
+    ModelSelectionError,
+    ProviderModel,
+    ProviderRow,
+)
 from ludex_agent.graph.provider import (
     CompletionEnvelope,
     CompletionUsage,
@@ -48,20 +52,51 @@ class ScriptedProvider:
 
 
 class FakeModelRepository:
-    """La DB fake: la seleccion activa se puede cambiar entre invocaciones."""
+    """La DB fake: la seleccion activa (settings) se puede cambiar entre
+    invocaciones. L-01 (R2): `validate_selection` replica la frontera unica
+    fail-closed del repositorio real (provider+model habilitados)."""
 
-    def __init__(self, selection):
+    def __init__(self, selection, *, default=None, models=None, providers=None):
         self.selection = selection
+        self.default = default
+        self.models = models if models is not None else {
+            ("google", "modelo-a"): True,
+            ("google", "modelo-b"): True,
+        }
+        self.providers = providers if providers is not None else {"google": True}
         self.selection_calls = 0
         self.provider_calls = 0
+        self.validate_calls = 0
 
     async def active_selection(self):
         self.selection_calls += 1
-        return self.selection
+        if self.selection is not None:
+            return self.selection
+        return self.default
 
     async def provider(self, name):
         self.provider_calls += 1
-        return ProviderRow(name=name, base_url=None, api_key_env="GEMINI_API_KEY", enabled=True)
+        enabled = self.providers.get(name, False)
+        return ProviderRow(
+            name=name, base_url=None, api_key_env="GEMINI_API_KEY",
+            enabled=enabled,
+        )
+
+    async def validate_selection(self, provider_name, model_id):
+        self.validate_calls += 1
+        if self.providers.get(provider_name) is not True:
+            raise ModelSelectionError(
+                f"provider {provider_name!r} no existe o esta deshabilitado"
+            )
+        if self.models.get((provider_name, model_id)) is not True:
+            raise ModelSelectionError(
+                f"model {model_id!r} no existe o esta deshabilitado "
+                f"para {provider_name!r}"
+            )
+        return ProviderRow(
+            name=provider_name, base_url=None, api_key_env="GEMINI_API_KEY",
+            enabled=True,
+        )
 
 
 def _fake_factory(providers):
@@ -172,7 +207,9 @@ async def test_resolver_reusa_la_instancia_del_mismo_modelo():
 
 @pytest.mark.asyncio
 async def test_resolver_cae_al_bootstrap_sin_seleccion_en_db():
-    repo = FakeModelRepository(None)
+    repo = FakeModelRepository(
+        None, providers={"google": True, "kimi": True},
+    )
     resolver = ProviderResolver(
         repo, provider_factory=_fake_factory([]),
         metrics=DecisionMetrics(), environ={"GEMINI_API_KEY": "k"},
@@ -213,6 +250,132 @@ async def test_resolver_sin_claves_env_falla_sin_exponer_secretos():
 
     assert "GEMINI_API_KEY" in str(exc.value)
     assert secreto not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_settings_stale_hacia_modelo_inexistente_falla_sin_factory():
+    """L-01 (R2): una seleccion de settings que apunta a un modelo que no
+    existe en la DB lanza ProviderSelectionError. FAIL-CLOSED: no cae al
+    bootstrap ni al default, y provider_factory jamas se llama."""
+    repo = FakeModelRepository(ProviderModel("google", "modelo-no-existe"))
+    providers: list[ScriptedProvider] = []
+    resolver = ProviderResolver(
+        repo, provider_factory=_fake_factory(providers),
+        metrics=DecisionMetrics(), environ={"GEMINI_API_KEY": "k"},
+        bootstrap=ProviderModel("kimi", "kimi-k2.6"),
+    )
+
+    with pytest.raises(ProviderSelectionError, match="modelo-no-existe"):
+        await resolver.resolve()
+
+    # Canario: el proveedor nunca se construyo; si el resolver cayera al
+    # bootstrap, la factory habria corrido y este test seria verde sin
+    # ejercer el fail-closed.
+    assert len(providers) == 0, (
+        "la seleccion stale no puede construir provider alguno"
+    )
+    assert repo.validate_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_settings_hacia_modelo_disabled_falla_sin_factory():
+    """L-01 (R2): mismo fail-closed para un modelo deshabilitado en la DB:
+    la decision no se atribuye a un modelo que la DB deshabilito."""
+    repo = FakeModelRepository(
+        ProviderModel("google", "modelo-a"),
+        models={("google", "modelo-a"): False},
+    )
+    providers: list[ScriptedProvider] = []
+    resolver = ProviderResolver(
+        repo, provider_factory=_fake_factory(providers),
+        metrics=DecisionMetrics(), environ={"GEMINI_API_KEY": "k"},
+    )
+
+    with pytest.raises(ProviderSelectionError, match="deshabilitad"):
+        await resolver.resolve()
+
+    assert len(providers) == 0, (
+        "un modelo disabled no puede construir provider alguno"
+    )
+
+
+@pytest.mark.asyncio
+async def test_settings_valida_funciona():
+    """L-01 (R2): una seleccion de settings valida (provider y model
+    habilitados) resuelve normalmente, con la factory llamandose una vez."""
+    repo = FakeModelRepository(ProviderModel("google", "modelo-a"))
+    providers: list[ScriptedProvider] = []
+    resolver = ProviderResolver(
+        repo, provider_factory=_fake_factory(providers),
+        metrics=DecisionMetrics(), environ={"GEMINI_API_KEY": "k"},
+    )
+
+    resolved = await resolver.resolve()
+
+    assert resolved.provider_name == "google"
+    assert resolved.model_id == "modelo-a"
+    assert len(providers) == 1
+    assert repo.validate_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sin_settings_default_habilitado_funciona():
+    """L-01 (R2): sin fila en settings, el fallback al default habilitado
+    (provider y model enabled en la DB) sigue funcionando."""
+    repo = FakeModelRepository(
+        None, default=ProviderModel("google", "modelo-a")
+    )
+    providers: list[ScriptedProvider] = []
+    resolver = ProviderResolver(
+        repo, provider_factory=_fake_factory(providers),
+        metrics=DecisionMetrics(), environ={"GEMINI_API_KEY": "k"},
+    )
+
+    resolved = await resolver.resolve()
+
+    assert resolved.provider_name == "google"
+    assert resolved.model_id == "modelo-a"
+    assert len(providers) == 1
+    # El default viene de la DB: tambien pasa por la frontera.
+    assert repo.validate_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_disabled_sigue_fallando():
+    """L-01 (R2): un provider deshabilitado en la DB sigue lanzando
+    ProviderSelectionError sin construir provider."""
+    repo = FakeModelRepository(
+        ProviderModel("google", "modelo-a"), providers={"google": False},
+    )
+    providers: list[ScriptedProvider] = []
+    resolver = ProviderResolver(
+        repo, provider_factory=_fake_factory(providers),
+        metrics=DecisionMetrics(), environ={"GEMINI_API_KEY": "k"},
+    )
+
+    with pytest.raises(ProviderSelectionError, match="google"):
+        await resolver.resolve()
+
+    assert len(providers) == 0
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_no_se_valida_contra_la_db():
+    """L-01 (R2): el bootstrap de env es el ultimo recurso y no depende de
+    la DB: no pasa por la frontera (la factory valida claves y rutas)."""
+    repo = FakeModelRepository(
+        None, providers={"google": True, "kimi": True}, models={},
+    )
+    resolver = ProviderResolver(
+        repo, provider_factory=_fake_factory([]),
+        metrics=DecisionMetrics(), environ={"GEMINI_API_KEY": "k"},
+        bootstrap=ProviderModel("kimi", "kimi-k2.6"),
+    )
+
+    resolved = await resolver.resolve()
+
+    assert resolved.provider_name == "kimi"
+    assert repo.validate_calls == 0
 
 
 @pytest.mark.asyncio

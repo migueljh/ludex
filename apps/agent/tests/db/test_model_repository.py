@@ -7,7 +7,10 @@ import pytest
 from sqlalchemy import text
 
 from ludex_agent.config import load_settings
-from ludex_agent.db.model_repository import ModelRepository
+from ludex_agent.db.model_repository import (
+    ModelRepository,
+    ModelSelectionError,
+)
 from ludex_agent.db.session import make_engine, session_factory
 
 pytestmark = pytest.mark.skipif(
@@ -29,11 +32,17 @@ async def repo():
         await s.execute(text(
             "INSERT INTO providers (name, base_url, api_key_env, enabled) "
             "VALUES ('google', NULL, 'GEMINI_API_KEY', true), "
-            "('kimi', NULL, 'KIMI_API_KEY', true)"
+            "('kimi', NULL, 'KIMI_API_KEY', true), "
+            "('off-provider', NULL, 'OFF_KEY', false)"
         ))
         await s.execute(text(
             "INSERT INTO models (provider_id, model_id, label, is_default, enabled) "
             "SELECT p.id, 'gemini-2.5-flash', 'Gemini 2.5 Flash', true, true "
+            "FROM providers p WHERE p.name = 'google'"
+        ))
+        await s.execute(text(
+            "INSERT INTO models (provider_id, model_id, label, is_default, enabled) "
+            "SELECT p.id, 'gemini-2.5-pro', 'Gemini 2.5 Pro', false, false "
             "FROM providers p WHERE p.name = 'google'"
         ))
         await s.execute(text(
@@ -96,3 +105,52 @@ async def test_provider_row_devuelve_nombre_env_no_valor(repo):
 
 async def test_provider_inexistente_devuelve_none(repo):
     assert await repo.provider("no-existe") is None
+
+
+# --- L-01 (MON-14 R2): frontera unica de consulta/validacion de la
+# seleccion activa ---------------------------------------------------------
+
+
+async def test_validate_selection_acepta_seleccion_valida(repo):
+    row = await repo.validate_selection("google", "gemini-2.5-flash")
+
+    assert row.name == "google"
+    assert row.api_key_env == "GEMINI_API_KEY"
+    assert row.enabled is True
+
+
+async def test_validate_selection_rechaza_provider_inexistente(repo):
+    with pytest.raises(ModelSelectionError, match="no existe"):
+        await repo.validate_selection("no-existe", "cualquier-modelo")
+
+
+async def test_validate_selection_rechaza_provider_disabled(repo):
+    with pytest.raises(ModelSelectionError, match="deshabilitado"):
+        await repo.validate_selection("off-provider", "cualquier-modelo")
+
+
+async def test_validate_selection_rechaza_modelo_inexistente(repo):
+    with pytest.raises(ModelSelectionError, match="no existe"):
+        await repo.validate_selection("google", "modelo-no-seedeado")
+
+
+async def test_validate_selection_rechaza_modelo_disabled(repo):
+    """La frontera no alcanza con que el provider este enabled: el model
+    deshabilitado en la DB se rechaza igual (la decision no se atribuye a un
+    modelo que la DB deshabilito)."""
+    with pytest.raises(ModelSelectionError, match="deshabilitado"):
+        await repo.validate_selection("google", "gemini-2.5-pro")
+
+
+async def test_validate_selection_no_altera_settings(repo):
+    """La frontera es de solo lectura: un rechazo deja el valor anterior de
+    settings intacto."""
+    await repo.set_active("google", "gemini-2.5-flash")
+
+    with pytest.raises(ModelSelectionError):
+        await repo.validate_selection("google", "gemini-2.5-pro")
+
+    selection = await repo.active_selection()
+    assert (selection.provider_name, selection.model_id) == (
+        "google", "gemini-2.5-flash",
+    )

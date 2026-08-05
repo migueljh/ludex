@@ -28,6 +28,12 @@ class ProviderRow:
     enabled: bool
 
 
+class ModelSelectionError(RuntimeError):
+    """L-01 (MON-14 R2): la seleccion apunta a un provider o model inexistente
+    o deshabilitado en la DB. Fail-closed: el llamador nunca cae
+    silenciosamente a otro candidato."""
+
+
 _ACTIVE_MODEL_KEY = "active_model"
 
 
@@ -66,6 +72,51 @@ class ModelRepository:
         if row is None:
             return None
         return ProviderRow(row[0], row[1], row[2], row[3])
+
+    async def validate_selection(self, provider_name: str, model_id: str) -> ProviderRow:
+        """Frontera UNICA de consulta/validacion de la seleccion activa (L-01).
+
+        Comprueba en UNA consulta que el provider existe y esta `enabled` y
+        que el model existe para ESE provider y esta `enabled`. Cualquier
+        violacion lanza `ModelSelectionError` (fail-closed: nunca se
+        reemplaza la seleccion por otro candidato). Devuelve la fila del
+        provider habilitado para que el resolver no haga una segunda
+        consulta.
+
+        La usan `model-set` (rechaza sin tocar settings) y
+        `ProviderResolver.resolve` (la seleccion de la DB se valida antes de
+        construir el provider; el bootstrap de env no pasa por aca, es el
+        ultimo recurso y no depende de la DB).
+        """
+        async with self.factory() as s:
+            row = (await s.execute(text("""
+                SELECT p.name, p.base_url, p.api_key_env, p.enabled,
+                       (m.id IS NOT NULL) AS model_exists,
+                       m.enabled AS model_enabled
+                FROM providers p
+                LEFT JOIN models m
+                  ON m.provider_id = p.id AND m.model_id = :m
+                WHERE p.name = :p
+            """), {"p": provider_name, "m": model_id})).first()
+        if row is None:
+            raise ModelSelectionError(
+                f"provider {provider_name!r} no existe en la DB"
+            )
+        name, base_url, api_key_env, provider_enabled, model_exists, model_enabled = row
+        if not provider_enabled:
+            raise ModelSelectionError(
+                f"provider {provider_name!r} esta deshabilitado en la DB"
+            )
+        if not model_exists:
+            raise ModelSelectionError(
+                f"model {model_id!r} no existe para {provider_name!r} en la DB"
+            )
+        if not model_enabled:
+            raise ModelSelectionError(
+                f"model {model_id!r} esta deshabilitado para "
+                f"{provider_name!r} en la DB"
+            )
+        return ProviderRow(name, base_url, api_key_env, True)
 
     async def set_active(self, provider_name: str, model_id: str) -> None:
         """Fija la seleccion activa (sin secretos: solo nombres)."""
