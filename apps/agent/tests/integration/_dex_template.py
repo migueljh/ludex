@@ -1,5 +1,5 @@
 """Plantilla Postgres sanitizada para tests LIVE (`test_play.py`,
-`test_graph_play.py`) -- MON-11 R3.
+`test_graph_play.py`) -- MON-11 R3, rediseñada R4 (BLOCKER 2).
 
 Estos tests juegan batallas REALES contra el Showdown local y persisten via
 `PostgresContextRepository`/`BattleRepository`, que necesitan el dex
@@ -13,6 +13,15 @@ excluyendo. Este modulo arma una plantilla PROPIA, con el DDL de
 tablas de referencia del dex, cargadas mediante una consulta a la base
 compartida forzada a `default_transaction_read_only=on`.
 
+`abilities` y `type_chart` (tablas separadas en `db/schema.sql`, distintas
+de la columna JSONB `pokemon.abilities` que SI se copia) NO se copian: no
+hay ningun caller real en `apps/agent/src` que las consulte (verificado con
+`grep -rl "FROM abilities|FROM type_chart" apps/agent/src/` -- vacio). Lo
+mismo para `seed_runs`/`usage_stats` (metadata de `packages/seed`, ajena a
+este codigo). Si algun caller real llega a necesitarlas, agregarlas a
+`_DEX_TABLES` invalida el fingerprint automaticamente (ver abajo) y la
+proxima corrida reconstruye.
+
 Nunca `CREATE DATABASE ... TEMPLATE ludex`. Nunca `pg_dump`/copia completa
 de la compartida (el cliente `pg_dump` instalado, 14.20, ademas rechaza
 conectar a un servidor 16.x -- se usa `asyncpg` puro, sin ese problema de
@@ -20,19 +29,58 @@ version). Cada corrida de test clona la plantilla sanitizada con
 `CREATE DATABASE ... TEMPLATE`, que en Postgres es una copia de archivos a
 nivel de servidor, no una re-insercion fila por fila -- rapido incluso con
 los ~130 000 renglones de `learnsets`.
+
+## R4 (BLOCKER 2) -- por que "si existe, return" no alcanzaba
+
+Latwan reprodujo `PARTIAL_TEMPLATE_ACCEPTED returned=True
+generations_table=None`: `ensure_dex_template` (R3) sólo miraba si una base
+llamada `ludex_dex_template` existía en `pg_database` -- ni el DDL, ni el
+contenido, ni siquiera que las tablas existieran. Una base vacía (creada a
+mano, o por una corrida anterior interrumpida ANTES de aplicar el schema)
+se aceptaba igual, y cada clon posterior heredaba esa base rota en
+silencio.
+
+El rediseño reemplaza "existe → aceptar" por tres cambios:
+
+1. **El nombre de la plantilla se deriva de un fingerprint** (hash del
+   contenido de `db/schema.sql` + un fingerprint barato pero suficiente del
+   dex fuente -- conteo y hash de claves por tabla, calculado con SQL en el
+   servidor, sin traer 130k filas sólo para hashear). Si el schema o el dex
+   cambian, el fingerprint cambia, el nombre cambia, y el nombre viejo
+   simplemente deja de buscarse -- nunca se reutiliza en silencio.
+2. **Publicación atómica vía staging.** Se construye TODO (DDL + copia del
+   dex) bajo un nombre de staging único (`ludex_dex_staging_<uuid>`, nunca
+   reutilizado entre corridas) y sólo se "publica" -- `ALTER DATABASE ...
+   RENAME TO <nombre-fingerprint>` -- si `_validate_template` aprueba. El
+   nombre fingerprintado, si existe, SIEMPRE es una plantilla completa y
+   validada: no hay ningún camino que lo cree sin pasar por la validación.
+3. **Incluso si el nombre fingerprintado ya existe, se re-valida antes de
+   aceptarlo** (no sólo se confía en que el nombre esté "ocupado" -- eso es
+   exactamente lo que reprodujo Latwan). Si falla la validación, la función
+   revienta ruidoso en vez de reconstruir automáticamente encima de algo
+   que otra corrida concurrente podría estar usando ahora mismo.
 """
 
 from __future__ import annotations
 
+import hashlib
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 from uuid import uuid4
 
 import asyncpg
 
-from _disposable import SharedDatabaseGuardError, _SCHEMA_PATH, _with_database, assert_disposable
+from _disposable import (
+    SharedDatabaseGuardError,
+    _FORBIDDEN_NAMES,
+    _SCHEMA_PATH,
+    _database_name,
+    _with_database,
+    assert_disposable,
+)
 
-TEMPLATE_NAME = "ludex_dex_template"
+_TEMPLATE_PREFIX = "ludex_dex_template_"
+_STAGING_PREFIX = "ludex_dex_staging_"
 
 _DEX_TABLES: dict[str, list[str]] = {
     "generations": ["id", "gen_number", "label"],
@@ -52,7 +100,60 @@ _DEX_TABLES: dict[str, list[str]] = {
 """Unicas tablas que este modulo copia desde la compartida. Nunca
 `battles`/`battle_turns`/`trajectories`/`trajectory_steps`/`providers`/
 `models`/`settings` -- esas quedan vacias en la plantilla por construccion:
-`db/schema.sql` las crea, y este modulo jamas les inserta una fila."""
+`db/schema.sql` las crea, y este modulo jamas les inserta una fila. Tampoco
+`abilities`/`type_chart`/`seed_runs`/`usage_stats` -- ver el docstring del
+modulo, sin caller real que las necesite hoy."""
+
+_MUTABLE_TABLES = (
+    "battles", "battle_turns", "trajectories", "trajectory_steps",
+    "providers", "models", "settings",
+)
+"""Deben quedar en CERO filas en toda plantilla válida -- verificado por
+`_validate_template`, no sólo asumido."""
+
+_PK_EXPR = {
+    "generations": "id::text",
+    "pokemon": "id::text",
+    "moves": "id::text",
+    "items": "id::text",
+    "learnsets": "(pokemon_id::text || ':' || move_id::text)",
+}
+
+
+async def _table_signature(conn: asyncpg.Connection, table: str) -> str:
+    """Conteo + hash de claves, calculado en el SERVIDOR (nunca trae las
+    filas al cliente sólo para fingerprint) -- "suficiente" en el sentido
+    de detectar altas/bajas/reordenamientos sin el costo de un hash de
+    contenido completo."""
+    row = await conn.fetchrow(
+        f"SELECT count(*) AS n, "
+        f"md5(coalesce(string_agg({_PK_EXPR[table]}, ',' ORDER BY {_PK_EXPR[table]}), '')) AS h "
+        f"FROM {table}",
+    )
+    return f"{table}:{row['n']}:{row['h']}"
+
+
+async def _dex_fingerprint(source: asyncpg.Connection) -> str:
+    parts = [await _table_signature(source, table) for table in _DEX_TABLES]
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+
+def _schema_fingerprint() -> str:
+    return hashlib.sha256(_SCHEMA_PATH.read_bytes()).hexdigest()
+
+
+async def _template_name(source: asyncpg.Connection) -> str:
+    schema_fp = _schema_fingerprint()
+    dex_fp = await _dex_fingerprint(source)
+    combined = hashlib.sha256(f"{schema_fp}:{dex_fp}".encode()).hexdigest()
+    # Nombre de base Postgres: identificador acotado, el hash completo sobra.
+    return f"{_TEMPLATE_PREFIX}{combined[:24]}"
+
+
+def _assert_not_reserved(url: str) -> None:
+    name = _database_name(url)
+    if name in _FORBIDDEN_NAMES:
+        raise SharedDatabaseGuardError(f"'{name}' no puede usarse -- nombre reservado.")
 
 
 async def _load_dex_table(source: asyncpg.Connection, dest: asyncpg.Connection, table: str) -> int:
@@ -66,72 +167,201 @@ async def _load_dex_table(source: asyncpg.Connection, dest: asyncpg.Connection, 
     return len(rows)
 
 
-async def ensure_dex_template(base_url: str, shared_url: str) -> str:
-    """Garantiza que `ludex_dex_template` existe, con el DDL completo y SOLO
-    las tablas de `_DEX_TABLES` cargadas desde `shared_url` (forzada
-    read-only). Idempotente: si ya existe, no la reconstruye -- la
-    plantilla es de solo lectura para los clones, nunca cambia entre
-    corridas de la misma sesion de Postgres."""
-    template_url = _with_database(base_url, TEMPLATE_NAME)
-    assert_disposable_template(template_url)
-    maintenance_url = _with_database(base_url, "postgres")
-
-    maintenance = await asyncpg.connect(maintenance_url)
-    try:
-        exists = await maintenance.fetchval(
-            "SELECT 1 FROM pg_database WHERE datname = $1", TEMPLATE_NAME,
+async def _generation_counts(conn: asyncpg.Connection, table: str) -> dict[int, int]:
+    if table == "generations":
+        rows = await conn.fetch("SELECT gen_number, count(*) AS n FROM generations GROUP BY gen_number")
+    elif table == "learnsets":
+        rows = await conn.fetch(
+            "SELECT g.gen_number, count(*) AS n FROM learnsets l "
+            "JOIN pokemon p ON p.id = l.pokemon_id "
+            "JOIN generations g ON g.id = p.gen_id "
+            "GROUP BY g.gen_number",
         )
-        if exists:
-            return TEMPLATE_NAME
-        await maintenance.execute(f'CREATE DATABASE "{TEMPLATE_NAME}"')
-    finally:
-        await maintenance.close()
+    else:
+        rows = await conn.fetch(
+            f"SELECT g.gen_number, count(*) AS n FROM {table} x "
+            f"JOIN generations g ON g.id = x.gen_id GROUP BY g.gen_number",
+        )
+    return {row["gen_number"]: row["n"] for row in rows}
 
-    schema_conn = await asyncpg.connect(template_url)
+
+async def _validate_template(template_url: str, source: asyncpg.Connection) -> tuple[bool, str]:
+    """Devuelve `(valido, motivo)`. Nunca se confía en que el nombre exista
+    -- esto es lo que reemplaza el `if exists: return` que Latwan
+    reprodujo. Corre SIEMPRE, tanto sobre una plantilla recién construida
+    en staging como sobre una ya publicada que se está por reutilizar."""
     try:
-        await schema_conn.execute(_SCHEMA_PATH.read_text())
-    finally:
-        await schema_conn.close()
+        conn = await asyncpg.connect(template_url)
+    except Exception as exc:
+        return False, f"no se pudo conectar: {exc}"
+    try:
+        expected_tables = set(_DEX_TABLES) | set(_MUTABLE_TABLES)
+        existing = {
+            row["table_name"]
+            for row in await conn.fetch(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name = ANY($1::text[])",
+                list(expected_tables),
+            )
+        }
+        missing = expected_tables - existing
+        if missing:
+            return False, f"faltan tablas: {sorted(missing)}"
 
-    # Conexion FORZADA read-only contra la compartida: es la unica fuente
-    # admitida para el dex, y esta funcion NUNCA le ejecuta nada mas que
-    # los SELECT de `_load_dex_table`.
+        for table in _MUTABLE_TABLES:
+            n = await conn.fetchval(f"SELECT count(*) FROM {table}")
+            if n != 0:
+                return False, f"{table} tiene {n} filas, debería estar vacía"
+
+        for table in _DEX_TABLES:
+            source_counts = await _generation_counts(source, table)
+            dest_counts = await _generation_counts(conn, table)
+            if source_counts != dest_counts:
+                return False, (
+                    f"{table}: conteos por generación no coinciden "
+                    f"(fuente={source_counts}, destino={dest_counts})"
+                )
+
+        orphan_checks = {
+            "learnsets.pokemon_id -> pokemon.id": (
+                "SELECT count(*) FROM learnsets l "
+                "WHERE NOT EXISTS (SELECT 1 FROM pokemon p WHERE p.id = l.pokemon_id)"
+            ),
+            "learnsets.move_id -> moves.id": (
+                "SELECT count(*) FROM learnsets l "
+                "WHERE NOT EXISTS (SELECT 1 FROM moves m WHERE m.id = l.move_id)"
+            ),
+            "pokemon.gen_id -> generations.id": (
+                "SELECT count(*) FROM pokemon p "
+                "WHERE NOT EXISTS (SELECT 1 FROM generations g WHERE g.id = p.gen_id)"
+            ),
+            "moves.gen_id -> generations.id": (
+                "SELECT count(*) FROM moves m "
+                "WHERE NOT EXISTS (SELECT 1 FROM generations g WHERE g.id = m.gen_id)"
+            ),
+            "items.gen_id -> generations.id": (
+                "SELECT count(*) FROM items i "
+                "WHERE NOT EXISTS (SELECT 1 FROM generations g WHERE g.id = i.gen_id)"
+            ),
+        }
+        for label, query in orphan_checks.items():
+            orphans = await conn.fetchval(query)
+            if orphans != 0:
+                return False, f"integridad referencial rota: {label} ({orphans} huérfanas)"
+
+        return True, "ok"
+    finally:
+        await conn.close()
+
+
+async def ensure_dex_template(base_url: str, shared_url: str) -> str:
+    """Garantiza una plantilla del dex válida y devuelve su nombre.
+
+    El nombre se deriva de un fingerprint del schema + el dex fuente: si
+    cambia cualquiera de los dos, el nombre cambia y una plantilla vieja
+    nunca se reutiliza en silencio. Si el nombre fingerprintado ya existe,
+    se RE-VALIDA antes de aceptarlo -- nunca se confía en la mera
+    existencia. Si no existe, se construye en un staging de nombre único,
+    se valida, y sólo entonces se publica con un `RENAME` atómico.
+    """
     source = await asyncpg.connect(
         shared_url, server_settings={"default_transaction_read_only": "on"},
     )
-    dest = await asyncpg.connect(template_url)
     try:
-        for table in _DEX_TABLES:
-            await _load_dex_table(source, dest, table)
+        template_name = await _template_name(source)
+        template_url = _with_database(base_url, template_name)
+        _assert_not_reserved(template_url)
+        maintenance_url = _with_database(base_url, "postgres")
+
+        maintenance = await asyncpg.connect(maintenance_url)
+        try:
+            exists = await maintenance.fetchval(
+                "SELECT 1 FROM pg_database WHERE datname = $1", template_name,
+            )
+        finally:
+            await maintenance.close()
+
+        if exists:
+            valid, reason = await _validate_template(template_url, source)
+            if valid:
+                return template_name
+            raise RuntimeError(
+                f"'{template_name}' existe pero no pasa la validación ({reason}). "
+                "No se reconstruye automáticamente encima de un nombre que otra "
+                "corrida concurrente podría estar usando ahora mismo -- requiere "
+                "intervención manual (confirmar que está huérfana y DROP DATABASE)."
+            )
+
+        staging_name = f"{_STAGING_PREFIX}{uuid4().hex[:16]}"
+        staging_url = _with_database(base_url, staging_name)
+        _assert_not_reserved(staging_url)
+
+        maintenance = await asyncpg.connect(maintenance_url)
+        try:
+            await maintenance.execute(f'CREATE DATABASE "{staging_name}"')
+        finally:
+            await maintenance.close()
+
+        try:
+            schema_conn = await asyncpg.connect(staging_url)
+            try:
+                await schema_conn.execute(_SCHEMA_PATH.read_text())
+            finally:
+                await schema_conn.close()
+
+            dest = await asyncpg.connect(staging_url)
+            try:
+                for table in _DEX_TABLES:
+                    await _load_dex_table(source, dest, table)
+            finally:
+                await dest.close()
+
+            valid, reason = await _validate_template(staging_url, source)
+            if not valid:
+                raise RuntimeError(
+                    f"la plantilla recién construida en '{staging_name}' no pasó "
+                    f"la validación: {reason}",
+                )
+
+            maintenance = await asyncpg.connect(maintenance_url)
+            try:
+                try:
+                    await maintenance.execute(
+                        f'ALTER DATABASE "{staging_name}" RENAME TO "{template_name}"',
+                    )
+                except asyncpg.exceptions.DuplicateDatabaseError:
+                    # Carrera: otro proceso publicó el MISMO fingerprint
+                    # primero. No es un fallo -- el trabajo ya está hecho;
+                    # sólo hace falta limpiar nuestro propio staging (nunca
+                    # el que ganó la carrera).
+                    await maintenance.execute(f'DROP DATABASE IF EXISTS "{staging_name}"')
+            finally:
+                await maintenance.close()
+        except BaseException:
+            # Cualquier falla (excepción o cancelación cooperativa) ANTES de
+            # publicar: se borra ÚNICAMENTE el staging de nombre exacto y
+            # único de ESTA corrida. Nunca `ludex`, nunca el nombre
+            # fingerprintado, nunca otro staging.
+            maintenance = await asyncpg.connect(maintenance_url)
+            try:
+                await maintenance.execute(f'DROP DATABASE IF EXISTS "{staging_name}" WITH (FORCE)')
+            finally:
+                await maintenance.close()
+            raise
+
+        return template_name
     finally:
         await source.close()
-        await dest.close()
-
-    return TEMPLATE_NAME
-
-
-def assert_disposable_template(url: str) -> None:
-    """La plantilla NO usa el prefijo `ludex_test_` (no es descartable por
-    corrida, es persistente entre corridas) pero tampoco puede ser `ludex`
-    ni ningun nombre reservado -- reusa la misma lista negra que
-    `assert_disposable`, sin exigir el prefijo de un clon efimero."""
-    from _disposable import _FORBIDDEN_NAMES, _database_name
-
-    name = _database_name(url)
-    if name in _FORBIDDEN_NAMES:
-        raise SharedDatabaseGuardError(
-            f"'{name}' no puede ser la plantilla del dex -- nombre reservado.",
-        )
 
 
 @asynccontextmanager
 async def disposable_dex_clone(base_url: str, shared_url: str) -> AsyncIterator[str]:
-    """Clona `ludex_dex_template` (construyéndola primero si hace falta) en
-    una base nueva `ludex_test_<uuid>`, la entrega, y la dropea en un
-    `finally` alrededor del `yield` -- mismo alcance que `disposable_database`
-    en `_disposable.py`: cubre salida normal, excepción, y cancelación
-    cooperativa; nunca un `SIGKILL`."""
-    await ensure_dex_template(base_url, shared_url)
+    """Clona la plantilla del dex válida (construyéndola primero si hace
+    falta) en una base nueva `ludex_test_<uuid>`, la entrega, y la dropea
+    en un `finally` alrededor del `yield` -- mismo alcance que
+    `disposable_database` en `_disposable.py`: cubre salida normal,
+    excepción, y cancelación cooperativa; nunca un `SIGKILL`."""
+    template_name = await ensure_dex_template(base_url, shared_url)
 
     name = f"ludex_test_{uuid4().hex[:16]}"
     clone_url = _with_database(base_url, name)
@@ -141,7 +371,7 @@ async def disposable_dex_clone(base_url: str, shared_url: str) -> AsyncIterator[
     maintenance = await asyncpg.connect(maintenance_url)
     try:
         await maintenance.execute(
-            f'CREATE DATABASE "{name}" WITH TEMPLATE "{TEMPLATE_NAME}"',
+            f'CREATE DATABASE "{name}" WITH TEMPLATE "{template_name}"',
         )
     finally:
         await maintenance.close()
