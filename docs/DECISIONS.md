@@ -2000,6 +2000,57 @@ cuando una mascara los exponga (hoy la rechaza). Migración
 `20260803000001_trajectory_decision_metadata.sql` verificada up/down en una
 DB descartable; la DB compartida no fue migrada.
 
+## D39 — la selección de provider/model se resuelve por decisión; la DB gobierna y el env solo bootstrap (F2-09/MON-14)
+
+**Contexto.** El switch de modelos del plan ("cambiar el modelo desde la UI, incluso entre turnos") no existía: el provider se inyectaba al compilar el grafo y no se podía cambiar sin recompilar. El plan define `providers`/`models`/`settings` desde el principio; nada de eso estaba en el esquema.
+
+**Decisión.** Tres tablas nuevas (`providers`, `models`, `settings`; migración `20260804000001`): `providers` guarda `name`, `base_url` opcional, `api_key_env` (el NOMBRE de la variable de entorno, NUNCA el valor — las claves no existen en la DB, en logs ni en snapshots) y `enabled`; `models` referencia al provider con `model_id`, `label`, `is_default`, `enabled`; `settings` es key/value jsonb con la selección activa (`active_model` = `{"provider": ..., "model": ...}`, sin secretos).
+
+**Resolución POR DECISIÓN, no por compilación ni por arranque de batalla.** El grafo gana el nodo `resolve_provider` al inicio (`START → resolve_provider → parse_state → retrieve_context → calc_damage → decide → END`): cada invocación consulta la selección activa en la DB (`ModelRepository.active_selection`, con fallback al modelo default habilitado y, si la DB está vacía, al bootstrap de env `LUDEX_PROVIDER`/`LUDEX_MODEL`). Cambiar el modelo activo entre dos invocaciones del mismo grafo surte efecto sin recompilar ni reiniciar la batalla (test bloqueante: `test_el_mismo_grafo_cambia_de_modelo_entre_invocaciones`; la mutación que cachea la selección al arranque lo pone rojo).
+
+**Instancias cacheadas por `(provider, model)`, selección nunca cacheada.** `ProviderResolver` reutiliza la INSTANCIA del provider para el mismo par: el cooldown de claves (D30) y los reintentos de infraestructura viven en la instancia y sobreviven entre turnos del mismo modelo. La selección activa se consulta en cada `resolve()`. El envelope inmutable de MON-13 (D38) sigue siendo la única vía de metadata efectiva: la selección resuelta por turno llega al `CompletionEnvelope` y de ahí a la metadata persistida de `trajectory_steps`.
+
+**Fail-closed de selecciones stale/disabled (R2/L-01).** `ModelRepository.validate_selection` es la ÚNICA frontera de consulta/validación de la selección activa: comprueba en una consulta que el provider existe y está `enabled` y que el model existe para ESE provider y está `enabled`; cualquier violación lanza `ModelSelectionError`. La usan `agent model-set` (rechaza sin tocar settings) y `ProviderResolver.resolve`: una selección de la DB (settings o default) que apunta a un modelo inexistente o deshabilitado lanza `ProviderSelectionError` y NUNCA cae silenciosamente al bootstrap ni al default — la decisión no se atribuye a un modelo que la DB deshabilitó, y `provider_factory` no se invoca (canarios en tests). El bootstrap de env no pasa por la frontera: es el último recurso, no depende de la DB, y la factory ya valida claves/rutas. El fallback de `active_selection` sin fila en settings sigue exigiendo provider y model habilitados (mismo query de default).
+
+**Benchmark pinneado y auditado.** El benchmark fija provider/model al inicio (D28) y usa `PinnedResolver(..., enforce_pin=True)`: un auditor envuelve el provider y verifica que cada envelope efectivo coincida con el pin; cualquier mezcla lanza `ProviderMixError` y aborta la corrida. Env bootstrap: el benchmark NO consulta la DB.
+
+**Adapter de ejecución explícito y cableado real.** `execute_action` en
+`graph/execute.py` (módulo PURO, sin poke-env) traduce el `action` del grafo
+al `BattleOrder` del mapa capturado. NO es un nodo LangGraph y no puede
+serlo: el mapa accion→`BattleOrder` se captura síncrono antes del primer
+await (D31/D22 — la disciplina que garantiza `action_taken in
+legal_actions` por construcción) y poke-env exige el `BattleOrder` como
+retorno de `choose_move`; el grafo corre después de awaits. La
+correspondencia grafo→poke-env queda cerrada por el adapter fuera del
+grafo: `run_graph` en `showdown/client.py` llama `execute_action(action,
+action_orders)` sobre el resultado del grafo y convierte `None` (fuera de
+la máscara capturada) en `RuntimeError`. El cableado quedó estacionado
+durante la ventana en que `client.py` era territorio de MON-18 y se
+completó en la integración final (MON-18 liberado, ver D40): la
+equivalencia end-to-end se prueba en `test_el_caller_ejecuta_despues_de_
+decide_en_orden` (orden `resolve_provider → parse_state →
+retrieve_context → calc_damage → decide → execute`); el test que rompe el
+cableado (quitar la llamada a `execute_action` de `run_graph`) se pone en
+rojo y se restaura.
+
+**Metadata por decisión desde el envelope del grafo.** Las 11 claves de
+metadata de la decisión (`rationale`, `confidence`, `alternatives`,
+`target`, `provider`, `model`, `decision_latency_ms`, `input_tokens`,
+`output_tokens`, `cached_input_tokens`, `reasoning_tokens`) llegan al
+`step` canónico SOLO desde el resultado de `decide` (que sale del
+`CompletionEnvelope` inmutable de D38, nunca de estado compartido
+`last_*`), en los DOS caminos: éxito LLM y fallback determinista usan la
+MISMA frontera (`run_graph` copia el resultado del grafo al step; la ruta
+random queda NULL). El test que reutiliza metadata de una decisión
+anterior (patrón `last_completion_info` de D38) cruza las 11 claves entre
+dos decisiones del mismo tag y se pone en rojo.
+
+**Catálogo OpenCode Zen no hardcodeado.** `agent provider-init` puebla `providers` desde el catálogo de config (bootstrap) y, para open_code_zen con clave y base URL presentes, sincroniza `models` resolviendo el endpoint `/models` (shape OpenAI-compatible asumido, `{"data": [{"id": ...}]}`; un shape inválido falla ruidoso — límite documentado: se verificó el formato del gateway contra el contrato OpenAI-compatible, no contra una key real en esta rebanada). `agent model-set` fija la selección activa. Sin PATCH endpoint ni UI (fase 3/4).
+
+**Excepción de cliente documentada.** No se usa `init_chat_model` de LangChain: el contrato real necesita opciones por proveedor (timeout, `thinking`/`max_tokens`, structured output) que esa API no expone sin ramas; se conservan los clientes especializados (`_LangChainBackend` por kind) construidos por `default_provider_factory` desde la fila de la DB.
+
+**Alcance y límites.** El camino LLM vivo de esta fase es el benchmark (pinneado); el resolver por turno queda probado a nivel workflow/caller y listo para fase 3 (HITL), donde el grafo jugará batallas largas con cambio de modelo entre turnos. `ProviderChain` queda como API para el caso interactivo multi-proveedor (hoy el benchmark la usa con un solo provider). D37 (MON-18) y D38 (MON-13) se conservan íntegras.
+
 ## D40 — el item del rival vive en `persistent_state`; el auditor reevalúa el dex en cada switch-in (MON-18 R3)
 
 **Contexto.** El ROOT-CAUSE CHECKPOINT R3 confirmó, en vivo

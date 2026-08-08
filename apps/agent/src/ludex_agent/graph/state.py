@@ -30,6 +30,9 @@ class GraphState(TypedDict, total=False):
     output_tokens: int | None
     cached_input_tokens: int | None
     reasoning_tokens: int | None
+    # F2-09 (MON-14): la seleccion activa resuelta por decision. Vive solo en
+    # memoria (sin checkpointer en esta fase): el provider no es serializable.
+    resolved_provider: Any
     turn_id: str
     deadline: float
 

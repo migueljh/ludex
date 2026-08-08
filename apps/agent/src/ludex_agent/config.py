@@ -35,6 +35,11 @@ _PROVIDERS: dict[str, tuple[str, str | None, str | None]] = {
     "openai": ("OPENAI_API_KEY", None, None),
 }
 
+# F2-09 (MON-14): catalogo publico (nombre -> (env var principal, pool de
+# env vars, env var de base URL)). Es el bootstrap de la DB: `provider init`
+# puebla `providers` desde aca con el NOMBRE de la env var, nunca el valor.
+PROVIDER_CATALOG = dict(_PROVIDERS)
+
 
 def _to_asyncpg(url: str) -> str:
     """dbmate y el seed usan `postgres://...?sslmode=disable`.

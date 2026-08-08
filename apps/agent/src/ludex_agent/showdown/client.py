@@ -27,6 +27,7 @@ from poke_env.player import RandomPlayer
 
 from ..state.actions import action_from_order, legal_actions
 from ..state.serializer import serialize_battle
+from ..graph.execute import execute_action
 from .protocol import (
     CURRENT_FRAME_SEQ,
     ProjectionTimeoutError,
@@ -1323,7 +1324,12 @@ class LudexPlayer(RandomPlayer):
             }
             result = await self.decision_graph.ainvoke(graph_input)
             action = result["action"]
-            order = action_orders.get(tuple(sorted(action.items())))
+            # F2-09 (D39): adapter explícito del resultado del grafo a la
+            # ejecución de poke-env. NO es un nodo LangGraph: el mapa
+            # accion->BattleOrder se captura SÍNCRONO antes del primer await
+            # y poke-env exige el BattleOrder como retorno de choose_move.
+            # `None` (fuera de la máscara capturada) se convierte en error.
+            order = execute_action(action, action_orders)
             if order is None:
                 raise RuntimeError(
                     f"decision graph returned action outside captured mask: {action!r}"
