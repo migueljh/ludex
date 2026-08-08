@@ -14,7 +14,7 @@ significa desconocido o no comparable, nunca cero implícito.
 | 2026-07-28 | [20260728-mimo-v25-5](../apps/agent/evals/runs/20260728-mimo-v25-5.json) | open_code_zen/mimo-v2.5-free | 5/5 | 2-3-0 | 40.0000% | 11.7621%–76.9276% | 41.2000 | 503090/23413 | 0.0000 | 0.0000 | 0.0000 | 21.8935%/0.0000% | 0 | 0 | 0 |  |  | 2026-07-28-official |
 | 2026-08-08 | [20260808-kimi-k26-battle-1](../apps/agent/evals/runs/20260808-kimi-k26-battle-1.json) | kimi/kimi-k2.6 | 0/1 | 0-0-0 |  |  |  | 0/0 | 0.0000 |  |  | 0.0000%/0.0000% | 1 | 0 | 0 |  |  | 2026-07-28-official |
 | 2026-08-08 | [20260808-gemini-25flash-d30](../apps/agent/evals/runs/20260808-gemini-25flash-d30.json) | google/gemini-2.5-flash | 0/1 | 0-0-0 |  |  |  | 439144/24515 |  |  |  | 0.0000%/0.0000% | 0 | 0 | 1 |  |  | 2026-07-28-official |
-| 2026-08-08 | [20260808-opencode-mimo-screen](../apps/agent/evals/runs/20260808-opencode-mimo-screen.json) | open_code_zen/claude-haiku-4-5 | 0/2 | 0-0-0 |  |  |  | 144/7133 |  |  |  | 44.8276%/24.1379% | 0 | 0 | 0 |  |  | 2026-07-28-official |
+| 2026-08-08 | [20260808-opencode-mimo-screen](../apps/agent/evals/runs/20260808-opencode-mimo-screen.json) | open_code_zen/claude-haiku-4-5 | 1/1 | 1-0-0 | 100.0000% | 20.6549%–100.0000% | 52.0000 | 156/7975 |  |  |  | 39.3939%/18.1818% | 0 | 0 | 0 | 3007/4304/7253 | 5466/7465/8885 | 2026-07-28-official |
 
 ## Controles parciales e incidencias
 
@@ -32,10 +32,14 @@ significa desconocido o no comparable, nunca cero implícito.
     en el deadline). Ejercitó D30 en vivo: 1 rotación de clave y 1 turno
     afectado por cuota real (429), 11 completions, 12 turnos.
   - **OpenCode Zen** (`20260808-opencode-mimo-screen`, pin
-    `open_code_zen/claude-haiku-4-5`, sin chain): abortó con
-    `BenchmarkDeadlineExceeded` a los 180 s; el modelo respondió 48
-    completions en 29 turnos (latencia real en el artefacto) pero con alta
-    tasa de respuestas inválidas (20 ilegales, 7 fallbacks).
+    `open_code_zen/claude-haiku-4-5`, sin chain): **completado** 1/1 con
+    winrate 100.0000% (Wilson 95% 20.6549%–100.0000%). 52 completions en 33
+    decisiones; latencia comparable en el ledger: completion p50/p95/max
+    3007/4304/7253 ms y decision 5466/7465/8885 ms. El modelo respondió con
+    alta tasa de respuestas inválidas (19 ilegales, 6 fallbacks) pero el
+    screen cerró comparable; el modelo `claude-haiku-4-5` fue validado contra
+    el catálogo `/models` real (existe) y se le agregó su ruta local en
+    `model-routes.json`.
 - `20260728-deepseek-v4-flash-control` completó 1 de 2 batallas antes de
   interrumpirse por la cancelación accidental del monitor reutilizable de
   errores de fondo. La batalla completada fue una derrota con 26 llamadas,
