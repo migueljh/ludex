@@ -4,7 +4,7 @@ Este documento asume que ya leíste `PLAN.md`, `DECISIONS.md` y `AGENTS.md`.
 No repite nada de eso. Lo que hay acá es lo que **no** está escrito en
 ningún otro lado: en qué estado real está el proyecto, qué se midió y qué
 se supuso, qué problemas están abiertos, y qué trampas ya nos costaron
-caro. Fecha de corte: 2026-08-08.
+caro. Fecha de corte: 2026-07-28.
 
 ---
 
@@ -144,11 +144,10 @@ batalla nunca entra al prompt, y dónde vive la validación de legalidad.
 **5. Limpieza**: el worktree `.worktrees/feat-agent` está mergeado y sin
 cambios propios, y quedó un contenedor huérfano `feat-agent-postgres-1`.
 
-**6. Resuelto en F2-10/MON-15**: `KeyRotatingProvider` ya no mezcla
-`self._clock()` con `time.monotonic()`. Toda la cadena de decisión
-(`decide()`, `FakeDecisionProvider`, `LudexPlayer`) ahora recibe un reloj
-inyectable, y las métricas de latencia (p50/p95/máximo) se reportan en el
-`BenchmarkRecord` y en el ledger. Ver D41.
+**6. Un detalle menor de calidad**: en `KeyRotatingProvider` el reloj
+inyectable convive con `time.monotonic()` en la comparación del deadline.
+En producción son el mismo reloj, así que no muerde; puede confundir a
+quien escriba un test futuro con reloj falso.
 
 ---
 
