@@ -913,6 +913,64 @@ def _firma_de_reemplazo_forzado(
     return None
 
 
+def _imprimir_diagnostico_sin_firma(
+    *, tag: str, indice: int, turno: int, rol: str | None, estado: dict,
+    legal_actions: list, action_taken: dict | None, previa: tuple | None,
+    protocolo_tag: list[tuple[int, str]],
+) -> None:
+    """R4 (MON-11 BLOCKER 3): diagnóstico completo de un `sin_firma`, impreso
+    ANTES de fallar (y antes de que `dex_clone` dropee el clon al terminar
+    el módulo, mientras la fila todavía existe). El propósito es que la
+    PRÓXIMA vez que esto pase no haga falta reinvestigar a ciegas: la salida
+    trae todo lo que un mecanismo nuevo (no reconocido por
+    `_firma_de_reemplazo_forzado`) necesitaría para identificarse.
+    """
+    print(f"\n[SIN_FIRMA] {tag} decisión {indice} turno {turno} rol={rol}")
+    print(f"  legal_actions: {legal_actions}")
+    print(f"  action_taken (de esta decisión, si ya se resolvió): {action_taken}")
+    if previa is not None:
+        p_indice, p_turno, p_estado, p_legal, p_action = previa
+        print(
+            f"  decisión anterior: índice={p_indice} turno={p_turno} "
+            f"action_taken={p_action} legal_actions={p_legal}"
+        )
+    activos = [p for p in estado.get("opponent", {}).get("pokemon", []) if p.get("active")]
+    print(f"  rival activo en el estado persistido: {activos}")
+
+    ventana = sorted({turno - 1, turno, turno + 1})
+    lineas_ventana = [
+        (t, linea) for t, linea in protocolo_tag if t in ventana
+    ]
+    print(f"  líneas públicas de protocolo, turnos {ventana} (lado {rol}):")
+    for t, linea in lineas_ventana:
+        print(f"    [{t}] {linea}")
+
+    # Intento de identificar el mecanismo: patrones conocidos que
+    # `_firma_de_reemplazo_forzado` NO reconoce hoy, para no tener que
+    # releer la ventana a mano cada vez.
+    candidatos = []
+    drag = f"|drag|{rol}a:" if rol else None
+    for t, linea in lineas_ventana:
+        if t != turno:
+            continue
+        if drag and linea.startswith(drag):
+            candidatos.append(("drag (Roar/Whirlwind/Dragon Tail/Circle Throw/Sand Tomb)", linea))
+        elif "|-activate|" in linea and rol and f"{rol}a:" in linea:
+            candidatos.append(("-activate (posible trapping/ability)", linea))
+        elif linea.startswith(f"|switch|{rol}a:") if rol else False:
+            candidatos.append(("switch SIN '[from] ' -- no debería llegar hasta acá", linea))
+    if candidatos:
+        print("  mecanismo candidato, NO reconocido por _firma_de_reemplazo_forzado:")
+        for etiqueta, linea in candidatos:
+            print(f"    {etiqueta}: {linea}")
+    else:
+        print(
+            "  ningún patrón conocido (drag/-activate/switch-sin-from) en la "
+            "ventana del turno -- mecanismo genuinamente no identificado, "
+            "revisar más allá de esta heurística"
+        )
+
+
 async def test_la_version_de_esquema_esta_en_todas_las_filas(jugadas):
     """Invariante de TODO el dataset (review final): sin filtro de tags.
 
@@ -1004,7 +1062,8 @@ async def test_el_rival_persistido_esta_al_dia_con_el_protocolo(jugadas):
                 )
 
             filas = (await s.execute(text(
-                "SELECT b.battle_tag, ts.decision_index, ts.turn_number, ts.state "
+                "SELECT b.battle_tag, ts.decision_index, ts.turn_number, ts.state, "
+                "       ts.legal_actions, ts.action_taken "
                 "FROM trajectory_steps ts "
                 "JOIN trajectories tr ON tr.id = ts.trajectory_id "
                 "JOIN battles b ON b.id = tr.battle_id "
@@ -1019,7 +1078,8 @@ async def test_el_rival_persistido_esta_al_dia_con_el_protocolo(jugadas):
             sin_firma = []
             por_mecanismo: dict[str, int] = {}
             turno_previo: dict[str, int] = {}
-            for tag, indice, turno, estado in filas:
+            fila_previa: dict[str, tuple] = {}
+            for tag, indice, turno, estado, legal_actions, action_taken in filas:
                 previo = turno_previo.get(tag)
                 turno_previo[tag] = turno
                 rol = estado.get("player_role")
@@ -1042,10 +1102,25 @@ async def test_el_rival_persistido_esta_al_dia_con_el_protocolo(jugadas):
                     )
                     if firma is None:
                         sin_firma.append((tag, indice, turno))
+                        # R4 (BLOCKER 3, MON-11): diagnostico completo ANTES
+                        # de que el clon descartable se dropee al terminar
+                        # el modulo -- pasos implicados, mascaras, lineas
+                        # publicas alrededor del turno, y un intento de
+                        # identificar el mecanismo (para no re-investigar a
+                        # ciegas la proxima vez que esto pase).
+                        _imprimir_diagnostico_sin_firma(
+                            tag=tag, indice=indice, turno=turno, rol=rol,
+                            estado=estado, legal_actions=legal_actions,
+                            action_taken=action_taken,
+                            previa=fila_previa.get(tag),
+                            protocolo_tag=protocolo.get(tag, []),
+                        )
                     else:
                         excluidas_mitad_de_turno += 1
                         por_mecanismo[firma] = por_mecanismo.get(firma, 0) + 1
+                    fila_previa[tag] = (indice, turno, estado, legal_actions, action_taken)
                     continue
+                fila_previa[tag] = (indice, turno, estado, legal_actions, action_taken)
                 opp = "p2" if rol == "p1" else "p1"
                 real = None
                 for t, linea in protocolo.get(tag, []):
