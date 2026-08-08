@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -21,6 +22,7 @@ def build_decision_graph(
     repository: ContextRepository,
     *,
     parser: Callable[[dict[str, Any]], dict[str, Any]] = allowlisted_state,
+    clock: Callable[[], float] = time.monotonic,
 ):
     async def resolve_node(state: GraphState) -> dict[str, Any]:
         # F2-09 (MON-14): la seleccion activa se resuelve en CADA invocacion
@@ -50,7 +52,7 @@ def build_decision_graph(
         if "deadline" in state:
             decision_state["deadline"] = state["deadline"]
         resolved = state["resolved_provider"]
-        return await decide(decision_state, resolved.provider, metrics)
+        return await decide(decision_state, resolved.provider, metrics, clock=clock)
 
     builder = StateGraph(GraphState)
     builder.add_node("resolve_provider", resolve_node)

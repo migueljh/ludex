@@ -3,6 +3,8 @@ import time
 import pytest
 from pydantic import ValidationError
 
+
+
 from ludex_agent.graph.decision import (
     DecisionAction,
     DecisionResponse,
@@ -437,3 +439,52 @@ async def test_fallback_sin_llamadas_no_inventa_usage_ni_latencia_modelo():
     assert result["decision_latency_ms"] >= 0
     assert result["input_tokens"] == 0
     assert result["output_tokens"] == 0
+
+
+class _FakeClock:
+    def __init__(self, start: float = 0.0):
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.mark.asyncio
+async def test_decide_usa_reloj_inyectado_para_deadline_y_latencia():
+    """F2-10: `decide` debe evaluar el deadline y medir la latencia con el
+    reloj inyectado, no con `time.monotonic()`. Avanzamos el reloj falso una
+    cantidad conocida y verificamos que la latencia refleje exactamente ese
+    avance."""
+    clock = _FakeClock(start=500.0)
+    metrics = DecisionMetrics()
+
+    class AdvancingProvider:
+        async def complete(self, prompt, *, deadline, turn_id):
+            clock.advance(0.125)
+            return CompletionEnvelope(
+                payload={
+                    "action": {"kind": "move", "id": "thunderbolt"},
+                    "rationale": "ok",
+                    "confidence": 0.8,
+                    "alternatives": [],
+                },
+                provider="fake",
+                model="fake-model",
+                usage=CompletionUsage(
+                    input_tokens=10, output_tokens=5, model="fake-model"
+                ),
+                latency_ms=125.0,
+            )
+
+    state = _state()
+    state["deadline"] = clock.now + 10.0
+    result = await decide(state, AdvancingProvider(), metrics, clock=clock)
+
+    assert result["action_path"] == "llm"
+    assert result["decision_latency_ms"] == 125.0
+    assert metrics.snapshot()["latency_ms_count"] == 1
+    assert metrics.snapshot()["latency_ms_total"] == 125
+    assert metrics.snapshot()["latency_ms_max"] == 125

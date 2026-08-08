@@ -44,6 +44,10 @@ class BenchmarkRecord:
     total_cost: Decimal | None
     cost_per_battle: Decimal | None
     projected_10k_cost: Decimal | None
+    latency_ms_total: int
+    latency_ms_p50: int
+    latency_ms_p95: int
+    latency_ms_max: int
     pricing_table_id: str
     pricing_currency: str
     pricing_source_url: str | None
@@ -144,6 +148,10 @@ def build_benchmark_record(
             if observed_cost_per_battle is not None
             else None
         ),
+        latency_ms_total=int(metrics.get("latency_ms_total", 0)),
+        latency_ms_p50=int(metrics.get("latency_ms_p50", 0)),
+        latency_ms_p95=int(metrics.get("latency_ms_p95", 0)),
+        latency_ms_max=int(metrics.get("latency_ms_max", 0)),
         pricing_table_id=pricing.table_id,
         pricing_currency=pricing.currency,
         pricing_source_url=price.source_url if price is not None else None,
@@ -186,8 +194,8 @@ LEDGER_HEADER = """# Benchmarks de modelos
 Registro acumulativo. El costo se calcula con usage real; una celda vacía
 significa desconocido o no comparable, nunca cero implícito.
 
-| Fecha | Run | Proveedor/modelo | Batallas | W-L-T | Winrate | Wilson 95% | Llamadas/batalla | Tokens in/out | Costo total | Costo/batalla | 10.000 batallas | Ilegales retry/fallback | Transitorios | Deadlines | Rotaciones | Precios |
-|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---|
+| Fecha | Run | Proveedor/modelo | Batallas | W-L-T | Winrate | Wilson 95% | Llamadas/batalla | Tokens in/out | Costo total | Costo/batalla | 10.000 batallas | Ilegales retry/fallback | Transitorios | Deadlines | Rotaciones | Latencia p50/p95/max (ms) | Precios |
+|---|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|---|---:|---:|---:|---|---|
 """
 
 
@@ -224,6 +232,7 @@ def append_ledger_row(
         f"{metrics.get('turns_transient_affected', 0)} | "
         f"{metrics.get('turns_deadline_affected', 0)} | "
         f"{metrics.get('key_rotations', 0)} | "
+        f"{record.latency_ms_p50}/{record.latency_ms_p95}/{record.latency_ms_max} | "
         f"{record.pricing_table_id} |\n"
     )
     lines = existing.rstrip().splitlines()

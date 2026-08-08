@@ -39,6 +39,7 @@ from .graph.provider import (
     PinnedResolver,
     ProviderChain,
     ProviderError,
+    ProviderSelectionError,
     load_model_routes,
     model_route,
     provider_keys,
@@ -331,6 +332,10 @@ def _benchmark_provider(
     keys = provider_keys(
         os.environ, primary_env, pool_env, aliases=aliases
     )
+    if not keys:
+        raise ProviderSelectionError(
+            f"NOT RUN: credential unavailable for {name}/{model}"
+        )
     route = (
         model_route(load_model_routes(), name, model)
         if name in {"kimi", "open_code_zen"}
@@ -378,9 +383,6 @@ def provider_smoke_command(
     """Una completion estructurada, sin Showdown ni persistencia."""
     settings = load_settings()
     metrics = DecisionMetrics()
-    selected = _benchmark_provider(
-        provider, model, settings.llm_request_timeout_seconds, metrics
-    )
     prompt = (
         "Elegí exactamente una acción legal y respondé con action, un "
         "rationale breve, confidence en [0,1] y alternatives (puede ser []). "
@@ -388,11 +390,17 @@ def provider_smoke_command(
         '[{"kind":"move","id":"tackle"},{"kind":"switch","species":"pikachu"}]'
     )
     try:
+        selected = _benchmark_provider(
+            provider, model, settings.llm_request_timeout_seconds, metrics
+        )
         envelope = asyncio.run(selected.complete(
             prompt,
             deadline=time.monotonic() + settings.llm_request_timeout_seconds,
             turn_id=f"provider-smoke:{provider}:{model}",
         ))
+    except ProviderSelectionError as exc:
+        typer.echo(f"{exc}")
+        raise typer.Exit(code=2) from None
     except ProviderError as exc:
         typer.echo(f"ABORTED: {type(exc).__name__}: {exc}")
         raise typer.Exit(code=1) from None
@@ -686,12 +694,50 @@ def benchmark_command(
             write_run_snapshot(partial, artifact)
         typer.echo(_progress_summary(partial))
 
-    result, metrics = asyncio.run(_benchmark_command(
-        n=n, opponent=opponent, concurrency=concurrency, persist=persist,
-        provider_name=provider_name, model=model_name,
-        fmt=fmt or settings.showdown_battle_format,
-        on_progress=report_progress,
-    ))
+    try:
+        result, metrics = asyncio.run(_benchmark_command(
+            n=n, opponent=opponent, concurrency=concurrency, persist=persist,
+            provider_name=provider_name, model=model_name,
+            fmt=fmt or settings.showdown_battle_format,
+            on_progress=report_progress,
+        ))
+    except ProviderSelectionError as exc:
+        # F2-10: sin credenciales no se corre ni se publica un winrate
+        # comparable. Se emite un artefacto de corrida explícito con status
+        # "not-run" para que quede trazable que el punto de control fue
+        # alcanzado aunque la corrida real no se ejecutó.
+        typer.echo(f"{exc}")
+        not_run_result = BenchmarkResult(
+            requested=n, completed=0, wins=0, losses=0, ties=0,
+            provider=provider_name, model=model_name,
+            failure=str(exc),
+        )
+        not_run_metrics: dict[str, int] = {
+            "turns_total": 0, "calls_total": 0, "input_tokens": 0,
+            "output_tokens": 0, "cached_input_tokens": 0,
+            "reasoning_tokens": 0, "key_rotations": 0,
+            "provider_switches": 0, "turns_quota_affected": 0,
+            "turns_transient_affected": 0, "turns_deadline_affected": 0,
+            "turns_model_invalid": 0, "turns_fallback": 0,
+            "latency_ms_count": 0, "latency_ms_total": 0,
+            "latency_ms_p50": 0, "latency_ms_p95": 0, "latency_ms_max": 0,
+        }
+        not_run_record = build_benchmark_record(
+            run_id=effective_run_id,
+            created_at=created_at,
+            result=not_run_result,
+            metrics=not_run_metrics,
+            opponent=opponent,
+            fmt=fmt or settings.showdown_battle_format,
+            route=effective_route,
+            pricing=pricing_table,
+            status="not-run",
+        )
+        if record:
+            write_run_snapshot(not_run_record, artifact)
+            append_ledger_row(not_run_record, ledger, artifact)
+            typer.echo(f"not_run_record={artifact}")
+        raise typer.Exit(code=2) from None
     typer.echo(
         f"completed={result.completed}/{result.requested} "
         f"provider={provider_name} model={model_name}"

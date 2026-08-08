@@ -21,6 +21,7 @@ from ludex_agent.graph.provider import FatalProviderError
 from typer.testing import CliRunner
 
 from ludex_agent.cli import (
+    DEFAULT_RUNS_PATH,
     IncompleteTrajectoryError,
     _battle_against_or_failure,
     _battle_outcome,
@@ -153,6 +154,22 @@ def test_provider_smoke_usa_flags_como_los_comandos_del_plan():
     assert "--model" in result.stdout
 
 
+def test_provider_smoke_sin_credenciales_emite_not_run_y_no_traceback():
+    result = CliRunner().invoke(
+        app,
+        ["provider-smoke", "--provider", "kimi", "--model", "kimi-k2.6"],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "SHOWDOWN_WS_URL": "ws://localhost:8100/showdown/websocket",
+            "LUDEX_PROVIDER": "kimi",
+            "LUDEX_MODEL": "kimi-k2.6",
+        },
+    )
+    assert result.exit_code == 2
+    assert "NOT RUN: credential unavailable" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
 def test_provider_smoke_sanitiza_fallo_sin_traceback_ni_clave(monkeypatch):
     class FailingProvider:
         async def complete(self, prompt, *, deadline, turn_id):
@@ -218,6 +235,36 @@ def test_provider_smoke_sanitiza_respuesta_semanticamente_invalida(monkeypatch):
     assert "Traceback" not in result.stdout
     assert "contenido privado" not in result.stdout
     assert "super-secret-key" not in result.stdout
+
+
+def test_benchmark_sin_credenciales_emite_not_run_y_no_publica_winrate(monkeypatch, tmp_path):
+    runs_dir = tmp_path / "runs"
+    monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", runs_dir)
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark", "--n", "5", "--opponent", "simple_heuristics",
+            "--provider", "kimi", "--model", "kimi-k2.6",
+            "--run-id", "test-kimi-not-run",
+            "--ledger", str(tmp_path / "ledger.md"),
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "SHOWDOWN_WS_URL": "ws://localhost:8100/showdown/websocket",
+            "LUDEX_PROVIDER": "kimi",
+            "LUDEX_MODEL": "kimi-k2.6",
+        },
+    )
+    assert result.exit_code == 2
+    assert "NOT RUN: credential unavailable" in result.stdout
+    artifact = runs_dir / "test-kimi-not-run.json"
+    assert artifact.exists()
+    data = json.loads(artifact.read_text())
+    assert data["status"] == "not-run"
+    assert data["completed"] == 0
+    assert data["win_rate"] is None
+    assert data["wilson95"] is None
+    assert "NOT RUN" in data["failure"]
 
 
 def test_benchmark_rechaza_modelo_sin_ruta_antes_de_llamarlo(monkeypatch):

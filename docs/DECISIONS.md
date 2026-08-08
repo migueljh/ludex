@@ -2190,3 +2190,37 @@ esperado y restaurada.
 **Alcance (R4).** Cero cambios en `showdown/client.py`, `cli.py` y
 `packages/dataset-audit` (código ya aceptado, sin tocar esta ronda). D37 y
 D38 siguen intactos. No se tocó ninguna fila de la DB compartida.
+
+## D41 — reloj inyectable en el grafo de decisión y métricas de latencia (F2-10/MON-15)
+
+Todas las mediciones de tiempo en el camino crítico de decisión usan un
+reloj inyectable (`Callable[[], float]` que devuelve segundos monotónicos),
+en vez de llamar directamente a `time.monotonic()`. `KeyRotatingProvider`,
+`decide()`, `FakeDecisionProvider` y `LudexPlayer` reciben el reloj por
+constructor o argumento; si el llamador no lo pasa, se usa `time.monotonic`
+como default.
+
+Motivo: las métricas de latencia (p50/p95/máximo por batalla y total) deben
+ser deterministas en tests y reproducibles en diagnóstico. Usar el reloj real
+hace imposible afirmar que un cambio no empeora la latencia sin correr
+batallas reales, y también hace imposible simular deadlines y cooldowns sin
+esperar. Con el reloj inyectado el test avanza el tiempo explícitamente y
+verifica que el provider enfríe claves, cumpla deadlines y reporte latencias
+esperadas.
+
+Regla de implementación: si una función necesita medir intervalos o comparar
+un instante contra un deadline, recibe `clock`. Nunca se mezcla `clock()` con
+`time.monotonic()` en la misma rutina: eso rompe los tests con reloj falso y
+puede hacer que un deadline nunca se dispare.
+
+Las métricas agregadas son `latency_ms_total`, `latency_ms_count`,
+`latency_ms_max`, `latency_ms_p50` y `latency_ms_p95`. Se calculan sobre cada
+llamada a `provider.complete()` dentro de una batalla, y el `BenchmarkRecord`
+las expone para el ledger. Los percentiles usan interpolación lineal de
+NumPy; cuando no hay muestras los valores son 0.
+
+**Tests.** `test_provider.py` verifica deadline, cooldown de claves con 429,
+y mezcla de modelos con conteos correctos usando `SequenceClock`.
+`test_decision.py` verifica que `decide()` registra latencia 125 ms cuando el
+provider tarda exactamente eso. Cada test falla si se revierte el uso de
+`self._clock()` o si se ignora el `clock` inyectado.
