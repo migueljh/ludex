@@ -4,6 +4,8 @@ import re
 import pytest
 from sqlalchemy import text
 
+from _dex_template import disposable_dex_clone
+from _disposable import verified_engine
 from ludex_agent.config import load_settings
 from ludex_agent.cli import play
 from ludex_agent.db.repository import BattleRepository
@@ -11,10 +13,43 @@ from ludex_agent.db.session import make_engine, session_factory
 from ludex_agent.showdown.client import PokeEnvVocabulary
 from ludex_agent.state.schema import STATE_SCHEMA_VERSION
 
+# MON-11 (R3): TEST_DATABASE_URL (clon descartable del dex, ver
+# _dex_template.py) + DATABASE_URL (unica fuente admitida, READ-ONLY, para
+# cargar generations/pokemon/moves/items/learnsets en la plantilla). Este
+# archivo juega batallas REALES y las persiste, pero nunca contra
+# DATABASE_URL: `dex_clone` (abajo) reapunta la variable a un clon efimero
+# antes de que `jugadas` juegue una sola batalla.
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"),
-    reason="necesita postgres y el server local de showdown",
+    not os.environ.get("TEST_DATABASE_URL") or not os.environ.get("DATABASE_URL"),
+    reason="necesita TEST_DATABASE_URL (clon descartable) + DATABASE_URL "
+    "(fuente read-only del dex) + el server local de showdown",
 )
+
+
+@pytest.fixture(scope="module")
+async def dex_clone():
+    """Clona la plantilla sanitizada del dex y reapunta `DATABASE_URL` al
+    clon durante toda la vida del modulo -- `jugadas` y las 11 funciones de
+    test que abren su propia conexion via `load_settings().database_url`
+    dependen de esto, directa o transitivamente, así que ninguna llega a
+    ver la base compartida."""
+    base = os.environ["TEST_DATABASE_URL"]
+    shared = os.environ["DATABASE_URL"]
+    async with disposable_dex_clone(base, shared) as url:
+        anterior = os.environ.get("DATABASE_URL")
+        os.environ["DATABASE_URL"] = url
+        try:
+            # Verificacion runtime ANTES de jugar o persistir una sola
+            # fila: `current_database()` sobre la conexion real que
+            # `load_settings()` resuelve ahora.
+            engine = await verified_engine(load_settings().database_url)
+            await engine.dispose()
+            yield url
+        finally:
+            if anterior is None:
+                os.environ.pop("DATABASE_URL", None)
+            else:
+                os.environ["DATABASE_URL"] = anterior
 
 
 def _normalizar(texto: str) -> str:
@@ -446,12 +481,15 @@ def _objetivos_de_transform(
 
 
 @pytest.fixture(scope="module")
-async def jugadas():
+async def jugadas(dex_clone):
     # I6 (review final): esta fixture juega batallas REALES contra el server
-    # local y las persiste en el MISMO Postgres que el dataset de
-    # entrenamiento. `source="test"` las marca sinteticas (D19,
-    # migracion 20260727000007) para que sean excluibles con
-    # `source <> 'test'` en vez de mezclarse en silencio.
+    # local y las persiste. `source="test"` las marca sinteticas (D19,
+    # migracion 20260727000007).
+    # MON-11 (R3): antes se persistia en el MISMO Postgres que el dataset de
+    # entrenamiento (la base compartida), confiando en `source='test'` para
+    # que quedaran excluibles. Ahora `dex_clone` ya reapunto `DATABASE_URL`
+    # a un clon descartable del dex ANTES de que esta linea juegue nada: la
+    # base compartida nunca ve estas filas, ni siquiera marcadas.
     return await play(2, "gen6randombattle", source="test")
 
 
