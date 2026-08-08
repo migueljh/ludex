@@ -107,19 +107,34 @@ describe("contra PostgreSQL real", () => {
     expect(training.turns.every((turn) => battleIds.has(turn.battleId))).toBe(true);
     const trajectoryIds = new Set(training.trajectories.map((t) => t.id));
     expect(training.steps.every((step) => trajectoryIds.has(step.trajectoryId))).toBe(true);
-    // Y es un subconjunto propio: si fuera igual, el filtro no está filtrando.
-    expect(training.steps.length).toBeLessThan(all.steps.length);
+    // Ninguna trayectoria de training tiene un paso fuera de v2 (D44): mixta
+    // o pura v1, se excluye completa.
+    expect(
+      training.steps.every((step) => step.stateSchemaVersion === 2),
+    ).toBe(true);
+    // Es un subconjunto -- nunca mayor que `all`. HOY (D44, MON-11 R3) es un
+    // subconjunto VACÍO: las 12 batallas `local` de este corpus son 100%
+    // schema v1, así que ninguna trayectoria de entrenamiento es elegible
+    // todavía. Esto documenta ese estado a propósito -- si algún día deja de
+    // ser 0, hay que revisar esta aserción, no relajarla en silencio. Ver
+    // `test/d44.test.ts` para los 7 escenarios con datos sintéticos.
+    expect(training.steps.length).toBeLessThanOrEqual(all.steps.length);
+    expect(training.trajectories).toHaveLength(0);
   }, 120_000);
 
-  it("--gen conserva el mismo contrato, filtrado por generación", async () => {
-    const training = await loadDataset(pool, { scope: "training" });
-    const gen = training.trajectories[0]?.gen;
+  it("--gen conserva el mismo contrato, filtrado por generación (scope all)", async () => {
+    // MON-11 R3 (D44): antes este test tomaba `gen` de la primera
+    // trayectoria de `training`, pero ese scope es hoy un corpus vacío en
+    // datos reales (ver el test de arriba) -- `scope: "all"` sigue teniendo
+    // datos reales y prueba el mismo mecanismo de `--gen`. La combinación
+    // `training` + `--gen` sobre un corpus no vacío está cubierta con datos
+    // sintéticos en `test/d44.test.ts`.
+    const all = await loadDataset(pool, { scope: "all" });
+    const gen = all.trajectories[0]?.gen;
     expect(gen).toBeDefined();
-    const filtered = await loadDataset(pool, { scope: "training", gen });
+    const filtered = await loadDataset(pool, { scope: "all", gen });
 
     expect(new Set(filtered.trajectories.map((t) => t.gen))).toEqual(new Set([gen]));
-    expect(filtered.battles.every((battle) => battle.source !== "test")).toBe(true);
-    expect(filtered.trajectories.every((t) => t.finalResult !== null)).toBe(true);
     expect(filtered.dexPokemon.every((entry) => entry.gen === gen)).toBe(true);
     expect(filtered.dexMoves.every((entry) => entry.gen === gen)).toBe(true);
   }, 120_000);

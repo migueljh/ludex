@@ -23,10 +23,25 @@ import type {
 } from "./types.js";
 
 /** Predicado de scope, idéntico en las cuatro queries del dataset.
- * `$1` = scope, `$2` = generación (NULL = todas). */
+ * `$1` = scope, `$2` = generación (NULL = todas).
+ *
+ * D44 (MON-11 R3): `training` exige, además de `source <> 'test'` y
+ * `final_result IS NOT NULL`, que TODOS los pasos de la trayectoria sean
+ * `state_schema_version = 2`. El `NOT EXISTS` opera sobre la trayectoria
+ * completa -- si existe UN SOLO paso con otra versión, la trayectoria entera
+ * queda fuera. Nunca se filtra por `state_schema_version` dentro del SELECT
+ * de `steps`: eso dejaría pasar los pasos v2 de una trayectoria mixta y
+ * escondería el resto, que es exactamente el defecto que el mutation test
+ * de `test/d44.test.ts` verifica que esta consulta NO tiene. */
 const SCOPE_BATTLE = "($1::text = 'all' OR b.source <> 'test')";
 const SCOPE_TRAJECTORY =
-  "($1::text = 'all' OR (b.source <> 'test' AND t.final_result IS NOT NULL))";
+  `($1::text = 'all' OR (
+      b.source <> 'test' AND t.final_result IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM trajectory_steps s2
+        WHERE s2.trajectory_id = t.id AND s2.state_schema_version <> 2
+      )
+    ))`;
 const GEN_BATTLE = `($2::int IS NULL OR EXISTS (
       SELECT 1 FROM trajectories tg
       JOIN generations gg ON gg.id = tg.gen_id

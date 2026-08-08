@@ -2264,3 +2264,66 @@ corrió completo tras el fix: los conteos de violaciones -- incluido
 corresponde: este fix sólo afecta grabaciones FUTURAS a través de
 `client.py` (fuera de alcance de MON-19), nunca las 701 batallas ya
 persistidas en la DB compartida.
+
+## D44 — `training` exige trayectoria ÍNTEGRAMENTE `state_schema_version=2`; una mezcla v1/v2 se excluye completa (MON-11 R3)
+
+**Nota de numeración.** D42 pertenece a MON-15 y D43 a MON-20 -- no se
+documentan acá; esta entrada continúa la numeración sin llenar ese hueco.
+
+**Contexto.** El CHECKPOINT R2 de MON-11 clasificó las 1 429 violaciones de
+`hidden_information` en las 12 batallas `local` (`scope=training`) y
+encontró que las 774 filas de ese corpus son 100% `state_schema_version=1`
+-- un esquema que D31 ya reemplazó. Antes de D44, `training` sólo exigía
+`battles.source <> 'test'` y `trajectories.final_result IS NOT NULL`
+(F2-09): eso deja pasar trayectorias v1 con el mismo defecto de proyección
+que D31/D40/D41 documentan, y --el riesgo real que motiva esta decisión--
+una trayectoria MIXTA (algunos pasos v1, algunos v2, producto de un cambio
+de esquema a mitad de una corrida larga) filtraría igual, mezclando pasos
+con contratos de estado distintos bajo el mismo `trajectory_id`.
+
+**Decisión.** `training` exige, ADEMÁS de `source <> 'test'` y
+`final_result IS NOT NULL`, que TODOS los `trajectory_steps` de la
+trayectoria tengan `state_schema_version = 2`. La condición se evalúa por
+`NOT EXISTS (SELECT 1 FROM trajectory_steps s2 WHERE s2.trajectory_id = t.id
+AND s2.state_schema_version <> 2)` sobre la trayectoria completa -- nunca
+filtrando `trajectory_steps` por versión dentro del `SELECT` de pasos. Una
+trayectoria con un solo paso v1 se excluye ENTERA, no parcialmente: el
+defecto exacto que esto evita es un filtro por-paso que dejara pasar los
+pasos v2 de una trayectoria mixta y escondiera sólo los v1, produciendo una
+trayectoria "recortada" que nunca existió así en el corpus real.
+
+`all` sigue auditando v1 y v2 sin exclusión -- D44 sólo estrecha `training`.
+
+**Consecuencia medida, hoy.** Aplicado contra el corpus real: las 12
+batallas `local` (774 pasos, 100% v1) quedan TODAS fuera de `training` --
+`scope=training` es hoy un corpus de **cero trayectorias elegibles**. Esto
+no es una regresión ni oculta nada: es la frontera funcionando como se
+diseñó sobre un corpus que, medido, no tiene todavía ninguna trayectoria
+`local` en el esquema vigente. La CLI lo reporta explícito (`⚠ corpus de
+entrenamiento VACÍO bajo D44`) precisamente para que un “0 violaciones” en
+cada invariante no se lea como “corpus limpio” -- es “no hay nada que
+auditar”, una distinción que D33 ya exigía para el caso general
+(`stepsAudited === 0` sobre un dataset con filas falla ruidoso) y que acá se
+extiende al caso legítimo de un scope vacío por diseño.
+
+**Verificación.** `test/d44.test.ts` (7 tests, base Postgres descartable con
+fixtures sintéticas -- la base compartida no tiene hoy ninguna trayectoria
+`local`/v2 ni mixta con las que probar esto contra datos reales): local/v1
+presente en `all` y ausente en `training`; local/v2 terminada presente en
+ambos; test/v2 ausente de `training`; local/v2 sin terminar ausente; una
+trayectoria mixta v1/v2 ausente COMPLETA (incluidos sus pasos v2, que un
+filtro por-paso dejaría pasar); una mezcla realista de las cuatro
+categorías anteriores en un solo corpus, donde sólo la trayectoria
+local/v2 terminada entra a `training`; y el corpus vacío reportado como tal
+(`toHaveLength(0)`, no una comparación vacua). Dos mutaciones dirigidas,
+cada una roja y restaurada: retirar el predicado `NOT EXISTS` completo
+(vuelve al comportamiento pre-D44, 4/7 tests rojos) y reemplazarlo por un
+filtro `state_schema_version = 2` dentro del `SELECT` de `steps` en vez de
+sobre la trayectoria (dejaba pasar los pasos v2 de la trayectoria mixta,
+exactamente el test que ese escenario existe para atrapar).
+
+`test/db.test.ts` (contra la base compartida real, sólo lectura) y
+`test/cli.test.ts` (extremo a extremo) se actualizaron para reflejar el
+corpus vacío real de hoy en vez de asumir `training` no vacío -- incluyendo
+un test que fija a propósito que si algún día deja de ser cero hay que
+revisar esa aserción, no relajarla en silencio.
