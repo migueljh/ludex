@@ -2191,7 +2191,81 @@ esperado y restaurada.
 `packages/dataset-audit` (código ya aceptado, sin tocar esta ronda). D37 y
 D38 siguen intactos. No se tocó ninguna fila de la DB compartida.
 
-## D41 — reloj inyectable en el grafo de decisión y métricas de latencia (F2-10/MON-15)
+## D41 — los tipos base del rival viven en `canonical_types`; `-formechange` es temporal, `detailschange` es permanente (MON-19)
+
+**Contexto.** El ROOT-CAUSE CHECKPOINT de MON-19 reprodujo en vivo, cruzando
+la frontera real (`serialize_battle` → `project_observable_state`), el
+defecto detrás de `battles.id=2787` (`battle-gen6randombattle-2719`):
+`Pokemon._update_from_details` de poke-env (`pokemon.py:669-671`) corta en
+seco si `details` no cambió desde la última vez. Relic Song narra un
+`-formechange` a Pirouette sin cambiar `details` (a diferencia de Mega, cuyo
+`details` SÍ cambia), así que el switch-in que revierte Pirouette al volver
+a entrar puede seguir leyendo el `types` corrupto del propio poke-env. Es
+exactamente el mismo mecanismo que D40 ya documentó para `item` tras Trick
+-- la diferencia es que D40 clasificó el hallazgo de `types` sobre Meloetta
+como un falso positivo del AUDITOR (`packages/dataset-audit/src/
+projection.ts`, ya corregido ahí); esta ronda confirmó, con snapshots
+frescos e independientes cruzando el boundary real, que además hay un
+defecto GENUINO en el RECORDER (`protocol.py`) para la misma criatura, no
+cubierto por esa corrección del auditor.
+
+**Decisión.** Mismo patrón arquitectónico que D37/D40: una clave nueva y
+permanente en `persistent_state`, `canonical_types`, reaplicada al
+principio de cada llamada, antes de procesar cualquier línea del frame. La
+clave preexistente `"types"` conserva exactamente su significado actual --
+backup de un override TEMPORAL activo (typechange, Transform) -- y ahora
+también cubre `-formechange`; las dos claves son mutuamente excluyentes en
+la reaplicación (mismo patrón que D37 exige entre `unknown_pp_moves` y
+`transform_unknown_pp_moves`): mientras `"types"` esté presente, el override
+es lo que se ve, y reaplicar `canonical_types` por encima lo pisaría mal.
+
+- **`switch_in`** es evidencia pública DIRECTA del tipo canónico: recalcula
+  `types` del dex sin condición (ya lo hacía) y ahora también escribe
+  `canonical_types`, además de descartar cualquier `"types"` colgado de la
+  misma identidad -- un override temporal no puede sobrevivir a un
+  switch-in de la propia identidad.
+- **`detailschange`** (Mega/Primal) es PERMANENTE -- `details` cambia, así
+  que poke-env nunca corta acá, y estos tipos SON el nuevo canónico:
+  actualiza `canonical_types` directo, sin pasar por el backup temporal.
+- **`-formechange`** (Relic Song y demás formas que sí revierten al salir)
+  es TEMPORAL: entra al mismo ciclo backup/restauración que ya usan
+  `apply_typechange`/`apply_transform`, y NUNCA toca `canonical_types` --
+  si lo hiciera, `canonical_types` quedaría con la forma temporal en vez de
+  la base, y la reaplicación la sostendría stale para siempre.
+- **`switch_out`** no requiere cambios: ya sólo restaura el backup temporal
+  de `"types"` (típechange/Transform/`-formechange`), dejando
+  `canonical_types` intacto y disponible para la próxima llamada fresca --
+  exactamente lo que pide el contrato.
+
+**Tests.** `apps/agent/tests/showdown/test_protocol.py`: reproducción
+determinista de `battles.id=2787` con snapshots frescos e independientes en
+cada etapa (switch-in inicial, Relic Song, una llamada fresca intermedia
+SIN evidencia nueva mientras Pirouette sigue activa, switch-out, switch-in
+con los mismos `details` base, y una llamada fresca posterior que confirma
+NORMAL/PSYCHIC -- el bug real la dejaba en NORMAL/FIGHTING en ese último
+paso); contrapeso Mega con cuatro snapshots frescos independientes
+(persiste permanentemente, incluso tras salir y volver); contrapeso
+typechange y contrapeso Transform (ambos siguen activos con
+`canonical_types` presente de fondo, sin que la reaplicación los pise);
+Meloetta sin `-formechange` no cambia; canario de orden (la reaplicación
+corre ANTES del loop de líneas, mismo patrón que D37/D40); switch_in
+descarta un override temporal colgado de la misma identidad. Cuatro
+mutaciones dirigidas (retirar la reaplicación; tratar `detailschange` como
+temporal; promover `-formechange` a `canonical_types`; reaplicar
+`canonical_types` aun con un override temporal activo), cada una puesta en
+rojo exactamente los tests esperados y restaurada.
+
+**Alcance.** Cero cambios en `showdown/client.py`, `cli.py`,
+`packages/dataset-audit`, migraciones o datos históricos (confirmado por
+`git diff --stat` vacío en esos rangos). D37 y D40 quedan intactos. El
+auditor (`dataset-audit --scope all` y `--scope training`, Node 22) se
+corrió completo tras el fix: los conteos de violaciones -- incluido
+`hidden_information/types` -- quedan IDÉNTICOS a la línea base previa, como
+corresponde: este fix sólo afecta grabaciones FUTURAS a través de
+`client.py` (fuera de alcance de MON-19), nunca las 701 batallas ya
+persistidas en la DB compartida.
+
+## D42 — reloj inyectable en el grafo de decisión y métricas de latencia (F2-10/MON-15)
 
 Todas las mediciones de tiempo en el camino crítico de decisión usan un
 reloj inyectable (`Callable[[], float]` que devuelve segundos monotónicos),
