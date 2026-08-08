@@ -242,7 +242,7 @@ def _percentile(sorted_values: list[float], percentile: int) -> float:
 
 class DecisionMetrics:
     def __init__(self) -> None:
-        self._counts = {
+        self._counts: dict[str, int | None] = {
             "turns_total": 0,
             "calls_total": 0,
             "input_tokens": 0,
@@ -256,11 +256,23 @@ class DecisionMetrics:
             "turns_deadline_affected": 0,
             "turns_model_invalid": 0,
             "turns_fallback": 0,
-            "latency_ms_count": 0,
-            "latency_ms_total": 0,
-            "latency_ms_p50": 0,
-            "latency_ms_p95": 0,
-            "latency_ms_max": 0,
+            # L-01 (R2): DOS poblaciones de latencia, jamas mezcladas. Una
+            # completion (llamada a `provider.complete()`) y una decision
+            # (end-to-end, retries incluidos) son muestras de poblaciones
+            # distintas: una decision con una completion aporta
+            # exactamente una muestra a cada una, nunca dos al mismo
+            # contador. Los percentiles sin muestras son None (null en
+            # artefactos y blanco en el ledger), nunca 0/0/0 comparable.
+            "completion_latency_ms_count": 0,
+            "completion_latency_ms_total": None,
+            "completion_latency_ms_p50": None,
+            "completion_latency_ms_p95": None,
+            "completion_latency_ms_max": None,
+            "decision_latency_ms_count": 0,
+            "decision_latency_ms_total": None,
+            "decision_latency_ms_p50": None,
+            "decision_latency_ms_p95": None,
+            "decision_latency_ms_max": None,
         }
         self._quota_turns: set[str] = set()
         self._transient_turns: set[str] = set()
@@ -268,7 +280,8 @@ class DecisionMetrics:
         self._invalid_turns: set[str] = set()
         self._fallback_turns: set[str] = set()
         self._turns: set[str] = set()
-        self._latencies: list[float] = []
+        self._completion_latencies: list[float] = []
+        self._decision_latencies: list[float] = []
 
     def turn(self, turn_id: str) -> None:
         if turn_id not in self._turns:
@@ -285,23 +298,45 @@ class DecisionMetrics:
         self._counts["cached_input_tokens"] += usage.cached_input_tokens
         self._counts["reasoning_tokens"] += usage.reasoning_tokens
 
-    def latency(self, latency_ms: float) -> None:
-        """Registra la latencia de una llamada o decisión completada.
-
-        F2-10: las métricas de decisión incluyen p50/p95/max para comparar
-        providers/modelos de forma reproducible. Los valores se calculan
-        sobre la lista acumulada; en corridas largas esto es barato porque
-        solo se lee en `snapshot()`.
-        """
+    def _register_latency(
+        self, prefix: str, samples: list[float], latency_ms: float
+    ) -> None:
+        """Registra una muestra en la poblacion `prefix` (completion o
+        decision). Nunca truncamos con `int()`: la politica de redondeo es
+        entero mas cercano via `round()` (un `99.999...` no puede quedar
+        en 99). Sin muestras, total/p50/p95/max son None, no 0."""
         if latency_ms < 0:
             raise ValueError("latency cannot be negative")
-        self._latencies.append(latency_ms)
-        self._counts["latency_ms_count"] = len(self._latencies)
-        self._counts["latency_ms_total"] = int(sum(self._latencies))
-        self._counts["latency_ms_max"] = int(max(self._latencies))
-        sorted_latencies = sorted(self._latencies)
-        self._counts["latency_ms_p50"] = round(_percentile(sorted_latencies, 50))
-        self._counts["latency_ms_p95"] = round(_percentile(sorted_latencies, 95))
+        samples.append(latency_ms)
+        count = len(samples)
+        self._counts[f"{prefix}_count"] = count
+        self._counts[f"{prefix}_total"] = round(sum(samples))
+        self._counts[f"{prefix}_max"] = round(max(samples))
+        sorted_latencies = sorted(samples)
+        self._counts[f"{prefix}_p50"] = round(_percentile(sorted_latencies, 50))
+        self._counts[f"{prefix}_p95"] = round(_percentile(sorted_latencies, 95))
+
+    def completion_latency(self, latency_ms: float) -> None:
+        """L-01 (R2): una muestra POR LLAMADA a `provider.complete()`.
+
+        Se registra aca, en el provider, por cada envelope devuelto; es la
+        poblacion de completions, no la de decisiones. `decide` jamas debe
+        llamar a este metodo (ver el test cruzado en test_decision.py).
+        """
+        self._register_latency(
+            "completion_latency_ms", self._completion_latencies, latency_ms
+        )
+
+    def decision_latency(self, latency_ms: float) -> None:
+        """L-01 (R2): una muestra POR DECISION, end-to-end, retries incluidos.
+
+        Se registra en `decide`, desde el primer intento LLM hasta la
+        respuesta aceptada o el fallback. `KeyRotatingProvider.complete`
+        jamas debe llamar a este metodo (ver el test cruzado).
+        """
+        self._register_latency(
+            "decision_latency_ms", self._decision_latencies, latency_ms
+        )
 
     def provider_switch(self) -> None:
         self._counts["provider_switches"] += 1
@@ -331,7 +366,7 @@ class DecisionMetrics:
             self._fallback_turns.add(turn_id)
             self._counts["turns_fallback"] += 1
 
-    def snapshot(self) -> dict[str, int]:
+    def snapshot(self) -> dict[str, int | None]:
         return dict(self._counts)
 
 
@@ -554,7 +589,7 @@ class KeyRotatingProvider:
                         # compartido entre llamadas: ver docstring de
                         # CompletionEnvelope.
                         latency_ms = (self._clock() - started_at) * 1000
-                        self._metrics.latency(latency_ms)
+                        self._metrics.completion_latency(latency_ms)
                         return CompletionEnvelope(
                             payload=completion.payload,
                             provider=self.name,

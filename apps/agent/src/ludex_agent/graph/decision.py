@@ -239,7 +239,10 @@ async def decide(
             )
             target = validate_target(parsed.target, legal)
             decision_latency_ms = (clock() - started_at) * 1000
-            metrics.latency(decision_latency_ms)
+            # L-01 (R2): latencia END-TO-END de la decision (retries
+            # incluidos) a la poblacion de decisiones; la de cada completion
+            # ya la registro `KeyRotatingProvider` en su propia poblacion.
+            metrics.decision_latency(decision_latency_ms)
             return {
                 "action": action,
                 "action_path": "llm" if semantic_attempt == 0 else "llm_retry",
@@ -267,7 +270,7 @@ async def decide(
     metrics.fallback(turn_id)
     fallback_rationale = "deterministic fallback after two invalid model responses"
     decision_latency_ms = (clock() - started_at) * 1000
-    metrics.latency(decision_latency_ms)
+    metrics.decision_latency(decision_latency_ms)
     return {
         "action": _fallback(state),
         "action_path": "fallback",

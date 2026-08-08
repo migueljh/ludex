@@ -485,6 +485,139 @@ async def test_decide_usa_reloj_inyectado_para_deadline_y_latencia():
 
     assert result["action_path"] == "llm"
     assert result["decision_latency_ms"] == 125.0
-    assert metrics.snapshot()["latency_ms_count"] == 1
-    assert metrics.snapshot()["latency_ms_total"] == 125
-    assert metrics.snapshot()["latency_ms_max"] == 125
+    assert metrics.snapshot()["decision_latency_ms_count"] == 1
+    assert metrics.snapshot()["decision_latency_ms_total"] == 125
+    assert metrics.snapshot()["decision_latency_ms_max"] == 125
+    assert metrics.snapshot()["completion_latency_ms_count"] == 0
+
+
+# --- L-01 (R2): poblaciones de latencia disjuntas, test CRUZADO ------------
+#
+# Los tests aislados no detectan el doble conteo: `KeyRotatingProvider`
+# registra una muestra por completion y `decide` registra una muestra por
+# decision. Si ambos escriben al MISMO contador, una decision con una
+# completion de ~100 ms produce latency_count=2, y ni el test del provider
+# ni el de decide por separado lo ven. Este test cruza el provider real con
+# `decide` sobre el MISMO `DecisionMetrics` y exige que cada poblacion
+# cuente exactamente sus muestras.
+
+
+class _CrossBackend:
+    """Backend scripted que avanza el reloj compartido para simular ~100 ms
+    por llamada y devuelve las respuestas en orden (o excepciones)."""
+
+    def __init__(self, clock: _FakeClock, responses: list):
+        self.clock = clock
+        self.responses = list(responses)
+        self.prompts: list[str] = []
+
+    async def complete(self, prompt, *, api_key, deadline):
+        self.prompts.append(prompt)
+        self.clock.advance(0.1)
+        value = self.responses.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return ProviderCompletion(
+            payload=value,
+            usage=CompletionUsage(
+                input_tokens=1, output_tokens=1, model="fake-model"
+            ),
+        )
+
+
+def _cross_state(clock: _FakeClock):
+    state = _state()
+    state["deadline"] = clock.now + 10.0
+    return state
+
+
+@pytest.mark.asyncio
+async def test_cruzado_una_completion_una_decision_no_dobla_conteo():
+    """Reproduccion de Latwan (L-01): una completion y una decision, ambas
+    de ~100 ms. El resultado incorrecto era latency_ms_count=2,
+    latency_ms_total=199. Ahora: completion_count=1, decision_count=1, y
+    cada poblacion suma ~100 ms."""
+    clock = _FakeClock(start=0.0)
+    metrics = DecisionMetrics()
+    backend = _CrossBackend(clock, [
+        {
+            "action": {"kind": "move", "id": "thunderbolt"},
+            "rationale": "ok",
+            "confidence": 0.8,
+            "alternatives": [],
+        },
+    ])
+    provider = KeyRotatingProvider(
+        "google", ("key-a",), backend, metrics=metrics, clock=clock
+    )
+
+    result = await decide(_cross_state(clock), provider, metrics, clock=clock)
+
+    assert result["action_path"] == "llm"
+    snapshot = metrics.snapshot()
+    assert snapshot["completion_latency_ms_count"] == 1
+    assert snapshot["completion_latency_ms_total"] == 100
+    assert snapshot["completion_latency_ms_max"] == 100
+    assert snapshot["decision_latency_ms_count"] == 1
+    assert snapshot["decision_latency_ms_total"] == 100
+    assert snapshot["decision_latency_ms_max"] == 100
+    # Ninguna muestra entra en ambas poblaciones: 1 completion + 1 decision
+    # suman 2 muestras TOTALES, no 2 en un solo contador.
+    total_samples = (
+        snapshot["completion_latency_ms_count"]
+        + snapshot["decision_latency_ms_count"]
+    )
+    assert total_samples == 2
+
+
+@pytest.mark.asyncio
+async def test_cruzado_retry_semantico_cuenta_dos_completions_una_decision():
+    """Una decision con dos intentos semanticos (el primero invalido, el
+    segundo aceptado): completion_count=2, decision_count=1."""
+    clock = _FakeClock(start=0.0)
+    metrics = DecisionMetrics()
+    backend = _CrossBackend(clock, [
+        {"action": {"kind": "move", "id": "illegal"}, "rationale": "bad"},
+        {
+            "action": {"kind": "move", "id": "thunderbolt"},
+            "rationale": "ok",
+            "confidence": 0.8,
+            "alternatives": [],
+        },
+    ])
+    provider = KeyRotatingProvider(
+        "google", ("key-a",), backend, metrics=metrics, clock=clock
+    )
+
+    result = await decide(_cross_state(clock), provider, metrics, clock=clock)
+
+    assert result["action_path"] == "llm_retry"
+    snapshot = metrics.snapshot()
+    assert snapshot["completion_latency_ms_count"] == 2
+    assert snapshot["completion_latency_ms_total"] == 200
+    assert snapshot["decision_latency_ms_count"] == 1
+    assert snapshot["decision_latency_ms_total"] == 200
+
+
+@pytest.mark.asyncio
+async def test_cruzado_fallback_cuenta_dos_completions_una_decision():
+    """Fallback tras dos respuestas invalidas: completion_count=2 (las dos
+    llamadas facturables), decision_count=1."""
+    clock = _FakeClock(start=0.0)
+    metrics = DecisionMetrics()
+    backend = _CrossBackend(clock, [
+        {"action": {"kind": "move", "id": "illegal"}, "rationale": "bad"},
+        {"action": {"kind": "switch", "species": "missing"}, "rationale": "worse"},
+    ])
+    provider = KeyRotatingProvider(
+        "google", ("key-a",), backend, metrics=metrics, clock=clock
+    )
+
+    result = await decide(_cross_state(clock), provider, metrics, clock=clock)
+
+    assert result["action_path"] == "fallback"
+    snapshot = metrics.snapshot()
+    assert snapshot["completion_latency_ms_count"] == 2
+    assert snapshot["completion_latency_ms_total"] == 200
+    assert snapshot["decision_latency_ms_count"] == 1
+    assert snapshot["decision_latency_ms_total"] == 200

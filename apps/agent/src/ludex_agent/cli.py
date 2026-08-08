@@ -550,7 +550,7 @@ async def _benchmark_command(
     *, n: int, opponent: str, concurrency: int, persist: bool,
     provider_name: str, model: str, fmt: str,
     on_progress: Callable[
-        [BenchmarkResult, Mapping[str, int]], Awaitable[None] | None
+        [BenchmarkResult, Mapping[str, int | None]], Awaitable[None] | None
     ] | None = None,
 ) -> tuple[BenchmarkResult, dict[str, int]]:
     settings = load_settings()
@@ -677,7 +677,7 @@ def benchmark_command(
     effective_route = selected_route or ModelRoute(protocol=provider_name)
 
     async def report_progress(
-        progress: BenchmarkResult, metrics: Mapping[str, int]
+        progress: BenchmarkResult, metrics: Mapping[str, int | None]
     ) -> None:
         partial = build_benchmark_record(
             run_id=effective_run_id,
@@ -712,15 +712,25 @@ def benchmark_command(
             provider=provider_name, model=model_name,
             failure=str(exc),
         )
-        not_run_metrics: dict[str, int] = {
+        not_run_metrics: dict[str, int | None] = {
             "turns_total": 0, "calls_total": 0, "input_tokens": 0,
             "output_tokens": 0, "cached_input_tokens": 0,
             "reasoning_tokens": 0, "key_rotations": 0,
             "provider_switches": 0, "turns_quota_affected": 0,
             "turns_transient_affected": 0, "turns_deadline_affected": 0,
             "turns_model_invalid": 0, "turns_fallback": 0,
-            "latency_ms_count": 0, "latency_ms_total": 0,
-            "latency_ms_p50": 0, "latency_ms_p95": 0, "latency_ms_max": 0,
+            # L-01 (R2): sin muestras no hay latencia comparable; los
+            # percentiles de una corrida no ejecutada son None, no 0.
+            "completion_latency_ms_count": 0,
+            "completion_latency_ms_total": None,
+            "completion_latency_ms_p50": None,
+            "completion_latency_ms_p95": None,
+            "completion_latency_ms_max": None,
+            "decision_latency_ms_count": 0,
+            "decision_latency_ms_total": None,
+            "decision_latency_ms_p50": None,
+            "decision_latency_ms_p95": None,
+            "decision_latency_ms_max": None,
         }
         not_run_record = build_benchmark_record(
             run_id=effective_run_id,

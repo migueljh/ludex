@@ -13,7 +13,12 @@ from ludex_agent.db.context_repository import PostgresContextRepository
 from ludex_agent.db.repository import BattleRepository
 from ludex_agent.db.session import make_engine, session_factory
 from ludex_agent.graph.calc import CalcClient
-from ludex_agent.graph.provider import DecisionMetrics
+from ludex_agent.graph.provider import (
+    CompletionEnvelope,
+    CompletionUsage,
+    DecisionMetrics,
+    PinnedResolver,
+)
 from ludex_agent.graph.workflow import build_decision_graph
 from ludex_agent.showdown.client import LudexPlayer, local_server_configuration
 
@@ -32,10 +37,18 @@ class FirstLegalGraph:
 
 class AlwaysIllegalProvider:
     async def complete(self, prompt, *, deadline, turn_id):
-        return {
-            "action": {"kind": "move", "id": "definitelyillegal"},
-            "reasoning": "forced invalid response",
-        }
+        return CompletionEnvelope(
+            payload={
+                "action": {"kind": "move", "id": "definitelyillegal"},
+                "rationale": "forced invalid response",
+                "confidence": 0.5,
+                "alternatives": [],
+            },
+            provider="fake",
+            model="fake-model",
+            usage=CompletionUsage(input_tokens=1, output_tokens=1),
+            latency_ms=0.0,
+        )
 
 
 SHADOW_TAG_AGENT_TEAM = """
@@ -184,7 +197,9 @@ async def test_respuesta_ilegal_dos_veces_juega_y_persiste_fallback():
     context_repository = PostgresContextRepository(settings.database_url)
     graph = build_decision_graph(
         calculator,
-        AlwaysIllegalProvider(),
+        PinnedResolver(
+            AlwaysIllegalProvider(), "fake", "fake-model",
+        ),
         DecisionMetrics(),
         context_repository,
     )

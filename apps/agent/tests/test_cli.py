@@ -154,7 +154,12 @@ def test_provider_smoke_usa_flags_como_los_comandos_del_plan():
     assert "--model" in result.stdout
 
 
-def test_provider_smoke_sin_credenciales_emite_not_run_y_no_traceback():
+def test_provider_smoke_sin_credenciales_emite_not_run_y_no_traceback(monkeypatch):
+    # El env de CliRunner se FUSIONA con el ambiente real: para ejercer el
+    # path "sin credenciales" de forma determinista hay que remover las
+    # variables de credenciales, no solo no pasarlas.
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.delenv("KIMI_API_KEYS", raising=False)
     result = CliRunner().invoke(
         app,
         ["provider-smoke", "--provider", "kimi", "--model", "kimi-k2.6"],
@@ -240,6 +245,10 @@ def test_provider_smoke_sanitiza_respuesta_semanticamente_invalida(monkeypatch):
 def test_benchmark_sin_credenciales_emite_not_run_y_no_publica_winrate(monkeypatch, tmp_path):
     runs_dir = tmp_path / "runs"
     monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", runs_dir)
+    # CliRunner fusiona su env con el ambiente real: remover credenciales
+    # para ejercer el path "sin credenciales" de forma determinista.
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.delenv("KIMI_API_KEYS", raising=False)
     result = CliRunner().invoke(
         app,
         [
@@ -265,6 +274,17 @@ def test_benchmark_sin_credenciales_emite_not_run_y_no_publica_winrate(monkeypat
     assert data["win_rate"] is None
     assert data["wilson95"] is None
     assert "NOT RUN" in data["failure"]
+    # L-01 (R2): sin muestras no hay latencia comparable: null, nunca 0.
+    assert data["completion_latency_ms_total"] is None
+    assert data["completion_latency_ms_p50"] is None
+    assert data["completion_latency_ms_p95"] is None
+    assert data["completion_latency_ms_max"] is None
+    assert data["decision_latency_ms_total"] is None
+    assert data["decision_latency_ms_p50"] is None
+    assert data["decision_latency_ms_p95"] is None
+    assert data["decision_latency_ms_max"] is None
+    ledger_text = (tmp_path / "ledger.md").read_text()
+    assert "0/0/0" not in ledger_text
 
 
 def test_benchmark_rechaza_modelo_sin_ruta_antes_de_llamarlo(monkeypatch):

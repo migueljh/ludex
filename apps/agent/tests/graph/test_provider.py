@@ -858,19 +858,67 @@ def test_metricas_de_latencia_calculan_p50_p95_y_max():
     metrics = DecisionMetrics()
 
     for latency in [10.0, 20.0, 30.0, 40.0, 50.0, 100.0, 200.0]:
-        metrics.latency(latency)
+        metrics.completion_latency(latency)
 
     snapshot = metrics.snapshot()
-    assert snapshot["latency_ms_count"] == 7
-    assert snapshot["latency_ms_total"] == 450
-    assert snapshot["latency_ms_max"] == 200
-    assert snapshot["latency_ms_p50"] == 40
-    assert snapshot["latency_ms_p95"] == 170
+    assert snapshot["completion_latency_ms_count"] == 7
+    assert snapshot["completion_latency_ms_total"] == 450
+    assert snapshot["completion_latency_ms_max"] == 200
+    assert snapshot["completion_latency_ms_p50"] == 40
+    assert snapshot["completion_latency_ms_p95"] == 170
+    assert snapshot["decision_latency_ms_count"] == 0
 
 
 def test_metricas_de_latencia_rechazan_valores_negativos():
     with pytest.raises(ValueError, match="latency cannot be negative"):
-        DecisionMetrics().latency(-1.0)
+        DecisionMetrics().completion_latency(-1.0)
+    with pytest.raises(ValueError, match="latency cannot be negative"):
+        DecisionMetrics().decision_latency(-1.0)
+
+
+def test_metricas_de_latencia_no_truncan_99999_ni_redondean_a_cero():
+    """L-01 (R2): la politica de redondeo es entero mas cercano via
+    `round()`; truncar con `int()` dejaria 99.999... en 99 y es una
+    regresion prohibida (mutacion dedicada)."""
+    metrics = DecisionMetrics()
+    metrics.completion_latency(99.99999)
+    snapshot = metrics.snapshot()
+    assert snapshot["completion_latency_ms_total"] == 100
+    assert snapshot["completion_latency_ms_max"] == 100
+    assert snapshot["completion_latency_ms_p50"] == 100
+    assert snapshot["completion_latency_ms_p95"] == 100
+
+
+def test_percentiles_sin_muestras_son_none_nunca_cero_comparable():
+    """L-01 (R2): una poblacion sin muestras deja total/p50/p95/max en None
+    (null en artefactos, blanco en el ledger), nunca 0/0/0."""
+    snapshot = DecisionMetrics().snapshot()
+    assert snapshot["completion_latency_ms_count"] == 0
+    assert snapshot["completion_latency_ms_total"] is None
+    assert snapshot["completion_latency_ms_p50"] is None
+    assert snapshot["completion_latency_ms_p95"] is None
+    assert snapshot["completion_latency_ms_max"] is None
+    assert snapshot["decision_latency_ms_count"] == 0
+    assert snapshot["decision_latency_ms_total"] is None
+    assert snapshot["decision_latency_ms_p50"] is None
+    assert snapshot["decision_latency_ms_p95"] is None
+    assert snapshot["decision_latency_ms_max"] is None
+
+
+def test_completion_y_decision_son_poblaciones_disjuntas():
+    """L-01 (R2): ninguna muestra entra en ambas poblaciones. Una completion
+    de 100 ms y una decision de 250 ms son dos poblaciones de una muestra
+    cada una, no una poblacion de dos muestras."""
+    metrics = DecisionMetrics()
+    metrics.completion_latency(100.0)
+    metrics.decision_latency(250.0)
+    snapshot = metrics.snapshot()
+    assert snapshot["completion_latency_ms_count"] == 1
+    assert snapshot["completion_latency_ms_total"] == 100
+    assert snapshot["completion_latency_ms_max"] == 100
+    assert snapshot["decision_latency_ms_count"] == 1
+    assert snapshot["decision_latency_ms_total"] == 250
+    assert snapshot["decision_latency_ms_max"] == 250
 
 
 async def test_envelope_latencia_mide_la_llamada_con_reloj_inyectable():

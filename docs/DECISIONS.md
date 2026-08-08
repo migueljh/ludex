@@ -2287,14 +2287,40 @@ un instante contra un deadline, recibe `clock`. Nunca se mezcla `clock()` con
 `time.monotonic()` en la misma rutina: eso rompe los tests con reloj falso y
 puede hacer que un deadline nunca se dispare.
 
-Las métricas agregadas son `latency_ms_total`, `latency_ms_count`,
-`latency_ms_max`, `latency_ms_p50` y `latency_ms_p95`. Se calculan sobre cada
-llamada a `provider.complete()` dentro de una batalla, y el `BenchmarkRecord`
-las expone para el ledger. Los percentiles usan interpolación lineal de
-NumPy; cuando no hay muestras los valores son 0.
+**L-01 (R2): DOS poblaciones de latencia, nunca mezcladas.** La latencia de
+cada completion (una llamada a `provider.complete()`) y la latencia
+end-to-end de cada decisión (retries incluidos) son muestras de
+poblaciones distintas, con contratos con nombre explícito:
+
+- `completion_latency_ms_count/total/p50/p95/max` — una muestra por cada
+  llamada exitosa al provider, registrada por `KeyRotatingProvider`.
+- `decision_latency_ms_count/total/p50/p95/max` — una muestra por decisión,
+  desde el primer intento LLM hasta la respuesta aceptada o el fallback,
+  registrada por `decide()`.
+
+Una decisión con una completion aporta exactamente una muestra a cada
+población (nunca dos al mismo contador); una decisión con dos intentos
+semánticos aporta 2 completions y 1 decisión; el fallback tras dos
+respuestas inválidas aporta 2 completions y 1 decisión. El
+`CompletionEnvelope.latency_ms` sigue siendo por llamada. El test cruzado
+`test_cruzado_*` en `test_decision.py` une `KeyRotatingProvider` con
+`decide()` sobre el MISMO `DecisionMetrics` y falla si alguien vuelve a
+mezclar las poblaciones en cualquiera de las dos direcciones.
+
+**Política de redondeo (L-01):** los agregados usan entero más cercano con
+`round()`; truncar con `int()` está prohibido (un 99.999... debe quedar en
+100, nunca en 99). Sin muestras, `total/p50/p95/max` son `None`: null en el
+artefacto JSON y blanco en el ledger, nunca 0/0/0 comparable. El
+`BenchmarkRecord` y el ledger distinguen ambas poblaciones por nombre
+(Completion vs Decision), y cada celda vacía significa "sin muestras o no
+comparable", nunca cero implícito.
 
 **Tests.** `test_provider.py` verifica deadline, cooldown de claves con 429,
-y mezcla de modelos con conteos correctos usando `SequenceClock`.
-`test_decision.py` verifica que `decide()` registra latencia 125 ms cuando el
-provider tarda exactamente eso. Cada test falla si se revierte el uso de
-`self._clock()` o si se ignora el `clock` inyectado.
+mezcla de modelos con conteos correctos usando `SequenceClock`, redondeo sin
+truncamiento y percentiles nulos sin muestras. `test_decision.py` verifica
+que `decide()` registra latencia 125 ms con reloj inyectado y los cuatro
+canarios cruzados del doble conteo (1 completion/1 decisión, retry
+semántico, fallback, y disyunción de poblaciones). Cada test falla si se
+revierte el uso de `self._clock()`, si se ignora el `clock` inyectado, si se
+vuelve a mezclar una población de latencia, o si se reintroduce el
+truncamiento por `int()`.

@@ -235,3 +235,94 @@ def test_run_id_no_permite_rutas_ni_espacios():
             route=ModelRoute(protocol="chat_completions"),
             pricing=PricingTable.load(),
         )
+
+
+def _metrics_con_latencia():
+    metrics = _metrics()
+    metrics.update({
+        "completion_latency_ms_count": 3,
+        "completion_latency_ms_total": 600,
+        "completion_latency_ms_p50": 200,
+        "completion_latency_ms_p95": 220,
+        "completion_latency_ms_max": 250,
+        "decision_latency_ms_count": 3,
+        "decision_latency_ms_total": 900,
+        "decision_latency_ms_p50": 300,
+        "decision_latency_ms_p95": 310,
+        "decision_latency_ms_max": 320,
+    })
+    return metrics
+
+
+def _aborted_result(failure="QuotaExceeded: provider quota exhausted"):
+    return BenchmarkResult(
+        requested=15, completed=3, wins=1, losses=2, ties=0,
+        provider="kimi", model="kimi-k2.6", failure=failure,
+    )
+
+
+def test_record_con_muestras_expone_ambas_poblaciones_y_ledger_distinguido(tmp_path):
+    """L-01 (R2): con muestras, el record y el ledger distinguen por nombre
+    completion vs decision, y cada poblacion lleva sus propios valores."""
+    record = build_benchmark_record(
+        run_id="test-latency-both",
+        created_at=datetime(2026, 8, 8, 12, tzinfo=timezone.utc),
+        result=_aborted_result(),
+        metrics=_metrics_con_latencia(),
+        opponent="simple_heuristics",
+        fmt="gen6randombattle",
+        route=ModelRoute(protocol="chat_completions"),
+        pricing=PricingTable.load(),
+    )
+    artifact = tmp_path / "runs" / "test-latency-both.json"
+    ledger = tmp_path / "BENCHMARKS.md"
+    write_run_snapshot(record, artifact)
+    append_ledger_row(record, ledger, artifact)
+
+    rendered = artifact.read_text()
+    assert '"completion_latency_ms_total": 600' in rendered
+    assert '"completion_latency_ms_p50": 200' in rendered
+    assert '"decision_latency_ms_total": 900' in rendered
+    assert '"decision_latency_ms_p50": 300' in rendered
+    markdown = ledger.read_text()
+    assert "Completion p50/p95/max (ms)" in markdown
+    assert "Decision p50/p95/max (ms)" in markdown
+    assert "200/220/250" in markdown
+    assert "300/310/320" in markdown
+
+
+def test_corrida_abortada_con_progreso_no_publica_latencia_comparable_ni_winrate(tmp_path):
+    """L-01 (R2): un run abortado con progreso real (3/15) puede versionarse
+    como abortado; si alguna poblacion no tiene muestras, sus percentiles
+    quedan null/blanco, nunca 0/0/0 comparable, y no publica winrate."""
+    metrics = _metrics_con_latencia()
+    metrics["completion_latency_ms_count"] = 0
+    for key in ("total", "p50", "p95", "max"):
+        metrics[f"completion_latency_ms_{key}"] = None
+    record = build_benchmark_record(
+        run_id="test-aborted-latency",
+        created_at=datetime(2026, 8, 8, 12, tzinfo=timezone.utc),
+        result=_aborted_result(),
+        metrics=metrics,
+        opponent="simple_heuristics",
+        fmt="gen6randombattle",
+        route=ModelRoute(protocol="chat_completions"),
+        pricing=PricingTable.load(),
+    )
+    artifact = tmp_path / "runs" / "test-aborted-latency.json"
+    ledger = tmp_path / "BENCHMARKS.md"
+    write_run_snapshot(record, artifact)
+    append_ledger_row(record, ledger, artifact)
+
+    rendered = artifact.read_text()
+    assert record.status == "aborted"
+    assert record.win_rate is None
+    assert record.wilson95 is None
+    assert '"completion_latency_ms_total": null' in rendered
+    assert '"completion_latency_ms_p50": null' in rendered
+    assert '"completion_latency_ms_max": null' in rendered
+    assert '"decision_latency_ms_p50": 300' in rendered
+    markdown = ledger.read_text()
+    assert "0/0/0" not in markdown
+    # La celda de completion queda vacia (dos separadores consecutivos).
+    assert "|  | 300/310/320 |" in markdown
