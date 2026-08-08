@@ -2324,3 +2324,36 @@ semántico, fallback, y disyunción de poblaciones). Cada test falla si se
 revierte el uso de `self._clock()`, si se ignora el `clock` inyectado, si se
 vuelve a mezclar una población de latencia, o si se reintroduce el
 truncamiento por `int()`.
+
+**R3 — evidencia durable y sanitizada del error original.** El artefacto
+JSON de una corrida fallida conserva tres campos separados: `failure`
+(mensaje público sanitizado, el de siempre), `failure_type` (clase del
+error clasificado, p.ej. `TransientProviderError`) y `failure_cause_type`
+(clase de la causa original vía `__cause__`, p.ej. `APITimeoutError`). La
+derivación vive en `failure_classification` (`benchmark.py`), que devuelve
+SOLO nombres de clase — nunca mensajes crudos, URLs, módulos, tracebacks ni
+secretos. Un error sin `__cause__` (p.ej. `BenchmarkDeadlineExceeded`
+sintético o `ProviderSelectionError` del path not-run) deja
+`failure_cause_type=None`; jamás se inventa una causa. El camino real
+funciona porque `KeyRotatingProvider.complete` re-lanza el error clasificado
+con `raise error from raw`, preservando el original en `__cause__`. Los
+tests sintéticos atraviesan la cadena completa raw → clasificado → resultado
+→ record → JSON y fallan si se retira la causa, si se clona el error sin
+causa, o si se intenta persistir el mensaje crudo con cualquier key señuelo.
+
+**R3 — contrato tipado de métricas.** `DecisionMetrics.snapshot()` mezcla
+contadores `int` con percentiles de latencia `int | None`. Todos los
+consumidores lo declaran así: `_benchmark_command` devuelve
+`dict[str, int | None]`, los callbacks de progreso y
+`build_benchmark_record` reciben `Mapping[str, int | None]`.
+`calculate_cost` consume ÚNICAMENTE los campos de tokens
+(`input_tokens`, `cached_input_tokens`, `output_tokens`) y rechaza con
+`ValueError` si alguno es `None` — un conteo de tokens ausente no es
+calculable y nunca se confunde con los percentiles nullable, que no se leen
+en el costo.
+
+**R3 — identidad del run.** El screen pinneado de OpenCode se identifica por
+el modelo que efectivamente ejecutó: `20260808-opencode-claude-haiku-4-5-screen`
+(antes `20260808-opencode-mimo-screen`), en archivo, `run_id`, ledger y
+notas. Un artefacto pinneado jamás se identifica por un modelo distinto del
+efectivo.

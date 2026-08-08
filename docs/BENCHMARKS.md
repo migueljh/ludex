@@ -14,25 +14,32 @@ significa desconocido o no comparable, nunca cero implícito.
 | 2026-07-28 | [20260728-mimo-v25-5](../apps/agent/evals/runs/20260728-mimo-v25-5.json) | open_code_zen/mimo-v2.5-free | 5/5 | 2-3-0 | 40.0000% | 11.7621%–76.9276% | 41.2000 | 503090/23413 | 0.0000 | 0.0000 | 0.0000 | 21.8935%/0.0000% | 0 | 0 | 0 |  |  | 2026-07-28-official |
 | 2026-08-08 | [20260808-kimi-k26-battle-1](../apps/agent/evals/runs/20260808-kimi-k26-battle-1.json) | kimi/kimi-k2.6 | 0/1 | 0-0-0 |  |  |  | 0/0 | 0.0000 |  |  | 0.0000%/0.0000% | 1 | 0 | 0 |  |  | 2026-07-28-official |
 | 2026-08-08 | [20260808-gemini-25flash-d30](../apps/agent/evals/runs/20260808-gemini-25flash-d30.json) | google/gemini-2.5-flash | 0/1 | 0-0-0 |  |  |  | 439144/24515 |  |  |  | 0.0000%/0.0000% | 0 | 0 | 1 |  |  | 2026-07-28-official |
-| 2026-08-08 | [20260808-opencode-mimo-screen](../apps/agent/evals/runs/20260808-opencode-mimo-screen.json) | open_code_zen/claude-haiku-4-5 | 1/1 | 1-0-0 | 100.0000% | 20.6549%–100.0000% | 52.0000 | 156/7975 |  |  |  | 39.3939%/18.1818% | 0 | 0 | 0 | 3007/4304/7253 | 5466/7465/8885 | 2026-07-28-official |
+| 2026-08-08 | [20260808-opencode-claude-haiku-4-5-screen](../apps/agent/evals/runs/20260808-opencode-claude-haiku-4-5-screen.json) | open_code_zen/claude-haiku-4-5 | 1/1 | 1-0-0 | 100.0000% | 20.6549%–100.0000% | 52.0000 | 156/7975 |  |  |  | 39.3939%/18.1818% | 0 | 0 | 0 | 3007/4304/7253 | 5466/7465/8885 | 2026-07-28-official |
+| 2026-08-08 | [test-transient](../../../../../private/var/folders/cb/9hprmpvj1fnbrqw0dbglf_pr0000gn/T/pytest-of-miguelhernandez/pytest-125/test_benchmark_command_transie0/test-transient.json) | fake/fake-model | 0/1 | 0-0-0 |  |  |  | 0/0 |  |  |  | 0.0000%/0.0000% | 0 | 0 | 0 |  |  | 2026-07-28-official |
+| 2026-08-08 | [test-transient](../../../../../private/var/folders/cb/9hprmpvj1fnbrqw0dbglf_pr0000gn/T/pytest-of-miguelhernandez/pytest-126/test_benchmark_command_transie0/test-transient.json) | fake/fake-model | 0/1 | 0-0-0 |  |  |  | 0/0 |  |  |  | 0.0000%/0.0000% | 0 | 0 | 0 |  |  | 2026-07-28-official |
+| 2026-08-08 | [test-transient](../../../../../private/var/folders/cb/9hprmpvj1fnbrqw0dbglf_pr0000gn/T/pytest-of-miguelhernandez/pytest-127/test_benchmark_command_transie0/test-transient.json) | fake/fake-model | 0/1 | 0-0-0 |  |  |  | 0/0 |  |  |  | 0.0000%/0.0000% | 0 | 0 | 0 |  |  | 2026-07-28-official |
+| 2026-08-08 | [test-transient](../../../../../private/var/folders/cb/9hprmpvj1fnbrqw0dbglf_pr0000gn/T/pytest-of-miguelhernandez/pytest-128/test_benchmark_command_transie0/test-transient.json) | fake/fake-model | 0/1 | 0-0-0 |  |  |  | 0/0 |  |  |  | 0.0000%/0.0000% | 0 | 0 | 0 |  |  | 2026-07-28-official |
 
 ## Controles parciales e incidencias
 
-- 2026-08-08 (MON-15 R2): los tres controles de proveedores de F2-10 se
-  ejecutaron con credenciales reales, todos con `status: aborted` (nunca
-  comparable, sin winrate ni latencia publicados en el ledger):
-  - **Kimi** (`20260808-kimi-k26-battle-1`, pin `kimi/kimi-k2.6`): la batalla
-    abortó con `TransientProviderError: provider transport failed`; la clase
-    original capturada en el log fue `APITimeoutError: Request timed out`
-    (límite externo del proveedor; el smoke pasa). El artefacto conserva el
-    progreso real (1 turno, 1 transitorio) y latencias `null`.
+- 2026-08-08 (MON-15): controles de proveedores de F2-10 con credenciales
+  reales. **Kimi y Gemini quedaron `aborted`** (no comparables, sin winrate
+  ni latencia publicados en el ledger); **OpenCode Zen quedó `complete`
+  1/1**, el único control comparable de la fecha:
+  - **Kimi** (`20260808-kimi-k26-battle-1`, pin `kimi/kimi-k2.6`): `aborted`
+    0/1. Fallo clasificado `TransientProviderError` con causa original
+    `APITimeoutError` (timeout de transporte del endpoint de Kimi con
+    thinking + 16k max_tokens; límite externo del proveedor, el smoke pasa).
+    El artefacto conserva ambos tipos (`failure_type` /
+    `failure_cause_type`), el progreso real (1 turno, 1 transitorio) y
+    latencias `null`.
   - **Gemini** (`20260808-gemini-25flash-d30`, pin `google/gemini-2.5-flash`,
-    sin chain): abrió con `BenchmarkDeadlineExceeded` a los 180 s (límite
-    externo: el modelo tarda 15–21 s por completion y no cierra una batalla
-    en el deadline). Ejercitó D30 en vivo: 1 rotación de clave y 1 turno
-    afectado por cuota real (429), 11 completions, 12 turnos.
-  - **OpenCode Zen** (`20260808-opencode-mimo-screen`, pin
-    `open_code_zen/claude-haiku-4-5`, sin chain): **completado** 1/1 con
+    sin chain): `aborted` 0/1 por `BenchmarkDeadlineExceeded` a los 180 s
+    (límite externo: el modelo tarda 15–21 s por completion y no cierra una
+    batalla en el deadline). Ejercitó D30 en vivo: 1 rotación de clave y 1
+    turno afectado por cuota real (429), 11 completions, 12 turnos.
+  - **OpenCode Zen** (`20260808-opencode-claude-haiku-4-5-screen`, pin
+    `open_code_zen/claude-haiku-4-5`, sin chain): **`complete` 1/1** con
     winrate 100.0000% (Wilson 95% 20.6549%–100.0000%). 52 completions en 33
     decisiones; latencia comparable en el ledger: completion p50/p95/max
     3007/4304/7253 ms y decision 5466/7465/8885 ms. El modelo respondió con
@@ -40,6 +47,14 @@ significa desconocido o no comparable, nunca cero implícito.
     screen cerró comparable; el modelo `claude-haiku-4-5` fue validado contra
     el catálogo `/models` real (existe) y se le agregó su ruta local en
     `model-routes.json`.
+
+    **Sobre el usage de OpenCode (156 input / 7.975 output tokens, 52
+    completions):** es el usage reportado por el gateway OpenCode Zen, no
+    validado como conteo semántico — el modelo respondió 19 respuestas
+    inválidas y 6 fallbacks dentro del screen, y el gateway no expone
+    facturación por completion. Como `claude-haiku-4-5` no tiene precio
+    aplicable en la tabla `2026-07-28-official`, **no se publica costo
+    comparable** para esta corrida (celdas de costo vacías).
 - `20260728-deepseek-v4-flash-control` completó 1 de 2 batallas antes de
   interrumpirse por la cancelación accidental del monitor reutilizable de
   errores de fondo. La batalla completada fue una derrota con 26 llamadas,
@@ -70,10 +85,12 @@ errores, 20s**. El cliente subyacente se reutiliza, así que construir el
 wrapper por llamada no abre sockets nuevos. Sea lo que sea el fallo de
 Kimi, no es esto.
 
-**Medido en vivo (MON-15 R2, 2026-08-08).** El primer aborto real de Kimi
+**Medido en vivo (MON-15 R2/R3, 2026-08-08).** El primer aborto real de Kimi
 con credenciales dejó la clase original en el log: `APITimeoutError:
 Request timed out` (timeout de transporte, límite externo del proveedor),
 clasificada como `TransientProviderError`. No es una fuga de sockets: es un
 timeout del endpoint de Kimi con `thinking` habilitado y `max_tokens`
 16.000. La batalla quedó versionada como `aborted` (0/1, sin winrate ni
-latencia comparable), el diagnóstico quedó desbloqueado y resuelto.
+latencia comparable), el diagnóstico quedó desbloqueado y resuelto. Desde
+R3 el artefacto persiste ambos tipos de forma durable y sanitizada:
+`failure_type=TransientProviderError`, `failure_cause_type=APITimeoutError`.

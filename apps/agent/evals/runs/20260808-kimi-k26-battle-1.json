@@ -62,5 +62,7 @@
   "decision_latency_ms_max": null,
   "pricing_table_id": "2026-07-28-official",
   "pricing_currency": "USD",
-  "pricing_source_url": "https://platform.kimi.ai/"
+  "pricing_source_url": "https://platform.kimi.ai/",
+  "failure_type": "TransientProviderError",
+  "failure_cause_type": "APITimeoutError"
 }
