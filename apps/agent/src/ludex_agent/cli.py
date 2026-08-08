@@ -21,8 +21,9 @@ from poke_env.player import (
 )
 
 from .benchmark import BenchmarkDeadlineExceeded, BenchmarkResult, run_benchmark
-from .config import load_settings
+from .config import PROVIDER_CATALOG, load_settings
 from .db.context_repository import PostgresContextRepository
+from .db.model_repository import ModelRepository, ModelSelectionError
 from .db.repository import BattleRepository
 from .db.session import make_engine, session_factory
 from .showdown.client import LudexPlayer, local_server_configuration
@@ -35,6 +36,7 @@ from .graph.provider import (
     GeminiDecisionProvider,
     ModelRoute,
     OpenAICompatibleDecisionProvider,
+    PinnedResolver,
     ProviderChain,
     ProviderError,
     load_model_routes,
@@ -403,6 +405,139 @@ def provider_smoke_command(
     typer.echo(f"decision_metrics={metrics.snapshot()}")
 
 
+async def _sync_open_code_zen_models(
+    *, base_url: str, api_key: str,
+    client: Any | None = None,
+) -> list[str]:
+    """Resuelve el catalogo de modelos de OpenCode Zen desde su endpoint
+    /models durante CONFIGURACION (nunca en runtime de batalla). El catalogo
+    no se hardcodea: se lee del endpoint (shape OpenAI-compatible,
+    {"data": [{"id": ...}]}). Un shape invalido falla ruidoso.
+
+    Excepcion de cliente documentada (D39): el sync usa httpx directo porque
+    es configuracion, no una decision; el runtime sigue con los clientes
+    especializados por proveedor.
+    """
+    import httpx
+
+    if client is None:
+        client = httpx.AsyncClient()
+        owns_client = True
+    else:
+        owns_client = False
+    try:
+        response = await client.get(
+            f"{base_url.rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        try:
+            document = response.json()
+        except ValueError as exc:
+            raise RuntimeError("OpenCode /models no devolvio JSON") from exc
+        data = document.get("data") if isinstance(document, dict) else None
+        if not isinstance(data, list):
+            raise RuntimeError(
+                "OpenCode /models sin forma {'data': [...]}: "
+                f"shape inesperado: {type(document).__name__}"
+            )
+        ids = [
+            entry["id"]
+            for entry in data
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+        ]
+        if not ids:
+            raise RuntimeError("OpenCode /models no devolvio ningun modelo con id")
+        return ids
+    finally:
+        if owns_client:
+            await client.aclose()
+
+
+@app.command("provider-init")
+def provider_init_command(
+    sync_open_code_zen: bool = typer.Option(
+        True, help="Sincronizar el catalogo de modelos de OpenCode Zen desde /models"
+    ),
+) -> None:
+    """Bootstrap de configuracion: puebla `providers` desde el catalogo de
+    config (nombres de env vars, NUNCA valores) y, para open_code_zen,
+    resuelve el catalogo de modelos desde su endpoint /models. Si LUDEX_MODEL
+    esta definido, lo deja como default y activo."""
+    import asyncio as _asyncio
+
+    settings = load_settings()
+    engine = make_engine(settings.database_url)
+    repo = ModelRepository(session_factory(engine))
+
+    async def run() -> None:
+        provider_ids: dict[str, int] = {}
+        for name, (primary_env, _, base_env) in PROVIDER_CATALOG.items():
+            base_url = os.environ.get(base_env) if base_env else None
+            provider_ids[name] = await repo.upsert_provider(
+                name=name, base_url=base_url, api_key_env=primary_env,
+            )
+            typer.echo(f"provider={name} api_key_env={primary_env}")
+        if sync_open_code_zen:
+            key = os.environ.get("OPEN_CODE_ZEN_API_KEY", "").strip()
+            base_url = os.environ.get("OPEN_CODE_ZEN_BASE_URL", "").strip()
+            if key and base_url:
+                ids = await _sync_open_code_zen_models(base_url=base_url, api_key=key)
+                for model_id in ids:
+                    await repo.upsert_model(
+                        provider_id=provider_ids["open_code_zen"],
+                        model_id=model_id, label=model_id,
+                    )
+                typer.echo(f"open_code_zen: {len(ids)} modelos sincronizados desde /models")
+            else:
+                typer.echo(
+                    "open_code_zen: sin OPEN_CODE_ZEN_API_KEY/OPEN_CODE_ZEN_BASE_URL, "
+                    "catalogo no sincronizado"
+                )
+        if settings.llm_model:
+            provider_id = provider_ids[settings.llm_provider]
+            await repo.upsert_model(
+                provider_id=provider_id, model_id=settings.llm_model,
+                label=settings.llm_model, is_default=True,
+            )
+            await repo.set_active(settings.llm_provider, settings.llm_model)
+            typer.echo(
+                f"activo={settings.llm_provider}/{settings.llm_model} "
+                "(default desde LUDEX_MODEL)"
+            )
+
+    _asyncio.run(run())
+    typer.echo("provider-init ok")
+
+
+@app.command("model-set")
+def model_set_command(
+    provider: str = typer.Option(...),
+    model: str = typer.Option(...),
+) -> None:
+    """Fija la seleccion activa de modelo en la DB (surte efecto en la
+    siguiente decision del grafo; sin secretos)."""
+    import asyncio as _asyncio
+
+    settings = load_settings()
+    engine = make_engine(settings.database_url)
+    repo = ModelRepository(session_factory(engine))
+
+    async def run() -> None:
+        # L-01 (R2): la frontera unica de validacion. Un provider o model
+        # inexistente o deshabilitado rechaza el comando ANTES de escribir
+        # nada en settings.
+        try:
+            await repo.validate_selection(provider, model)
+        except ModelSelectionError as exc:
+            raise typer.BadParameter(str(exc))
+        await repo.set_active(provider, model)
+        typer.echo(f"activo={provider}/{model}")
+
+    _asyncio.run(run())
+
+
 async def _benchmark_command(
     *, n: int, opponent: str, concurrency: int, persist: bool,
     provider_name: str, model: str, fmt: str,
@@ -422,8 +557,14 @@ async def _benchmark_command(
         timeout_seconds=settings.llm_request_timeout_seconds,
     )
     context_repository = PostgresContextRepository(settings.database_url)
+    # F2-09 (D28): el benchmark fija provider/model al inicio y el resolver
+    # pinneado audita cada envelope: cualquier mezcla efectiva dentro de la
+    # corrida aborta con ProviderMixError.
+    pinned = PinnedResolver(
+        selected, provider_name, model, enforce_pin=True,
+    )
     graph = build_decision_graph(
-        calculator, selected, metrics, context_repository
+        calculator, pinned, metrics, context_repository
     )
     suffix = str(time.time_ns())[-8:]
     common = {

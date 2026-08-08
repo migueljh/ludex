@@ -771,6 +771,21 @@ def project_observable_state(
     permanente para la identidad del propio tenedor. `value=None` (item
     consumido/removido) es tan significativo como cualquier item real -- la
     clave `"item"` queda presente con ese valor, nunca ausente.
+
+    `canonical_types` (D41) es la misma idea aplicada a los tipos BASE del
+    rival: `Pokemon._update_from_details` de poke-env corta en seco si
+    `details` no cambio desde la ultima vez, asi que tras un `-formechange`
+    TEMPORAL (Relic Song) su propio snapshot puede seguir stale en el
+    PROXIMO switch-in con el mismo `details` base -- `switch_in()` ya
+    recalcula sin condicion en la llamada donde el switch ocurre, pero esa
+    correccion no sobrevive sola a la llamada SIGUIENTE si nada vuelve a
+    nombrar a esa identidad (ROOT-CAUSE CHECKPOINT, MON-19). A diferencia de
+    `item`, `types` YA tenia una clave `"types"` en `persistent_state`
+    -- el backup de un override TEMPORAL activo (typechange, Transform, y
+    ahora tambien `-formechange`). `canonical_types` es una clave DISTINTA
+    y estrictamente permanente (`switch_in`, `detailschange`/Mega); las dos
+    son mutuamente excluyentes en la reaplicacion: mientras `"types"` este
+    presente, el override manda y `canonical_types` no se toca.
     """
     persistent_state = {} if persistent_state is None else persistent_state
     projected = {
@@ -944,6 +959,22 @@ def project_observable_state(
         mon["boosts"] = _blank_boosts()
         mon["types"] = vocabulary.species_types(species)
         mon["ability"] = _dex_ability(species, mon.get("ability"), vocabulary)
+        # D41 (MON-19): `switch_in` es evidencia publica DIRECTA del tipo
+        # canonico -- poke-env corta en seco en `_update_from_details` si
+        # `details` no cambio desde la ultima vez, asi que tras un
+        # `-formechange` temporal (Relic Song) su propio snapshot puede
+        # seguir stale en el PROXIMO switch-in con el mismo `details` base.
+        # Esta linea SIEMPRE recalcula del dex sin importar el cache de
+        # poke-env, pero esa correccion no sobrevive sola a la llamada
+        # SIGUIENTE si nada vuelve a nombrar a esta identidad -- por eso se
+        # memoriza en `canonical_types` y se reaplica mas abajo (mismo
+        # patron que `item`, D40). Tambien termina cualquier override
+        # temporal colgado de esta identidad: en curso normal `switch_out`
+        # ya lo limpia, pero `switch_in` no puede depender de eso.
+        identidad = canon(normalize_id(mon.get("species") or ""))
+        entry = persistent_state.setdefault(identidad, {})
+        entry.pop("types", None)
+        entry["canonical_types"] = list(mon["types"])
         level = _level_from_details(details)
         if level is not None:
             mon["level"] = level
@@ -1387,8 +1418,9 @@ def project_observable_state(
         if reveal and len(event) > 3:
             register_move(mon, event[3], use=use)
 
-    def forme_change(forme: str) -> None:
-        """`detailschange` (Mega/Primal) y `-formechange`.
+    def forme_change(forme: str, *, permanent: bool) -> None:
+        """`detailschange` (Mega/Primal, `permanent=True`) y `-formechange`
+        (Meloetta y demas formas transitorias, `permanent=False`).
 
         Cambia los TIPOS pero NO `species`, porque es exactamente lo que hace
         poke-env: `Pokemon.forme_change()` llama a `_update_from_pokedex(...,
@@ -1400,15 +1432,41 @@ def project_observable_state(
         posteriores de poke-env siguen diciendo `slowbro`. Si aca se escribiera
         `slowbromega`, la proyeccion contradiria al resto del dataset dentro de
         la MISMA batalla.
+
+        D41 (MON-19): las dos etiquetas comparten esta funcion pero NO el
+        mismo destino en `persistent_state` -- son semanticas opuestas:
+
+          - `detailschange` (Mega/Primal) es PERMANENTE: no revierte al
+            salir del campo (`switch_out` nunca toca `_type_1`/`_type_2`),
+            asi que estos tipos SON el nuevo canonico. Actualiza
+            `canonical_types` directo, sin backup temporal.
+          - `-formechange` (Relic Song y demas formas que SI revierten al
+            salir) es TEMPORAL: entra al mismo ciclo backup/restauracion
+            que ya usan `apply_typechange`/`apply_transform` (`entry.
+            setdefault("types", ...)`, restaurado en `switch_out`). NUNCA
+            toca `canonical_types` -- si lo hiciera, `canonical_types`
+            quedaria con la forma temporal en vez de la base, y la
+            reaplicacion de mas abajo la sostendria stale para siempre.
         """
         mon = active()
         if mon is None:
             return
-        mon["types"] = vocabulary.species_types(forme)
+        identidad = canon(normalize_id(mon.get("species") or ""))
+        if permanent:
+            mon["types"] = vocabulary.species_types(forme)
+            persistent_state.setdefault(identidad, {})["canonical_types"] = list(mon["types"])
+        else:
+            entry = persistent_state.setdefault(identidad, {})
+            entry.setdefault("types", list(mon["types"]))
+            mon["types"] = vocabulary.species_types(forme)
         # La ability SI cambia: `_update_from_pokedex` la guarda en
         # `forme_change_ability` para una forma Mega/Primal y la property la
         # prefiere (`pokemon.py:650-655`, `861-871`). Medido: tras el
         # detailschange a Camerupt-Mega, poke-env reporta `sheerforce`.
+        # Meloetta-Pirouette no es Mega/Primal (`forme_change_ability`
+        # devuelve `None` para ella), asi que esta rama es un no-op para
+        # `-formechange` en la practica -- compartida por simetria, no
+        # porque Relic Song cambie la ability.
         forme_ability = vocabulary.forme_change_ability(forme)
         if forme_ability is not None:
             mon["ability"] = forme_ability
@@ -1442,6 +1500,16 @@ def project_observable_state(
         # reemplazandolo (D40, requisito 5).
         if "item" in entry:
             mon["item"] = entry["item"]
+        # D41: `canonical_types` es tipos permanentes (switch_in,
+        # `detailschange`/Mega). La clave `"types"` sigue significando
+        # exclusivamente "backup de un override temporal activo"
+        # (typechange, Transform, `-formechange`/Relic Song) -- mientras
+        # este presente, el override es lo que se ve, y reaplicar el
+        # canonico por encima lo pisaria mal. Mutuamente excluyentes, mismo
+        # patron que D37 exige entre `unknown_pp_moves`/`transform_
+        # unknown_pp_moves`.
+        if "types" not in entry and "canonical_types" in entry:
+            mon["types"] = list(entry["canonical_types"])
         if "moves" in entry:
             desconocidos = entry.get("transform_unknown_pp_moves") or ()
         else:
@@ -1558,8 +1626,10 @@ def project_observable_state(
             apply_typechange(parts)
         elif tag == "-transform":
             apply_transform(parts)
-        elif tag in ("detailschange", "-formechange") and len(parts) > 3:
-            forme_change(normalize_id(parts[3].split(",", 1)[0]))
+        elif tag == "detailschange" and len(parts) > 3:
+            forme_change(normalize_id(parts[3].split(",", 1)[0]), permanent=True)
+        elif tag == "-formechange" and len(parts) > 3:
+            forme_change(normalize_id(parts[3].split(",", 1)[0]), permanent=False)
         elif tag in ("-damage", "-heal", "-sethp") and len(parts) > 3:
             mon = active()
             if mon is not None:

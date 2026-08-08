@@ -7,7 +7,14 @@ from unittest.mock import patch
 import pytest
 from poke_env.data import GenData
 
-from ludex_agent.graph.provider import TransientProviderError
+from ludex_agent.graph.provider import (
+    CompletionEnvelope,
+    CompletionUsage,
+    DecisionMetrics,
+    ResolvedProvider,
+    TransientProviderError,
+)
+from ludex_agent.graph.workflow import build_decision_graph
 from ludex_agent.showdown import client as client_module
 from ludex_agent.showdown.client import (
     LudexPlayer,
@@ -2009,3 +2016,275 @@ def test_la_ruta_random_no_deja_metadata_en_el_step():
     ):
         assert key not in step, f"la ruta random no debe setear {key!r}"
         assert step.get(key) is None
+# --- F2-09 (MON-14): adapter de ejecucion cableado y metadata por turno ---
+
+
+async def test_el_caller_ejecuta_despues_de_decide_en_orden():
+    """Correspondencia end-to-end (F2-09/D39): el grafo corre
+    resolve_provider → parse_state → retrieve_context → calc_damage → decide
+    y el adapter de ejecucion (`execute_action`, desde graph/execute.py) se
+    aplica DESPUES, dentro de `run_graph`, sobre el resultado del grafo.
+
+    Canario del cableado: el evento "execute" solo puede salir de la llamada
+    real a `execute_action` dentro de `run_graph`. Si el cableado se
+    desconecta (se vuelve a la traduccion inline de la base), el patch no
+    intercepta nada y el orden queda sin "execute" -- el test se pone en
+    rojo exactamente cuando el adapter deja de estar conectado."""
+    tag = "battle-graph-orden"
+    move = SimpleNamespace(id="tackle")
+    battle = _fake_battle(turn=1, battle_tag=tag, available_moves=[move])
+    events: list[str] = []
+
+    class Calculator:
+        async def calculate(self, request):
+            events.append("calc_damage")
+            return {
+                "damage_rolls": [[10]], "min_damage": 10, "max_damage": 10,
+                "defender_hp": {"cur": 100, "max": 100},
+            }
+
+    class Repository:
+        async def load_battle_context(self, **kwargs):
+            events.append("retrieve_context")
+            return {
+                "generation": {"gen_number": 6, "label": "XY/ORAS"},
+                "own": [], "opponent": [],
+            }
+
+        async def load_moves(self, **kwargs):
+            return {}
+
+        async def load_mega_forms(self, **kwargs):
+            return {}
+
+    class Provider:
+        async def complete(self, prompt, *, deadline, turn_id):
+            events.append("decide")
+            return CompletionEnvelope(
+                payload={
+                    "action": {"kind": "move", "id": "tackle"},
+                    "rationale": "breve",
+                    "confidence": 0.9,
+                    "alternatives": [],
+                },
+                provider="google", model="gemini-2.5-flash",
+                usage=CompletionUsage(input_tokens=1, output_tokens=1),
+                latency_ms=1.0,
+            )
+
+    class Resolver:
+        async def resolve(self):
+            events.append("resolve_provider")
+            return ResolvedProvider("google", "gemini-2.5-flash", Provider())
+
+    def parser(raw):
+        events.append("parse_state")
+        return raw
+
+    graph = build_decision_graph(
+        Calculator(), Resolver(), DecisionMetrics(), Repository(), parser=parser,
+    )
+
+    real_execute = client_module.execute_action
+
+    def recording_execute(action, orders):
+        events.append("execute")
+        return real_execute(action, orders)
+
+    player = _player(decision_graph=graph, decision_budget_seconds=5)
+    with patch.object(
+        client_module, "serialize_battle",
+        lambda b: {
+            "gen": 6, "turn": 1, "player_role": "p1",
+            "format": "gen6randombattle",
+            "me": {"pokemon": [{
+                "species": "pikachu", "active": True, "hp_fraction": 1,
+                "moves": [],
+            }]},
+            "opponent": {"pokemon": [{
+                "species": "eevee", "active": True, "hp_fraction": 1,
+                "moves": [],
+            }]},
+            "field": {"weather": {}, "field_effects": {},
+                      "my_side": {}, "opponent_side": {}},
+            "legal_actions": [{"kind": "move", "id": "tackle"}],
+        },
+    ), patch.object(client_module, "execute_action", recording_execute):
+        pending = player.choose_move(battle)
+        await player.frame_inbox.publish(tag, ("|upkeep",))
+        order = await pending
+
+    assert order.order.id == "tackle"
+    assert events == [
+        "resolve_provider", "parse_state", "retrieve_context",
+        "calc_damage", "decide", "execute",
+    ]
+
+
+async def test_la_metadata_efectiva_cambia_por_turno_hasta_el_step():
+    """BLOQUEANTE (F2-09): provider/model efectivos se resuelven POR TURNO a
+    traves del flujo real (`choose_move` → grafo → step) y las claves de
+    metadata llegan al step desde el resultado de CADA decision.
+
+    Tres decisiones del mismo tag, sin recompilar el grafo: dos exito LLM con
+    modelos distintos y una tercera que cae al fallback determinista. Detecta
+    las regresiones del bloqueante:
+    - resolucion cacheada al inicio: si la seleccion se cacheara, la decision
+      2 seguiria con el modelo de la 1 (paso 2 con model equivocado);
+    - reutilizacion tipo `last_*` (patron D38): si la metadata saliera de
+      estado compartido de una decision anterior, cada paso heredaria la del
+      anterior;
+    - fuente equivocada de metadata: los 11 campos salen del resultado del
+      grafo (envelope de D38), nunca de otra parte;
+    - exito y fallback usan la MISMA frontera: el paso del fallback no
+      atribuye provider/model, confidence ni alternatives a ningun modelo."""
+    tag = "battle-graph-per-turn"
+    move = SimpleNamespace(id="tackle")
+    battle = _fake_battle(turn=1, battle_tag=tag, available_moves=[move])
+
+    class Calculator:
+        async def calculate(self, request):
+            return {
+                "damage_rolls": [[10]], "min_damage": 10, "max_damage": 10,
+                "defender_hp": {"cur": 100, "max": 100},
+            }
+
+    class Repository:
+        async def load_battle_context(self, **kwargs):
+            return {
+                "generation": {"gen_number": 6, "label": "XY/ORAS"},
+                "own": [], "opponent": [],
+            }
+
+        async def load_moves(self, **kwargs):
+            return {}
+
+        async def load_mega_forms(self, **kwargs):
+            return {}
+
+    class TurnProvider:
+        def __init__(self, provider_name, model_id, *, valid=True,
+                     rationale="breve", confidence=0.7):
+            self.provider_name = provider_name
+            self.model_id = model_id
+            self.valid = valid
+            self.rationale = rationale
+            self.confidence = confidence
+
+        async def complete(self, prompt, *, deadline, turn_id):
+            if not self.valid:
+                # Dos respuestas semanticamente invalidas: decide cae al
+                # fallback determinista.
+                payload = {
+                    "action": {"kind": "move", "id": "fuera-de-la-mascara"},
+                    "rationale": "invalida",
+                    "confidence": 0.5,
+                    "alternatives": [],
+                }
+            else:
+                payload = {
+                    "action": {"kind": "move", "id": "tackle"},
+                    "rationale": self.rationale,
+                    "confidence": self.confidence,
+                    "alternatives": [],
+                }
+            return CompletionEnvelope(
+                payload=payload,
+                provider=self.provider_name, model=self.model_id,
+                usage=CompletionUsage(input_tokens=1, output_tokens=1),
+                latency_ms=1.0,
+            )
+
+    class TurnResolver:
+        def __init__(self):
+            self.turnos = [
+                ResolvedProvider(
+                    "google", "gemini-2.5-flash",
+                    TurnProvider(
+                        "google", "gemini-2.5-flash",
+                        rationale="breve-gemini-2.5-flash", confidence=0.7,
+                    ),
+                ),
+                ResolvedProvider(
+                    "kimi", "kimi-k2.6",
+                    TurnProvider(
+                        "kimi", "kimi-k2.6",
+                        rationale="breve-kimi-k2.6", confidence=0.9,
+                    ),
+                ),
+                ResolvedProvider(
+                    "anthropic", "claude-sonnet-4",
+                    TurnProvider("anthropic", "claude-sonnet-4", valid=False),
+                ),
+            ]
+            self.index = 0
+
+        async def resolve(self):
+            resolved = self.turnos[self.index]
+            self.index += 1
+            return resolved
+
+    graph = build_decision_graph(
+        Calculator(), TurnResolver(), DecisionMetrics(), Repository(),
+    )
+    player = _player(decision_graph=graph, decision_budget_seconds=5)
+    with patch.object(
+        client_module, "serialize_battle",
+        lambda b: {
+            "gen": 6, "turn": 1, "player_role": "p1",
+            "format": "gen6randombattle",
+            "me": {"pokemon": [{
+                "species": "pikachu", "active": True, "hp_fraction": 1,
+                "moves": [],
+            }]},
+            "opponent": {"pokemon": [{
+                "species": "eevee", "active": True, "hp_fraction": 1,
+                "moves": [],
+            }]},
+            "field": {"weather": {}, "field_effects": {},
+                      "my_side": {}, "opponent_side": {}},
+            "legal_actions": [{"kind": "move", "id": "tackle"}],
+        },
+    ):
+        for _ in range(3):
+            pending = player.choose_move(battle)
+            await player.frame_inbox.publish(tag, ("|upkeep",))
+            await pending
+            player._resolve_pending_choice(tag)
+
+    primer_paso = player.steps[tag][0]
+    segundo_paso = player.steps[tag][1]
+    tercer_paso = player.steps[tag][2]
+
+    assert (primer_paso["provider"], primer_paso["model"]) == (
+        "google", "gemini-2.5-flash",
+    )
+    assert primer_paso["rationale"] == "breve-gemini-2.5-flash"
+    assert primer_paso["confidence"] == 0.7
+    assert (segundo_paso["provider"], segundo_paso["model"]) == (
+        "kimi", "kimi-k2.6",
+    )
+    assert segundo_paso["rationale"] == "breve-kimi-k2.6"
+    assert segundo_paso["confidence"] == 0.9
+    # Las 11 claves de metadata llegan al step desde el resultado del grafo
+    # en ambas decisiones, sin cruzarse entre si.
+    for paso in (primer_paso, segundo_paso):
+        for key in (
+            "rationale", "confidence", "alternatives", "target", "provider",
+            "model", "decision_latency_ms", "input_tokens", "output_tokens",
+            "cached_input_tokens", "reasoning_tokens",
+        ):
+            assert key in paso, f"el step debe llevar la metadata {key!r}"
+    assert segundo_paso["provider"] != primer_paso["provider"]
+    assert segundo_paso["model"] != primer_paso["model"]
+    # Fallback: la misma frontera que el exito. Nada de la decision 2 puede
+    # filtrarse a la 3.
+    assert tercer_paso["action_path"] == "fallback"
+    assert tercer_paso["provider"] is None
+    assert tercer_paso["model"] is None
+    assert tercer_paso["confidence"] is None
+    assert tercer_paso["alternatives"] == []
+    assert tercer_paso["target"] is None
+    assert tercer_paso["rationale"] == (
+        "deterministic fallback after two invalid model responses"
+    )

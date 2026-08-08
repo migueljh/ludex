@@ -2000,6 +2000,57 @@ cuando una mascara los exponga (hoy la rechaza). Migración
 `20260803000001_trajectory_decision_metadata.sql` verificada up/down en una
 DB descartable; la DB compartida no fue migrada.
 
+## D39 — la selección de provider/model se resuelve por decisión; la DB gobierna y el env solo bootstrap (F2-09/MON-14)
+
+**Contexto.** El switch de modelos del plan ("cambiar el modelo desde la UI, incluso entre turnos") no existía: el provider se inyectaba al compilar el grafo y no se podía cambiar sin recompilar. El plan define `providers`/`models`/`settings` desde el principio; nada de eso estaba en el esquema.
+
+**Decisión.** Tres tablas nuevas (`providers`, `models`, `settings`; migración `20260804000001`): `providers` guarda `name`, `base_url` opcional, `api_key_env` (el NOMBRE de la variable de entorno, NUNCA el valor — las claves no existen en la DB, en logs ni en snapshots) y `enabled`; `models` referencia al provider con `model_id`, `label`, `is_default`, `enabled`; `settings` es key/value jsonb con la selección activa (`active_model` = `{"provider": ..., "model": ...}`, sin secretos).
+
+**Resolución POR DECISIÓN, no por compilación ni por arranque de batalla.** El grafo gana el nodo `resolve_provider` al inicio (`START → resolve_provider → parse_state → retrieve_context → calc_damage → decide → END`): cada invocación consulta la selección activa en la DB (`ModelRepository.active_selection`, con fallback al modelo default habilitado y, si la DB está vacía, al bootstrap de env `LUDEX_PROVIDER`/`LUDEX_MODEL`). Cambiar el modelo activo entre dos invocaciones del mismo grafo surte efecto sin recompilar ni reiniciar la batalla (test bloqueante: `test_el_mismo_grafo_cambia_de_modelo_entre_invocaciones`; la mutación que cachea la selección al arranque lo pone rojo).
+
+**Instancias cacheadas por `(provider, model)`, selección nunca cacheada.** `ProviderResolver` reutiliza la INSTANCIA del provider para el mismo par: el cooldown de claves (D30) y los reintentos de infraestructura viven en la instancia y sobreviven entre turnos del mismo modelo. La selección activa se consulta en cada `resolve()`. El envelope inmutable de MON-13 (D38) sigue siendo la única vía de metadata efectiva: la selección resuelta por turno llega al `CompletionEnvelope` y de ahí a la metadata persistida de `trajectory_steps`.
+
+**Fail-closed de selecciones stale/disabled (R2/L-01).** `ModelRepository.validate_selection` es la ÚNICA frontera de consulta/validación de la selección activa: comprueba en una consulta que el provider existe y está `enabled` y que el model existe para ESE provider y está `enabled`; cualquier violación lanza `ModelSelectionError`. La usan `agent model-set` (rechaza sin tocar settings) y `ProviderResolver.resolve`: una selección de la DB (settings o default) que apunta a un modelo inexistente o deshabilitado lanza `ProviderSelectionError` y NUNCA cae silenciosamente al bootstrap ni al default — la decisión no se atribuye a un modelo que la DB deshabilitó, y `provider_factory` no se invoca (canarios en tests). El bootstrap de env no pasa por la frontera: es el último recurso, no depende de la DB, y la factory ya valida claves/rutas. El fallback de `active_selection` sin fila en settings sigue exigiendo provider y model habilitados (mismo query de default).
+
+**Benchmark pinneado y auditado.** El benchmark fija provider/model al inicio (D28) y usa `PinnedResolver(..., enforce_pin=True)`: un auditor envuelve el provider y verifica que cada envelope efectivo coincida con el pin; cualquier mezcla lanza `ProviderMixError` y aborta la corrida. Env bootstrap: el benchmark NO consulta la DB.
+
+**Adapter de ejecución explícito y cableado real.** `execute_action` en
+`graph/execute.py` (módulo PURO, sin poke-env) traduce el `action` del grafo
+al `BattleOrder` del mapa capturado. NO es un nodo LangGraph y no puede
+serlo: el mapa accion→`BattleOrder` se captura síncrono antes del primer
+await (D31/D22 — la disciplina que garantiza `action_taken in
+legal_actions` por construcción) y poke-env exige el `BattleOrder` como
+retorno de `choose_move`; el grafo corre después de awaits. La
+correspondencia grafo→poke-env queda cerrada por el adapter fuera del
+grafo: `run_graph` en `showdown/client.py` llama `execute_action(action,
+action_orders)` sobre el resultado del grafo y convierte `None` (fuera de
+la máscara capturada) en `RuntimeError`. El cableado quedó estacionado
+durante la ventana en que `client.py` era territorio de MON-18 y se
+completó en la integración final (MON-18 liberado, ver D40): la
+equivalencia end-to-end se prueba en `test_el_caller_ejecuta_despues_de_
+decide_en_orden` (orden `resolve_provider → parse_state →
+retrieve_context → calc_damage → decide → execute`); el test que rompe el
+cableado (quitar la llamada a `execute_action` de `run_graph`) se pone en
+rojo y se restaura.
+
+**Metadata por decisión desde el envelope del grafo.** Las 11 claves de
+metadata de la decisión (`rationale`, `confidence`, `alternatives`,
+`target`, `provider`, `model`, `decision_latency_ms`, `input_tokens`,
+`output_tokens`, `cached_input_tokens`, `reasoning_tokens`) llegan al
+`step` canónico SOLO desde el resultado de `decide` (que sale del
+`CompletionEnvelope` inmutable de D38, nunca de estado compartido
+`last_*`), en los DOS caminos: éxito LLM y fallback determinista usan la
+MISMA frontera (`run_graph` copia el resultado del grafo al step; la ruta
+random queda NULL). El test que reutiliza metadata de una decisión
+anterior (patrón `last_completion_info` de D38) cruza las 11 claves entre
+dos decisiones del mismo tag y se pone en rojo.
+
+**Catálogo OpenCode Zen no hardcodeado.** `agent provider-init` puebla `providers` desde el catálogo de config (bootstrap) y, para open_code_zen con clave y base URL presentes, sincroniza `models` resolviendo el endpoint `/models` (shape OpenAI-compatible asumido, `{"data": [{"id": ...}]}`; un shape inválido falla ruidoso — límite documentado: se verificó el formato del gateway contra el contrato OpenAI-compatible, no contra una key real en esta rebanada). `agent model-set` fija la selección activa. Sin PATCH endpoint ni UI (fase 3/4).
+
+**Excepción de cliente documentada.** No se usa `init_chat_model` de LangChain: el contrato real necesita opciones por proveedor (timeout, `thinking`/`max_tokens`, structured output) que esa API no expone sin ramas; se conservan los clientes especializados (`_LangChainBackend` por kind) construidos por `default_provider_factory` desde la fila de la DB.
+
+**Alcance y límites.** El camino LLM vivo de esta fase es el benchmark (pinneado); el resolver por turno queda probado a nivel workflow/caller y listo para fase 3 (HITL), donde el grafo jugará batallas largas con cambio de modelo entre turnos. `ProviderChain` queda como API para el caso interactivo multi-proveedor (hoy el benchmark la usa con un solo provider). D37 (MON-18) y D38 (MON-13) se conservan íntegras.
+
 ## D40 — el item del rival vive en `persistent_state`; el auditor reevalúa el dex en cada switch-in (MON-18 R3)
 
 **Contexto.** El ROOT-CAUSE CHECKPOINT R3 confirmó, en vivo
@@ -2139,3 +2190,77 @@ esperado y restaurada.
 **Alcance (R4).** Cero cambios en `showdown/client.py`, `cli.py` y
 `packages/dataset-audit` (código ya aceptado, sin tocar esta ronda). D37 y
 D38 siguen intactos. No se tocó ninguna fila de la DB compartida.
+
+## D41 — los tipos base del rival viven en `canonical_types`; `-formechange` es temporal, `detailschange` es permanente (MON-19)
+
+**Contexto.** El ROOT-CAUSE CHECKPOINT de MON-19 reprodujo en vivo, cruzando
+la frontera real (`serialize_battle` → `project_observable_state`), el
+defecto detrás de `battles.id=2787` (`battle-gen6randombattle-2719`):
+`Pokemon._update_from_details` de poke-env (`pokemon.py:669-671`) corta en
+seco si `details` no cambió desde la última vez. Relic Song narra un
+`-formechange` a Pirouette sin cambiar `details` (a diferencia de Mega, cuyo
+`details` SÍ cambia), así que el switch-in que revierte Pirouette al volver
+a entrar puede seguir leyendo el `types` corrupto del propio poke-env. Es
+exactamente el mismo mecanismo que D40 ya documentó para `item` tras Trick
+-- la diferencia es que D40 clasificó el hallazgo de `types` sobre Meloetta
+como un falso positivo del AUDITOR (`packages/dataset-audit/src/
+projection.ts`, ya corregido ahí); esta ronda confirmó, con snapshots
+frescos e independientes cruzando el boundary real, que además hay un
+defecto GENUINO en el RECORDER (`protocol.py`) para la misma criatura, no
+cubierto por esa corrección del auditor.
+
+**Decisión.** Mismo patrón arquitectónico que D37/D40: una clave nueva y
+permanente en `persistent_state`, `canonical_types`, reaplicada al
+principio de cada llamada, antes de procesar cualquier línea del frame. La
+clave preexistente `"types"` conserva exactamente su significado actual --
+backup de un override TEMPORAL activo (typechange, Transform) -- y ahora
+también cubre `-formechange`; las dos claves son mutuamente excluyentes en
+la reaplicación (mismo patrón que D37 exige entre `unknown_pp_moves` y
+`transform_unknown_pp_moves`): mientras `"types"` esté presente, el override
+es lo que se ve, y reaplicar `canonical_types` por encima lo pisaría mal.
+
+- **`switch_in`** es evidencia pública DIRECTA del tipo canónico: recalcula
+  `types` del dex sin condición (ya lo hacía) y ahora también escribe
+  `canonical_types`, además de descartar cualquier `"types"` colgado de la
+  misma identidad -- un override temporal no puede sobrevivir a un
+  switch-in de la propia identidad.
+- **`detailschange`** (Mega/Primal) es PERMANENTE -- `details` cambia, así
+  que poke-env nunca corta acá, y estos tipos SON el nuevo canónico:
+  actualiza `canonical_types` directo, sin pasar por el backup temporal.
+- **`-formechange`** (Relic Song y demás formas que sí revierten al salir)
+  es TEMPORAL: entra al mismo ciclo backup/restauración que ya usan
+  `apply_typechange`/`apply_transform`, y NUNCA toca `canonical_types` --
+  si lo hiciera, `canonical_types` quedaría con la forma temporal en vez de
+  la base, y la reaplicación la sostendría stale para siempre.
+- **`switch_out`** no requiere cambios: ya sólo restaura el backup temporal
+  de `"types"` (típechange/Transform/`-formechange`), dejando
+  `canonical_types` intacto y disponible para la próxima llamada fresca --
+  exactamente lo que pide el contrato.
+
+**Tests.** `apps/agent/tests/showdown/test_protocol.py`: reproducción
+determinista de `battles.id=2787` con snapshots frescos e independientes en
+cada etapa (switch-in inicial, Relic Song, una llamada fresca intermedia
+SIN evidencia nueva mientras Pirouette sigue activa, switch-out, switch-in
+con los mismos `details` base, y una llamada fresca posterior que confirma
+NORMAL/PSYCHIC -- el bug real la dejaba en NORMAL/FIGHTING en ese último
+paso); contrapeso Mega con cuatro snapshots frescos independientes
+(persiste permanentemente, incluso tras salir y volver); contrapeso
+typechange y contrapeso Transform (ambos siguen activos con
+`canonical_types` presente de fondo, sin que la reaplicación los pise);
+Meloetta sin `-formechange` no cambia; canario de orden (la reaplicación
+corre ANTES del loop de líneas, mismo patrón que D37/D40); switch_in
+descarta un override temporal colgado de la misma identidad. Cuatro
+mutaciones dirigidas (retirar la reaplicación; tratar `detailschange` como
+temporal; promover `-formechange` a `canonical_types`; reaplicar
+`canonical_types` aun con un override temporal activo), cada una puesta en
+rojo exactamente los tests esperados y restaurada.
+
+**Alcance.** Cero cambios en `showdown/client.py`, `cli.py`,
+`packages/dataset-audit`, migraciones o datos históricos (confirmado por
+`git diff --stat` vacío en esos rangos). D37 y D40 quedan intactos. El
+auditor (`dataset-audit --scope all` y `--scope training`, Node 22) se
+corrió completo tras el fix: los conteos de violaciones -- incluido
+`hidden_information/types` -- quedan IDÉNTICOS a la línea base previa, como
+corresponde: este fix sólo afecta grabaciones FUTURAS a través de
+`client.py` (fuera de alcance de MON-19), nunca las 701 batallas ya
+persistidas en la DB compartida.
