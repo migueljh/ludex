@@ -65,5 +65,7 @@
   "decision_latency_ms_max": 8885,
   "pricing_table_id": "2026-07-28-official",
   "pricing_currency": "USD",
-  "pricing_source_url": null
+  "pricing_source_url": null,
+  "failure_type": null,
+  "failure_cause_type": null
 }
