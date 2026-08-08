@@ -12,9 +12,10 @@ export const SCOPE_RULES: Record<Scope, readonly string[]> = {
     + "ver db/migrations/20260727000007_battle_source_test.sql)",
     "excluye trajectories.final_result IS NULL (batalla sin terminar: reward nunca "
     + "se propagó, la fila no es entrenable)",
-    "excluye toda trayectoria con AL MENOS UN paso state_schema_version <> 2 (D44, "
-    + "MON-11 R3): una trayectoria mixta v1/v2 se excluye COMPLETA, nunca se filtran "
-    + "pasos sueltos dentro de ella",
+    "excluye toda trayectoria con AL MENOS UN paso state_schema_version <> 2, o con "
+    + "CERO pasos (D44, MON-11 R3/R4): una trayectoria mixta v1/v2 se excluye COMPLETA, "
+    + "nunca se filtran pasos sueltos dentro de ella; una trayectoria sin ningún paso "
+    + "tampoco es 'toda v2' -- es indeterminada, y nunca se acepta por vacuidad",
   ],
 };
 

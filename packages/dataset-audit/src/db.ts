@@ -25,18 +25,35 @@ import type {
 /** Predicado de scope, idéntico en las cuatro queries del dataset.
  * `$1` = scope, `$2` = generación (NULL = todas).
  *
- * D44 (MON-11 R3): `training` exige, además de `source <> 'test'` y
- * `final_result IS NOT NULL`, que TODOS los pasos de la trayectoria sean
- * `state_schema_version = 2`. El `NOT EXISTS` opera sobre la trayectoria
- * completa -- si existe UN SOLO paso con otra versión, la trayectoria entera
- * queda fuera. Nunca se filtra por `state_schema_version` dentro del SELECT
- * de `steps`: eso dejaría pasar los pasos v2 de una trayectoria mixta y
- * escondería el resto, que es exactamente el defecto que el mutation test
- * de `test/d44.test.ts` verifica que esta consulta NO tiene. */
+ * D44 (MON-11 R3, corregido R4): `training` exige, además de
+ * `source <> 'test'` y `final_result IS NOT NULL`, que la trayectoria
+ * tenga AL MENOS UN paso (`EXISTS`) y que TODOS sus pasos sean
+ * `state_schema_version = 2` (`NOT EXISTS` de cualquier version distinta).
+ * Los dos `EXISTS`/`NOT EXISTS` operan sobre la trayectoria completa -- si
+ * existe UN SOLO paso con otra versión, o si no existe NINGÚN paso, la
+ * trayectoria entera queda fuera. Nunca se filtra por `state_schema_version`
+ * dentro del SELECT de `steps`: eso dejaría pasar los pasos v2 de una
+ * trayectoria mixta y escondería el resto, que es exactamente el defecto
+ * que el mutation test de `test/d44.test.ts` verifica que esta consulta NO
+ * tiene.
+ *
+ * R4 (BLOCKER 1, reproducción de Latwan: `ZERO_STEP_SELECTED_BY_D44
+ * count=1`): antes de agregar el `EXISTS`, una trayectoria `local`,
+ * finalizada, con CERO `trajectory_steps` pasaba el `NOT EXISTS` por
+ * vacuidad -- "no existe ningún paso con otra versión" es trivialmente
+ * cierto cuando no existe ningún paso. `training` la aceptaba sin haber
+ * verificado nada sobre schema v2, porque no había nada que verificar. El
+ * `EXISTS` explícito cierra ese caso: una trayectoria sin pasos nunca es
+ * "toda v2", es indeterminada, y `training` no puede tratar lo
+ * indeterminado como aprobado. */
 const SCOPE_BATTLE = "($1::text = 'all' OR b.source <> 'test')";
 const SCOPE_TRAJECTORY =
   `($1::text = 'all' OR (
       b.source <> 'test' AND t.final_result IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM trajectory_steps s1
+        WHERE s1.trajectory_id = t.id
+      )
       AND NOT EXISTS (
         SELECT 1 FROM trajectory_steps s2
         WHERE s2.trajectory_id = t.id AND s2.state_schema_version <> 2

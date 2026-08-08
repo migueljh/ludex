@@ -1,11 +1,18 @@
-/** D44 (MON-11 R3): frontera canónica de `training`.
+/** D44 (MON-11 R3, corregido R4): frontera canónica de `training`.
  *
  * `training` sólo incluye trayectorias con `source <> 'test'`,
- * `final_result IS NOT NULL`, y TODOS sus pasos en `state_schema_version =
- * 2` -- una trayectoria mixta v1/v2 se excluye COMPLETA, nunca se filtran
- * pasos sueltos dentro de ella.
+ * `final_result IS NOT NULL`, AL MENOS UN paso, y TODOS sus pasos en
+ * `state_schema_version = 2` -- una trayectoria mixta v1/v2 se excluye
+ * COMPLETA, nunca se filtran pasos sueltos dentro de ella.
  *
- * Los 7 escenarios exigidos necesitan datos que la base compartida NO tiene
+ * R4 (BLOCKER 1, reproducción de Latwan `ZERO_STEP_SELECTED_BY_D44
+ * count=1`): antes del `EXISTS`, una trayectoria `local`, finalizada, con
+ * CERO pasos pasaba por vacuidad -- "ningún paso con otra versión" es
+ * trivialmente cierto cuando no hay ningún paso. El caso de CERO pasos
+ * tiene su propio test abajo, con la mutación dirigida que retira sólo el
+ * `EXISTS` y confirma que ese test (y solo ese) se pone rojo.
+ *
+ * Los escenarios exigidos necesitan datos que la base compartida NO tiene
  * hoy (las 12 batallas `local` son 100% schema v1; no existe ninguna
  * trayectoria `local`/v2 ni mixta) -- por eso corren contra una base
  * descartable con fixtures sintéticas, nunca contra `DATABASE_URL`.
@@ -166,6 +173,25 @@ describe.skipIf(requiresTestDatabase)("D44: frontera canónica de training", () 
 
     expect(training.trajectories.map((t) => t.id)).toEqual([2]);
     expect(training.steps.every((s) => s.trajectoryId === 2)).toBe(true);
+  });
+
+  it("local/final_result no nulo/CERO steps: presente en all, ausente en training (R4 BLOCKER 1, ZERO_STEP_SELECTED_BY_D44)", async () => {
+    // Antes del fix, `NOT EXISTS (paso con version <> 2)` es VACUAMENTE
+    // cierto sobre una trayectoria sin ningun paso: "toda v2" no significa
+    // nada cuando no hay nada que verificar. `training` la aceptaba sin
+    // haber comprobado schema alguno. El `EXISTS` explicito cierra esto:
+    // una trayectoria sin pasos nunca es "toda v2", es indeterminada.
+    await seed(
+      db,
+      [{ id: 1, tag: "b1", source: "local" }],
+      [{ id: 1, battleId: 1, finalResult: "win", stepVersions: [] }],
+    );
+    const all = await loadDataset(db.pool, { scope: "all" });
+    const training = await loadDataset(db.pool, { scope: "training" });
+
+    expect(all.trajectories.map((t) => t.id)).toEqual([1]);
+    expect(training.trajectories).toHaveLength(0);
+    expect(training.steps).toHaveLength(0);
   });
 
   it("corpus vacío bajo D44: training reporta 0 trayectorias, no un total vacuo", async () => {
