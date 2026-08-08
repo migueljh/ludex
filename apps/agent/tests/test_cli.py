@@ -17,10 +17,11 @@ from types import SimpleNamespace
 import pytest
 from ludex_agent import cli as cli_module
 from ludex_agent.benchmark import BenchmarkDeadlineExceeded, BenchmarkResult, run_benchmark
-from ludex_agent.graph.provider import FatalProviderError
+from ludex_agent.graph.provider import FatalProviderError, TransientProviderError
 from typer.testing import CliRunner
 
 from ludex_agent.cli import (
+    DEFAULT_RUNS_PATH,
     IncompleteTrajectoryError,
     _battle_against_or_failure,
     _battle_outcome,
@@ -153,6 +154,27 @@ def test_provider_smoke_usa_flags_como_los_comandos_del_plan():
     assert "--model" in result.stdout
 
 
+def test_provider_smoke_sin_credenciales_emite_not_run_y_no_traceback(monkeypatch):
+    # El env de CliRunner se FUSIONA con el ambiente real: para ejercer el
+    # path "sin credenciales" de forma determinista hay que remover las
+    # variables de credenciales, no solo no pasarlas.
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.delenv("KIMI_API_KEYS", raising=False)
+    result = CliRunner().invoke(
+        app,
+        ["provider-smoke", "--provider", "kimi", "--model", "kimi-k2.6"],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "SHOWDOWN_WS_URL": "ws://localhost:8100/showdown/websocket",
+            "LUDEX_PROVIDER": "kimi",
+            "LUDEX_MODEL": "kimi-k2.6",
+        },
+    )
+    assert result.exit_code == 2
+    assert "NOT RUN: credential unavailable" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
 def test_provider_smoke_sanitiza_fallo_sin_traceback_ni_clave(monkeypatch):
     class FailingProvider:
         async def complete(self, prompt, *, deadline, turn_id):
@@ -218,6 +240,51 @@ def test_provider_smoke_sanitiza_respuesta_semanticamente_invalida(monkeypatch):
     assert "Traceback" not in result.stdout
     assert "contenido privado" not in result.stdout
     assert "super-secret-key" not in result.stdout
+
+
+def test_benchmark_sin_credenciales_emite_not_run_y_no_publica_winrate(monkeypatch, tmp_path):
+    runs_dir = tmp_path / "runs"
+    monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", runs_dir)
+    # CliRunner fusiona su env con el ambiente real: remover credenciales
+    # para ejercer el path "sin credenciales" de forma determinista.
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.delenv("KIMI_API_KEYS", raising=False)
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark", "--n", "5", "--opponent", "simple_heuristics",
+            "--provider", "kimi", "--model", "kimi-k2.6",
+            "--run-id", "test-kimi-not-run",
+            "--ledger", str(tmp_path / "ledger.md"),
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "SHOWDOWN_WS_URL": "ws://localhost:8100/showdown/websocket",
+            "LUDEX_PROVIDER": "kimi",
+            "LUDEX_MODEL": "kimi-k2.6",
+        },
+    )
+    assert result.exit_code == 2
+    assert "NOT RUN: credential unavailable" in result.stdout
+    artifact = runs_dir / "test-kimi-not-run.json"
+    assert artifact.exists()
+    data = json.loads(artifact.read_text())
+    assert data["status"] == "not-run"
+    assert data["completed"] == 0
+    assert data["win_rate"] is None
+    assert data["wilson95"] is None
+    assert "NOT RUN" in data["failure"]
+    # L-01 (R2): sin muestras no hay latencia comparable: null, nunca 0.
+    assert data["completion_latency_ms_total"] is None
+    assert data["completion_latency_ms_p50"] is None
+    assert data["completion_latency_ms_p95"] is None
+    assert data["completion_latency_ms_max"] is None
+    assert data["decision_latency_ms_total"] is None
+    assert data["decision_latency_ms_p50"] is None
+    assert data["decision_latency_ms_p95"] is None
+    assert data["decision_latency_ms_max"] is None
+    ledger_text = (tmp_path / "ledger.md").read_text()
+    assert "0/0/0" not in ledger_text
 
 
 def test_benchmark_rechaza_modelo_sin_ruta_antes_de_llamarlo(monkeypatch):
@@ -919,9 +986,80 @@ def test_benchmark_command_deadline_clasificado_y_escribe_final(
     assert data["requested"] == 3
     assert data["completed"] == 1
     assert data["failure"].startswith("BenchmarkDeadlineExceeded")
+    # R3 (MON-15): evidencia durable y sanitizada — solo nombres de clase.
+    assert data["failure_type"] == "BenchmarkDeadlineExceeded"
+    assert data["failure_cause_type"] == "TimeoutError"
 
     assert ledger_path.exists()
     ledger_text = ledger_path.read_text()
     assert "test-deadline" in ledger_text
     assert "1/3" in ledger_text
     assert "1-0-0" in ledger_text
+
+
+def test_benchmark_command_transient_con_causa_persiste_tipos_en_json(
+    monkeypatch, tmp_path
+):
+    """R3: el camino de fallo transitorio de `_benchmark_command` persiste
+    `failure_type` y `failure_cause_type` (solo nombres de clase) en el
+    artefacto. La causa original (raw) viaja por `__cause__` del error
+    clasificado, igual que en produccion con `raise error from raw`."""
+
+    class FailingAgent:
+        def __init__(self, **kwargs) -> None:
+            self.n_won_battles = 0
+            self.n_lost_battles = 0
+            self.n_tied_battles = 0
+            self.battles = {}
+
+        async def battle_against(self, rival, n_battles=1):
+            raw = TimeoutError(
+                "Request timed out. (url: https://api.kimi.com/v1/chat/completions)"
+            )
+            try:
+                raise TransientProviderError("provider transport failed") from raw
+            except TransientProviderError as exc:
+                raise exc
+
+        async def wait_for_background_failure(self):
+            await asyncio.Event().wait()
+
+    _patch_benchmark_command_dependencies(monkeypatch, FailingAgent)
+
+    async def reachable(url):
+        pass
+
+    monkeypatch.setattr(cli_module, "_check_showdown_reachable", reachable)
+    monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark",
+            "--n", "1",
+            "--opponent", "random",
+            "--provider", "fake",
+            "--model", "fake-model",
+            "--run-id", "test-transient",
+            "--ledger", str(tmp_path / "ledger.md"),
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "SHOWDOWN_WS_URL": "ws://localhost:8100/showdown/websocket",
+            "LUDEX_PROVIDER": "fake",
+            "LUDEX_MODEL": "fake-model",
+        },
+    )
+
+    assert result.exit_code == 1
+    assert "ABORTED: TransientProviderError" in result.stdout
+    artifact = tmp_path / "test-transient.json"
+    assert artifact.exists()
+    data = json.loads(artifact.read_text())
+    assert data["status"] == "aborted"
+    assert data["failure_type"] == "TransientProviderError"
+    assert data["failure_cause_type"] == "TimeoutError"
+    # Sanitizado: sin mensaje crudo, URL ni secreto en el artefacto.
+    rendered = artifact.read_text()
+    assert "Request timed out" not in rendered
+    assert "api.kimi.com" not in rendered

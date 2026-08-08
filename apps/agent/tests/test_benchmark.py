@@ -6,6 +6,7 @@ import pytest
 from ludex_agent.benchmark import (
     BenchmarkDeadlineExceeded,
     BenchmarkResult,
+    failure_classification,
     run_benchmark,
     wilson_interval,
 )
@@ -15,6 +16,62 @@ from ludex_agent.graph.provider import TransientProviderError
 def test_wilson_reproduce_intervalo_medido_de_random():
     low, high = wilson_interval(143, 300)
     assert (round(low, 4), round(high, 4)) == (0.4208, 0.5331)
+
+
+# --- R3 (MON-15): evidencia durable y sanitizada del error original -------
+
+
+def _relanzado_clasificado(raw: BaseException) -> TransientProviderError:
+    """Reproduce el camino real: `KeyRotatingProvider.complete` clasifica el
+    error crudo y lo re-lanza con `raise error from raw`, de modo que el
+    clasificado conserve `__cause__` con el original."""
+    try:
+        raise TransientProviderError("provider transport failed") from raw
+    except TransientProviderError as exc:
+        return exc
+
+
+def test_failure_classification_persiste_clases_no_mensajes():
+    raw = TimeoutError("Request timed out. (url: https://api.kimi.com/private)"
+                       "api_key=AIzaSyFake-000000000000")
+    classified = _relanzado_clasificado(raw)
+
+    failure_type, failure_cause_type = failure_classification(classified)
+
+    assert failure_type == "TransientProviderError"
+    assert failure_cause_type == "TimeoutError"
+    # Nunca mensajes crudos, URLs ni secretos.
+    assert "Request timed out" not in (failure_type, failure_cause_type)
+    assert "api_key" not in (failure_type, failure_cause_type)
+
+
+def test_failure_classification_sin_causa_deja_cause_type_null():
+    try:
+        raise BenchmarkDeadlineExceeded("benchmark deadline exceeded after 180s")
+    except BenchmarkDeadlineExceeded as exc:
+        failure_type, failure_cause_type = failure_classification(exc)
+
+    assert failure_type == "BenchmarkDeadlineExceeded"
+    assert failure_cause_type is None
+
+
+def test_resultado_con_fallo_guarda_tipos_y_sigue_sin_ser_comparable():
+    raw = TimeoutError("Request timed out.")
+    classified = _relanzado_clasificado(raw)
+    failure_type, failure_cause_type = failure_classification(classified)
+
+    result = BenchmarkResult(
+        requested=1, completed=0, wins=0, losses=0, ties=0,
+        provider="kimi", model="kimi-k2.6",
+        failure=f"{failure_type}: {classified}",
+        failure_type=failure_type,
+        failure_cause_type=failure_cause_type,
+    )
+
+    assert result.failure_type == "TransientProviderError"
+    assert result.failure_cause_type == "TimeoutError"
+    assert result.comparable is False
+    assert result.win_rate is None
 
 
 class FakeAgent:

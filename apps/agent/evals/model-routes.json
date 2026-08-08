@@ -8,6 +8,12 @@
     },
     {
       "provider": "open_code_zen",
+      "model": "claude-haiku-4-5",
+      "protocol": "chat_completions",
+      "timeout_seconds": 60
+    },
+    {
+      "provider": "open_code_zen",
       "model": "minimax-m2.7",
       "protocol": "chat_completions"
     },

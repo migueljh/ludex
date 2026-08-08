@@ -20,7 +20,12 @@ from poke_env.player import (
     SimpleHeuristicsPlayer,
 )
 
-from .benchmark import BenchmarkDeadlineExceeded, BenchmarkResult, run_benchmark
+from .benchmark import (
+    BenchmarkDeadlineExceeded,
+    BenchmarkResult,
+    failure_classification,
+    run_benchmark,
+)
 from .config import PROVIDER_CATALOG, load_settings
 from .db.context_repository import PostgresContextRepository
 from .db.model_repository import ModelRepository, ModelSelectionError
@@ -39,6 +44,7 @@ from .graph.provider import (
     PinnedResolver,
     ProviderChain,
     ProviderError,
+    ProviderSelectionError,
     load_model_routes,
     model_route,
     provider_keys,
@@ -331,6 +337,10 @@ def _benchmark_provider(
     keys = provider_keys(
         os.environ, primary_env, pool_env, aliases=aliases
     )
+    if not keys:
+        raise ProviderSelectionError(
+            f"NOT RUN: credential unavailable for {name}/{model}"
+        )
     route = (
         model_route(load_model_routes(), name, model)
         if name in {"kimi", "open_code_zen"}
@@ -378,9 +388,6 @@ def provider_smoke_command(
     """Una completion estructurada, sin Showdown ni persistencia."""
     settings = load_settings()
     metrics = DecisionMetrics()
-    selected = _benchmark_provider(
-        provider, model, settings.llm_request_timeout_seconds, metrics
-    )
     prompt = (
         "Elegí exactamente una acción legal y respondé con action, un "
         "rationale breve, confidence en [0,1] y alternatives (puede ser []). "
@@ -388,11 +395,17 @@ def provider_smoke_command(
         '[{"kind":"move","id":"tackle"},{"kind":"switch","species":"pikachu"}]'
     )
     try:
+        selected = _benchmark_provider(
+            provider, model, settings.llm_request_timeout_seconds, metrics
+        )
         envelope = asyncio.run(selected.complete(
             prompt,
             deadline=time.monotonic() + settings.llm_request_timeout_seconds,
             turn_id=f"provider-smoke:{provider}:{model}",
         ))
+    except ProviderSelectionError as exc:
+        typer.echo(f"{exc}")
+        raise typer.Exit(code=2) from None
     except ProviderError as exc:
         typer.echo(f"ABORTED: {type(exc).__name__}: {exc}")
         raise typer.Exit(code=1) from None
@@ -542,9 +555,9 @@ async def _benchmark_command(
     *, n: int, opponent: str, concurrency: int, persist: bool,
     provider_name: str, model: str, fmt: str,
     on_progress: Callable[
-        [BenchmarkResult, Mapping[str, int]], Awaitable[None] | None
+        [BenchmarkResult, Mapping[str, int | None]], Awaitable[None] | None
     ] | None = None,
-) -> tuple[BenchmarkResult, dict[str, int]]:
+) -> tuple[BenchmarkResult, dict[str, int | None]]:
     settings = load_settings()
     await _check_showdown_reachable(settings.showdown_ws_url)
     server = local_server_configuration(settings.showdown_ws_url)
@@ -618,11 +631,19 @@ async def _benchmark_command(
                 agent.n_won_battles + agent.n_lost_battles
                 + agent.n_tied_battles
             )
+            # R3 (MON-15): evidencia durable y sanitizada del fallo. El
+            # error clasificado (`TransientProviderError`, etc.) conserva su
+            # `__cause__` original (p.ej. `APITimeoutError`) porque
+            # `KeyRotatingProvider` lo re-lanza con `raise error from raw`.
+            # Persistimos SOLO los nombres de clase, nunca el mensaje crudo.
+            failure_type, failure_cause_type = failure_classification(exc)
             result = BenchmarkResult(
                 requested=n, completed=completed,
                 wins=agent.n_won_battles, losses=agent.n_lost_battles,
                 ties=agent.n_tied_battles, provider=provider_name,
                 model=model, failure=f"{type(exc).__name__}: {exc}",
+                failure_type=failure_type,
+                failure_cause_type=failure_cause_type,
             )
     finally:
         await calculator.aclose()
@@ -669,7 +690,7 @@ def benchmark_command(
     effective_route = selected_route or ModelRoute(protocol=provider_name)
 
     async def report_progress(
-        progress: BenchmarkResult, metrics: Mapping[str, int]
+        progress: BenchmarkResult, metrics: Mapping[str, int | None]
     ) -> None:
         partial = build_benchmark_record(
             run_id=effective_run_id,
@@ -686,12 +707,66 @@ def benchmark_command(
             write_run_snapshot(partial, artifact)
         typer.echo(_progress_summary(partial))
 
-    result, metrics = asyncio.run(_benchmark_command(
-        n=n, opponent=opponent, concurrency=concurrency, persist=persist,
-        provider_name=provider_name, model=model_name,
-        fmt=fmt or settings.showdown_battle_format,
-        on_progress=report_progress,
-    ))
+    try:
+        result, metrics = asyncio.run(_benchmark_command(
+            n=n, opponent=opponent, concurrency=concurrency, persist=persist,
+            provider_name=provider_name, model=model_name,
+            fmt=fmt or settings.showdown_battle_format,
+            on_progress=report_progress,
+        ))
+    except ProviderSelectionError as exc:
+        # F2-10: sin credenciales no se corre ni se publica un winrate
+        # comparable. Se emite un artefacto de corrida explícito con status
+        # "not-run" para que quede trazable que el punto de control fue
+        # alcanzado aunque la corrida real no se ejecutó.
+        typer.echo(f"{exc}")
+        # R3 (MON-15): not-run conserva la clase del error de seleccion
+        # (`ProviderSelectionError`) sin inventar una causa: este error se
+        # lanza directo, sin `raise ... from`, asi que `__cause__` es None.
+        failure_type, failure_cause_type = failure_classification(exc)
+        not_run_result = BenchmarkResult(
+            requested=n, completed=0, wins=0, losses=0, ties=0,
+            provider=provider_name, model=model_name,
+            failure=str(exc),
+            failure_type=failure_type,
+            failure_cause_type=failure_cause_type,
+        )
+        not_run_metrics: dict[str, int | None] = {
+            "turns_total": 0, "calls_total": 0, "input_tokens": 0,
+            "output_tokens": 0, "cached_input_tokens": 0,
+            "reasoning_tokens": 0, "key_rotations": 0,
+            "provider_switches": 0, "turns_quota_affected": 0,
+            "turns_transient_affected": 0, "turns_deadline_affected": 0,
+            "turns_model_invalid": 0, "turns_fallback": 0,
+            # L-01 (R2): sin muestras no hay latencia comparable; los
+            # percentiles de una corrida no ejecutada son None, no 0.
+            "completion_latency_ms_count": 0,
+            "completion_latency_ms_total": None,
+            "completion_latency_ms_p50": None,
+            "completion_latency_ms_p95": None,
+            "completion_latency_ms_max": None,
+            "decision_latency_ms_count": 0,
+            "decision_latency_ms_total": None,
+            "decision_latency_ms_p50": None,
+            "decision_latency_ms_p95": None,
+            "decision_latency_ms_max": None,
+        }
+        not_run_record = build_benchmark_record(
+            run_id=effective_run_id,
+            created_at=created_at,
+            result=not_run_result,
+            metrics=not_run_metrics,
+            opponent=opponent,
+            fmt=fmt or settings.showdown_battle_format,
+            route=effective_route,
+            pricing=pricing_table,
+            status="not-run",
+        )
+        if record:
+            write_run_snapshot(not_run_record, artifact)
+            append_ledger_row(not_run_record, ledger, artifact)
+            typer.echo(f"not_run_record={artifact}")
+        raise typer.Exit(code=2) from None
     typer.echo(
         f"completed={result.completed}/{result.requested} "
         f"provider={provider_name} model={model_name}"

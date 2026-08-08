@@ -35,15 +35,30 @@ class BenchmarkRecord:
     losses: int
     ties: int
     failure: str | None
+    # R3 (MON-15): evidencia durable y sanitizada del fallo. Solo nombres de
+    # clase; nunca mensajes crudos, URLs, módulos, tracebacks ni secretos.
+    failure_type: str | None
+    failure_cause_type: str | None
     win_rate: Decimal | None
     wilson95: tuple[Decimal, Decimal] | None
-    metrics: Mapping[str, int]
+    metrics: Mapping[str, int | None]
     calls_per_battle: Decimal | None
     invalid_recovered_pct: Decimal
     fallback_pct: Decimal
     total_cost: Decimal | None
     cost_per_battle: Decimal | None
     projected_10k_cost: Decimal | None
+    # L-01 (R2): DOS poblaciones de latencia explicitas y con nombre
+    # inequivoco. `None` = sin muestras (null en el artefacto, blanco en el
+    # ledger), nunca 0 comparable.
+    completion_latency_ms_total: int | None
+    completion_latency_ms_p50: int | None
+    completion_latency_ms_p95: int | None
+    completion_latency_ms_max: int | None
+    decision_latency_ms_total: int | None
+    decision_latency_ms_p50: int | None
+    decision_latency_ms_p95: int | None
+    decision_latency_ms_max: int | None
     pricing_table_id: str
     pricing_currency: str
     pricing_source_url: str | None
@@ -74,7 +89,7 @@ def build_benchmark_record(
     run_id: str,
     created_at: datetime,
     result: BenchmarkResult,
-    metrics: Mapping[str, int],
+    metrics: Mapping[str, int | None],
     opponent: str,
     fmt: str,
     route: ModelRoute,
@@ -127,6 +142,8 @@ def build_benchmark_record(
         losses=result.losses,
         ties=result.ties,
         failure=result.failure,
+        failure_type=result.failure_type,
+        failure_cause_type=result.failure_cause_type,
         win_rate=win_rate,
         wilson95=wilson,
         metrics=dict(metrics),
@@ -144,6 +161,14 @@ def build_benchmark_record(
             if observed_cost_per_battle is not None
             else None
         ),
+        completion_latency_ms_total=metrics.get("completion_latency_ms_total"),
+        completion_latency_ms_p50=metrics.get("completion_latency_ms_p50"),
+        completion_latency_ms_p95=metrics.get("completion_latency_ms_p95"),
+        completion_latency_ms_max=metrics.get("completion_latency_ms_max"),
+        decision_latency_ms_total=metrics.get("decision_latency_ms_total"),
+        decision_latency_ms_p50=metrics.get("decision_latency_ms_p50"),
+        decision_latency_ms_p95=metrics.get("decision_latency_ms_p95"),
+        decision_latency_ms_max=metrics.get("decision_latency_ms_max"),
         pricing_table_id=pricing.table_id,
         pricing_currency=pricing.currency,
         pricing_source_url=price.source_url if price is not None else None,
@@ -181,13 +206,23 @@ def _display(value: Decimal | None, *, percent: bool = False) -> str:
     return f"{rendered:.4f}" + ("%" if percent else "")
 
 
+def _latency_cell(
+    p50: int | None, p95: int | None, max_ms: int | None
+) -> str:
+    """L-01 (R2): una celda de latencia sin muestras es BLANCA (None), nunca
+    0/0/0 comparable. Con muestras, p50/p95/max en ms, separados por /."""
+    if p50 is None or p95 is None or max_ms is None:
+        return ""
+    return f"{p50}/{p95}/{max_ms}"
+
+
 LEDGER_HEADER = """# Benchmarks de modelos
 
 Registro acumulativo. El costo se calcula con usage real; una celda vacía
 significa desconocido o no comparable, nunca cero implícito.
 
-| Fecha | Run | Proveedor/modelo | Batallas | W-L-T | Winrate | Wilson 95% | Llamadas/batalla | Tokens in/out | Costo total | Costo/batalla | 10.000 batallas | Ilegales retry/fallback | Transitorios | Deadlines | Rotaciones | Precios |
-|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---|
+| Fecha | Run | Proveedor/modelo | Batallas | W-L-T | Winrate | Wilson 95% | Llamadas/batalla | Tokens in/out | Costo total | Costo/batalla | 10.000 batallas | Ilegales retry/fallback | Transitorios | Deadlines | Rotaciones | Completion p50/p95/max (ms) | Decision p50/p95/max (ms) | Precios |
+|---|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|---|---:|---:|---:|---|---:|---|
 """
 
 
@@ -208,6 +243,24 @@ def append_ledger_row(
         else ""
     )
     metrics = record.metrics
+    # L-01 (R2): la latencia solo se publica en el ledger para corridas
+    # COMPLETAS. Un run abortado/not-run con muestras reales conserva sus
+    # valores en el artefacto JSON (evidencia con status explicito), pero el
+    # ledger no lo hace comparable: celda blanca = "no comparable".
+    if record.status == "complete":
+        completion_cell = _latency_cell(
+            record.completion_latency_ms_p50,
+            record.completion_latency_ms_p95,
+            record.completion_latency_ms_max,
+        )
+        decision_cell = _latency_cell(
+            record.decision_latency_ms_p50,
+            record.decision_latency_ms_p95,
+            record.decision_latency_ms_max,
+        )
+    else:
+        completion_cell = ""
+        decision_cell = ""
     row = (
         f"| {record.created_at[:10]} | [{record.run_id}]({link}) | "
         f"{record.provider}/{record.model} | "
@@ -224,6 +277,7 @@ def append_ledger_row(
         f"{metrics.get('turns_transient_affected', 0)} | "
         f"{metrics.get('turns_deadline_affected', 0)} | "
         f"{metrics.get('key_rotations', 0)} | "
+        f"{completion_cell} | {decision_cell} | "
         f"{record.pricing_table_id} |\n"
     )
     lines = existing.rstrip().splitlines()

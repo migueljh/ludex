@@ -235,3 +235,230 @@ def test_run_id_no_permite_rutas_ni_espacios():
             route=ModelRoute(protocol="chat_completions"),
             pricing=PricingTable.load(),
         )
+
+
+def _metrics_con_latencia():
+    metrics = _metrics()
+    metrics.update({
+        "completion_latency_ms_count": 3,
+        "completion_latency_ms_total": 600,
+        "completion_latency_ms_p50": 200,
+        "completion_latency_ms_p95": 220,
+        "completion_latency_ms_max": 250,
+        "decision_latency_ms_count": 3,
+        "decision_latency_ms_total": 900,
+        "decision_latency_ms_p50": 300,
+        "decision_latency_ms_p95": 310,
+        "decision_latency_ms_max": 320,
+    })
+    return metrics
+
+
+def _aborted_result(failure="QuotaExceeded: provider quota exhausted"):
+    return BenchmarkResult(
+        requested=15, completed=3, wins=1, losses=2, ties=0,
+        provider="kimi", model="kimi-k2.6", failure=failure,
+    )
+
+
+def test_record_con_muestras_expone_ambas_poblaciones_y_ledger_distinguido(tmp_path):
+    """L-01 (R2): con muestras, el record y el ledger distinguen por nombre
+    completion vs decision, y cada poblacion lleva sus propios valores."""
+    record = build_benchmark_record(
+        run_id="test-latency-both",
+        created_at=datetime(2026, 8, 8, 12, tzinfo=timezone.utc),
+        result=BenchmarkResult(
+            requested=3, completed=3, wins=1, losses=2, ties=0,
+            provider="kimi", model="kimi-k2.6",
+        ),
+        metrics=_metrics_con_latencia(),
+        opponent="simple_heuristics",
+        fmt="gen6randombattle",
+        route=ModelRoute(protocol="chat_completions"),
+        pricing=PricingTable.load(),
+    )
+    artifact = tmp_path / "runs" / "test-latency-both.json"
+    ledger = tmp_path / "BENCHMARKS.md"
+    write_run_snapshot(record, artifact)
+    append_ledger_row(record, ledger, artifact)
+
+    rendered = artifact.read_text()
+    assert '"completion_latency_ms_total": 600' in rendered
+    assert '"completion_latency_ms_p50": 200' in rendered
+    assert '"decision_latency_ms_total": 900' in rendered
+    assert '"decision_latency_ms_p50": 300' in rendered
+    markdown = ledger.read_text()
+    assert "Completion p50/p95/max (ms)" in markdown
+    assert "Decision p50/p95/max (ms)" in markdown
+    assert "200/220/250" in markdown
+    assert "300/310/320" in markdown
+
+
+def test_corrida_abortada_con_progreso_no_publica_latencia_comparable_ni_winrate(tmp_path):
+    """L-01/L-02 (R2): un run abortado con progreso real (3/15) puede
+    versionarse como abortado; el artefacto JSON conserva los valores reales
+    como evidencia, pero el LEDGER no publica latencia ni winrate de runs
+    incompletos: celdas blancas, nunca 0/0/0 comparable."""
+    metrics = _metrics_con_latencia()
+    metrics["completion_latency_ms_count"] = 0
+    for key in ("total", "p50", "p95", "max"):
+        metrics[f"completion_latency_ms_{key}"] = None
+    record = build_benchmark_record(
+        run_id="test-aborted-latency",
+        created_at=datetime(2026, 8, 8, 12, tzinfo=timezone.utc),
+        result=_aborted_result(),
+        metrics=metrics,
+        opponent="simple_heuristics",
+        fmt="gen6randombattle",
+        route=ModelRoute(protocol="chat_completions"),
+        pricing=PricingTable.load(),
+    )
+    artifact = tmp_path / "runs" / "test-aborted-latency.json"
+    ledger = tmp_path / "BENCHMARKS.md"
+    write_run_snapshot(record, artifact)
+    append_ledger_row(record, ledger, artifact)
+
+    rendered = artifact.read_text()
+    assert record.status == "aborted"
+    assert record.win_rate is None
+    assert record.wilson95 is None
+    assert '"completion_latency_ms_total": null' in rendered
+    assert '"completion_latency_ms_p50": null' in rendered
+    assert '"completion_latency_ms_max": null' in rendered
+    assert '"decision_latency_ms_p50": 300' in rendered
+    markdown = ledger.read_text()
+    assert "0/0/0" not in markdown
+    # El ledger no publica latencia de runs incompletos: las dos celdas de
+    # latencia quedan vacias (tres separadores consecutivos).
+    assert "|  |  | 2026-07-28-official" in markdown
+    assert "300/310/320" not in markdown
+
+
+# --- R3 (MON-15): cadena sintetica del error original hasta el JSON --------
+
+import json as _json
+
+from ludex_agent.benchmark import (
+    BenchmarkDeadlineExceeded,
+    failure_classification,
+)
+from ludex_agent.graph.provider import TransientProviderError
+
+
+def _relanzado(raw: BaseException) -> TransientProviderError:
+    """Mismo camino que `KeyRotatingProvider.complete`: clasifica y re-lanza
+    con `raise error from raw` para conservar `__cause__`."""
+    try:
+        raise TransientProviderError("provider transport failed") from raw
+    except TransientProviderError as exc:
+        return exc
+
+
+def test_chain_sintetico_kimi_llega_sanitizado_al_json(tmp_path):
+    """R3: raw APITimeoutError -> TransientProviderError(__cause__) ->
+    resultado de _benchmark_command -> BenchmarkRecord -> JSON. Solo
+    nombres de clase; el mensaje crudo jamas aparece en el artefacto."""
+    raw = TimeoutError(
+        "Request timed out. (url: https://api.kimi.com/v1/chat/completions?api_key=AIzaSyFake-000000000000)"
+    )
+    classified = _relanzado(raw)
+    failure_type, failure_cause_type = failure_classification(classified)
+    result = BenchmarkResult(
+        requested=1, completed=0, wins=0, losses=0, ties=0,
+        provider="kimi", model="kimi-k2.6",
+        failure=f"{failure_type}: {classified}",
+        failure_type=failure_type,
+        failure_cause_type=failure_cause_type,
+    )
+
+    record = build_benchmark_record(
+        run_id="test-kimi-chain",
+        created_at=datetime(2026, 8, 8, 12, tzinfo=timezone.utc),
+        result=result,
+        metrics=_metrics(),
+        opponent="simple_heuristics",
+        fmt="gen6randombattle",
+        route=ModelRoute(protocol="chat_completions"),
+        pricing=PricingTable.load(),
+    )
+    artifact = tmp_path / "runs" / "test-kimi-chain.json"
+    write_run_json(record, artifact)
+
+    assert record.failure_type == "TransientProviderError"
+    assert record.failure_cause_type == "TimeoutError"
+    rendered = artifact.read_text()
+    assert '"failure_type": "TransientProviderError"' in rendered
+    assert '"failure_cause_type": "TimeoutError"' in rendered
+    # El mensaje crudo, la URL y el secreto jamas se persisten.
+    assert "Request timed out" not in rendered
+    assert "api.kimi.com" not in rendered
+    assert "AIzaSyFake" not in rendered
+
+
+def test_chain_sintetico_deadline_sin_causa_queda_null():
+    """R3: `BenchmarkDeadlineExceeded` sin `__cause__` deja
+    `failure_cause_type=None` en el JSON; no se inventa causa."""
+    try:
+        raise BenchmarkDeadlineExceeded("benchmark deadline exceeded after 180s")
+    except BenchmarkDeadlineExceeded as exc:
+        failure_type, failure_cause_type = failure_classification(exc)
+        failure_message = str(exc)
+    result = BenchmarkResult(
+        requested=1, completed=0, wins=0, losses=0, ties=0,
+        provider="google", model="gemini-2.5-flash",
+        failure=f"{failure_type}: {failure_message}",
+        failure_type=failure_type,
+        failure_cause_type=failure_cause_type,
+    )
+
+    record = build_benchmark_record(
+        run_id="test-deadline-chain",
+        created_at=datetime(2026, 8, 8, 12, tzinfo=timezone.utc),
+        result=result,
+        metrics=_metrics(),
+        opponent="simple_heuristics",
+        fmt="gen6randombattle",
+        route=ModelRoute(protocol="chat_completions"),
+        pricing=PricingTable.load(),
+    )
+
+    assert record.failure_type == "BenchmarkDeadlineExceeded"
+    assert record.failure_cause_type is None
+    rendered = _json.dumps(record.to_json_dict())
+    assert '"failure_cause_type": null' in rendered
+    assert "benchmark deadline exceeded" in rendered
+
+
+def test_not_run_conserva_provider_selection_error_sin_causa():
+    """R3: el path not-run de la CLI conserva `ProviderSelectionError` y no
+    inventa causa (el error se lanza directo, sin `raise ... from`)."""
+    from ludex_agent.graph.provider import ProviderSelectionError
+
+    try:
+        raise ProviderSelectionError("NOT RUN: credential unavailable for kimi/kimi-k2.6")
+    except ProviderSelectionError as exc:
+        failure_type, failure_cause_type = failure_classification(exc)
+        failure_message = str(exc)
+    result = BenchmarkResult(
+        requested=1, completed=0, wins=0, losses=0, ties=0,
+        provider="kimi", model="kimi-k2.6",
+        failure=failure_message,
+        failure_type=failure_type,
+        failure_cause_type=failure_cause_type,
+    )
+
+    record = build_benchmark_record(
+        run_id="test-not-run-chain",
+        created_at=datetime(2026, 8, 8, 12, tzinfo=timezone.utc),
+        result=result,
+        metrics=_metrics(),
+        opponent="simple_heuristics",
+        fmt="gen6randombattle",
+        route=ModelRoute(protocol="chat_completions"),
+        pricing=PricingTable.load(),
+        status="not-run",
+    )
+
+    assert record.failure_type == "ProviderSelectionError"
+    assert record.failure_cause_type is None
+    assert record.status == "not-run"

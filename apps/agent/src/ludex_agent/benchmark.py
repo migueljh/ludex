@@ -34,6 +34,24 @@ class BenchmarkDeadlineExceeded(Exception):
     """El deadline propio de una batalla del benchmark venció."""
 
 
+def failure_classification(
+    exc: BaseException,
+) -> tuple[str, str | None]:
+    """Nombres de clase del error clasificado y de su causa original.
+
+    R3 (MON-15): los artefactos persisten SOLO nombres de clases —
+    `failure_type` (clase del error clasificado) y `failure_cause_type`
+    (clase de la causa original, via `__cause__`) — nunca mensajes crudos,
+    URLs, módulos, tracebacks ni secretos. Un error sin causa deja
+    `failure_cause_type=None`; jamas se inventa una.
+    """
+    cause = exc.__cause__
+    return (
+        type(exc).__name__,
+        type(cause).__name__ if cause is not None else None,
+    )
+
+
 @dataclass(frozen=True)
 class BenchmarkResult:
     requested: int
@@ -44,6 +62,11 @@ class BenchmarkResult:
     provider: str | None = None
     model: str | None = None
     failure: str | None = None
+    # R3 (MON-15): evidencia durable y sanitizada del fallo. `failure` es el
+    # mensaje publico sanitizado; `failure_type` y `failure_cause_type` son
+    # SOLO nombres de clase (ver `failure_classification`).
+    failure_type: str | None = None
+    failure_cause_type: str | None = None
 
     @property
     def comparable(self) -> bool:

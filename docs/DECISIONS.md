@@ -2264,3 +2264,96 @@ corrió completo tras el fix: los conteos de violaciones -- incluido
 corresponde: este fix sólo afecta grabaciones FUTURAS a través de
 `client.py` (fuera de alcance de MON-19), nunca las 701 batallas ya
 persistidas en la DB compartida.
+
+## D42 — reloj inyectable en el grafo de decisión y métricas de latencia (F2-10/MON-15)
+
+Todas las mediciones de tiempo en el camino crítico de decisión usan un
+reloj inyectable (`Callable[[], float]` que devuelve segundos monotónicos),
+en vez de llamar directamente a `time.monotonic()`. `KeyRotatingProvider`,
+`decide()`, `FakeDecisionProvider` y `LudexPlayer` reciben el reloj por
+constructor o argumento; si el llamador no lo pasa, se usa `time.monotonic`
+como default.
+
+Motivo: las métricas de latencia (p50/p95/máximo por batalla y total) deben
+ser deterministas en tests y reproducibles en diagnóstico. Usar el reloj real
+hace imposible afirmar que un cambio no empeora la latencia sin correr
+batallas reales, y también hace imposible simular deadlines y cooldowns sin
+esperar. Con el reloj inyectado el test avanza el tiempo explícitamente y
+verifica que el provider enfríe claves, cumpla deadlines y reporte latencias
+esperadas.
+
+Regla de implementación: si una función necesita medir intervalos o comparar
+un instante contra un deadline, recibe `clock`. Nunca se mezcla `clock()` con
+`time.monotonic()` en la misma rutina: eso rompe los tests con reloj falso y
+puede hacer que un deadline nunca se dispare.
+
+**L-01 (R2): DOS poblaciones de latencia, nunca mezcladas.** La latencia de
+cada completion (una llamada a `provider.complete()`) y la latencia
+end-to-end de cada decisión (retries incluidos) son muestras de
+poblaciones distintas, con contratos con nombre explícito:
+
+- `completion_latency_ms_count/total/p50/p95/max` — una muestra por cada
+  llamada exitosa al provider, registrada por `KeyRotatingProvider`.
+- `decision_latency_ms_count/total/p50/p95/max` — una muestra por decisión,
+  desde el primer intento LLM hasta la respuesta aceptada o el fallback,
+  registrada por `decide()`.
+
+Una decisión con una completion aporta exactamente una muestra a cada
+población (nunca dos al mismo contador); una decisión con dos intentos
+semánticos aporta 2 completions y 1 decisión; el fallback tras dos
+respuestas inválidas aporta 2 completions y 1 decisión. El
+`CompletionEnvelope.latency_ms` sigue siendo por llamada. El test cruzado
+`test_cruzado_*` en `test_decision.py` une `KeyRotatingProvider` con
+`decide()` sobre el MISMO `DecisionMetrics` y falla si alguien vuelve a
+mezclar las poblaciones en cualquiera de las dos direcciones.
+
+**Política de redondeo (L-01):** los agregados usan entero más cercano con
+`round()`; truncar con `int()` está prohibido (un 99.999... debe quedar en
+100, nunca en 99). Sin muestras, `total/p50/p95/max` son `None`: null en el
+artefacto JSON y blanco en el ledger, nunca 0/0/0 comparable. El
+`BenchmarkRecord` y el ledger distinguen ambas poblaciones por nombre
+(Completion vs Decision), y cada celda vacía significa "sin muestras o no
+comparable", nunca cero implícito.
+
+**Tests.** `test_provider.py` verifica deadline, cooldown de claves con 429,
+mezcla de modelos con conteos correctos usando `SequenceClock`, redondeo sin
+truncamiento y percentiles nulos sin muestras. `test_decision.py` verifica
+que `decide()` registra latencia 125 ms con reloj inyectado y los cuatro
+canarios cruzados del doble conteo (1 completion/1 decisión, retry
+semántico, fallback, y disyunción de poblaciones). Cada test falla si se
+revierte el uso de `self._clock()`, si se ignora el `clock` inyectado, si se
+vuelve a mezclar una población de latencia, o si se reintroduce el
+truncamiento por `int()`.
+
+**R3 — evidencia durable y sanitizada del error original.** El artefacto
+JSON de una corrida fallida conserva tres campos separados: `failure`
+(mensaje público sanitizado, el de siempre), `failure_type` (clase del
+error clasificado, p.ej. `TransientProviderError`) y `failure_cause_type`
+(clase de la causa original vía `__cause__`, p.ej. `APITimeoutError`). La
+derivación vive en `failure_classification` (`benchmark.py`), que devuelve
+SOLO nombres de clase — nunca mensajes crudos, URLs, módulos, tracebacks ni
+secretos. Un error sin `__cause__` (p.ej. `BenchmarkDeadlineExceeded`
+sintético o `ProviderSelectionError` del path not-run) deja
+`failure_cause_type=None`; jamás se inventa una causa. El camino real
+funciona porque `KeyRotatingProvider.complete` re-lanza el error clasificado
+con `raise error from raw`, preservando el original en `__cause__`. Los
+tests sintéticos atraviesan la cadena completa raw → clasificado → resultado
+→ record → JSON y fallan si se retira la causa, si se clona el error sin
+causa, o si se intenta persistir el mensaje crudo con cualquier key señuelo.
+
+**R3 — contrato tipado de métricas.** `DecisionMetrics.snapshot()` mezcla
+contadores `int` con percentiles de latencia `int | None`. Todos los
+consumidores lo declaran así: `_benchmark_command` devuelve
+`dict[str, int | None]`, los callbacks de progreso y
+`build_benchmark_record` reciben `Mapping[str, int | None]`.
+`calculate_cost` consume ÚNICAMENTE los campos de tokens
+(`input_tokens`, `cached_input_tokens`, `output_tokens`) y rechaza con
+`ValueError` si alguno es `None` — un conteo de tokens ausente no es
+calculable y nunca se confunde con los percentiles nullable, que no se leen
+en el costo.
+
+**R3 — identidad del run.** El screen pinneado de OpenCode se identifica por
+el modelo que efectivamente ejecutó: `20260808-opencode-claude-haiku-4-5-screen`
+(antes `20260808-opencode-mimo-screen`), en archivo, `run_id`, ledger y
+notas. Un artefacto pinneado jamás se identifica por un modelo distinto del
+efectivo.

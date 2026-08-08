@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
@@ -194,19 +195,22 @@ async def decide(
     state: GraphState,
     provider: DecisionProvider,
     metrics: DecisionMetrics,
+    *,
+    clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     legal = state["battle_state"].get("legal_actions", [])
     turn_id = str(state.get(
         "turn_id",
         f"{state['battle_state'].get('player_role')}:{state['battle_state'].get('turn')}",
     ))
-    deadline = float(state.get("deadline", time.monotonic() + 240))
+    deadline = float(state.get("deadline", clock() + 240))
     previous_error: str | None = None
     metrics.turn(turn_id)
     # F2-08: la latencia de la decision va desde el primer intento LLM hasta
     # la respuesta aceptada o el fallback, retries incluidos. Se mide aca, en
     # el camino de la decision, no por llamada.
-    started_at = time.monotonic()
+    # F2-10: el reloj es inyectable para tests con reloj falso/scripted.
+    started_at = clock()
     usage: CompletionUsage | None = None
 
     for semantic_attempt in range(2):
@@ -234,6 +238,11 @@ async def decide(
                 parsed.alternatives, action, legal
             )
             target = validate_target(parsed.target, legal)
+            decision_latency_ms = (clock() - started_at) * 1000
+            # L-01 (R2): latencia END-TO-END de la decision (retries
+            # incluidos) a la poblacion de decisiones; la de cada completion
+            # ya la registro `KeyRotatingProvider` en su propia poblacion.
+            metrics.decision_latency(decision_latency_ms)
             return {
                 "action": action,
                 "action_path": "llm" if semantic_attempt == 0 else "llm_retry",
@@ -248,7 +257,7 @@ async def decide(
                 "target": target,
                 "provider": envelope.provider,
                 "model": envelope.model,
-                "decision_latency_ms": (time.monotonic() - started_at) * 1000,
+                "decision_latency_ms": decision_latency_ms,
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
                 "cached_input_tokens": usage.cached_input_tokens,
@@ -260,6 +269,8 @@ async def decide(
 
     metrics.fallback(turn_id)
     fallback_rationale = "deterministic fallback after two invalid model responses"
+    decision_latency_ms = (clock() - started_at) * 1000
+    metrics.decision_latency(decision_latency_ms)
     return {
         "action": _fallback(state),
         "action_path": "fallback",
@@ -270,7 +281,7 @@ async def decide(
         "target": None,
         "provider": None,
         "model": None,
-        "decision_latency_ms": (time.monotonic() - started_at) * 1000,
+        "decision_latency_ms": decision_latency_ms,
         "input_tokens": usage.input_tokens if usage is not None else None,
         "output_tokens": usage.output_tokens if usage is not None else None,
         "cached_input_tokens": usage.cached_input_tokens if usage is not None else None,

@@ -17,8 +17,10 @@ from ludex_agent.graph.provider import (
     FatalProviderError,
     KeyRotatingProvider,
     ModelRoute,
-    ProviderCompletion,
+    PinnedResolver,
     ProviderChain,
+    ProviderCompletion,
+    ProviderMixError,
     ProviderPoolExhausted,
     QuotaExceeded,
     TransientProviderError,
@@ -355,6 +357,75 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+
+@pytest.mark.asyncio
+async def test_deadline_se_evalua_con_el_reloj_inyectado_no_con_time_monotonic():
+    """F2-10: `KeyRotatingProvider` debe usar `self._clock()` para decidir si
+    el deadline venció. Si se filtra `time.monotonic()`, este test falla:
+    construimos un deadline en el futuro del reloj real pero en el pasado
+    del reloj falso; avanzamos el falso más allá del deadline y exigimos que
+    complete() lo detecte SIN invocar el backend."""
+    # time.monotonic() real es del orden de segundos desde el boot
+    # (típicamente < 1e9); 1e12 está lejos en el futuro real.
+    clock = FakeClock(start=1e12)
+    backend = ScriptedBackend([{"never": True}])
+    provider = KeyRotatingProvider(
+        "google", ("k",), backend, clock=clock
+    )
+
+    deadline = clock.now + 5.0
+    clock.advance(10.0)  # el reloj falso superó el deadline; el real no.
+
+    with pytest.raises(DecisionDeadlineExceeded):
+        await provider.complete("p", deadline=deadline, turn_id="t")
+
+    assert backend.calls == []
+    assert provider._metrics.snapshot()["turns_deadline_affected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cooldown_y_deadline_usan_el_mismo_reloj_inyectado():
+    """F2-10: el cooldown de una clave y el deadline del turno deben vivir en
+    la misma escala de tiempo; si usaran relojes distintos, una clave podría
+    parecer disponible cuando el deadline ya venció o viceversa."""
+    clock = FakeClock(start=0.0)
+    backend = ScriptedBackend([
+        QuotaExceeded("quota"),
+        QuotaExceeded("quota"),
+        {"ok": True},
+    ])
+    provider = KeyRotatingProvider(
+        "google", ("key-a", "key-b"), backend, clock=clock,
+        quota_cooldown_seconds=30.0,
+    )
+
+    # Turno 1: ambas claves dan 429. El deadline es demasiado corto para
+    # esperar el cooldown, así que la decisión aborta.
+    with pytest.raises(ProviderPoolExhausted):
+        await provider.complete(
+            "turno 1", deadline=clock.now + 10, turn_id="battle:1"
+        )
+
+    # Avanzamos 20s: ambas claves todavía enfriándose (quedan 10s).
+    clock.advance(20.0)
+    # El deadline del turno 2 vence en 5s, antes de que se libere ninguna.
+    with pytest.raises(ProviderPoolExhausted):
+        await provider.complete(
+            "turno 2", deadline=clock.now + 5, turn_id="battle:2"
+        )
+
+    # Avanzamos 15s más: key-a ya está disponible (30s totales).
+    clock.advance(15.0)
+    second = await provider.complete(
+        "turno 3", deadline=clock.now + 10, turn_id="battle:3"
+    )
+    assert second.payload == {"ok": True}
+    assert backend.calls == [
+        ("turno 1", "key-a"),
+        ("turno 1", "key-b"),
+        ("turno 3", "key-a"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -783,6 +854,73 @@ async def test_envelope_model_efectivo_cae_al_configurado_sin_reporte():
     assert envelope.model == "gemini-2.5-flash"
 
 
+def test_metricas_de_latencia_calculan_p50_p95_y_max():
+    metrics = DecisionMetrics()
+
+    for latency in [10.0, 20.0, 30.0, 40.0, 50.0, 100.0, 200.0]:
+        metrics.completion_latency(latency)
+
+    snapshot = metrics.snapshot()
+    assert snapshot["completion_latency_ms_count"] == 7
+    assert snapshot["completion_latency_ms_total"] == 450
+    assert snapshot["completion_latency_ms_max"] == 200
+    assert snapshot["completion_latency_ms_p50"] == 40
+    assert snapshot["completion_latency_ms_p95"] == 170
+    assert snapshot["decision_latency_ms_count"] == 0
+
+
+def test_metricas_de_latencia_rechazan_valores_negativos():
+    with pytest.raises(ValueError, match="latency cannot be negative"):
+        DecisionMetrics().completion_latency(-1.0)
+    with pytest.raises(ValueError, match="latency cannot be negative"):
+        DecisionMetrics().decision_latency(-1.0)
+
+
+def test_metricas_de_latencia_no_truncan_99999_ni_redondean_a_cero():
+    """L-01 (R2): la politica de redondeo es entero mas cercano via
+    `round()`; truncar con `int()` dejaria 99.999... en 99 y es una
+    regresion prohibida (mutacion dedicada)."""
+    metrics = DecisionMetrics()
+    metrics.completion_latency(99.99999)
+    snapshot = metrics.snapshot()
+    assert snapshot["completion_latency_ms_total"] == 100
+    assert snapshot["completion_latency_ms_max"] == 100
+    assert snapshot["completion_latency_ms_p50"] == 100
+    assert snapshot["completion_latency_ms_p95"] == 100
+
+
+def test_percentiles_sin_muestras_son_none_nunca_cero_comparable():
+    """L-01 (R2): una poblacion sin muestras deja total/p50/p95/max en None
+    (null en artefactos, blanco en el ledger), nunca 0/0/0."""
+    snapshot = DecisionMetrics().snapshot()
+    assert snapshot["completion_latency_ms_count"] == 0
+    assert snapshot["completion_latency_ms_total"] is None
+    assert snapshot["completion_latency_ms_p50"] is None
+    assert snapshot["completion_latency_ms_p95"] is None
+    assert snapshot["completion_latency_ms_max"] is None
+    assert snapshot["decision_latency_ms_count"] == 0
+    assert snapshot["decision_latency_ms_total"] is None
+    assert snapshot["decision_latency_ms_p50"] is None
+    assert snapshot["decision_latency_ms_p95"] is None
+    assert snapshot["decision_latency_ms_max"] is None
+
+
+def test_completion_y_decision_son_poblaciones_disjuntas():
+    """L-01 (R2): ninguna muestra entra en ambas poblaciones. Una completion
+    de 100 ms y una decision de 250 ms son dos poblaciones de una muestra
+    cada una, no una poblacion de dos muestras."""
+    metrics = DecisionMetrics()
+    metrics.completion_latency(100.0)
+    metrics.decision_latency(250.0)
+    snapshot = metrics.snapshot()
+    assert snapshot["completion_latency_ms_count"] == 1
+    assert snapshot["completion_latency_ms_total"] == 100
+    assert snapshot["completion_latency_ms_max"] == 100
+    assert snapshot["decision_latency_ms_count"] == 1
+    assert snapshot["decision_latency_ms_total"] == 250
+    assert snapshot["decision_latency_ms_max"] == 250
+
+
 async def test_envelope_latencia_mide_la_llamada_con_reloj_inyectable():
     clock = FakeClock(start=1000.0)
 
@@ -867,3 +1005,58 @@ async def test_envelopes_concurrentes_no_se_cruzan_metadata():
     assert envelope_b.provider == "google"
     assert envelope_b.model == "kimi-k2.6"
     assert envelope_b.usage.input_tokens == 2
+
+
+@pytest.mark.asyncio
+async def test_pinned_auditor_aborta_si_la_respuesta_efectiva_difiere_del_pin():
+    """F2-10/D28: un benchmark fija provider/model al inicio y jamás mezcla.
+    Si una respuesta efectiva devuelve otro provider o modelo, la corrida
+    aborta con ProviderMixError en vez de contaminar el winrate."""
+
+    class ShapeshiftingProvider:
+        async def complete(self, prompt, *, deadline, turn_id):
+            return CompletionEnvelope(
+                payload={"ok": True},
+                provider="google",
+                model="gemini-2.5-flash",
+                usage=CompletionUsage(input_tokens=1, output_tokens=1),
+                latency_ms=0.0,
+            )
+
+    resolver = PinnedResolver(
+        ShapeshiftingProvider(),
+        "kimi",
+        "kimi-k2.6",
+        enforce_pin=True,
+    )
+    resolved = await resolver.resolve()
+
+    with pytest.raises(ProviderMixError, match="mezclado"):
+        await resolved.provider.complete(
+            "p", deadline=time.monotonic() + 1, turn_id="t"
+        )
+
+
+@pytest.mark.asyncio
+async def test_pinned_auditor_permite_respuesta_que_coincide_con_el_pin():
+    class HonestProvider:
+        async def complete(self, prompt, *, deadline, turn_id):
+            return CompletionEnvelope(
+                payload={"ok": True},
+                provider="google",
+                model="gemini-2.5-flash",
+                usage=CompletionUsage(input_tokens=1, output_tokens=1),
+                latency_ms=0.0,
+            )
+
+    resolver = PinnedResolver(
+        HonestProvider(),
+        "google",
+        "gemini-2.5-flash",
+        enforce_pin=True,
+    )
+    resolved = await resolver.resolve()
+    envelope = await resolved.provider.complete(
+        "p", deadline=time.monotonic() + 1, turn_id="t"
+    )
+    assert envelope.model == "gemini-2.5-flash"

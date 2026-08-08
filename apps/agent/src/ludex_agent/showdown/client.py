@@ -14,6 +14,7 @@ import logging
 import re
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -704,6 +705,7 @@ class LudexPlayer(RandomPlayer):
         decision_graph: Any = None,
         decision_budget_seconds: float = 240,
         projection_timeout_seconds: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
         **kwargs: Any,
     ) -> None:
         # El listener se arranca DESPUES de instalar el observador pre-lock:
@@ -715,6 +717,9 @@ class LudexPlayer(RandomPlayer):
         self.decision_graph = decision_graph
         self.decision_budget_seconds = decision_budget_seconds
         self.projection_timeout_seconds = projection_timeout_seconds
+        # F2-10: el reloj que gobierna deadlines y métricas es inyectable.
+        # En producción es `time.monotonic`; en tests usamos un reloj falso.
+        self._clock = clock
         self.recorders: dict[str, ProtocolRecorder] = defaultdict(ProtocolRecorder)
         self.steps: dict[str, list[dict | None]] = defaultdict(list)
         # Frames crudos publicados ANTES del lock por batalla. Es lo unico
@@ -1186,7 +1191,7 @@ class LudexPlayer(RandomPlayer):
         snapshot = {**serialize_battle(battle), "legal_actions": captured_legal}
         opponent_side = "p2" if battle.player_role == "p1" else "p1"
         vocabulary = self._vocabulary(battle.gen)
-        deadline = time.monotonic() + self.decision_budget_seconds
+        deadline = self._clock() + self.decision_budget_seconds
         # Todo esto se lee AHORA, sincronicamente, y nunca se vuelve a leer
         # de `battle`: `available_moves`/`available_switches` ya reflejan el
         # `|request|` que acaba de procesar `parse_request` (poke-env llama a
@@ -1392,7 +1397,7 @@ class LudexPlayer(RandomPlayer):
                 "opponent": copy.deepcopy(previous["opponent"]),
                 "field": copy.deepcopy(previous["field"]),
             }
-        budget = max(0.0, deadline - time.monotonic())
+        budget = max(0.0, deadline - self._clock())
         try:
             frame = await self.frame_inbox.wait_for_resolution(
                 tag,
