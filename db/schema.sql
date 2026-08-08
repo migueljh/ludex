@@ -236,6 +236,40 @@ CREATE TABLE public.learnsets (
 
 
 --
+-- Name: models; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.models (
+    id integer NOT NULL,
+    provider_id integer NOT NULL,
+    model_id text NOT NULL,
+    label text NOT NULL,
+    is_default boolean DEFAULT false NOT NULL,
+    enabled boolean DEFAULT true NOT NULL
+);
+
+
+--
+-- Name: models_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.models_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: models_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.models_id_seq OWNED BY public.models.id;
+
+
+--
 -- Name: moves; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -329,6 +363,39 @@ ALTER SEQUENCE public.pokemon_id_seq OWNED BY public.pokemon.id;
 
 
 --
+-- Name: providers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.providers (
+    id integer NOT NULL,
+    name text NOT NULL,
+    base_url text,
+    api_key_env text NOT NULL,
+    enabled boolean DEFAULT true NOT NULL
+);
+
+
+--
+-- Name: providers_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.providers_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: providers_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.providers_id_seq OWNED BY public.providers.id;
+
+
+--
 -- Name: schema_migrations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -369,6 +436,16 @@ CREATE SEQUENCE public.seed_runs_id_seq
 --
 
 ALTER SEQUENCE public.seed_runs_id_seq OWNED BY public.seed_runs.id;
+
+
+--
+-- Name: settings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.settings (
+    key text NOT NULL,
+    value jsonb NOT NULL
+);
 
 
 --
@@ -523,6 +600,13 @@ ALTER TABLE ONLY public.items ALTER COLUMN id SET DEFAULT nextval('public.items_
 
 
 --
+-- Name: models id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.models ALTER COLUMN id SET DEFAULT nextval('public.models_id_seq'::regclass);
+
+
+--
 -- Name: moves id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -534,6 +618,13 @@ ALTER TABLE ONLY public.moves ALTER COLUMN id SET DEFAULT nextval('public.moves_
 --
 
 ALTER TABLE ONLY public.pokemon ALTER COLUMN id SET DEFAULT nextval('public.pokemon_id_seq'::regclass);
+
+
+--
+-- Name: providers id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.providers ALTER COLUMN id SET DEFAULT nextval('public.providers_id_seq'::regclass);
 
 
 --
@@ -638,6 +729,22 @@ ALTER TABLE ONLY public.learnsets
 
 
 --
+-- Name: models models_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.models
+    ADD CONSTRAINT models_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: models models_provider_id_model_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.models
+    ADD CONSTRAINT models_provider_id_model_id_key UNIQUE (provider_id, model_id);
+
+
+--
 -- Name: moves moves_gen_id_showdown_id_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -670,6 +777,22 @@ ALTER TABLE ONLY public.pokemon
 
 
 --
+-- Name: providers providers_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.providers
+    ADD CONSTRAINT providers_name_key UNIQUE (name);
+
+
+--
+-- Name: providers providers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.providers
+    ADD CONSTRAINT providers_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: schema_migrations schema_migrations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -683,6 +806,14 @@ ALTER TABLE ONLY public.schema_migrations
 
 ALTER TABLE ONLY public.seed_runs
     ADD CONSTRAINT seed_runs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: settings settings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.settings
+    ADD CONSTRAINT settings_pkey PRIMARY KEY (key);
 
 
 --
@@ -823,6 +954,14 @@ ALTER TABLE ONLY public.learnsets
 
 
 --
+-- Name: models models_provider_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.models
+    ADD CONSTRAINT models_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
+
+
+--
 -- Name: moves moves_gen_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -913,4 +1052,5 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20260727000007'),
     ('20260727000008'),
     ('20260729000001'),
-    ('20260803000001');
+    ('20260803000001'),
+    ('20260804000001');

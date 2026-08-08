@@ -42,6 +42,9 @@ _TIPOS_CONOCIDOS = {
     # F2-08: `double precision` (confidence, decision_latency_ms) es la
     # sintaxis del DDL; `float8` es el udt_name real de Postgres.
     "DOUBLE PRECISION": ("double precision", "float8"),
+    # F2-09: `boolean` (enabled/is_default) compila a BOOLEAN en SQLAlchemy;
+    # el udt_name real de Postgres es `bool`.
+    "BOOLEAN": ("boolean", "bool"),
 }
 
 
@@ -115,12 +118,55 @@ async def test_models_espeja_el_ddl_columna_por_columna():
             # Canario: sin esto, una `Base.metadata` vacia (o un typo que
             # deje `tables` sin nada) pasaria en verde sin haber comparado
             # una sola columna.
-            assert tablas_comparadas == 4, (
-                f"se esperaban 4 tablas mapeadas, se compararon {tablas_comparadas}"
+            assert tablas_comparadas == 7, (
+                f"se esperaban 7 tablas mapeadas (battles, battle_turns, "
+                f"trajectories, trajectory_steps + providers, models, "
+                f"settings de F2-09), se compararon {tablas_comparadas}"
             )
             assert columnas_comparadas > 0, "no se comparo ninguna columna"
     finally:
         await engine.dispose()
+
+
+async def test_models_fk_y_unique_compuesto_espejan_el_ddl():
+    """L-02 (MON-14 R2): el ORM de `models` refleja EXACTAMENTE el DDL ya
+    aprobado de la migracion F2-09: FK a `providers.id` con `ON DELETE
+    CASCADE` y UNIQUE compuesto `(provider_id, model_id)`. El espejo
+    columna a columna no alcanzaba para esto: la FK podia perder el
+    ondelete (la DB sigue borrando en cascada y el ORM afirmaria otra cosa)
+    o desaparecer la unicidad compuesta, y el resto de los tests seguia en
+    verde.
+
+    Las mutaciones que eliminan `ondelete="CASCADE"` o el
+    `UniqueConstraint` del modelo ponen este test en rojo.
+    """
+    table = models.Model.__table__
+
+    fks = [fk for fk in table.foreign_keys if fk.parent.name == "provider_id"]
+    assert len(fks) == 1, (
+        "models.provider_id debe declarar exactamente una FK a providers.id"
+    )
+    assert fks[0].target_fullname == "providers.id", (
+        f"la FK de models.provider_id apunta a {fks[0].target_fullname!r}, "
+        "no a providers.id"
+    )
+    assert fks[0].ondelete == "CASCADE", (
+        f"la FK de models.provider_id dice ondelete={fks[0].ondelete!r}: "
+        "el DDL aprobado es ON DELETE CASCADE"
+    )
+
+    uniques = [
+        c for c in table.constraints if isinstance(c, UniqueConstraint)
+    ]
+    assert len(uniques) == 1, (
+        "models debe declarar exactamente un UniqueConstraint (el compuesto "
+        "provider_id, model_id del DDL)"
+    )
+    columnas = sorted(c.name for c in uniques[0].columns)
+    assert columnas == ["model_id", "provider_id"], (
+        f"el UNIQUE del ORM cubre {columnas!r}, no ['model_id', "
+        "'provider_id']"
+    )
 
 
 async def test_action_path_es_text_nullable_con_dominio_acotado():

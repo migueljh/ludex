@@ -140,3 +140,41 @@ class TrajectoryStep(Base):
     cached_input_tokens: Mapped[int | None] = mapped_column(nullable=True)
     reasoning_tokens: Mapped[int | None] = mapped_column(nullable=True)
     reward: Mapped[float | None] = mapped_column(Numeric, nullable=True)
+
+
+class Provider(Base):
+    """F2-09 (MON-14): catalogo de proveedores. `api_key_env` es el NOMBRE de
+    la variable de entorno; los valores de las claves nunca entran a la DB."""
+
+    __tablename__ = "providers"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(Text, unique=True)
+    base_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    api_key_env: Mapped[str] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(default=True)
+
+
+class Model(Base):
+    """F2-09 (MON-14): catalogo de modelos por provider. L-02 (R2): el ORM
+    espeja el DDL aprobado: FK a `providers.id` con `ON DELETE CASCADE` y
+    UNIQUE compuesto `(provider_id, model_id)` -- si una migracion los
+    cambiara, `tests/db/test_models.py` se pone rojo."""
+
+    __tablename__ = "models"
+    __table_args__ = (
+        UniqueConstraint("provider_id", "model_id"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider_id: Mapped[int] = mapped_column(
+        ForeignKey("providers.id", ondelete="CASCADE"), nullable=False
+    )
+    model_id: Mapped[str] = mapped_column(Text)
+    label: Mapped[str] = mapped_column(Text)
+    is_default: Mapped[bool] = mapped_column(default=False)
+    enabled: Mapped[bool] = mapped_column(default=True)
+
+
+class Setting(Base):
+    __tablename__ = "settings"
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    value: Mapped[dict] = mapped_column(JSONB)

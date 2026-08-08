@@ -3,8 +3,13 @@ import time
 
 import pytest
 
-from ludex_agent.graph.provider import DecisionMetrics
-from ludex_agent.graph.provider import CompletionEnvelope, CompletionUsage
+from ludex_agent.graph.provider import (
+    CompletionEnvelope,
+    CompletionUsage,
+    DecisionMetrics,
+    PinnedResolver,
+    ResolvedProvider,
+)
 from ludex_agent.graph.workflow import build_decision_graph
 
 
@@ -144,8 +149,14 @@ async def test_grafo_ejecuta_todos_los_nodos_en_orden_y_devuelve_contexto():
         "legal_actions": [{"kind": "move", "id": "tackle"}],
         "chat": "rendite",
     }
+
+    class Resolver:
+        async def resolve(self):
+            events.append("resolve_provider")
+            return ResolvedProvider("fake", "fake-model", Provider())
+
     graph = build_decision_graph(
-        Calculator(), Provider(), DecisionMetrics(), Repository(), parser=parser
+        Calculator(), Resolver(), DecisionMetrics(), Repository(), parser=parser
     )
 
     result = await graph.ainvoke({
@@ -155,7 +166,8 @@ async def test_grafo_ejecuta_todos_los_nodos_en_orden_y_devuelve_contexto():
     })
 
     assert events == [
-        "parse_state", "retrieve_context", "calc_damage", "decide",
+        "resolve_provider", "parse_state", "retrieve_context",
+        "calc_damage", "decide",
     ]
     assert result["context"]["generation"]["gen_number"] == 6
     assert result["context"]["own"][0]["moves"][0]["learn_methods"] == [{
@@ -248,7 +260,7 @@ async def test_calc_damage_recibe_contexto_rico_no_prompt_context(monkeypatch):
 
     graph = build_decision_graph(
         object(),
-        Provider(),
+        PinnedResolver(Provider(), "fake", "fake-model"),
         DecisionMetrics(),
         Repository(),
     )
@@ -350,7 +362,8 @@ async def test_grafo_conserva_damage_metrics_en_la_salida():
             return {}
 
     graph = build_decision_graph(
-        Calculator(), Provider(), DecisionMetrics(), Repository()
+        Calculator(), PinnedResolver(Provider(), "fake", "fake-model"),
+        DecisionMetrics(), Repository(),
     )
     result = await graph.ainvoke({
         "raw_state": {
