@@ -35,6 +35,10 @@ class BenchmarkRecord:
     losses: int
     ties: int
     failure: str | None
+    # R3 (MON-15): evidencia durable y sanitizada del fallo. Solo nombres de
+    # clase; nunca mensajes crudos, URLs, módulos, tracebacks ni secretos.
+    failure_type: str | None
+    failure_cause_type: str | None
     win_rate: Decimal | None
     wilson95: tuple[Decimal, Decimal] | None
     metrics: Mapping[str, int | None]
@@ -138,6 +142,8 @@ def build_benchmark_record(
         losses=result.losses,
         ties=result.ties,
         failure=result.failure,
+        failure_type=result.failure_type,
+        failure_cause_type=result.failure_cause_type,
         win_rate=win_rate,
         wilson95=wilson,
         metrics=dict(metrics),

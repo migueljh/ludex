@@ -71,3 +71,49 @@ def test_modelo_sin_precio_deja_hueco_honesto():
 
     with pytest.raises(KeyError, match="sin precio"):
         table.price("open_code_zen", "modelo-inventado")
+
+
+def test_calculo_rechaza_none_en_campos_de_tokens():
+    """R3: `calculate_cost` consume solo campos de tokens y rechaza None en
+    ellos; los percentiles de latencia nullable no se leen aca."""
+    price = PriceEntry(
+        provider="open_code_zen",
+        model="minimax-m2.7",
+        input_per_million=Decimal("0.30"),
+        output_per_million=Decimal("1.20"),
+        cached_input_per_million=Decimal("0.06"),
+        checked_at="2026-07-28",
+        source_url="https://opencode.ai/docs/zen/",
+    )
+    usage_con_none_en_tokens = {
+        "input_tokens": None,
+        "cached_input_tokens": 0,
+        "output_tokens": 10,
+    }
+    with pytest.raises(ValueError, match="token usage fields cannot be None"):
+        calculate_cost(usage_con_none_en_tokens, price)
+
+
+def test_calculo_ignora_percentiles_nullable_y_costo_se_mantiene():
+    """R3: un snapshot de `DecisionMetrics` con percentiles de latencia en
+    None (sin muestras) no debe romper el costo: los tokens son int."""
+    usage = {
+        "input_tokens": 100,
+        "cached_input_tokens": 0,
+        "output_tokens": 10,
+        "completion_latency_ms_p50": None,
+        "completion_latency_ms_p95": None,
+        "decision_latency_ms_p50": None,
+        "decision_latency_ms_max": None,
+    }
+    price = PriceEntry(
+        provider="open_code_zen",
+        model="minimax-m2.7",
+        input_per_million=Decimal("0.30"),
+        output_per_million=Decimal("1.20"),
+        cached_input_per_million=Decimal("0.06"),
+        checked_at="2026-07-28",
+        source_url="https://opencode.ai/docs/zen/",
+    )
+
+    assert calculate_cost(usage, price) == Decimal("0.000042")

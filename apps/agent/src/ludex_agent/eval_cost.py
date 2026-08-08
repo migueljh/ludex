@@ -79,12 +79,26 @@ class PricingTable:
 
 
 def calculate_cost(
-    usage: Mapping[str, int],
+    usage: Mapping[str, int | None],
     price: PriceEntry,
 ) -> Decimal | None:
-    input_tokens = int(usage.get("input_tokens", 0))
-    cached_tokens = int(usage.get("cached_input_tokens", 0))
-    output_tokens = int(usage.get("output_tokens", 0))
+    """Costo desde usage real y precios versionados.
+
+    R3 (MON-15): `DecisionMetrics.snapshot()` mezcla contadores `int` con
+    percentiles de latencia `int | None`. `calculate_cost` consume
+    ÚNICAMENTE los campos de tokens (`input_tokens`, `cached_input_tokens`,
+    `output_tokens`) y rechaza con `ValueError` si alguno es `None`: un
+    conteo de tokens ausente no es calculable, y jamas se confunde con los
+    percentiles nullable, que no se leen aca.
+    """
+    raw_input = usage.get("input_tokens")
+    raw_cached = usage.get("cached_input_tokens")
+    raw_output = usage.get("output_tokens")
+    if None in (raw_input, raw_cached, raw_output):
+        raise ValueError("token usage fields cannot be None")
+    input_tokens = int(raw_input)
+    cached_tokens = int(raw_cached)
+    output_tokens = int(raw_output)
     if min(input_tokens, cached_tokens, output_tokens) < 0:
         raise ValueError("token usage cannot be negative")
     if cached_tokens > input_tokens:

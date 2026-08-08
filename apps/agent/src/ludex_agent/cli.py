@@ -20,7 +20,12 @@ from poke_env.player import (
     SimpleHeuristicsPlayer,
 )
 
-from .benchmark import BenchmarkDeadlineExceeded, BenchmarkResult, run_benchmark
+from .benchmark import (
+    BenchmarkDeadlineExceeded,
+    BenchmarkResult,
+    failure_classification,
+    run_benchmark,
+)
 from .config import PROVIDER_CATALOG, load_settings
 from .db.context_repository import PostgresContextRepository
 from .db.model_repository import ModelRepository, ModelSelectionError
@@ -552,7 +557,7 @@ async def _benchmark_command(
     on_progress: Callable[
         [BenchmarkResult, Mapping[str, int | None]], Awaitable[None] | None
     ] | None = None,
-) -> tuple[BenchmarkResult, dict[str, int]]:
+) -> tuple[BenchmarkResult, dict[str, int | None]]:
     settings = load_settings()
     await _check_showdown_reachable(settings.showdown_ws_url)
     server = local_server_configuration(settings.showdown_ws_url)
@@ -626,11 +631,19 @@ async def _benchmark_command(
                 agent.n_won_battles + agent.n_lost_battles
                 + agent.n_tied_battles
             )
+            # R3 (MON-15): evidencia durable y sanitizada del fallo. El
+            # error clasificado (`TransientProviderError`, etc.) conserva su
+            # `__cause__` original (p.ej. `APITimeoutError`) porque
+            # `KeyRotatingProvider` lo re-lanza con `raise error from raw`.
+            # Persistimos SOLO los nombres de clase, nunca el mensaje crudo.
+            failure_type, failure_cause_type = failure_classification(exc)
             result = BenchmarkResult(
                 requested=n, completed=completed,
                 wins=agent.n_won_battles, losses=agent.n_lost_battles,
                 ties=agent.n_tied_battles, provider=provider_name,
                 model=model, failure=f"{type(exc).__name__}: {exc}",
+                failure_type=failure_type,
+                failure_cause_type=failure_cause_type,
             )
     finally:
         await calculator.aclose()
@@ -707,10 +720,16 @@ def benchmark_command(
         # "not-run" para que quede trazable que el punto de control fue
         # alcanzado aunque la corrida real no se ejecutó.
         typer.echo(f"{exc}")
+        # R3 (MON-15): not-run conserva la clase del error de seleccion
+        # (`ProviderSelectionError`) sin inventar una causa: este error se
+        # lanza directo, sin `raise ... from`, asi que `__cause__` es None.
+        failure_type, failure_cause_type = failure_classification(exc)
         not_run_result = BenchmarkResult(
             requested=n, completed=0, wins=0, losses=0, ties=0,
             provider=provider_name, model=model_name,
             failure=str(exc),
+            failure_type=failure_type,
+            failure_cause_type=failure_cause_type,
         )
         not_run_metrics: dict[str, int | None] = {
             "turns_total": 0, "calls_total": 0, "input_tokens": 0,

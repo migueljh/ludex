@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 from ludex_agent import cli as cli_module
 from ludex_agent.benchmark import BenchmarkDeadlineExceeded, BenchmarkResult, run_benchmark
-from ludex_agent.graph.provider import FatalProviderError
+from ludex_agent.graph.provider import FatalProviderError, TransientProviderError
 from typer.testing import CliRunner
 
 from ludex_agent.cli import (
@@ -986,9 +986,79 @@ def test_benchmark_command_deadline_clasificado_y_escribe_final(
     assert data["requested"] == 3
     assert data["completed"] == 1
     assert data["failure"].startswith("BenchmarkDeadlineExceeded")
+    # R3 (MON-15): evidencia durable y sanitizada — solo nombres de clase.
+    assert data["failure_type"] == "BenchmarkDeadlineExceeded"
+    assert data["failure_cause_type"] == "TimeoutError"
 
     assert ledger_path.exists()
     ledger_text = ledger_path.read_text()
     assert "test-deadline" in ledger_text
     assert "1/3" in ledger_text
     assert "1-0-0" in ledger_text
+
+
+def test_benchmark_command_transient_con_causa_persiste_tipos_en_json(
+    monkeypatch, tmp_path
+):
+    """R3: el camino de fallo transitorio de `_benchmark_command` persiste
+    `failure_type` y `failure_cause_type` (solo nombres de clase) en el
+    artefacto. La causa original (raw) viaja por `__cause__` del error
+    clasificado, igual que en produccion con `raise error from raw`."""
+
+    class FailingAgent:
+        def __init__(self, **kwargs) -> None:
+            self.n_won_battles = 0
+            self.n_lost_battles = 0
+            self.n_tied_battles = 0
+            self.battles = {}
+
+        async def battle_against(self, rival, n_battles=1):
+            raw = TimeoutError(
+                "Request timed out. (url: https://api.kimi.com/v1/chat/completions)"
+            )
+            try:
+                raise TransientProviderError("provider transport failed") from raw
+            except TransientProviderError as exc:
+                raise exc
+
+        async def wait_for_background_failure(self):
+            await asyncio.Event().wait()
+
+    _patch_benchmark_command_dependencies(monkeypatch, FailingAgent)
+
+    async def reachable(url):
+        pass
+
+    monkeypatch.setattr(cli_module, "_check_showdown_reachable", reachable)
+    monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark",
+            "--n", "1",
+            "--opponent", "random",
+            "--provider", "fake",
+            "--model", "fake-model",
+            "--run-id", "test-transient",
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "SHOWDOWN_WS_URL": "ws://localhost:8100/showdown/websocket",
+            "LUDEX_PROVIDER": "fake",
+            "LUDEX_MODEL": "fake-model",
+        },
+    )
+
+    assert result.exit_code == 1
+    assert "ABORTED: TransientProviderError" in result.stdout
+    artifact = tmp_path / "test-transient.json"
+    assert artifact.exists()
+    data = json.loads(artifact.read_text())
+    assert data["status"] == "aborted"
+    assert data["failure_type"] == "TransientProviderError"
+    assert data["failure_cause_type"] == "TimeoutError"
+    # Sanitizado: sin mensaje crudo, URL ni secreto en el artefacto.
+    rendered = artifact.read_text()
+    assert "Request timed out" not in rendered
+    assert "api.kimi.com" not in rendered
