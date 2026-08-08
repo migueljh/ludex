@@ -6,21 +6,24 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from _disposable import verified_engine
 from ludex_agent.db.repository import (
     _SAVE_BATTLE_SQL,
     BattleIdentityConflictError,
     BattleRepository,
 )
-from ludex_agent.db.session import make_engine, session_factory
+from ludex_agent.db.session import session_factory
 from ludex_agent.showdown.protocol import compute_opening_identity
 
-# MON-11 (E): TEST_DATABASE_URL, no DATABASE_URL -- este archivo nunca corre
-# contra la base compartida. Cada test recibe una base descartable nueva via
-# la fixture `test_database_url` (ver conftest.py / _disposable.py): antes,
-# el unico cleanup era un DELETE al ARRANQUE de la fixture siguiente, que no
-# protegia contra una corrida cancelada o que revienta a mitad de camino
-# (asi quedo huerfana `battle-test-metadata` en la base compartida el
-# 2026-08-08).
+# MON-11 (E/R2): TEST_DATABASE_URL, no DATABASE_URL -- este archivo nunca
+# corre contra la base compartida. Cada test recibe una base descartable
+# nueva via la fixture `test_database_url` (ver conftest.py / _disposable.py):
+# antes, el unico cleanup era un DELETE al ARRANQUE de la fixture siguiente,
+# que no protegia contra una corrida cancelada o que revienta a mitad de
+# camino (asi quedo huerfana `battle-test-metadata` en la base compartida el
+# 2026-08-08). El `repo` fixture pasa por `verified_engine` (no `make_engine`
+# directo): confirma `current_database()` sobre la conexion REAL antes de
+# que corra cualquier sentencia mutadora, no solo el string de la URL.
 pytestmark = pytest.mark.skipif(
     not os.environ.get("TEST_DATABASE_URL"),
     reason="necesita TEST_DATABASE_URL (base descartable; nunca DATABASE_URL)",
@@ -67,7 +70,7 @@ def _identity(tag: str, **kwargs: str) -> str:
 # funcion, y asyncpg revienta con "attached to a different loop".
 @pytest_asyncio.fixture(loop_scope="function")
 async def repo(test_database_url):
-    engine = make_engine(test_database_url)
+    engine = await verified_engine(test_database_url)
     factory = session_factory(engine)
     async with factory() as s:
         # La base descartable trae el DDL de db/schema.sql pero no el seed
@@ -292,7 +295,7 @@ async def test_winner_repetido_no_revienta(repo):
 
 async def _dos_conexiones_forzando_conflicto(database_url: str, datos1: dict, datos2: dict):
     """Devuelve (bloqueada_mientras_txn1_abierta, resultado2, filas_finales)."""
-    engine = make_engine(database_url)
+    engine = await verified_engine(database_url)
     try:
         async with engine.connect() as conn1, engine.connect() as conn2:
             await conn1.execute(_SAVE_BATTLE_SQL, datos1)
