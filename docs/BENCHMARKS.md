@@ -15,10 +15,6 @@ significa desconocido o no comparable, nunca cero implícito.
 | 2026-08-08 | [20260808-kimi-k26-battle-1](../apps/agent/evals/runs/20260808-kimi-k26-battle-1.json) | kimi/kimi-k2.6 | 0/1 | 0-0-0 |  |  |  | 0/0 | 0.0000 |  |  | 0.0000%/0.0000% | 1 | 0 | 0 |  |  | 2026-07-28-official |
 | 2026-08-08 | [20260808-gemini-25flash-d30](../apps/agent/evals/runs/20260808-gemini-25flash-d30.json) | google/gemini-2.5-flash | 0/1 | 0-0-0 |  |  |  | 439144/24515 |  |  |  | 0.0000%/0.0000% | 0 | 0 | 1 |  |  | 2026-07-28-official |
 | 2026-08-08 | [20260808-opencode-claude-haiku-4-5-screen](../apps/agent/evals/runs/20260808-opencode-claude-haiku-4-5-screen.json) | open_code_zen/claude-haiku-4-5 | 1/1 | 1-0-0 | 100.0000% | 20.6549%–100.0000% | 52.0000 | 156/7975 |  |  |  | 39.3939%/18.1818% | 0 | 0 | 0 | 3007/4304/7253 | 5466/7465/8885 | 2026-07-28-official |
-| 2026-08-08 | [test-transient](../../../../../private/var/folders/cb/9hprmpvj1fnbrqw0dbglf_pr0000gn/T/pytest-of-miguelhernandez/pytest-125/test_benchmark_command_transie0/test-transient.json) | fake/fake-model | 0/1 | 0-0-0 |  |  |  | 0/0 |  |  |  | 0.0000%/0.0000% | 0 | 0 | 0 |  |  | 2026-07-28-official |
-| 2026-08-08 | [test-transient](../../../../../private/var/folders/cb/9hprmpvj1fnbrqw0dbglf_pr0000gn/T/pytest-of-miguelhernandez/pytest-126/test_benchmark_command_transie0/test-transient.json) | fake/fake-model | 0/1 | 0-0-0 |  |  |  | 0/0 |  |  |  | 0.0000%/0.0000% | 0 | 0 | 0 |  |  | 2026-07-28-official |
-| 2026-08-08 | [test-transient](../../../../../private/var/folders/cb/9hprmpvj1fnbrqw0dbglf_pr0000gn/T/pytest-of-miguelhernandez/pytest-127/test_benchmark_command_transie0/test-transient.json) | fake/fake-model | 0/1 | 0-0-0 |  |  |  | 0/0 |  |  |  | 0.0000%/0.0000% | 0 | 0 | 0 |  |  | 2026-07-28-official |
-| 2026-08-08 | [test-transient](../../../../../private/var/folders/cb/9hprmpvj1fnbrqw0dbglf_pr0000gn/T/pytest-of-miguelhernandez/pytest-128/test_benchmark_command_transie0/test-transient.json) | fake/fake-model | 0/1 | 0-0-0 |  |  |  | 0/0 |  |  |  | 0.0000%/0.0000% | 0 | 0 | 0 |  |  | 2026-07-28-official |
 
 ## Controles parciales e incidencias
 

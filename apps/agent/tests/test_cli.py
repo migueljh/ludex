@@ -1041,6 +1041,7 @@ def test_benchmark_command_transient_con_causa_persiste_tipos_en_json(
             "--provider", "fake",
             "--model", "fake-model",
             "--run-id", "test-transient",
+            "--ledger", str(tmp_path / "ledger.md"),
         ],
         env={
             "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
