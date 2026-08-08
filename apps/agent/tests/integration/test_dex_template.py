@@ -27,7 +27,12 @@ from _dex_template import (
     disposable_dex_clone,
     ensure_dex_template,
 )
-from _disposable import SharedDatabaseGuardError, _with_database, verified_engine
+from _disposable import (
+    SharedDatabaseGuardError,
+    _with_database,
+    disposable_database,
+    verified_engine,
+)
 
 requires_databases = pytest.mark.skipif(
     not os.environ.get("TEST_DATABASE_URL") or not os.environ.get("DATABASE_URL"),
@@ -45,6 +50,94 @@ async def _connect_source():
 
 async def _maintenance(base: str) -> asyncpg.Connection:
     return await asyncpg.connect(_with_database(base, "postgres"))
+
+
+async def _seed_minimal_dex(conn: asyncpg.Connection) -> None:
+    """Dex sintético mínimo, con integridad referencial completa, para
+    probar el fingerprint/validación de CONTENIDO (R5, L-03) sin tocar la
+    base compartida -- nunca se usa como plantilla real, sólo como fuente
+    falsa dentro de una base descartable propia."""
+    await conn.execute(
+        "INSERT INTO generations (id, gen_number, label) VALUES (1, 6, 'XY/ORAS')",
+    )
+    await conn.execute(
+        "INSERT INTO pokemon (id, gen_id, showdown_id, dex_num, name, base_species, "
+        "is_default, types, base_stats, abilities, base_species_name) VALUES "
+        "(1, 1, 'bulbasaur', 1, 'Bulbasaur', 'bulbasaur', true, ARRAY['GRASS','POISON'], "
+        "$1::jsonb, $2::jsonb, 'Bulbasaur')",
+        '{"hp": 45, "atk": 49}', '{"0": "overgrow"}',
+    )
+    await conn.execute(
+        "INSERT INTO moves (id, gen_id, showdown_id, name, type, category, power, pp, "
+        "priority, target, flags) VALUES "
+        "(1, 1, 'tackle', 'Tackle', 'NORMAL', 'Physical', 40, 15, 0, 'normal', '{}'::jsonb)",
+    )
+    await conn.execute(
+        "INSERT INTO items (id, gen_id, showdown_id, name, properties) "
+        "VALUES (1, 1, 'leftovers', 'Leftovers', '{}'::jsonb)",
+    )
+    await conn.execute(
+        "INSERT INTO learnsets (pokemon_id, move_id, learn_methods) VALUES (1, 1, $1::jsonb)",
+        '["level-up"]',
+    )
+
+
+async def _drop_database(base: str, name: str) -> None:
+    maintenance = await _maintenance(base)
+    try:
+        await maintenance.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    finally:
+        await maintenance.close()
+
+
+async def _assert_content_mutation_changes_fingerprint_and_invalidates(
+    base: str, mutate_sql: str, label: str,
+) -> None:
+    """R5 (LINEAR_VERDICT L-03): mutar UNA columna no-clave, sin tocar ids
+    ni conteos, tiene que (a) cambiar el nombre fingerprintado y (b) hacer
+    que la plantilla VIEJA (contenido stale) no pase `_validate_template`
+    contra la fuente mutada -- ni siquiera si alguien la fuerza/reutiliza a
+    mano. Corre enteramente contra una base descartable propia (`_disposable.
+    database`), nunca contra `DATABASE_URL`."""
+    async with disposable_database(base) as fake_source_url:
+        conn = await asyncpg.connect(fake_source_url)
+        try:
+            await _seed_minimal_dex(conn)
+        finally:
+            await conn.close()
+
+        template_v1 = await ensure_dex_template(base, fake_source_url)
+        try:
+            conn = await asyncpg.connect(fake_source_url)
+            try:
+                await conn.execute(mutate_sql)
+            finally:
+                await conn.close()
+
+            template_v2 = await ensure_dex_template(base, fake_source_url)
+            try:
+                assert template_v2 != template_v1, (
+                    f"{label}: el nombre fingerprintado no cambió pese a mutar "
+                    "una columna no-clave sin tocar ids/conteos"
+                )
+
+                source_conn = await asyncpg.connect(
+                    fake_source_url, server_settings={"default_transaction_read_only": "on"},
+                )
+                try:
+                    valid, reason = await _validate_template(
+                        _with_database(base, template_v1), source_conn,
+                    )
+                finally:
+                    await source_conn.close()
+                assert not valid, (
+                    f"{label}: la plantilla vieja (contenido stale) validó "
+                    f"igual contra la fuente mutada -- reason={reason!r}"
+                )
+            finally:
+                await _drop_database(base, template_v2)
+        finally:
+            await _drop_database(base, template_v1)
 
 
 @requires_databases
@@ -206,6 +299,49 @@ async def test_fallo_a_mitad_de_construccion_no_publica_y_limpia_el_staging(monk
         await maintenance.close()
     assert published == 0, "no se puede publicar una plantilla parcial bajo el nombre fingerprintado"
     assert staging_orphans == 0, "el staging de esta corrida debe limpiarse tras el fallo"
+
+
+# --- R5 (LINEAR_VERDICT L-01/L-03): mutar contenido no-clave, sin tocar
+# ids ni conteos, tiene que cambiar el fingerprint y tumbar la validación
+# de una plantilla stale. Las tres corren enteramente contra una base
+# descartable propia -- nunca DATABASE_URL, nunca se muta la compartida. ---
+
+@requires_databases
+async def test_fingerprint_cambia_si_moves_pp_muta_sin_cambiar_ids_ni_conteos():
+    """Reproducción exacta de Latwan: `moves.pp` 15 -> 16, mismo `id`,
+    mismo conteo por tabla/generación. R4 (conteo+PK) devolvía
+    `FINGERPRINT_UNCHANGED=True` y `_validate_template(...)=(True, "ok")`
+    contra la plantilla vieja -- acá tiene que cambiar el nombre y la
+    plantilla vieja tiene que dejar de validar."""
+    base = os.environ["TEST_DATABASE_URL"]
+    await _assert_content_mutation_changes_fingerprint_and_invalidates(
+        base, "UPDATE moves SET pp = 16 WHERE id = 1", "moves.pp",
+    )
+
+
+@requires_databases
+async def test_fingerprint_cambia_si_un_campo_jsonb_muta_sin_cambiar_ids_ni_conteos():
+    """`pokemon.base_stats` es `jsonb` de verdad (a diferencia de
+    `pokemon.types`, que es `text[]` -- el ejemplo del LINEAR_VERDICT usa
+    "types/base_stats" como si fueran intercambiables; acá se prueba el
+    campo genuinamente `jsonb` para que la aserción sea estricta)."""
+    base = os.environ["TEST_DATABASE_URL"]
+    await _assert_content_mutation_changes_fingerprint_and_invalidates(
+        base,
+        "UPDATE pokemon SET base_stats = '{\"hp\": 99, \"atk\": 49}'::jsonb WHERE id = 1",
+        "pokemon.base_stats (jsonb)",
+    )
+
+
+@requires_databases
+async def test_fingerprint_cambia_si_learnsets_learn_methods_muta_sin_cambiar_ids_ni_conteos():
+    base = os.environ["TEST_DATABASE_URL"]
+    await _assert_content_mutation_changes_fingerprint_and_invalidates(
+        base,
+        "UPDATE learnsets SET learn_methods = '[\"level-up\", \"tm\"]'::jsonb "
+        "WHERE pokemon_id = 1 AND move_id = 1",
+        "learnsets.learn_methods",
+    )
 
 
 @pytest.mark.skipif(

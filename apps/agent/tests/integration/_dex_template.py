@@ -42,12 +42,12 @@ silencio.
 
 El rediseño reemplaza "existe → aceptar" por tres cambios:
 
-1. **El nombre de la plantilla se deriva de un fingerprint** (hash del
-   contenido de `db/schema.sql` + un fingerprint barato pero suficiente del
-   dex fuente -- conteo y hash de claves por tabla, calculado con SQL en el
-   servidor, sin traer 130k filas sólo para hashear). Si el schema o el dex
-   cambian, el fingerprint cambia, el nombre cambia, y el nombre viejo
-   simplemente deja de buscarse -- nunca se reutiliza en silencio.
+1. **El nombre de la plantilla se deriva de un fingerprint** del contenido
+   de `db/schema.sql` + un fingerprint del dex fuente, calculado con SQL en
+   el servidor (nunca trae las filas al cliente sólo para hashear). Si el
+   schema o el dex cambian, el fingerprint cambia, el nombre cambia, y el
+   nombre viejo simplemente deja de buscarse -- nunca se reutiliza en
+   silencio.
 2. **Publicación atómica vía staging.** Se construye TODO (DDL + copia del
    dex) bajo un nombre de staging único (`ludex_dex_staging_<uuid>`, nunca
    reutilizado entre corridas) y sólo se "publica" -- `ALTER DATABASE ...
@@ -59,6 +59,45 @@ El rediseño reemplaza "existe → aceptar" por tres cambios:
    exactamente lo que reprodujo Latwan). Si falla la validación, la función
    revienta ruidoso en vez de reconstruir automáticamente encima de algo
    que otra corrida concurrente podría estar usando ahora mismo.
+
+## R5 (LINEAR_VERDICT L-01..L-03, L-05) -- por que conteo+PK tampoco alcanzaba
+
+Latwan reprodujo esto TAMBIÉN: mutó `moves.pp` de 15 a 16 en un clon
+descartable (mismo `id`, mismo conteo por tabla y por generación) y
+`ensure_dex_template` seguía devolviendo `FINGERPRINT_UNCHANGED=True` /
+`_validate_template(...)=(True, "ok")` contra la plantilla con el
+contenido VIEJO. La huella R4 sólo agregaba PKs (`string_agg(id::text,
+...)`) y la validación sólo comparaba conteos por generación + integridad
+referencial -- ninguno de los dos mira el CONTENIDO de las columnas no
+clave.
+
+Tres cambios más:
+
+4. **La huella cubre TODAS las columnas copiadas, no sólo la PK.** Cada
+   fila se hashea completa vía `md5(ROW(col1, col2, ...)::text)` (Postgres
+   normaliza la representación de texto de una fila, arrays y `jsonb`
+   incluidos) y esos hashes se agregan ordenados por PK. Cambiar
+   `moves.pp`, un campo `jsonb` (`pokemon.base_stats`/`abilities`) o
+   `learnsets.learn_methods` cambia el hash de esa fila, cambia la huella
+   de la tabla, cambia el fingerprint completo, cambia el nombre.
+5. **La lista de columnas es una ÚNICA fuente de verdad.** `_DEX_TABLES`
+   ya gobernaba qué columnas copia `_load_dex_table`; ahora TAMBIÉN
+   gobierna qué columnas entran al `ROW(...)` de la huella
+   (`_row_hash_expr`, construida a partir de `_DEX_TABLES[table]`). No hay
+   una segunda lista de columnas que copiar y validar puedan divergir en
+   silencio.
+6. **Huella, copia y validación leen una única transacción `REPEATABLE
+   READ` de sólo lectura** sobre la fuente (`source.transaction(...)`,
+   abierta una vez en `ensure_dex_template` y usada para TODO lo que lee
+   `source`). Antes eran sentencias `READ COMMITTED` independientes: nada
+   garantizaba que la huella, la copia de filas, y la comparación de
+   `_validate_template` vieran el mismo estado de la fuente si algo
+   cambiara entre medio.
+
+`_validate_template` ahora compara `_table_signature` (conteo + huella de
+CONTENIDO completo) entre fuente y destino, no sólo conteos por generación
+-- una plantilla con los mismos IDs y conteos pero datos distintos se
+rechaza.
 """
 
 from __future__ import annotations
@@ -120,14 +159,29 @@ _PK_EXPR = {
 }
 
 
+def _row_hash_expr(table: str) -> str:
+    """`ROW(...)::text` sobre EXACTAMENTE las columnas de `_DEX_TABLES`
+    (R5, L-05: única fuente de verdad -- las mismas columnas que
+    `_load_dex_table` copia). Postgres normaliza la representación de texto
+    de una fila completa, `text[]` y `jsonb` incluidos: dos filas con el
+    mismo contenido producen el mismo texto siempre; cualquier columna
+    distinta (`moves.pp`, un `jsonb` como `pokemon.base_stats`,
+    `learnsets.learn_methods`) cambia el hash."""
+    columns = _DEX_TABLES[table]
+    return f"md5(ROW({', '.join(columns)})::text)"
+
+
 async def _table_signature(conn: asyncpg.Connection, table: str) -> str:
-    """Conteo + hash de claves, calculado en el SERVIDOR (nunca trae las
-    filas al cliente sólo para fingerprint) -- "suficiente" en el sentido
-    de detectar altas/bajas/reordenamientos sin el costo de un hash de
-    contenido completo."""
+    """Conteo + hash de CONTENIDO completo (R5, L-01), calculado en el
+    SERVIDOR -- nunca trae las filas al cliente sólo para fingerprint. Ya
+    no es conteo+PK (R4): eso dejaba pasar una fila con el mismo `id` pero
+    columnas no-clave distintas (reproducido por Latwan mutando
+    `moves.pp`)."""
+    pk_expr = _PK_EXPR[table]
+    row_hash = _row_hash_expr(table)
     row = await conn.fetchrow(
         f"SELECT count(*) AS n, "
-        f"md5(coalesce(string_agg({_PK_EXPR[table]}, ',' ORDER BY {_PK_EXPR[table]}), '')) AS h "
+        f"md5(coalesce(string_agg({row_hash}, ',' ORDER BY {pk_expr}), '')) AS h "
         f"FROM {table}",
     )
     return f"{table}:{row['n']}:{row['h']}"
@@ -214,12 +268,30 @@ async def _validate_template(template_url: str, source: asyncpg.Connection) -> t
                 return False, f"{table} tiene {n} filas, debería estar vacía"
 
         for table in _DEX_TABLES:
+            # Capa 1, barata: conteos por generación -- falla rápido con un
+            # diagnóstico claro ante un desfase grueso (filas de más/menos).
             source_counts = await _generation_counts(source, table)
             dest_counts = await _generation_counts(conn, table)
             if source_counts != dest_counts:
                 return False, (
                     f"{table}: conteos por generación no coinciden "
                     f"(fuente={source_counts}, destino={dest_counts})"
+                )
+
+        for table in _DEX_TABLES:
+            # Capa 2 (R5, L-01): firma de CONTENIDO completo -- misma
+            # función que la huella del nombre (`_table_signature`), así
+            # que "el destino valida" significa literalmente "el destino
+            # tiene el mismo contenido, columna por columna, que la
+            # fuente" -- no sólo los mismos conteos. Esto es lo que
+            # atrapa el caso que Latwan reprodujo: mismo `id`, mismo
+            # conteo, `moves.pp` distinto.
+            source_sig = await _table_signature(source, table)
+            dest_sig = await _table_signature(conn, table)
+            if source_sig != dest_sig:
+                return False, (
+                    f"{table}: firma de contenido no coincide "
+                    f"(fuente={source_sig}, destino={dest_sig})"
                 )
 
         orphan_checks = {
@@ -263,93 +335,101 @@ async def ensure_dex_template(base_url: str, shared_url: str) -> str:
     se RE-VALIDA antes de aceptarlo -- nunca se confía en la mera
     existencia. Si no existe, se construye en un staging de nombre único,
     se valida, y sólo entonces se publica con un `RENAME` atómico.
+
+    R5 (L-02): TODO lo que lee `source` -- la huella, la copia de filas, y
+    la comparación de `_validate_template` -- corre dentro de UNA sola
+    transacción `REPEATABLE READ` de sólo lectura, abierta acá y sostenida
+    hasta el final. Antes eran sentencias `READ COMMITTED` sueltas: nada
+    impedía que la huella viera un estado de la fuente distinto del que
+    después leía la copia o la validación.
     """
     source = await asyncpg.connect(
         shared_url, server_settings={"default_transaction_read_only": "on"},
     )
     try:
-        template_name = await _template_name(source)
-        template_url = _with_database(base_url, template_name)
-        _assert_not_reserved(template_url)
-        maintenance_url = _with_database(base_url, "postgres")
+        async with source.transaction(isolation="repeatable_read", readonly=True):
+            template_name = await _template_name(source)
+            template_url = _with_database(base_url, template_name)
+            _assert_not_reserved(template_url)
+            maintenance_url = _with_database(base_url, "postgres")
 
-        maintenance = await asyncpg.connect(maintenance_url)
-        try:
-            exists = await maintenance.fetchval(
-                "SELECT 1 FROM pg_database WHERE datname = $1", template_name,
-            )
-        finally:
-            await maintenance.close()
-
-        if exists:
-            valid, reason = await _validate_template(template_url, source)
-            if valid:
-                return template_name
-            raise RuntimeError(
-                f"'{template_name}' existe pero no pasa la validación ({reason}). "
-                "No se reconstruye automáticamente encima de un nombre que otra "
-                "corrida concurrente podría estar usando ahora mismo -- requiere "
-                "intervención manual (confirmar que está huérfana y DROP DATABASE)."
-            )
-
-        staging_name = f"{_STAGING_PREFIX}{uuid4().hex[:16]}"
-        staging_url = _with_database(base_url, staging_name)
-        _assert_not_reserved(staging_url)
-
-        maintenance = await asyncpg.connect(maintenance_url)
-        try:
-            await maintenance.execute(f'CREATE DATABASE "{staging_name}"')
-        finally:
-            await maintenance.close()
-
-        try:
-            schema_conn = await asyncpg.connect(staging_url)
+            maintenance = await asyncpg.connect(maintenance_url)
             try:
-                await schema_conn.execute(_SCHEMA_PATH.read_text())
+                exists = await maintenance.fetchval(
+                    "SELECT 1 FROM pg_database WHERE datname = $1", template_name,
+                )
             finally:
-                await schema_conn.close()
+                await maintenance.close()
 
-            dest = await asyncpg.connect(staging_url)
-            try:
-                for table in _DEX_TABLES:
-                    await _load_dex_table(source, dest, table)
-            finally:
-                await dest.close()
-
-            valid, reason = await _validate_template(staging_url, source)
-            if not valid:
+            if exists:
+                valid, reason = await _validate_template(template_url, source)
+                if valid:
+                    return template_name
                 raise RuntimeError(
-                    f"la plantilla recién construida en '{staging_name}' no pasó "
-                    f"la validación: {reason}",
+                    f"'{template_name}' existe pero no pasa la validación ({reason}). "
+                    "No se reconstruye automáticamente encima de un nombre que otra "
+                    "corrida concurrente podría estar usando ahora mismo -- requiere "
+                    "intervención manual (confirmar que está huérfana y DROP DATABASE)."
                 )
 
-            maintenance = await asyncpg.connect(maintenance_url)
-            try:
-                try:
-                    await maintenance.execute(
-                        f'ALTER DATABASE "{staging_name}" RENAME TO "{template_name}"',
-                    )
-                except asyncpg.exceptions.DuplicateDatabaseError:
-                    # Carrera: otro proceso publicó el MISMO fingerprint
-                    # primero. No es un fallo -- el trabajo ya está hecho;
-                    # sólo hace falta limpiar nuestro propio staging (nunca
-                    # el que ganó la carrera).
-                    await maintenance.execute(f'DROP DATABASE IF EXISTS "{staging_name}"')
-            finally:
-                await maintenance.close()
-        except BaseException:
-            # Cualquier falla (excepción o cancelación cooperativa) ANTES de
-            # publicar: se borra ÚNICAMENTE el staging de nombre exacto y
-            # único de ESTA corrida. Nunca `ludex`, nunca el nombre
-            # fingerprintado, nunca otro staging.
-            maintenance = await asyncpg.connect(maintenance_url)
-            try:
-                await maintenance.execute(f'DROP DATABASE IF EXISTS "{staging_name}" WITH (FORCE)')
-            finally:
-                await maintenance.close()
-            raise
+            staging_name = f"{_STAGING_PREFIX}{uuid4().hex[:16]}"
+            staging_url = _with_database(base_url, staging_name)
+            _assert_not_reserved(staging_url)
 
-        return template_name
+            maintenance = await asyncpg.connect(maintenance_url)
+            try:
+                await maintenance.execute(f'CREATE DATABASE "{staging_name}"')
+            finally:
+                await maintenance.close()
+
+            try:
+                schema_conn = await asyncpg.connect(staging_url)
+                try:
+                    await schema_conn.execute(_SCHEMA_PATH.read_text())
+                finally:
+                    await schema_conn.close()
+
+                dest = await asyncpg.connect(staging_url)
+                try:
+                    for table in _DEX_TABLES:
+                        await _load_dex_table(source, dest, table)
+                finally:
+                    await dest.close()
+
+                valid, reason = await _validate_template(staging_url, source)
+                if not valid:
+                    raise RuntimeError(
+                        f"la plantilla recién construida en '{staging_name}' no pasó "
+                        f"la validación: {reason}",
+                    )
+
+                maintenance = await asyncpg.connect(maintenance_url)
+                try:
+                    try:
+                        await maintenance.execute(
+                            f'ALTER DATABASE "{staging_name}" RENAME TO "{template_name}"',
+                        )
+                    except asyncpg.exceptions.DuplicateDatabaseError:
+                        # Carrera: otro proceso publicó el MISMO fingerprint
+                        # primero. No es un fallo -- el trabajo ya está hecho;
+                        # sólo hace falta limpiar nuestro propio staging (nunca
+                        # el que ganó la carrera).
+                        await maintenance.execute(f'DROP DATABASE IF EXISTS "{staging_name}"')
+                finally:
+                    await maintenance.close()
+            except BaseException:
+                # Cualquier falla (excepción o cancelación cooperativa) ANTES de
+                # publicar: se borra ÚNICAMENTE el staging de nombre exacto y
+                # único de ESTA corrida. Nunca `ludex`, nunca el nombre
+                # fingerprintado, nunca otro staging.
+                maintenance = await asyncpg.connect(maintenance_url)
+                try:
+                    await maintenance.execute(f'DROP DATABASE IF EXISTS "{staging_name}" WITH (FORCE)')
+                finally:
+                    await maintenance.close()
+                raise
+
+            return template_name
     finally:
         await source.close()
 
