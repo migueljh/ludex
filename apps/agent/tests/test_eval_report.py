@@ -267,7 +267,10 @@ def test_record_con_muestras_expone_ambas_poblaciones_y_ledger_distinguido(tmp_p
     record = build_benchmark_record(
         run_id="test-latency-both",
         created_at=datetime(2026, 8, 8, 12, tzinfo=timezone.utc),
-        result=_aborted_result(),
+        result=BenchmarkResult(
+            requested=3, completed=3, wins=1, losses=2, ties=0,
+            provider="kimi", model="kimi-k2.6",
+        ),
         metrics=_metrics_con_latencia(),
         opponent="simple_heuristics",
         fmt="gen6randombattle",
@@ -292,9 +295,10 @@ def test_record_con_muestras_expone_ambas_poblaciones_y_ledger_distinguido(tmp_p
 
 
 def test_corrida_abortada_con_progreso_no_publica_latencia_comparable_ni_winrate(tmp_path):
-    """L-01 (R2): un run abortado con progreso real (3/15) puede versionarse
-    como abortado; si alguna poblacion no tiene muestras, sus percentiles
-    quedan null/blanco, nunca 0/0/0 comparable, y no publica winrate."""
+    """L-01/L-02 (R2): un run abortado con progreso real (3/15) puede
+    versionarse como abortado; el artefacto JSON conserva los valores reales
+    como evidencia, pero el LEDGER no publica latencia ni winrate de runs
+    incompletos: celdas blancas, nunca 0/0/0 comparable."""
     metrics = _metrics_con_latencia()
     metrics["completion_latency_ms_count"] = 0
     for key in ("total", "p50", "p95", "max"):
@@ -324,5 +328,7 @@ def test_corrida_abortada_con_progreso_no_publica_latencia_comparable_ni_winrate
     assert '"decision_latency_ms_p50": 300' in rendered
     markdown = ledger.read_text()
     assert "0/0/0" not in markdown
-    # La celda de completion queda vacia (dos separadores consecutivos).
-    assert "|  | 300/310/320 |" in markdown
+    # El ledger no publica latencia de runs incompletos: las dos celdas de
+    # latencia quedan vacias (tres separadores consecutivos).
+    assert "|  |  | 2026-07-28-official" in markdown
+    assert "300/310/320" not in markdown

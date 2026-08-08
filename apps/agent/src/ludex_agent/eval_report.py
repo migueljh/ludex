@@ -237,6 +237,24 @@ def append_ledger_row(
         else ""
     )
     metrics = record.metrics
+    # L-01 (R2): la latencia solo se publica en el ledger para corridas
+    # COMPLETAS. Un run abortado/not-run con muestras reales conserva sus
+    # valores en el artefacto JSON (evidencia con status explicito), pero el
+    # ledger no lo hace comparable: celda blanca = "no comparable".
+    if record.status == "complete":
+        completion_cell = _latency_cell(
+            record.completion_latency_ms_p50,
+            record.completion_latency_ms_p95,
+            record.completion_latency_ms_max,
+        )
+        decision_cell = _latency_cell(
+            record.decision_latency_ms_p50,
+            record.decision_latency_ms_p95,
+            record.decision_latency_ms_max,
+        )
+    else:
+        completion_cell = ""
+        decision_cell = ""
     row = (
         f"| {record.created_at[:10]} | [{record.run_id}]({link}) | "
         f"{record.provider}/{record.model} | "
@@ -253,8 +271,7 @@ def append_ledger_row(
         f"{metrics.get('turns_transient_affected', 0)} | "
         f"{metrics.get('turns_deadline_affected', 0)} | "
         f"{metrics.get('key_rotations', 0)} | "
-        f"{_latency_cell(record.completion_latency_ms_p50, record.completion_latency_ms_p95, record.completion_latency_ms_max)} | "
-        f"{_latency_cell(record.decision_latency_ms_p50, record.decision_latency_ms_p95, record.decision_latency_ms_max)} | "
+        f"{completion_cell} | {decision_cell} | "
         f"{record.pricing_table_id} |\n"
     )
     lines = existing.rstrip().splitlines()
