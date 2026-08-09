@@ -2431,3 +2431,92 @@ precio publicable → pending-budget. `ling-3.0-flash-free` no figura en la
 documentación de Zen → `missing-route` hasta verificación. Los modelos
 deprecados (docs Zen) siguen listados en /models y en scope, marcados como
 deprecados.
+
+## D44 — `training` exige trayectoria ÍNTEGRAMENTE `state_schema_version=2`, con al menos un paso; una mezcla v1/v2 se excluye completa (MON-11 R3, corregido R4)
+
+**Nota de numeración.** D42 pertenece a MON-15 y D43 a MON-20 -- no se
+documentan acá; esta entrada continúa la numeración sin llenar ese hueco.
+No se renumera en R4.
+
+**Contexto.** El CHECKPOINT R2 de MON-11 clasificó las violaciones en las
+12 batallas `local` (`scope=training`, 774 pasos): **1 429 en total**, de
+las cuales **1 424 son `hidden_information`** y **5 son `decision_index`**
+(turno que retrocede respecto de la decisión anterior) -- dos invariantes
+distintos, no una sola cifra de `hidden_information`. Las 774 filas de ese
+corpus son 100% `state_schema_version=1` -- un esquema que D31 ya
+reemplazó. Antes de D44, `training` sólo exigía `battles.source <> 'test'`
+y `trajectories.final_result IS NOT NULL` -- el contrato canónico del
+scope, fijado por **D33** (`## D33 — el auditor de dataset es la compuerta
+del corpus...`), no por F2-09/D39 (que es la resolución de provider/model
+por decisión, MON-14, un tema sin relación). D33 documenta además que la
+migración `20260727000007_battle_source_test.sql` cita mal a "D19" para
+este mismo contrato; D44 hereda D33 como su antecedente correcto, no la
+cita incorrecta. Antes de D44, ese contrato dejaba pasar trayectorias v1
+con el mismo defecto de proyección que D31/D40/D41 documentan, y --el
+riesgo real que motiva esta decisión-- una trayectoria MIXTA (algunos pasos
+v1, algunos v2, producto de un cambio de esquema a mitad de una corrida
+larga) filtraría igual, mezclando pasos con contratos de estado distintos
+bajo el mismo `trajectory_id`.
+
+**Decisión.** `training` exige, ADEMÁS de `source <> 'test'` y
+`final_result IS NOT NULL`, que la trayectoria tenga **al menos un**
+`trajectory_step` (`EXISTS`) y que TODOS sus pasos tengan
+`state_schema_version = 2` (`NOT EXISTS` de cualquier otra versión). Las
+dos condiciones se evalúan sobre la trayectoria completa -- nunca filtrando
+`trajectory_steps` por versión dentro del `SELECT` de pasos. Una
+trayectoria con un solo paso v1 se excluye ENTERA, no parcialmente: el
+defecto exacto que esto evita es un filtro por-paso que dejara pasar los
+pasos v2 de una trayectoria mixta y escondiera sólo los v1, produciendo una
+trayectoria "recortada" que nunca existió así en el corpus real.
+
+`all` sigue auditando v1 y v2 sin exclusión -- D44 sólo estrecha `training`.
+
+**R4 (BLOCKER 1) -- el `EXISTS` explícito.** La versión original de D44
+(R3) sólo tenía el `NOT EXISTS` de arriba. Latwan reprodujo
+`ZERO_STEP_SELECTED_BY_D44 count=1`: una trayectoria `local`, con
+`final_result` no nulo, y **cero** `trajectory_steps`, pasaba `training`
+por VACUIDAD -- "no existe ningún paso con otra versión" es trivialmente
+cierto cuando no existe ningún paso, así que el `NOT EXISTS` solo no
+verificaba nada sobre esa trayectoria. `training` la aceptaba sin haber
+comprobado schema alguno. El `EXISTS (SELECT 1 FROM trajectory_steps ...)`
+agregado cierra ese caso: una trayectoria sin pasos nunca es "toda v2", es
+indeterminada, y `training` no puede tratar lo indeterminado como
+aprobado. La exclusión de trayectorias mixtas (el `NOT EXISTS`) queda
+intacta -- R4 sólo agrega la condición que faltaba, no reemplaza nada.
+
+**Consecuencia medida, hoy.** Aplicado contra el corpus real: las 12
+batallas `local` (774 pasos, 100% v1) quedan TODAS fuera de `training` --
+`scope=training` es hoy un corpus de **cero trayectorias elegibles**. Esto
+no es una regresión ni oculta nada: es la frontera funcionando como se
+diseñó sobre un corpus que, medido, no tiene todavía ninguna trayectoria
+`local` en el esquema vigente. La CLI lo reporta explícito (`⚠ corpus de
+entrenamiento VACÍO bajo D44`) precisamente para que un “0 violaciones” en
+cada invariante no se lea como “corpus limpio” -- es “no hay nada que
+auditar”, una distinción que D33 ya exigía para el caso general
+(`stepsAudited === 0` sobre un dataset con filas falla ruidoso) y que acá se
+extiende al caso legítimo de un scope vacío por diseño.
+
+**Verificación.** `test/d44.test.ts` (8 tests, base Postgres descartable con
+fixtures sintéticas -- la base compartida no tiene hoy ninguna trayectoria
+`local`/v2, mixta, ni de cero pasos con las que probar esto contra datos
+reales): local/v1 presente en `all` y ausente en `training`; local/v2
+terminada presente en ambos; test/v2 ausente de `training`; local/v2 sin
+terminar ausente; una trayectoria mixta v1/v2 ausente COMPLETA (incluidos
+sus pasos v2, que un filtro por-paso dejaría pasar); una mezcla realista de
+las cuatro categorías anteriores en un solo corpus, donde sólo la
+trayectoria local/v2 terminada entra a `training`; **una trayectoria local,
+finalizada, con CERO pasos, ausente de `training` (R4, el caso exacto de
+`ZERO_STEP_SELECTED_BY_D44`)**; y el corpus vacío reportado como tal
+(`toHaveLength(0)`, no una comparación vacua). Tres mutaciones dirigidas,
+cada una roja y restaurada: retirar el predicado `NOT EXISTS` completo
+(vuelve al comportamiento pre-D44, 4/8 tests rojos), reemplazarlo por un
+filtro `state_schema_version = 2` dentro del `SELECT` de `steps` en vez de
+sobre la trayectoria (dejaba pasar los pasos v2 de la trayectoria mixta,
+exactamente el test que ese escenario existe para atrapar), y retirar SÓLO
+el `EXISTS` de R4 (el test de cero pasos, y únicamente ese, se pone rojo).
+
+`test/db.test.ts` (contra la base compartida real, sólo lectura) y
+`test/cli.test.ts` (extremo a extremo) se actualizaron para reflejar el
+corpus vacío real de hoy en vez de asumir `training` no vacío -- incluyendo
+un test que fija a propósito que si algún día deja de ser cero hay que
+revisar esa aserción, no relajarla en silencio.

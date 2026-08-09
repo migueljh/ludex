@@ -6,15 +6,22 @@ import os
 import pytest
 from sqlalchemy import text
 
-from ludex_agent.config import load_settings
+from _disposable import verified_engine
 from ludex_agent.db.model_repository import (
     ModelRepository,
     ModelSelectionError,
 )
-from ludex_agent.db.session import make_engine, session_factory
+from ludex_agent.db.session import session_factory
 
+# MON-11 (E/R2): TEST_DATABASE_URL, no DATABASE_URL -- este archivo nunca
+# corre contra la base compartida. La fixture `repo` hace DELETE FROM
+# settings/models/providers sin ningun guardia propio; sobre la base
+# compartida eso es destructivo de config real, no solo de filas
+# source='test'. `verified_engine` (ver _disposable.py) confirma
+# `current_database()` ANTES de que cualquiera de esos DELETE pueda correr.
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"), reason="necesita la base levantada"
+    not os.environ.get("TEST_DATABASE_URL"),
+    reason="necesita TEST_DATABASE_URL (base descartable; nunca DATABASE_URL)",
 )
 
 
@@ -22,8 +29,8 @@ pytest_asyncio = pytest.importorskip("pytest_asyncio")
 
 
 @pytest_asyncio.fixture(loop_scope="function")
-async def repo():
-    engine = make_engine(load_settings().database_url)
+async def repo(test_database_url):
+    engine = await verified_engine(test_database_url)
     factory = session_factory(engine)
     async with factory() as s:
         await s.execute(text("DELETE FROM settings"))
@@ -55,10 +62,10 @@ async def repo():
     await engine.dispose()
 
 
-async def test_no_se_persiste_ninguna_api_key(repo):
+async def test_no_se_persiste_ninguna_api_key(repo, test_database_url):
     """BLOQUEANTE 3 (F2-09): la DB guarda el NOMBRE de la env var; el valor
     de una API key nunca aparece en ninguna columna."""
-    engine = make_engine(load_settings().database_url)
+    engine = await verified_engine(test_database_url)
     try:
         async with session_factory(engine)() as s:
             filas = (await s.execute(text(

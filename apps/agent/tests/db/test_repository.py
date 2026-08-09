@@ -6,25 +6,34 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
-from ludex_agent.config import load_settings
+from _disposable import verified_engine
 from ludex_agent.db.repository import (
     _SAVE_BATTLE_SQL,
     BattleIdentityConflictError,
     BattleRepository,
 )
-from ludex_agent.db.session import make_engine, session_factory
+from ludex_agent.db.session import session_factory
 from ludex_agent.showdown.protocol import compute_opening_identity
 
+# MON-11 (E/R2): TEST_DATABASE_URL, no DATABASE_URL -- este archivo nunca
+# corre contra la base compartida. Cada test recibe una base descartable
+# nueva via la fixture `test_database_url` (ver conftest.py / _disposable.py):
+# antes, el unico cleanup era un DELETE al ARRANQUE de la fixture siguiente,
+# que no protegia contra una corrida cancelada o que revienta a mitad de
+# camino (asi quedo huerfana `battle-test-metadata` en la base compartida el
+# 2026-08-08). El `repo` fixture pasa por `verified_engine` (no `make_engine`
+# directo): confirma `current_database()` sobre la conexion REAL antes de
+# que corra cualquier sentencia mutadora, no solo el string de la URL.
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"), reason="necesita la base levantada"
+    not os.environ.get("TEST_DATABASE_URL"),
+    reason="necesita TEST_DATABASE_URL (base descartable; nunca DATABASE_URL)",
 )
 
 TAG = "battle-test-repo-1"
 
-# I6 (review final): estas filas viven en las mismas tablas que el dataset de
-# entrenamiento. `source="test"` (migracion 20260727000007) las marca como
-# sinteticas, y el DELETE de la fixture se acota ADEMAS por `source = 'test'`
-# para que ni siquiera una coincidencia de prefijo pueda tocar una fila real.
+# Aunque la base ahora es descartable y no compartida, `source="test"` se
+# conserva: es el mismo dato que produciria una corrida real y varios tests
+# lo verifican explicitamente (ver `SCOPE_TRAJECTORY` en dataset-audit).
 SOURCE = "test"
 
 
@@ -60,12 +69,17 @@ def _identity(tag: str, **kwargs: str) -> str:
 # (scope function) corre en el loop de modulo mientras el test corre en el de
 # funcion, y asyncpg revienta con "attached to a different loop".
 @pytest_asyncio.fixture(loop_scope="function")
-async def repo():
-    engine = make_engine(load_settings().database_url)
+async def repo(test_database_url):
+    engine = await verified_engine(test_database_url)
     factory = session_factory(engine)
     async with factory() as s:
+        # La base descartable trae el DDL de db/schema.sql pero no el seed
+        # de `generations`: `save_trajectory` resuelve gen_number=6 contra
+        # esa tabla, asi que todo test de este archivo (que solo usa gen 6)
+        # la necesita presente.
         await s.execute(text(
-            "DELETE FROM battles WHERE battle_tag LIKE 'battle-test-%' AND source = 'test'"
+            "INSERT INTO generations (gen_number, label) VALUES (6, 'XY/ORAS') "
+            "ON CONFLICT (gen_number) DO NOTHING"
         ))
         await s.commit()
     yield BattleRepository(factory)
@@ -279,9 +293,9 @@ async def test_winner_repetido_no_revienta(repo):
 # conflicto haya evaluado la incompatibilidad, ATOMICAMENTE, contra la fila
 # que la conexion 1 acaba de confirmar.
 
-async def _dos_conexiones_forzando_conflicto(datos1: dict, datos2: dict):
+async def _dos_conexiones_forzando_conflicto(database_url: str, datos1: dict, datos2: dict):
     """Devuelve (bloqueada_mientras_txn1_abierta, resultado2, filas_finales)."""
-    engine = make_engine(load_settings().database_url)
+    engine = await verified_engine(database_url)
     try:
         async with engine.connect() as conn1, engine.connect() as conn2:
             await conn1.execute(_SAVE_BATTLE_SQL, datos1)
@@ -302,14 +316,14 @@ async def _dos_conexiones_forzando_conflicto(datos1: dict, datos2: dict):
         await engine.dispose()
 
 
-async def test_dos_conexiones_reales_se_serializan_por_metadata_incompatible(repo):
+async def test_dos_conexiones_reales_se_serializan_por_metadata_incompatible(repo, test_database_url):
     key = _identity(TAG)
     datos1 = {"tag": TAG, "key": key, "fmt": "gen6randombattle",
              "p1": "A", "p2": "B", "w": None, "pb": "bot", "src": SOURCE}
     datos2 = {"tag": TAG, "key": key, "fmt": "gen6randombattle",
              "p1": "OTRO", "p2": "B", "w": None, "pb": "bot", "src": SOURCE}
 
-    bloqueada, filas2 = await _dos_conexiones_forzando_conflicto(datos1, datos2)
+    bloqueada, filas2 = await _dos_conexiones_forzando_conflicto(test_database_url, datos1, datos2)
 
     assert bloqueada, (
         "la conexion 2 tendria que haber quedado bloqueada por el lock de "
@@ -327,14 +341,14 @@ async def test_dos_conexiones_reales_se_serializan_por_metadata_incompatible(rep
     assert filas[0][0] == "A", "conn1 comiteo primero: su metadata es la que queda, sin pisar"
 
 
-async def test_dos_conexiones_reales_se_serializan_por_winner_incompatible(repo):
+async def test_dos_conexiones_reales_se_serializan_por_winner_incompatible(repo, test_database_url):
     key = _identity(TAG)
     datos1 = {"tag": TAG, "key": key, "fmt": "f",
              "p1": "A", "p2": "B", "w": "A", "pb": "bot", "src": SOURCE}
     datos2 = {"tag": TAG, "key": key, "fmt": "f",
              "p1": "A", "p2": "B", "w": "B", "pb": "bot", "src": SOURCE}
 
-    bloqueada, filas2 = await _dos_conexiones_forzando_conflicto(datos1, datos2)
+    bloqueada, filas2 = await _dos_conexiones_forzando_conflicto(test_database_url, datos1, datos2)
 
     assert bloqueada, (
         "la conexion 2 tendria que haber quedado bloqueada mientras la "
@@ -413,31 +427,36 @@ async def test_dos_recorders_de_lados_opuestos_crean_una_battle_y_dos_trajectori
         assert n_trajectories == 2
 
 
-async def test_identity_key_es_unica_y_no_nula_en_todo_el_corpus():
+async def test_identity_key_es_unica_y_no_nula_en_todo_el_corpus(repo):
     """Canario dinamico (DESIGN VERDICT #10): sobre TODA la tabla `battles`,
     no solo sobre las filas de esta corrida (AGENTS.md: `WHERE battle_tag =
     ANY(:tags)` ya escondio un defecto una vez). No fija el total mutable de
     filas -- eso cambia con cada corrida real -- pero exige `rows_checked >
     0` para que un dataset vacio no haga pasar el canario sin haber
-    verificado nada."""
-    engine = make_engine(load_settings().database_url)
-    try:
-        async with session_factory(engine)() as s:
-            total = (await s.execute(text("SELECT count(*) FROM battles"))).scalar_one()
-            nulas = (await s.execute(text(
-                "SELECT count(*) FROM battles WHERE identity_key IS NULL"
-            ))).scalar_one()
-            duplicadas = (await s.execute(text("""
-                SELECT count(*) FROM (
-                    SELECT source, identity_key FROM battles
-                    GROUP BY source, identity_key HAVING count(*) > 1
-                ) d
-            """))).scalar_one()
-        assert total > 0, "rows_checked debe ser > 0: el canario no verifico nada"
-        assert nulas == 0, f"{nulas} filas con identity_key NULL en todo el corpus"
-        assert duplicadas == 0, f"{duplicadas} pares (source, identity_key) duplicados"
-    finally:
-        await engine.dispose()
+    verificado nada.
+
+    MON-11 (E): "toda la tabla" ahora es la de la base descartable de este
+    test, no la compartida -- se inserta una fila propia para que
+    `rows_checked > 0` siga siendo una verificacion real y no un fixture
+    vacio que pasa por vacuidad."""
+    await repo.save_battle(
+        battle_tag=TAG, identity_key=_identity(TAG), fmt="gen6randombattle",
+        p1="A", p2="B", winner=None, source=SOURCE, played_by="bot",
+    )
+    async with repo.factory() as s:
+        total = (await s.execute(text("SELECT count(*) FROM battles"))).scalar_one()
+        nulas = (await s.execute(text(
+            "SELECT count(*) FROM battles WHERE identity_key IS NULL"
+        ))).scalar_one()
+        duplicadas = (await s.execute(text("""
+            SELECT count(*) FROM (
+                SELECT source, identity_key FROM battles
+                GROUP BY source, identity_key HAVING count(*) > 1
+            ) d
+        """))).scalar_one()
+    assert total > 0, "rows_checked debe ser > 0: el canario no verifico nada"
+    assert nulas == 0, f"{nulas} filas con identity_key NULL en todo el corpus"
+    assert duplicadas == 0, f"{duplicadas} pares (source, identity_key) duplicados"
 
 
 # --- F2-08 (MON-13): metadata de decision en trajectory_steps ------------
@@ -463,14 +482,7 @@ async def _trajectory_test(repo) -> int:
         fmt="gen6randombattle", p1="A", p2="B", winner=None, source=SOURCE,
         played_by="bot",
     )
-    # La DB de tests puede no tener el seed: `save_trajectory` resuelve la
-    # generacion contra `generations`, que en una base vacia no devuelve fila.
-    async with repo.factory() as s:
-        await s.execute(text(
-            "INSERT INTO generations (gen_number, label) VALUES (6, 'XY/ORAS') "
-            "ON CONFLICT (gen_number) DO NOTHING"
-        ))
-        await s.commit()
+    # El seed de `generations` (gen 6) ya lo aplica la fixture `repo`.
     return await repo.save_trajectory(
         bid, gen_number=6, fmt="gen6randombattle", player_side="p1"
     )

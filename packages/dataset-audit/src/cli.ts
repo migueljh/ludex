@@ -105,6 +105,19 @@ async function main(): Promise<void> {
     console.log(
       `Dataset: ${dataset.battles.length} batallas · ${dataset.trajectories.length} trayectorias · ${dataset.steps.length} pasos · scope ${scope}${gen === undefined ? "" : ` · gen ${gen}`}`,
     );
+    // D44 (MON-11 R3): `training` puede legítimamente no tener NINGUNA
+    // trayectoria elegible (source≠test, terminada, 100% schema v2) -- hoy
+    // es el caso real de este corpus. Un "PASS" en cada invariante de abajo
+    // sobre CERO filas no certifica un corpus limpio: certifica que no hubo
+    // nada que auditar. Se avisa explícito para que nadie lo lea como
+    // evidencia de calidad por vacuidad.
+    if (scope === "training" && dataset.trajectories.length === 0) {
+      console.log(
+        "\n⚠ corpus de entrenamiento VACÍO bajo D44: 0 trayectorias elegibles "
+        + "(source≠test, finalizada, y TODOS sus pasos en state_schema_version=2). "
+        + "Los PASS de abajo no certifican un corpus limpio -- no hay nada que auditar todavía.",
+      );
+    }
     for (const check of result.checks) {
       console.log(`${check.violations === 0 ? "PASS" : "FAIL"} ${check.name}: ${check.violations}`);
       if (check.name !== "hidden_information") continue;
