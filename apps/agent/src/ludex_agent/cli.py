@@ -74,6 +74,18 @@ DEFAULT_LEDGER_PATH = REPO_ROOT / "docs" / "BENCHMARKS.md"
 DEFAULT_RUNS_PATH = AGENT_ROOT / "evals" / "runs"
 
 
+def _atomic_write_json(target: Path, payload: dict[str, Any]) -> None:
+    """Escritura atomica: primero el .tmp, luego rename. Un fallo a mitad
+    de escritura JAMAS reemplaza el ultimo artefacto valido."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+
+
 def _progress_summary(record: BenchmarkRecord) -> str:
     metrics = record.metrics
     cost = (
@@ -834,11 +846,14 @@ def matrix_plan_command(
     """
     from .matrix import (
         BudgetSpec,
+        ManifestRow,
+        MatrixModelResult,
         build_manifest,
         delta_catalog,
         manifest_to_dict,
         plan_budget,
         refresh_models,
+        run_matrix_round,
         tier_prices_from_pricing_table,
     )
     from .eval_cost import PricingTable
@@ -961,6 +976,184 @@ def matrix_plan_command(
         typer.echo(f"matrix-plan: {target} rows={len(rows)} {by_status}")
 
     _asyncio.run(run())
+
+
+@app.command("matrix-run")
+def matrix_run_command(
+    manifest: Path = typer.Option(..., "--manifest", help="Manifiesto aprobado"),
+    tier: str = typer.Option(..., "--tier", help="Fase: free | paid"),
+    round_name: str = typer.Option("r1", "--round", help="Nombre de la ronda"),
+    battle_timeout: float = typer.Option(
+        1800.0, "--battle-timeout", help="Deadline por batalla (matriz: 1800)",
+    ),
+    smoke_timeout: float = typer.Option(
+        None, "--smoke-timeout",
+        help="Deadline del smoke en segundos (default: request timeout + margen)",
+    ),
+    resume: bool = typer.Option(False, "--resume"),
+    zen_auto_reload_confirmed: bool = typer.Option(
+        False, "--zen-auto-reload-confirmed",
+        help="Confirmacion explicita de que el auto-reload de OpenCode Zen "
+        "esta DESACTIVADO. Obligatorio si la fase toca open_code_zen.",
+    ),
+) -> None:
+    """Ejecuta una fase de la matriz de forma fail-closed.
+
+    - `--tier` es obligatorio: solo se ejecutan filas `ready` de ESE tier;
+    - refresca /models antes de la ronda (metadata, sin cuota);
+    - 1 smoke por modelo; si pasa, EXACTAMENTE 2 batallas pinneadas
+      (enforce_pin=True, sin chains, concurrency=1, persist=false,
+      opponent=simple_heuristics, formato configurado);
+    - artefacto atomico por modelo + estado de reanudacion;
+    - un parcial/abortado nunca publica winrate comparable.
+    """
+    from .matrix import ManifestRow, MatrixModelResult, run_matrix_round
+
+    settings = load_settings()
+    if battle_timeout <= 0:
+        raise typer.BadParameter("--battle-timeout debe ser positivo")
+    if tier not in {"free", "paid"}:
+        raise typer.BadParameter("--tier debe ser free o paid")
+
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    rows = _manifest_rows_from_document(document)
+    if any(row.tier == "free" and row.provider == "open_code_zen"
+           for row in rows if row.status == "ready"):
+        if not zen_auto_reload_confirmed:
+            raise typer.BadParameter(
+                "fase que toca open_code_zen requiere "
+                "--zen-auto-reload-confirmed (auto-reload desactivado)"
+            )
+
+    run_dir = Path(DEFAULT_RUNS_PATH)
+    state_path = run_dir / f"{round_name}-matrix-run-state.json"
+    previous: dict[str, MatrixModelResult] = {}
+    if resume and state_path.exists():
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+        for key, value in raw.items():
+            previous[key] = MatrixModelResult(**value)
+
+    import asyncio as _asyncio
+
+    async def refresh_catalog() -> dict[str, list[str]]:
+        fresh: dict[str, list[str]] = {}
+        for provider, (key_env, base_env) in (
+            ("google", ("GEMINI_API_KEY", None)),
+            ("kimi", ("KIMI_API_KEY", "KIMI_BASE_URL")),
+            ("open_code_zen", (
+                "OPEN_CODE_ZEN_API_KEY", "OPEN_CODE_ZEN_BASE_URL",
+            )),
+        ):
+            key = os.environ.get(key_env, "").strip()
+            base_url = (
+                os.environ.get(base_env, "").strip() if base_env else None
+            )
+            if not key:
+                continue
+            fresh[provider] = await refresh_models(
+                provider, base_url=base_url, api_key=key,
+                environ=os.environ,
+            )
+        return fresh
+
+    def on_result(result: MatrixModelResult) -> None:
+        key = f"{result.provider}/{result.model}"
+        previous[key] = result
+        state: dict[str, Any] = {
+            k: v.to_dict() for k, v in previous.items()
+        }
+        _atomic_write_json(state_path, state)
+        if result.status == "already-finalized":
+            return
+        _atomic_write_json(
+            run_dir / f"{round_name}-{result.provider}-{result.model}-matrix.json",
+            result.to_dict(),
+        )
+        typer.echo(
+            f"matrix-run: {key} -> {result.status} "
+            f"battles={result.battles_completed}/{result.battles_requested}"
+        )
+
+    async def run_battles(provider_name, model_name, *, n, battle_timeout_seconds,
+                          fmt, opponent):
+        return await _benchmark_command(
+            n=n, opponent=opponent, concurrency=1, persist=False,
+            provider_name=provider_name, model=model_name,
+            fmt=fmt, battle_timeout_seconds=battle_timeout_seconds,
+        )
+
+    def build_provider(provider_name: str, model_name: str):
+        from .graph.provider import load_model_routes, model_route
+
+        metrics = DecisionMetrics()
+        if provider_name in {"kimi", "open_code_zen"}:
+            model_route(load_model_routes(), provider_name, model_name)
+        return _benchmark_provider(
+            provider_name, model_name,
+            settings.llm_request_timeout_seconds, metrics,
+        )
+
+    effective_smoke_timeout = smoke_timeout or (
+        max(settings.llm_request_timeout_seconds, 60.0) + 30.0
+    )
+
+    _asyncio.run(run_matrix_round(
+        rows=rows,
+        tier=tier,
+        battle_timeout_seconds=battle_timeout,
+        fmt=settings.showdown_battle_format,
+        opponent="simple_heuristics",
+        smoke_deadline_seconds=effective_smoke_timeout,
+        build_provider=build_provider,
+        run_battles=run_battles,
+        refresh_catalog=refresh_catalog,
+        previous=previous,
+        on_result=on_result,
+    ))
+    summary = _matrix_run_summary(previous)
+    typer.echo(f"matrix-run: {round_name} terminado: {summary}")
+
+
+def _manifest_rows_from_document(document: dict[str, Any]) -> list[ManifestRow]:
+    from .matrix import ManifestRow
+    rows: list[ManifestRow] = []
+    for raw in document.get("rows", []):
+        pin = raw.get("pin")
+        rows.append(ManifestRow(
+            provider=raw["provider"], model=raw["model"],
+            protocol=raw.get("protocol"),
+            endpoint=raw.get("endpoint"),
+            structured_output=raw.get("structured_output"),
+            tier=raw.get("tier", "unknown"),
+            status=raw.get("status", "pending"),
+            battles=int(raw.get("battles", 0)),
+            concurrency=int(raw.get("concurrency", 1)),
+            persist=bool(raw.get("persist", False)),
+            pin=(pin[0], pin[1]) if isinstance(pin, list) and len(pin) == 2
+            else (raw["provider"], raw["model"]),
+            estimated_cost_usd=(
+                Decimal(str(raw["estimated_cost_usd"]))
+                if raw.get("estimated_cost_usd") is not None else None
+            ),
+            estimated_smoke_usd=(
+                Decimal(str(raw["estimated_smoke_usd"]))
+                if raw.get("estimated_smoke_usd") is not None else None
+            ),
+            cumulative_cost_usd=(
+                Decimal(str(raw["cumulative_cost_usd"]))
+                if raw.get("cumulative_cost_usd") is not None else None
+            ),
+            classification_note=raw.get("classification_note"),
+        ))
+    return rows
+
+
+def _matrix_run_summary(previous: Mapping[str, Any]) -> dict[str, int]:
+    from collections import Counter
+    counter: Counter[str] = Counter()
+    for result in previous.values():
+        counter[result.status] += 1
+    return dict(counter)
 
 
 if __name__ == "__main__":

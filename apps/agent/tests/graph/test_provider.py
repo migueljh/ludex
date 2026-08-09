@@ -1139,10 +1139,64 @@ async def test_401_cuarentena_solo_esa_clave_y_sigue_con_la_siguiente():
     ]
 
 
+def _http_error_with_body(status: int, body: dict) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://provider.example/v1/x")
+    return httpx.HTTPStatusError(
+        "request failed",
+        request=request,
+        response=httpx.Response(status, request=request, json=body),
+    )
+
+
+def _google_403(reason: str) -> httpx.HTTPStatusError:
+    return _http_error_with_body(403, {
+        "error": {
+            "code": 403,
+            "status": "PERMISSION_DENIED",
+            "details": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": reason,
+                "domain": "googleapis.com",
+            }],
+        },
+    })
+
+
+def _openai_403(code: str) -> httpx.HTTPStatusError:
+    return _http_error_with_body(403, {
+        "error": {"message": "forbidden", "type": "permission_error", "code": code},
+    })
+
+
 @pytest.mark.asyncio
-async def test_403_cuarentena_solo_esa_clave():
+async def test_403_sin_senal_estructurada_es_model_wide_y_detiene():
+    """Un 403 sin senal estructurada (o model-wide: ACCESS_DENIED,
+    PERMISSION_DENIED, model_not_accessible...) es un error de
+    modelo/proyecto/region: se detiene en la PRIMERA clave y no quema el
+    pool de 11 (canario del blocker R3 de MON-20)."""
+    for error in (_http_error(403), _google_403("ACCESS_DENIED"),
+                  _openai_403("model_not_accessible")):
+        keys = tuple(f"k{i}" for i in range(11))
+        backend = ScriptedBackend([error])
+        provider = KeyRotatingProvider(
+            "google", keys, backend, metrics=DecisionMetrics()
+        )
+        with pytest.raises(FatalProviderError):
+            await provider.complete(
+                "p", deadline=time.monotonic() + 5, turn_id="t"
+            )
+        assert len(backend.calls) == 1, f"pool quemado para {error}"
+        assert backend.calls[0][1] == keys[0]
+        assert provider._metrics.snapshot()["keys_quarantined"] == 0
+
+
+@pytest.mark.asyncio
+async def test_403_credential_specific_google_rota_solo_esa_clave():
+    """reason=API_KEY_INVALID (senal estructurada de Google) demuestra
+    rechazo de credencial: cuarentena de esa clave y sigue con la
+    siguiente."""
     metrics = DecisionMetrics()
-    backend = ScriptedBackend([_http_error(403), {"ok": True}])
+    backend = ScriptedBackend([_google_403("API_KEY_INVALID"), {"ok": True}])
     provider = KeyRotatingProvider(
         "google", ("key-bad", "key-ok"), backend, metrics=metrics
     )
@@ -1152,6 +1206,62 @@ async def test_403_cuarentena_solo_esa_clave():
     assert result.payload == {"ok": True}
     assert metrics.snapshot()["keys_quarantined"] == 1
     assert metrics.snapshot()["turns_quota_affected"] == 0
+
+
+@pytest.mark.asyncio
+async def test_403_credential_specific_openai_rota_solo_esa_clave():
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([_openai_403("invalid_api_key"), {"ok": True}])
+    provider = KeyRotatingProvider(
+        "open_code_zen", ("key-bad", "key-ok"), backend, metrics=metrics
+    )
+    result = await provider.complete(
+        "p", deadline=time.monotonic() + 1, turn_id="t"
+    )
+    assert result.payload == {"ok": True}
+    assert metrics.snapshot()["keys_quarantined"] == 1
+    assert metrics.snapshot()["turns_quota_affected"] == 0
+
+
+@pytest.mark.asyncio
+async def test_403_credential_specific_google_a_traves_del_wrapper_langchain():
+    """langchain_google_genai envuelve el APIError de Google en
+    ChatGoogleGenerativeAIError: la senal estructurada (reason) vive en la
+    cadena de causas. La clasificacion debe caminarla."""
+    from google.genai.errors import APIError as GoogleAPIError
+
+    api_error = GoogleAPIError(
+        code=403,
+        response_json={
+            "error": {
+                "code": 403,
+                "status": "PERMISSION_DENIED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "API_KEY_EXPIRED",
+                    "domain": "googleapis.com",
+                }],
+            },
+        },
+    )
+    try:
+        raise RuntimeError(
+            f"Error calling model 'gemini-2.5-flash' "
+            f"(PERMISSION_DENIED): {api_error}"
+        ) from api_error
+    except RuntimeError as exc:
+        wrapper = exc
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([wrapper, {"ok": True}])
+    provider = KeyRotatingProvider(
+        "google", ("key-bad", "key-ok"), backend, metrics=metrics
+    )
+    result = await provider.complete(
+        "p", deadline=time.monotonic() + 1, turn_id="t"
+    )
+    assert result.payload == {"ok": True}
+    assert metrics.snapshot()["keys_quarantined"] == 1
+    assert metrics.snapshot()["key_rotations"] == 0
 
 
 @pytest.mark.asyncio
@@ -1342,33 +1452,52 @@ async def test_backend_google_usa_google_api_key_timeout_y_base_url(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_backend_responses_posta_a_responses_y_parsea_usage(monkeypatch):
+async def test_backend_responses_posta_exactamente_al_endpoint(monkeypatch):
+    """CONTRATO DE ENDPOINT (D43): `endpoint` es la URL COMPLETA y el
+    backend postea exactamente ahi. Debe fallar si la URL terminara en
+    `/responses/responses` o en cualquier otro endpoint."""
     captured: dict[str, object] = {}
-
-    class FakeResponses:
-        async def create(self, **kwargs):
-            captured.update(kwargs)
-            return SimpleNamespace(
-                output_text='{"action": "switch", "target": "pikachu"}',
-                model="gpt-5.5",
-                usage=SimpleNamespace(
-                    input_tokens=100, output_tokens=20,
-                    output_tokens_details=SimpleNamespace(reasoning_tokens=5),
-                ),
-            )
+    calls: list[tuple[str, dict]] = []
 
     class FakeClient:
         def __init__(self, **kwargs):
             captured["client_kwargs"] = kwargs
-            self.responses = FakeResponses()
 
-    import openai
-    monkeypatch.setattr(openai, "AsyncOpenAI", FakeClient)
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            calls.append((url, json))
+            return SimpleNamespace(
+                status_code=200,
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "model": "gpt-5.5",
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": '{"action": "switch", "target": "pikachu"}',
+                        }],
+                    }],
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "output_tokens_details": {"reasoning_tokens": 5},
+                    },
+                },
+            )
+
+    import httpx as httpx_module
+    monkeypatch.setattr(httpx_module, "AsyncClient", FakeClient)
 
     from ludex_agent.graph.provider import _ResponsesBackend
     backend = _ResponsesBackend(
         model="gpt-5.5",
-        base_url="https://opencode.ai/zen/v1/responses",
+        endpoint="https://opencode.ai/zen/v1/responses",
         timeout_seconds=60,
         route=ModelRoute(
             protocol="responses", temperature=0.2, max_tokens=8000,
@@ -1377,19 +1506,61 @@ async def test_backend_responses_posta_a_responses_y_parsea_usage(monkeypatch):
     result = await backend.complete(
         "p", api_key="sk-zen", deadline=time.monotonic() + 5
     )
-    client_kwargs = captured["client_kwargs"]
-    assert client_kwargs["base_url"] == "https://opencode.ai/zen/v1/responses"
-    assert client_kwargs["api_key"] == "sk-zen"
-    assert client_kwargs["max_retries"] == 0
-    assert captured["model"] == "gpt-5.5"
-    assert captured["input"] == "p"
-    assert captured["temperature"] == 0.2
-    assert captured["max_output_tokens"] == 8000
+    assert [url for url, _ in calls] == [
+        "https://opencode.ai/zen/v1/responses"
+    ]
+    body = calls[0][1]
+    assert body["model"] == "gpt-5.5"
+    assert body["input"] == "p"
+    assert body["temperature"] == 0.2
+    assert body["max_output_tokens"] == 8000
     assert result.payload == {"action": "switch", "target": "pikachu"}
     assert result.usage.input_tokens == 100
     assert result.usage.output_tokens == 20
     assert result.usage.reasoning_tokens == 5
     assert result.usage.model == "gpt-5.5"
+
+
+@pytest.mark.asyncio
+async def test_responses_endpoint_derivado_no_duplica_el_path(monkeypatch):
+    """Sin `endpoint` en la ruta, se deriva `{base_url}/responses`: nunca
+    `/responses/responses`."""
+    captured: dict[str, object] = {}
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            calls.append(url)
+            return SimpleNamespace(
+                status_code=200,
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "model": "gpt-5.5",
+                    "output": [{"type": "message", "content": []}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+
+    import httpx as httpx_module
+    monkeypatch.setattr(httpx_module, "AsyncClient", FakeClient)
+
+    from ludex_agent.graph.provider import OpenAIResponsesDecisionProvider
+    provider = OpenAIResponsesDecisionProvider(
+        "open_code_zen", ("k",), model="gpt-5.5",
+        base_url="https://opencode.ai/zen/v1", timeout_seconds=60,
+        route=ModelRoute(protocol="responses"),
+    )
+    await provider.complete("p", deadline=time.monotonic() + 5, turn_id="t")
+    assert calls == ["https://opencode.ai/zen/v1/responses"]
 
 
 def test_responses_protocolo_por_defecto_usa_text_json():

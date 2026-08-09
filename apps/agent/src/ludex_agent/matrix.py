@@ -385,6 +385,338 @@ def tier_prices_from_pricing_table(
     return result
 
 
+def select_rows_for_tier(
+    rows: Sequence[ManifestRow], tier: str
+) -> list[ManifestRow]:
+    """Filas ejecutables de una fase/tier (fail-closed).
+
+    Solo filas `ready` del tier pedido: un manifiesto con filas paid y una
+    fase `free` ejecuta unicamente free y NUNCA toca una fila paid (canario
+    del ejecutor R1 de MON-20). El runner ademas revalida el tier justo
+    antes de construir el provider de cada fila seleccionada."""
+    return [row for row in rows if row.status == "ready" and row.tier == tier]
+
+
+@dataclass(frozen=True)
+class MatrixModelResult:
+    provider: str
+    model: str
+    tier: str
+    protocol: str | None
+    status: str
+    smoke_ok: bool
+    battles_requested: int
+    battles_completed: int
+    effective_provider: str | None
+    effective_model: str | None
+    win_rate: str | None
+    completion_latency_ms: dict[str, int | None] | None
+    decision_latency_ms: dict[str, int | None] | None
+    tokens: dict[str, int] | None
+    retries: int
+    rotations: int
+    quarantined: int
+    failure_type: str | None
+    failure_cause_type: str | None
+    note: str | None = None
+
+    @property
+    def final(self) -> bool:
+        """Clasificaciones terminales: un modelo finalizado no se repite en
+        una reanudacion ni se salta sin clasificacion."""
+        return self.status not in {"running", "pending"}
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+FINAL_STATUSES = frozenset({
+    "compatible", "invalid-semantic-response", "credential/model unavailable",
+    "unsupported-protocol", "externally-limited", "internal-defect",
+    "aborted", "missing-route", "not-in-tier", "removed-from-catalog",
+    "already-finalized", "smoke-failed",
+})
+
+
+async def run_matrix_round(
+    *,
+    rows: Sequence[ManifestRow],
+    tier: str,
+    battle_timeout_seconds: float,
+    fmt: str,
+    opponent: str,
+    smoke_deadline_seconds: float,
+    build_provider: Callable[[str, str], Any],
+    run_battles: Callable[..., Awaitable[
+        tuple[Any, Mapping[str, int | None]]
+    ]],
+    refresh_catalog: Callable[[], Awaitable[dict[str, list[str]]]] | None,
+    previous: Mapping[str, MatrixModelResult] | None = None,
+    on_result: Callable[[MatrixModelResult], None] | None = None,
+) -> list[MatrixModelResult]:
+    """Ejecuta una fase de la matriz con fail-closed.
+
+    - selecciona SOLO filas `ready` del tier pedido (nunca mezcla);
+    - refresca el catalogo antes de la ronda: un modelo que ya no esta en
+      /models se clasifica `removed-from-catalog`, no se ejecuta;
+    - por modelo: 1 smoke -> si pasa, EXACTAMENTE 2 batallas pinneadas
+      (sin chains ni fallback cruzado: el pin lo audita el runner de
+      batallas con enforce_pin=True);
+    - `previous` permite reanudar: filas con clasificacion final no se
+      repiten (`already-finalized`) y las sin clasificacion se reejecutan
+      (nunca se salta una sin clasificar);
+    - un resultado parcial/abortado nunca publica winrate comparable.
+    """
+    results: list[MatrixModelResult] = []
+    previous = previous or {}
+
+    selected = select_rows_for_tier(rows, tier)
+    offenders = [row for row in selected if row.tier != tier]
+    if offenders:
+        # Fail-closed ANTES del primer request: aunque el filtro de
+        # seleccion se rompa, ninguna fila fuera de la fase llega al
+        # provider (canario: quitar el filtro -> rojo sin llamadas).
+        raise ValueError(
+            "fila(s) fuera de la fase "
+            + ", ".join(f"{r.provider}/{r.model}" for r in offenders)
+        )
+
+    fresh: dict[str, list[str]] = {}
+    if refresh_catalog is not None:
+        fresh = await refresh_catalog() or {}
+
+    for row in selected:
+        key = f"{row.provider}/{row.model}"
+        prior = previous.get(key)
+        if prior is not None and prior.final:
+            results.append(MatrixModelResult(
+                provider=row.provider, model=row.model, tier=row.tier,
+                protocol=row.protocol, status="already-finalized",
+                smoke_ok=prior.smoke_ok,
+                battles_requested=prior.battles_requested,
+                battles_completed=prior.battles_completed,
+                effective_provider=prior.effective_provider,
+                effective_model=prior.effective_model,
+                win_rate=prior.win_rate,
+                completion_latency_ms=prior.completion_latency_ms,
+                decision_latency_ms=prior.decision_latency_ms,
+                tokens=prior.tokens, retries=prior.retries,
+                rotations=prior.rotations, quarantined=prior.quarantined,
+                failure_type=prior.failure_type,
+                failure_cause_type=prior.failure_cause_type,
+                note="ya finalizado en una corrida anterior: no se repite",
+            ))
+            if on_result is not None:
+                on_result(results[-1])
+            continue
+        if refresh_catalog is not None and (
+            row.model not in fresh.get(row.provider, [])
+        ):
+            result = MatrixModelResult(
+                provider=row.provider, model=row.model, tier=row.tier,
+                protocol=row.protocol, status="removed-from-catalog",
+                smoke_ok=False, battles_requested=0, battles_completed=0,
+                effective_provider=None, effective_model=None,
+                win_rate=None, completion_latency_ms=None,
+                decision_latency_ms=None, tokens=None,
+                retries=0, rotations=0, quarantined=0,
+                failure_type=None, failure_cause_type=None,
+                note="ya no esta en /models fresco: no se ejecuta",
+            )
+            results.append(result)
+            if on_result is not None:
+                on_result(result)
+            continue
+        try:
+            result = await _run_one(
+                row=row, battle_timeout_seconds=battle_timeout_seconds,
+                fmt=fmt, opponent=opponent,
+                smoke_deadline_seconds=smoke_deadline_seconds,
+                build_provider=build_provider, run_battles=run_battles,
+            )
+        except Exception as exc:  # noqa: BLE001 - fallo interno del runner
+            result = MatrixModelResult(
+                provider=row.provider, model=row.model, tier=row.tier,
+                protocol=row.protocol, status="internal-defect",
+                smoke_ok=False, battles_requested=0, battles_completed=0,
+                effective_provider=None, effective_model=None,
+                win_rate=None, completion_latency_ms=None,
+                decision_latency_ms=None, tokens=None,
+                retries=0, rotations=0, quarantined=0,
+                failure_type=type(exc).__name__,
+                failure_cause_type=(
+                    type(exc.__cause__).__name__ if exc.__cause__ else None
+                ),
+                note="fallo del runner de la matriz, no del modelo",
+            )
+        results.append(result)
+        if on_result is not None:
+            on_result(result)
+    return results
+
+
+async def _run_one(
+    *,
+    row: ManifestRow,
+    battle_timeout_seconds: float,
+    fmt: str,
+    opponent: str,
+    smoke_deadline_seconds: float,
+    build_provider: Callable[[str, str], Any],
+    run_battles: Callable[..., Awaitable[
+        tuple[Any, Mapping[str, int | None]]
+    ]],
+) -> MatrixModelResult:
+    from .graph.decision import DecisionResponse
+    from .graph.provider import (
+        CredentialRejected,
+        DecisionDeadlineExceeded,
+        FatalProviderError,
+        ProviderError,
+        ProviderPoolExhausted,
+        TransientProviderError,
+    )
+
+    # --- smoke: una completion estructurada, sin Showdown ---------------
+    try:
+        provider = build_provider(row.provider, row.model)
+    except ProviderError as exc:
+        return _smoke_failed(
+            row, "credential/model unavailable", exc
+        )
+    except ValueError as exc:
+        return _smoke_failed(
+            row, "missing-route", exc
+        )
+    try:
+        envelope = await provider.complete(
+            _SMOKE_PROMPT,
+            deadline=time.monotonic() + smoke_deadline_seconds,
+            turn_id=f"matrix-smoke:{row.provider}:{row.model}",
+        )
+    except ProviderPoolExhausted as exc:
+        return _smoke_failed(row, "credential/model unavailable", exc)
+    except CredentialRejected as exc:
+        return _smoke_failed(row, "credential/model unavailable", exc)
+    except ProviderError as exc:
+        # FatalProviderError: endpoint/protocolo/modelo rechazado (la clase
+        # exacta se preserva en failure_type). Transitorio o deadline:
+        # limite externo.
+        status = (
+            "unsupported-protocol"
+            if isinstance(exc, FatalProviderError)
+            else "externally-limited"
+        )
+        return _smoke_failed(row, status, exc)
+    try:
+        DecisionResponse.model_validate(envelope.payload)
+    except (ValueError, TypeError) as exc:
+        return _smoke_failed(
+            row, "invalid-semantic-response", exc,
+            note="la respuesta del modelo no valida el contrato DecisionResponse",
+        )
+
+    # --- smoke verde: exactamente 2 batallas pinneadas -------------------
+    try:
+        result, metrics = await run_battles(
+            row.provider, row.model,
+            n=BATTLES_PER_MODEL, battle_timeout_seconds=battle_timeout_seconds,
+            fmt=fmt, opponent=opponent,
+        )
+    except ProviderError as exc:
+        # ProviderMixError (mezcla efectiva) aborta la corrida del modelo.
+        status = "internal-defect" if type(exc).__name__ == "ProviderMixError" \
+            else "externally-limited"
+        return _smoke_failed(row, status, exc, smoke_ok=True)
+
+    completed = getattr(result, "completed", 0)
+    requested = getattr(result, "requested", 0)
+    failure = getattr(result, "failure", None)
+    failure_type = getattr(result, "failure_type", None)
+    if failure_type == "ProviderMixError":
+        status = "internal-defect"
+    elif failure_type == "BenchmarkDeadlineExceeded":
+        status = "externally-limited"
+    elif failure is not None:
+        status = "aborted"
+    elif completed == requested:
+        status = "compatible"
+    else:
+        status = "externally-limited"
+    win_rate = None
+    if status == "compatible" and completed:
+        wins = getattr(result, "wins", 0)
+        win_rate = f"{wins / completed:.4f}"
+    return MatrixModelResult(
+        provider=row.provider, model=row.model, tier=row.tier,
+        protocol=row.protocol, status=status, smoke_ok=True,
+        battles_requested=requested, battles_completed=completed,
+        effective_provider=getattr(result, "provider", None),
+        effective_model=getattr(result, "model", None),
+        win_rate=win_rate,
+        completion_latency_ms=_latency_slice(metrics, "completion_latency_ms"),
+        decision_latency_ms=_latency_slice(metrics, "decision_latency_ms"),
+        tokens={
+            "input_tokens": int(metrics.get("input_tokens", 0)),
+            "output_tokens": int(metrics.get("output_tokens", 0)),
+            "cached_input_tokens": int(metrics.get("cached_input_tokens", 0)),
+            "reasoning_tokens": int(metrics.get("reasoning_tokens", 0)),
+        },
+        retries=int(metrics.get("turns_transient_affected", 0)),
+        rotations=int(metrics.get("key_rotations", 0)),
+        quarantined=int(metrics.get("keys_quarantined", 0)),
+        failure_type=getattr(result, "failure_type", None),
+        failure_cause_type=getattr(result, "failure_cause_type", None),
+        note=None if status == "compatible" else (
+            "batallas parciales o abortadas: sin winrate comparable"
+        ),
+    )
+
+
+_SMOKE_PROMPT = (
+    "Elegí exactamente una acción legal y respondé con action, un "
+    "rationale breve, confidence en [0,1] y alternatives (puede ser []). "
+    "legal_actions="
+    '[{"kind":"move","id":"tackle"},{"kind":"switch","species":"pikachu"}]'
+)
+
+
+def _smoke_failed(
+    row: ManifestRow,
+    status: str,
+    exc: BaseException,
+    *,
+    note: str | None = None,
+    smoke_ok: bool = False,
+) -> MatrixModelResult:
+    return MatrixModelResult(
+        provider=row.provider, model=row.model, tier=row.tier,
+        protocol=row.protocol, status=status, smoke_ok=smoke_ok,
+        battles_requested=0, battles_completed=0,
+        effective_provider=None, effective_model=None,
+        win_rate=None, completion_latency_ms=None,
+        decision_latency_ms=None, tokens=None,
+        retries=0, rotations=0, quarantined=0,
+        failure_type=type(exc).__name__,
+        failure_cause_type=(
+            type(exc.__cause__).__name__ if exc.__cause__ else None
+        ),
+        note=note or f"smoke fallido ({type(exc).__name__})",
+    )
+
+
+def _latency_slice(
+    metrics: Mapping[str, int | None], prefix: str
+) -> dict[str, int | None]:
+    return {
+        "count": metrics.get(f"{prefix}_count"),
+        "total": metrics.get(f"{prefix}_total"),
+        "p50": metrics.get(f"{prefix}_p50"),
+        "p95": metrics.get(f"{prefix}_p95"),
+        "max": metrics.get(f"{prefix}_max"),
+    }
+
+
 def manifest_to_dict(rows: Sequence[ManifestRow]) -> dict[str, Any]:
     return {
         "rows": [asdict(row) for row in rows],

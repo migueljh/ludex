@@ -2520,3 +2520,52 @@ el `EXISTS` de R4 (el test de cero pasos, y únicamente ese, se pone rojo).
 corpus vacío real de hoy en vez de asumir `training` no vacío -- incluyendo
 un test que fija a propósito que si algún día deja de ser cero hay que
 revisar esa aserción, no relajarla en silencio.
+
+**D43 R3 — 403 ambiguo y contrato de endpoint responses (MON-20, post-merge
+de la integración MON-11/D44).** Dos correcciones sobre D43:
+
+1. **403 NO es siempre credencial.** Latwan reprodujo contra 5af25c7 un 403
+   model-wide con pool de 11 claves que terminó en calls=11,
+   keys_quarantined=11 y `ProviderPoolExhausted`: todo 403 clasificaba
+   `CredentialRejected`. Ahora: **401 → `CredentialRejected` siempre**
+   (por definición es rechazo de credencial); **403 → `CredentialRejected`
+   SOLO si una señal estructurada demuestra rechazo de credencial**:
+   - Google: `details[].reason` en la whitelist de razones de clave
+     (`API_KEY_*`, `KEY_*`, `CONSUMER_*`, `USER_*`, `MISSING_API_KEY`,
+     `DOMAIN_BLOCKED`); `ACCESS_DENIED`, `PERMISSION_DENIED`,
+     `SERVICE_DISABLED` y ausencia de señal quedan fuera → model-wide.
+   - OpenAI-compatible: `error.code` en la whitelist (`invalid_api_key`,
+     `api_key_expired`, `api_key_revoked`, `api_key_not_found`,
+     `authentication_error`, `account_deactivated`, `account_disabled`);
+     `insufficient_quota`, `model_not_accessible`, `access_denied` → model-wide.
+   - Anthropic: 403 (`permission_error`) nunca rota (sin señal de credencial).
+   El cuerpo estructurado se lee caminando la cadena de causas
+   (`__cause__`): `langchain_google_genai` envuelve el `APIError` de Google
+   en `ChatGoogleGenerativeAIError`, y el wrapper no conserva
+   status/details — la señal vive en la causa. Sin señal estructurada, un
+   403 es `FatalProviderError` y **se detiene en la primera clave** (el
+   pool de 11 hace exactamente 1 llamada; canario). Nunca se decide por
+   texto libre: la sanitización de claves en logs/artefactos sigue siendo
+   la de siempre.
+
+2. **`ModelRoute.endpoint` = URL COMPLETA del endpoint** (p.ej.
+   `https://opencode.ai/zen/v1/responses`, tal como la publica la doc de
+   Zen). El backend `_ResponsesBackend` postea con httpx EXACTAMENTE a esa
+   URL y NO usa el SDK de openai (que volvería a agregar `/responses` y
+   produciría `/responses/responses`). Sin `endpoint` en la ruta, se
+   deriva `{base_url}/responses`. Test en la frontera HTTP: el POST va a
+   `https://opencode.ai/zen/v1/responses`, nunca a `/responses/responses`.
+
+3. **`matrix-run` fail-closed (R1).** Ejecutor versionado y probado:
+   `--tier` obligatorio (free/paid), selección SOLO de filas `ready` del
+   tier pedido con revalidación del tier antes del primer provider
+   (mutación verificada: quitar el filtro pone rojo antes de llamar),
+   refresh de `/models` antes de la ronda (`removed-from-catalog` para
+   modelos que ya no están), 1 smoke → exactamente 2 batallas pinneadas
+   (enforce_pin=True, sin chains, concurrency=1, persist=false,
+   opponent=simple_heuristics, formato configurado, battle timeout 1800),
+   artefacto atómico por modelo + estado de reanudación (un modelo
+   finalizado no se repite; uno sin clasificar se reejecuta), parcial/
+   abortado nunca publica winrate, `ProviderMixError` → internal-defect.
+   Fase que toca open_code_zen exige `--zen-auto-reload-confirmed`
+   (auto-reload desactivado); sin confirmación, no hay requests.

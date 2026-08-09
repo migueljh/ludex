@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
 from decimal import Decimal
+
+import pytest
 
 from ludex_agent.graph.provider import ModelRoute
 from ludex_agent.matrix import (
@@ -273,3 +276,312 @@ def test_catalog_entry_preserva_deprecated_y_tier():
     )
     assert entry.deprecated is True
     assert entry.tier == "paid"
+
+
+# --- F2-10B R3 (MON-20): ejecutor fail-closed de R1 ----------------------
+
+
+def _ready_row(provider, model, tier, protocol="chat_completions") -> ManifestRow:
+    return ManifestRow(
+        provider=provider, model=model, protocol=protocol, endpoint=None,
+        structured_output=None, tier=tier, status="ready", battles=2,
+        concurrency=1, persist=False, pin=(provider, model),
+        estimated_cost_usd=Decimal("0"), estimated_smoke_usd=Decimal("0"),
+    )
+
+
+class _FakeSmokeProvider:
+    def __init__(self, error=None, payload=None):
+        self.error = error
+        self.payload = payload or {
+            "action": {"kind": "move", "id": "thunderbolt"},
+            "target": None,
+            "rationale": "brief rationale",
+            "confidence": 0.9,
+            "alternatives": [],
+        }
+        self.calls: list[str] = []
+
+    async def complete(self, prompt, *, deadline, turn_id):
+        self.calls.append(turn_id)
+        if self.error is not None:
+            raise self.error
+        from ludex_agent.graph.provider import (
+            CompletionEnvelope, CompletionUsage,
+        )
+        return CompletionEnvelope(
+            payload=self.payload, provider="fake", model="fake-model",
+            usage=CompletionUsage(input_tokens=1, output_tokens=1),
+            latency_ms=1.0,
+        )
+
+
+def _ok_battles(completed=2, requested=2, wins=1, failure=None,
+                failure_type=None, provider="fake", model="fake-model"):
+    from ludex_agent.benchmark import BenchmarkResult
+    return (
+        BenchmarkResult(
+            requested=requested, completed=completed, wins=wins,
+            losses=completed - wins, ties=0, provider=provider, model=model,
+            failure=failure, failure_type=failure_type,
+        ),
+        {
+            "turns_total": 4, "calls_total": 6,
+            "input_tokens": 100, "output_tokens": 20,
+            "cached_input_tokens": 0, "reasoning_tokens": 0,
+            "key_rotations": 1, "keys_quarantined": 0,
+            "turns_transient_affected": 0, "turns_deadline_affected": 0,
+            "turns_quota_affected": 0, "turns_model_invalid": 0,
+            "turns_fallback": 0,
+            "completion_latency_ms_count": 6,
+            "completion_latency_ms_total": 60,
+            "completion_latency_ms_p50": 10,
+            "completion_latency_ms_p95": 12,
+            "completion_latency_ms_max": 15,
+            "decision_latency_ms_count": 4,
+            "decision_latency_ms_total": 40,
+            "decision_latency_ms_p50": 10,
+            "decision_latency_ms_p95": 12,
+            "decision_latency_ms_max": 15,
+        },
+    )
+
+
+async def _run(rows, *, tier="free", refresh=None, previous=None,
+               battle_failure=None, battle_failure_type=None,
+               battles_completed=2, battles_requested=2, battles_wins=1,
+               smoke_error=None, smoke_payload=None):
+    from ludex_agent.matrix import run_matrix_round
+    from ludex_agent.graph.provider import ProviderError
+
+    built: list[tuple[str, str]] = []
+    battle_calls: list[int] = []
+
+    def build_provider(provider, model):
+        built.append((provider, model))
+        return _FakeSmokeProvider(error=smoke_error, payload=smoke_payload)
+
+    async def run_battles(provider, model, *, n, battle_timeout_seconds,
+                          fmt, opponent):
+        battle_calls.append(n)
+        return _ok_battles(
+            completed=battles_completed, requested=battles_requested,
+            wins=battles_wins, failure=battle_failure,
+            failure_type=battle_failure_type,
+        )
+
+    async def _refresh():
+        result = refresh()
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    results = await run_matrix_round(
+        rows=rows, tier=tier, battle_timeout_seconds=1800,
+        fmt="gen6randombattle", opponent="simple_heuristics",
+        smoke_deadline_seconds=120,
+        build_provider=build_provider, run_battles=run_battles,
+        refresh_catalog=_refresh if refresh is not None else None,
+        previous=previous,
+    )
+    return results, built, battle_calls
+
+
+def test_r1_con_free_y_paid_ejecuta_unicamente_free():
+    """Canario: un manifiesto con filas free+paid, --tier free, solo
+    construye providers de las filas free. Si alguien quitara el filtro,
+    el provider paid apareceria en `built` y el test se pondria rojo."""
+    import asyncio
+
+    rows = [
+        _ready_row("open_code_zen", "mimo-v2.5-free", "free"),
+        _ready_row("open_code_zen", "deepseek-v4-flash", "paid"),
+        _ready_row("google", "gemma-4-26b-a4b-it", "free"),
+    ]
+    results, built, battle_calls = asyncio.run(_run(rows, tier="free"))
+    assert sorted(built) == [
+        ("google", "gemma-4-26b-a4b-it"),
+        ("open_code_zen", "mimo-v2.5-free"),
+    ]
+    assert "deepseek-v4-flash" not in {m for _, m in built}
+    assert all(r.status == "compatible" for r in results)
+    assert battle_calls == [2, 2]
+
+
+def test_tier_free_filtra_paid_y_el_runner_revalida_antes_del_provider():
+    import asyncio
+    from ludex_agent.matrix import run_matrix_round, select_rows_for_tier
+
+    rows = [
+        _ready_row("open_code_zen", "mimo-v2.5-free", "free"),
+        _ready_row("open_code_zen", "deepseek-v4-flash", "paid"),
+    ]
+    assert [r.model for r in select_rows_for_tier(rows, "free")] == [
+        "mimo-v2.5-free"
+    ]
+
+    # Si alguien quitara el filtro de seleccion, el check fail-closed del
+    # runner aborta ANTES de construir el provider paid (mutacion).
+    built: list[str] = []
+    battle_calls: list[int] = []
+
+    def build_provider(provider, model):
+        built.append(model)
+        return _FakeSmokeProvider()
+
+    async def run_battles(provider, model, **kwargs):
+        battle_calls.append(model)
+        return _ok_battles()
+
+    async def refresh():
+        return {"open_code_zen": ["mimo-v2.5-free", "deepseek-v4-flash"]}
+
+    # MUTACION: un filtro roto que devuelve todas las ready (free+paid)
+    # debe ser atrapado por el check fail-closed ANTES de construir
+    # cualquier provider.
+    import ludex_agent.matrix as matrix_module
+
+    def broken_filter(rows, tier):
+        return [r for r in rows if r.status == "ready"]
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(matrix_module, "select_rows_for_tier", broken_filter)
+    try:
+        with pytest.raises(ValueError, match="fuera de la fase"):
+            asyncio.run(run_matrix_round(
+                rows=rows, tier="free", battle_timeout_seconds=1800,
+                fmt="gen6randombattle", opponent="simple_heuristics",
+                smoke_deadline_seconds=120,
+                build_provider=build_provider, run_battles=run_battles,
+                refresh_catalog=None,
+            ))
+    finally:
+        monkeypatch.undo()
+    assert built == [] and battle_calls == []
+
+
+def test_smoke_fallido_produce_0_batallas():
+    import asyncio
+    from ludex_agent.graph.provider import FatalProviderError
+
+    rows = [_ready_row("open_code_zen", "mimo-v2.5-free", "free")]
+    results, built, battle_calls = asyncio.run(_run(
+        rows, smoke_error=FatalProviderError("provider permission or model unavailable"),
+    ))
+    assert results[0].status == "unsupported-protocol"
+    assert results[0].smoke_ok is False
+    assert results[0].battles_completed == 0
+    assert battle_calls == []
+    assert results[0].win_rate is None
+
+
+def test_smoke_semantic_invalido_produce_0_batallas():
+    import asyncio
+
+    rows = [_ready_row("open_code_zen", "mimo-v2.5-free", "free")]
+    results, _, battle_calls = asyncio.run(_run(
+        rows, smoke_payload={"action": {"kind": "move", "id": "thunderbolt"}},
+    ))
+    assert results[0].status == "invalid-semantic-response"
+    assert results[0].battles_completed == 0
+    assert battle_calls == []
+
+
+def test_smoke_verde_produce_exactamente_2_batallas_y_winrate():
+    import asyncio
+
+    rows = [_ready_row("google", "gemma-4-26b-a4b-it", "free")]
+    results, _, battle_calls = asyncio.run(_run(rows))
+    assert results[0].status == "compatible"
+    assert results[0].battles_requested == 2
+    assert results[0].battles_completed == 2
+    assert battle_calls == [2]
+    assert results[0].win_rate == "0.5000"
+    assert results[0].rotations == 1
+    assert results[0].completion_latency_ms["p50"] == 10
+
+
+def test_mezcla_efectiva_aborta_sin_winrate():
+    import asyncio
+
+    rows = [_ready_row("open_code_zen", "mimo-v2.5-free", "free")]
+    results, _, _ = asyncio.run(_run(
+        rows, battle_failure="ProviderMixError: provider/model mezclado",
+        battle_failure_type="ProviderMixError",
+    ))
+    assert results[0].status == "internal-defect"
+    assert results[0].win_rate is None
+    assert results[0].failure_type == "ProviderMixError"
+
+
+def test_parcial_abortado_no_publica_winrate_comparable():
+    import asyncio
+
+    rows = [_ready_row("open_code_zen", "mimo-v2.5-free", "free")]
+    results, _, _ = asyncio.run(_run(
+        rows, battles_completed=1, battles_requested=2,
+        battle_failure="TransientProviderError: provider transport failed",
+        battle_failure_type="TransientProviderError",
+    ))
+    assert results[0].status == "aborted"
+    assert results[0].win_rate is None
+    assert results[0].battles_completed == 1
+    assert results[0].failure_type == "TransientProviderError"
+
+
+def test_resume_no_repite_modelo_finalizado_ni_salta_sin_clasificar():
+    import asyncio
+    from ludex_agent.matrix import MatrixModelResult, run_matrix_round
+
+    rows = [
+        _ready_row("open_code_zen", "mimo-v2.5-free", "free"),
+        _ready_row("open_code_zen", "deepseek-v4-flash-free", "free"),
+    ]
+    done = MatrixModelResult(
+        provider="open_code_zen", model="mimo-v2.5-free", tier="free",
+        protocol="chat_completions", status="compatible", smoke_ok=True,
+        battles_requested=2, battles_completed=2,
+        effective_provider="open_code_zen", effective_model="mimo-v2.5-free",
+        win_rate="0.5000", completion_latency_ms=None,
+        decision_latency_ms=None, tokens=None, retries=0, rotations=0,
+        quarantined=0, failure_type=None, failure_cause_type=None,
+    )
+    built: list[str] = []
+
+    def build_provider(provider, model):
+        built.append(model)
+        return _FakeSmokeProvider()
+
+    async def run_battles(provider, model, **kwargs):
+        return _ok_battles()
+
+    results = asyncio.run(run_matrix_round(
+        rows=rows, tier="free", battle_timeout_seconds=1800,
+        fmt="gen6randombattle", opponent="simple_heuristics",
+        smoke_deadline_seconds=120,
+        build_provider=build_provider, run_battles=run_battles,
+        refresh_catalog=None,
+        previous={"open_code_zen/mimo-v2.5-free": done},
+    ))
+    statuses = {r.model: r.status for r in results}
+    assert statuses["mimo-v2.5-free"] == "already-finalized"
+    assert statuses["deepseek-v4-flash-free"] == "compatible"
+    # el finalizado NO se repite; el sin clasificar SÍ se ejecuta
+    assert built == ["deepseek-v4-flash-free"]
+
+
+def test_modelo_fuera_del_catalogo_fresco_se_clasifica_no_se_ejecuta():
+    import asyncio
+
+    rows = [
+        _ready_row("open_code_zen", "mimo-v2.5-free", "free"),
+        _ready_row("open_code_zen", "deepseek-v4-flash-free", "free"),
+    ]
+    results, built, battle_calls = asyncio.run(_run(
+        rows, refresh=lambda: {"open_code_zen": ["deepseek-v4-flash-free"]},
+    ))
+    by_model = {r.model: r for r in results}
+    assert by_model["mimo-v2.5-free"].status == "removed-from-catalog"
+    assert by_model["deepseek-v4-flash-free"].status == "compatible"
+    assert built == [("open_code_zen", "deepseek-v4-flash-free")]
+    assert battle_calls == [2]

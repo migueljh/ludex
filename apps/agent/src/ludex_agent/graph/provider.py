@@ -57,14 +57,16 @@ class ProviderPoolExhausted(ProviderError):
 
 
 class CredentialRejected(ProviderError):
-    """401/403 especificos de UNA clave (vencida, revocada o sin permiso).
+    """401 o 403 CON señal estructurada de rechazo de credencial.
 
-    F2-10B (MON-20): a diferencia de `FatalProviderError` (error
-    model-wide: 404, 400 de modelo, fallo inesperado), un 401/403 no
-    detiene la corrida: la clave se pone en CUARENTENA permanente para el
-    proceso y se intenta la siguiente del pool. El mensaje es fijo y no
-    expone la clave; la clasificacion final si el pool se agota de
-    credenciales es `ProviderPoolExhausted` (nunca un falso "incompatible").
+    F2-10B (MON-20): un 401/403 especifico de UNA clave (vencida, revocada,
+    sin permiso) no detiene la corrida: la clave se pone en CUARENTENA
+    permanente para el proceso y se intenta la siguiente del pool. Un 403
+    SIN señal estructurada de credencial (permiso de modelo/proyecto/region
+    o error model-wide) es `FatalProviderError` y se detiene en la primera
+    clave. El mensaje es fijo y no expone la clave; la clasificacion final
+    si el pool se agota de credenciales es `ProviderPoolExhausted` (nunca
+    un falso "incompatible").
     """
 
 
@@ -453,6 +455,123 @@ def _status_code(exc: Exception) -> int | None:
     return status if isinstance(status, int) else None
 
 
+# F2-10B R3 (MON-20): senales ESTRUCTURADAS de rechazo de credencial.
+# `google.genai.APIError` expone `details` (el cuerpo) con
+# `error.details[].reason`; los SDK de openai/anthropic exponen `body` con
+# `error.code` / `error.type`. langchain_google_genai envuelve el APIError
+# de Google en `ChatGoogleGenerativeAIError`, asi que la cadena de causas
+# (`__cause__`) es la que conserva la senal estructurada.
+_GOOGLE_CREDENTIAL_REASONS = frozenset({
+    "API_KEY_INVALID", "API_KEY_EXPIRED", "API_KEY_NOT_FOUND",
+    "API_KEY_SERVICE_DISABLED", "API_KEY_REQUIRED", "API_KEY_DISABLED",
+    "API_KEY_ANDROID_APPLICATION_BLOCKED", "API_KEY_HTTP_REFERRER_BLOCKED",
+    "API_KEY_IP_ADDRESS_BLOCKED", "API_KEY_IN_ANDROID_APPLICATION",
+    "API_KEY_IN_HTTP_REFERRER", "API_KEY_IN_IP_ADDRESS",
+    "KEY_DELETED", "KEY_EXPIRED", "KEY_INVALID", "KEY_REVOKED",
+    "CONSUMER_INVALID", "CONSUMER_DEACTIVATED",
+    "CONSUMER_QUOTA_REQUIRES_SIGN_UP",
+    "MISSING_API_KEY", "USER_DELETED", "USER_INVALID", "DOMAIN_BLOCKED",
+})
+
+_OPENAI_CREDENTIAL_CODES = frozenset({
+    "invalid_api_key", "api_key_expired", "api_key_revoked",
+    "api_key_not_found", "authentication_error",
+    "account_deactivated", "account_disabled",
+})
+
+# Razones de Google y tipos de openai/anthropic que son NOTORIAMENTE
+# model/account-wide: se citan en el docstring para que la exclusion sea
+# explicita, no implícita (ACCESS_DENIED, PERMISSION_DENIED, SERVICE_DISABLED,
+# insufficient_quota, model_not_accessible, permission_error, ...).
+
+
+def _error_chain(exc: BaseException) -> list[BaseException]:
+    """Cadena de causas completa (`raise ... from`), incluyendo el wrapper
+    de langchain_google_genai que envuelve el APIError real de Google."""
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__
+    return chain
+
+
+def _http_status_chain(exc: Exception) -> int | None:
+    """Status HTTP mirando la cadena completa: `.response.status_code`,
+    `.status_code`, o `.code` numerico de `google.genai.APIError`."""
+    for candidate in _error_chain(exc):
+        response = getattr(candidate, "response", None)
+        status = getattr(response, "status_code", None)
+        if status is None:
+            status = getattr(candidate, "status_code", None)
+        if status is None:
+            code = getattr(candidate, "code", None)
+            if isinstance(code, int) and 100 <= code <= 599:
+                status = code
+        if isinstance(status, int) and 100 <= status <= 599:
+            return status
+    return None
+
+
+def _structured_body(exc: Exception) -> dict[str, Any] | None:
+    """Cuerpo estructurado de la respuesta de error: `details` (google),
+    `body` (openai/anthropic) o `response.json()` (httpx). Solo dicts."""
+    for candidate in _error_chain(exc):
+        details = getattr(candidate, "details", None)
+        if isinstance(details, dict):
+            return details
+        body = getattr(candidate, "body", None)
+        if isinstance(body, dict):
+            return body
+        response = getattr(candidate, "response", None)
+        if response is not None and hasattr(response, "json"):
+            try:
+                parsed = response.json()
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return None
+
+
+def _google_reasons(body: dict[str, Any]) -> list[str]:
+    error = body.get("error") if isinstance(body.get("error"), dict) else body
+    reasons: list[str] = []
+    details = error.get("details", []) if isinstance(error, dict) else []
+    if not isinstance(details, list):
+        return reasons
+    for entry in details:
+        if isinstance(entry, dict) and isinstance(entry.get("reason"), str):
+            reasons.append(entry["reason"])
+    return reasons
+
+
+def _openai_code(body: dict[str, Any]) -> str | None:
+    error = body.get("error")
+    if isinstance(error, dict) and isinstance(error.get("code"), str):
+        return error["code"]
+    return None
+
+
+def _credential_specific_rejection(exc: Exception) -> bool:
+    """403: solo rota si una senal ESTRUCTURADA demuestra que el rechazo es
+    de la credencial. Sin senal -> model-wide (falla cerrada). Nunca se usa
+    texto libre para decidir esto: el mensaje puede llegar censurado o
+    variar entre proveedores, y un 403 de permiso de modelo/proyecto/region
+    debe detener la corrida en la primera clave."""
+    body = _structured_body(exc)
+    if body is None:
+        return False
+    if any(reason in _GOOGLE_CREDENTIAL_REASONS for reason in _google_reasons(body)):
+        return True
+    code = _openai_code(body)
+    if code is not None and code in _OPENAI_CREDENTIAL_CODES:
+        return True
+    return False
+
+
 # Gemini (google.rpc.RetryInfo) manda un `retry_delay` estructurado en el
 # 429, pero `langchain_google_genai` lo aplana a texto antes de que nos
 # llegue -- lo confirma su propio docstring
@@ -498,7 +617,7 @@ def _redacted(text: str) -> str:
 def _classified(exc: Exception) -> ProviderError:
     if isinstance(exc, ProviderError):
         return exc
-    status = _status_code(exc)
+    status = _http_status_chain(exc)
     rendered = str(exc)
     if status == 429 or (
         "RESOURCE_EXHAUSTED" in rendered and "429" in rendered
@@ -509,12 +628,20 @@ def _classified(exc: Exception) -> ProviderError:
         )
     elif status is not None and status >= 500:
         classified = TransientProviderError("provider server error")
-    elif status in (401, 403):
-        # F2-10B (MON-20): 401/403 son especificos de la clave (vencida,
-        # revocada, sin permiso). Se distinguen de los fatales model-wide
-        # (404, 400 de modelo) para que KeyRotatingProvider pueda poner la
-        # clave en cuarentena y seguir con la siguiente sin quemar el pool.
+    elif status == 401:
+        # 401 es, por definicion, rechazo de la credencial: rota.
         classified = CredentialRejected("provider authentication failed")
+    elif status == 403 and _credential_specific_rejection(exc):
+        # 403 SOLO rota si una senal estructurada demuestra rechazo de
+        # credencial (p.ej. reason=API_KEY_INVALID de Google). Un 403 de
+        # permiso de modelo/proyecto/region o sin senal es model-wide:
+        # FatalProviderError -> se detiene en la primera clave y no quema
+        # el pool de 11.
+        classified = CredentialRejected("provider authentication failed")
+    elif status in (403, 404):
+        classified = FatalProviderError(
+            "provider permission or model unavailable"
+        )
     elif isinstance(exc, (
         asyncio.TimeoutError,
         TimeoutError,
@@ -606,10 +733,12 @@ class KeyRotatingProvider:
         # clave y nunca se recuperaba, ni siquiera entre batallas del mismo
         # run (ver docs/DECISIONS.md).
         self._cooldown_until: dict[int, float] = {}
-        # F2-10B (MON-20): cuarentena por 401/403, PERMANENTE para el
+        # F2-10B (MON-20): cuarentena por 401 (rechazo de credencial) y
+        # por 403 CON senal estructurada de credencial, PERMANENTE para el
         # proceso (a diferencia del cooldown, que es acotado). Una clave
-        # vencida/revocada no vuelve; un error model-wide no quema el pool
-        # porque `FatalProviderError` se propaga de inmediato.
+        # vencida/revocada no vuelve; un 403 model-wide o un error fatal
+        # no queman el pool porque `FatalProviderError` se propaga de
+        # inmediato en la primera clave.
         self._quarantined: set[int] = set()
 
     def __repr__(self) -> str:
@@ -667,11 +796,12 @@ class KeyRotatingProvider:
                             self._metrics.deadline(turn_id)
                             raise error from raw
                         if isinstance(error, CredentialRejected):
-                            # F2-10B: cuarentena solo de ESTA clave; la
-                            # siguiente del pool se intenta en el proximo
-                            # pase. Un pool completo de credenciales
-                            # rechazadas termina en ProviderPoolExhausted,
-                            # nunca en falso incompatible/unsupported.
+                            # F2-10B: cuarentena solo de ESTA clave (401 o
+                            # 403 credential-specific); la siguiente del
+                            # pool se intenta en el proximo pase. Un pool
+                            # completo de credenciales rechazadas termina
+                            # en ProviderPoolExhausted, nunca en falso
+                            # incompatible/unsupported.
                             self._quarantined.add(key_index)
                             self._metrics.key_quarantine()
                             break
@@ -961,16 +1091,45 @@ class OpenAICompatibleDecisionProvider(KeyRotatingProvider):
         )
 
 
+def _responses_output_text(document: dict[str, Any]) -> str:
+    """Extrae el texto de una respuesta OpenAI Responses API: los items de
+    `output` con type `message` contienen bloques de contenido `output_text`
+    (o `text`)."""
+    fragments: list[str] = []
+    output = document.get("output", [])
+    if not isinstance(output, list):
+        return ""
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            continue
+        content = item.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text") if block.get("type") == "output_text" else None
+            if isinstance(text, str):
+                fragments.append(text)
+    return "".join(fragments)
+
+
 class _ResponsesBackend(ProviderBackend):
     """Backend del protocolo OpenAI Responses (F2-10B/MON-20).
 
-    Los modelos GPT-5.x y Grok del gateway OpenCode Zen se sirven por
-    `POST {endpoint}/responses` (documentacion oficial de Zen), no por
-    `/chat/completions`. El payload se obtiene del texto de la respuesta
-    (JSON textual estricto, misma validacion semantica de D26) y el usage
-    del objeto `usage` del SDK. Un modelo sin soporte nativo queda como
-    clasificacion explicita de la respuesta, nunca como discovery por
-    ensayo pagado.
+    CONTRATO DE ENDPOINT (D43): `endpoint` es la URL COMPLETA del endpoint
+    (p.ej. `https://opencode.ai/zen/v1/responses`), exactamente como la
+    publica la documentacion oficial de Zen. El backend la postea tal cual
+    con httpx; NO usa el SDK de openai (que volveria a agregar `/responses`
+    al base_url y produciria `/responses/responses`). Si la ruta no declara
+    `endpoint`, se deriva `{base_url}/responses`.
+
+    El payload se obtiene del texto de la respuesta (JSON textual estricto,
+    misma validacion semantica de D26) y el usage del objeto `usage` del
+    documento. Un modelo sin soporte nativo queda como clasificacion
+    explicita de la respuesta, nunca como discovery por ensayo pagado.
     """
 
     def __init__(
@@ -978,11 +1137,11 @@ class _ResponsesBackend(ProviderBackend):
         *,
         model: str,
         timeout_seconds: float,
-        base_url: str | None,
+        endpoint: str,
         route: ModelRoute,
     ) -> None:
         self.model = model
-        self.base_url = base_url
+        self.endpoint = endpoint
         self.route = route
         self.timeout_seconds = (
             route.timeout_seconds
@@ -993,14 +1152,6 @@ class _ResponsesBackend(ProviderBackend):
     async def complete(
         self, prompt: str, *, api_key: str, deadline: float
     ) -> ProviderCompletion:
-        from openai import AsyncOpenAI
-
-        client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=self.base_url,
-            max_retries=0,
-            timeout=self.timeout_seconds,
-        )
         body: dict[str, Any] = {
             "model": self.model,
             "input": prompt,
@@ -1008,24 +1159,43 @@ class _ResponsesBackend(ProviderBackend):
         }
         if self.route.max_tokens is not None:
             body["max_output_tokens"] = self.route.max_tokens
-        response = await client.responses.create(**body)
-        usage = getattr(response, "usage", None)
-        if usage is None:
+        async with httpx.AsyncClient(
+            timeout=self.timeout_seconds, max_retries=0
+        ) as client:
+            response = await client.post(
+                self.endpoint,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=body,
+            )
+            # raise_for_status deja un httpx.HTTPStatusError con
+            # `response.json()` disponible: la clasificacion de 429/401/403
+            # (con senal estructurada) corre aguas arriba en `_classified`.
+            response.raise_for_status()
+            try:
+                document = response.json()
+            except ValueError as exc:
+                raise FatalProviderError(
+                    "provider response was not valid JSON"
+                ) from exc
+        if not isinstance(document, dict):
+            raise FatalProviderError(
+                "provider response was not a JSON object"
+            )
+        usage = document.get("usage")
+        if not isinstance(usage, dict):
             raise FatalProviderError(
                 "provider response did not include token usage"
             )
-        output_details = getattr(usage, "output_tokens_details", None) or {}
+        details = usage.get("output_tokens_details") or {}
         return ProviderCompletion(
-            payload=text_json_payload(
-                getattr(response, "output_text", "") or ""
-            ),
+            payload=text_json_payload(_responses_output_text(document)),
             usage=CompletionUsage(
-                input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
-                output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+                input_tokens=int(usage.get("input_tokens", 0) or 0),
+                output_tokens=int(usage.get("output_tokens", 0) or 0),
                 reasoning_tokens=int(
-                    getattr(output_details, "reasoning_tokens", 0) or 0
+                    details.get("reasoning_tokens", 0) or 0
                 ),
-                model=getattr(response, "model", None) or self.model,
+                model=document.get("model") or self.model,
             ),
         )
 
@@ -1040,12 +1210,17 @@ class OpenAIResponsesDecisionProvider(KeyRotatingProvider):
         # `response_schema` se acepta por consistencia de firma con los
         # demas providers; el protocolo responses valida el JSON textual
         # (text_json) aguas abajo en `decide`, no en el backend.
+        # CONTRATO DE ENDPOINT (D43): `route.endpoint` es la URL COMPLETA
+        # del endpoint; si la ruta no la declara, se deriva de la base.
+        effective_route = route or ModelRoute(protocol="responses")
+        endpoint = effective_route.endpoint or (
+            f"{base_url.rstrip('/')}/responses"
+        )
         super().__init__(
             name, keys,
             _ResponsesBackend(
-                model=model, base_url=base_url,
-                timeout_seconds=timeout_seconds,
-                route=route or ModelRoute(protocol="responses"),
+                model=model, timeout_seconds=timeout_seconds,
+                endpoint=endpoint, route=effective_route,
             ),
             model=model,
             metrics=metrics,
@@ -1255,8 +1430,10 @@ def build_route_provider(
     from .decision import DecisionResponse  # evita el ciclo decision<->provider
 
     if route.protocol == "responses":
+        # CONTRATO (D43): `route.endpoint` es la URL COMPLETA del endpoint
+        # y la resuelve el propio provider; aca solo pasa la base.
         return OpenAIResponsesDecisionProvider(
-            name, keys, model=model_id, base_url=route.endpoint or base_url,
+            name, keys, model=model_id, base_url=base_url,
             response_schema=DecisionResponse, timeout_seconds=timeout_seconds,
             metrics=metrics, route=route,
         )

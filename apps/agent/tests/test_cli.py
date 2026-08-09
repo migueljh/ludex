@@ -23,6 +23,7 @@ from typer.testing import CliRunner
 from ludex_agent.cli import (
     DEFAULT_RUNS_PATH,
     IncompleteTrajectoryError,
+    _atomic_write_json,
     _battle_against_or_failure,
     _battle_outcome,
     _benchmark_provider,
@@ -1202,3 +1203,110 @@ async def test_battle_timeout_llega_a_run_benchmark(monkeypatch):
         fmt="gen6randombattle", battle_timeout_seconds=1800.0,
     )
     assert captured.get("timeout") == 1800.0
+
+
+# --- F2-10B R3 (MON-20): ejecutor matrix-run fail-closed ----------------
+
+
+def _manifest_document(tmp_path, rows=None):
+    import json as _json
+
+    if rows is None:
+        rows = [
+            {
+                "provider": "open_code_zen", "model": "mimo-v2.5-free",
+                "protocol": "chat_completions", "endpoint": None,
+                "structured_output": "json_schema", "tier": "free",
+                "status": "ready", "battles": 2, "concurrency": 1,
+                "persist": False, "pin": ["open_code_zen", "mimo-v2.5-free"],
+                "estimated_cost_usd": "0", "estimated_smoke_usd": "0",
+                "classification_note": "free (zen-docs)",
+            },
+            {
+                "provider": "open_code_zen", "model": "deepseek-v4-flash",
+                "protocol": "chat_completions", "endpoint": None,
+                "structured_output": "json_schema", "tier": "paid",
+                "status": "ready", "battles": 2, "concurrency": 1,
+                "persist": False, "pin": ["open_code_zen", "deepseek-v4-flash"],
+                "estimated_cost_usd": "0.4536", "estimated_smoke_usd": "0.006",
+                "classification_note": "paid (zen-docs)",
+            },
+        ]
+    path = tmp_path / "manifest.json"
+    path.write_text(_json.dumps({"rows": rows}))
+    return path
+
+
+def test_matrix_run_rechaza_opciones_de_persistencia_y_concurrencia(
+    tmp_path, monkeypatch
+):
+    """Canario: el ejecutor de la matriz NO expone --persist ni
+    --concurrency: la persistencia y la concurrencia estan prohibidas por
+    diseno (persist=false, concurrency=1)."""
+    manifest = _manifest_document(tmp_path)
+    for extra in (["--persist"], ["--concurrency", "2"]):
+        result = CliRunner().invoke(
+            app,
+            ["matrix-run", "--manifest", str(manifest), "--tier", "free"]
+            + extra,
+            env={
+                "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+                "OPEN_CODE_ZEN_API_KEY": "fake-key",
+            },
+        )
+        assert result.exit_code != 0, extra
+        assert "No such option" in result.stdout, extra
+
+
+def test_matrix_run_exige_tier_y_auto_reload_para_zen(tmp_path):
+    manifest = _manifest_document(tmp_path)
+    env = {
+        "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+        "OPEN_CODE_ZEN_API_KEY": "fake-key",
+    }
+    # --tier es obligatorio
+    sin_tier = CliRunner().invoke(
+        app, ["matrix-run", "--manifest", str(manifest)], env=env
+    )
+    assert sin_tier.exit_code != 0
+    # fase que toca open_code_zen exige confirmacion de auto-reload OFF
+    sin_confirm = CliRunner().invoke(
+        app, ["matrix-run", "--manifest", str(manifest), "--tier", "free"],
+        env=env,
+    )
+    assert sin_confirm.exit_code != 0
+    assert "auto-reload" in sin_confirm.stdout
+
+
+def test_matrix_run_rechaza_battle_timeout_no_positivo(tmp_path):
+    manifest = _manifest_document(tmp_path)
+    result = CliRunner().invoke(
+        app,
+        ["matrix-run", "--manifest", str(manifest), "--tier", "free",
+         "--battle-timeout", "0"],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+        },
+    )
+    assert result.exit_code != 0
+    assert "positivo" in result.stdout
+
+
+def test_escritura_parcial_no_reemplaza_el_ultimo_artefacto_valido(tmp_path):
+    """Canario: una escritura fallida a mitad de camino (JSON no
+    serializable) no debe tocar el artefacto valido previo."""
+    artifact = tmp_path / "r1-matrix.json"
+    _atomic_write_json(artifact, {"status": "compatible", "battles": 2})
+    assert artifact.read_text() == (
+        '{\n  "status": "compatible",\n  "battles": 2\n}\n'
+    )
+    with pytest.raises(TypeError):
+        _atomic_write_json(
+            artifact,
+            {"status": "running", "bad": object()},
+        )
+    # el artefacto valido sigue intacto
+    assert artifact.read_text() == (
+        '{\n  "status": "compatible",\n  "battles": 2\n}\n'
+    )
+    assert not artifact.with_suffix(".json.tmp").exists()
