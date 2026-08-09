@@ -179,16 +179,85 @@ def test_plan_budget_ordena_por_costo_y_aplica_hard_stop():
     assert ready[0].tier == "free"
     costs = [r.estimated_cost_usd for r in ready if r.estimated_cost_usd is not None]
     assert costs == sorted(costs)
-    # gpt-5.5 (5/30) y gemini-3.6-flash (1.5/7.5) son caros: con cap 10 y
-    # leave 1, el hard-stop debe dejar alguno en pending-budget o todos
-    # ready pero con acumulado <= 9.
+    # L-02: disponibilidad = min(cap, balance - leave) = min(10, 10) = 10.
+    # Ninguna fila ready acumula mas de 10; gpt-5.5 (reserva ~9.56) queda
+    # pending-budget si el acumulado previo ya lo empuja sobre 10.
     total = sum(
         (r.cumulative_cost_usd or Decimal("0"))
         for r in ready if r.cumulative_cost_usd is not None
     )
-    assert total <= Decimal("9") or any(
-        r.status == "pending-budget" for r in planned
-    )
+    assert total <= Decimal("10")
+    assert any(r.status == "pending-budget" for r in planned)
+    assert planned[0].model == "mimo-v2.5-free"
+
+
+def test_plan_budget_disponibilidad_es_min_cap_balance_menos_leave():
+    """L-02: con balance 11 / cap 10 / leave 1 la disponibilidad es
+    EXACTAMENTE 10 (min(cap, balance - leave)), no 9 (cap - leave). Una
+    reserva de 9.5 entra; una de 10.5 no."""
+    rows = [
+        ManifestRow(
+            provider="open_code_zen", model="a", protocol="chat_completions",
+            endpoint=None, structured_output=None, tier="paid",
+            status="ready", battles=2, concurrency=1, persist=False,
+            pin=("open_code_zen", "a"),
+            estimated_cost_usd=Decimal("9.5"), estimated_smoke_usd=Decimal("0"),
+        ),
+        ManifestRow(
+            provider="open_code_zen", model="b", protocol="chat_completions",
+            endpoint=None, structured_output=None, tier="paid",
+            status="ready", battles=2, concurrency=1, persist=False,
+            pin=("open_code_zen", "b"),
+            estimated_cost_usd=Decimal("10.5"), estimated_smoke_usd=Decimal("0"),
+        ),
+    ]
+    planned = plan_budget(rows, {
+        "open_code_zen": BudgetSpec(
+            balance_usd=Decimal("11"), cap_usd=Decimal("10"),
+            leave_usd=Decimal("1"),
+        ),
+    })
+    by_model = {r.model: r for r in planned}
+    assert by_model["a"].status == "ready"
+    assert by_model["b"].status == "pending-budget"
+    assert by_model["a"].cumulative_cost_usd == Decimal("9.5")
+
+
+def test_plan_budget_limites_efectivos_10_y_550():
+    """L-02: con la autorizacion real (Zen 11/10/1, Kimi 6/5.50/0.50) los
+    limites efectivos son exactamente 10.00 y 5.50."""
+    rows = [
+        ManifestRow(
+            provider="open_code_zen", model="m", protocol="chat_completions",
+            endpoint=None, structured_output=None, tier="paid",
+            status="ready", battles=2, concurrency=1, persist=False,
+            pin=("open_code_zen", "m"),
+            estimated_cost_usd=Decimal("9.9"), estimated_smoke_usd=Decimal("0.05"),
+        ),
+        ManifestRow(
+            provider="kimi", model="n", protocol="chat_completions",
+            endpoint=None, structured_output=None, tier="paid",
+            status="ready", battles=2, concurrency=1, persist=False,
+            pin=("kimi", "n"),
+            estimated_cost_usd=Decimal("5.4"), estimated_smoke_usd=Decimal("0.05"),
+        ),
+    ]
+    planned = plan_budget(rows, {
+        "open_code_zen": BudgetSpec(
+            balance_usd=Decimal("11"), cap_usd=Decimal("10"),
+            leave_usd=Decimal("1"),
+        ),
+        "kimi": BudgetSpec(
+            balance_usd=Decimal("6"), cap_usd=Decimal("5.5"),
+            leave_usd=Decimal("0.5"),
+        ),
+    })
+    by_model = {r.model: r for r in planned}
+    # 9.95 <= 10.00 entra; 5.45 <= 5.50 entra.
+    assert by_model["m"].status == "ready"
+    assert by_model["m"].cumulative_cost_usd == Decimal("9.95")
+    assert by_model["n"].status == "ready"
+    assert by_model["n"].cumulative_cost_usd == Decimal("5.45")
 
 
 def test_plan_budget_pending_nunca_es_unsupported():
@@ -616,8 +685,9 @@ def test_artefactos_de_matriz_no_llevan_secretos_ni_campos_de_env():
 
 
 def test_datos_de_evals_no_contienen_patrones_de_clave_real():
-    """Canario de repositorio: los archivos de datos de evals (inventarios,
-    manifiestos, precios, presupuesto) jamás versionan patrones de clave."""
+    """Canario de repositorio (L-03): TODOS los JSON de evals — incluidos
+    artefactos y state files de matrix-run — jamás versionan patrones de
+    clave. Se reportan SOLO rutas/nombres, nunca el valor coincidente."""
     import re
     from pathlib import Path
 
@@ -625,11 +695,57 @@ def test_datos_de_evals_no_contienen_patrones_de_clave_real():
     pattern = re.compile(r"AIza[0-9A-Za-z_-]{20,}|sk-[A-Za-z0-9]{20,}")
     offenders: list[str] = []
     for path in sorted(root.rglob("*.json")):
-        if "runs" in path.parts and "matrix-run" in path.name:
-            continue
         if pattern.search(path.read_text(encoding="utf-8")):
             offenders.append(str(path.relative_to(root)))
+    # solo nombres/rutas en el mensaje: el valor de la coincidencia no se
+    # imprime (podria ser material de credencial)
     assert offenders == [], f"patrones de clave en datos de evals: {offenders}"
+
+
+def test_artefactos_matrix_run_no_contienen_patrones_de_credencial():
+    """Canario L-03: los artefactos y state files de matrix-run (escritos
+    por el ejecutor) no pueden contener patrones de credencial. El valor
+    coincidente NUNCA se imprime."""
+    import re
+    from pathlib import Path
+
+    # cubre los artefactos por modelo (`{round}-{provider}-{model}-matrix.json`)
+    # Y los state files (`{round}-matrix-run-state.json`)
+    root = Path(__file__).resolve().parents[1] / "evals" / "runs"
+    pattern = re.compile(r"AIza[0-9A-Za-z_-]{20,}|sk-[A-Za-z0-9]{20,}")
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*matrix*.json")):
+        if pattern.search(path.read_text(encoding="utf-8")):
+            offenders.append(str(path.relative_to(root)))
+    # solo nombres, nunca valores
+    assert offenders == [], (
+        f"patrones de credencial en artefactos matrix-run: {offenders}"
+    )
+
+
+def test_el_canario_de_scan_detecta_un_patron_de_credencial(tmp_path):
+    """El canario de matrix-run DEBE detectar un patron de credencial en un
+    archivo del directorio de corrida: si escribimos un artefacto con un
+    patron falso, el scan lo reporta (por nombre). El valor falso del
+    fixture no se imprime en ningun caso."""
+    import re
+    from pathlib import Path
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    (root / "r1-open_code_zen-mimo-v2.5-free-matrix.json").write_text(
+        '{"status": "compatible", "note": "AIzaSy0000000000000000000000000000000x"}'
+    )
+    (root / "r1-matrix-run-state.json").write_text(
+        '{"open_code_zen/mimo-v2.5-free": {"status": "compatible"}}'
+    )
+    pattern = re.compile(r"AIza[0-9A-Za-z_-]{20,}|sk-[A-Za-z0-9]{20,}")
+    offenders = [
+        str(p.relative_to(root))
+        for p in sorted(root.rglob("*matrix*.json"))
+        if pattern.search(p.read_text(encoding="utf-8"))
+    ]
+    assert offenders == ["r1-open_code_zen-mimo-v2.5-free-matrix.json"]
 
 
 @pytest.mark.asyncio
@@ -712,3 +828,45 @@ async def test_responses_backend_429_401_y_403_clasifican_por_senal(monkeypatch)
                            "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
                                         "reason": "ACCESS_DENIED"}]}}
     assert await classify(403, body_wide) == "FatalProviderError"
+
+
+def _paid_row(provider, model, cost) -> ManifestRow:
+    return ManifestRow(
+        provider=provider, model=model, protocol="chat_completions",
+        endpoint=None, structured_output=None, tier="paid",
+        status="ready", battles=2, concurrency=1, persist=False,
+        pin=(provider, model),
+        estimated_cost_usd=Decimal(str(cost)), estimated_smoke_usd=Decimal("0"),
+    )
+
+
+def test_plan_budget_ignorar_el_cap_pondria_rojo_el_canario():
+    """L-02: con balance 20 / cap 10 / leave 1 la disponibilidad es
+    min(10, 19) = 10. Una reserva de 15 NO puede entrar: si el codigo
+    ignorara el cap (allowed = balance - leave = 19), el canario se pone
+    rojo."""
+    rows = [_paid_row("open_code_zen", "frontier", 15)]
+    planned = plan_budget(rows, {
+        "open_code_zen": BudgetSpec(
+            balance_usd=Decimal("20"), cap_usd=Decimal("10"),
+            leave_usd=Decimal("1"),
+        ),
+    })
+    assert planned[0].status == "pending-budget"
+    assert "no alcanza" in (planned[0].classification_note or "")
+
+
+def test_plan_budget_ignorar_el_saldo_minimo_pondria_rojo_el_canario():
+    """L-02: con balance 5 / cap 10 / leave 1 la disponibilidad es
+    min(10, 4) = 4. Una reserva de 8 NO puede entrar (quemaria el saldo):
+    si el codigo ignorara el saldo minimo (allowed = cap = 10), el canario
+    se pone rojo."""
+    rows = [_paid_row("kimi", "caro", 8)]
+    planned = plan_budget(rows, {
+        "kimi": BudgetSpec(
+            balance_usd=Decimal("5"), cap_usd=Decimal("10"),
+            leave_usd=Decimal("1"),
+        ),
+    })
+    assert planned[0].status == "pending-budget"
+    assert "no alcanza" in (planned[0].classification_note or "")

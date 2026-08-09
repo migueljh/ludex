@@ -1578,3 +1578,58 @@ def test_responses_protocolo_por_defecto_usa_text_json():
     assert route_structured_output(
         ModelRoute(protocol="google"), "google", None
     ) == "json_schema"
+
+
+@pytest.mark.asyncio
+async def test_responses_backend_atraviesa_el_constructor_real_de_asyncclient(monkeypatch):
+    """Canario L-01 (MON-20): el backend construye el `httpx.AsyncClient`
+    REAL de la version instalada (0.28.1) y solo se sustituye la operacion
+    de red por un transporte falso. En httpx 0.28.1 `max_retries` no es un
+    kwarg de AsyncClient y su constructor lanza TypeError: si el backend
+    volviera a pasarlo, este test se pone rojo exactamente aca. El test
+    anterior reemplazaba todo AsyncClient por un fake permisivo y no
+    detectaba esa regresion."""
+    import httpx as httpx_module
+
+    real_async_client = httpx_module.AsyncClient
+    seen_urls: list[str] = []
+
+    class FakeTransport(httpx_module.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            seen_urls.append(str(request.url))
+            return httpx_module.Response(
+                200,
+                json={
+                    "model": "gpt-5.5",
+                    "output": [{"type": "message", "content": [
+                        {"type": "output_text", "text": '{"action": {"kind": "move", "id": "tackle"}, "target": null, "rationale": "r", "confidence": 0.5, "alternatives": []}'},
+                    ]}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+                request=request,
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    class RealConstructorClient(real_async_client):
+        def __init__(self, *args, **kwargs):
+            # CONSTRUCTOR REAL: TypeError si el codigo pasa max_retries.
+            super().__init__(*args, **kwargs)
+            self._transport = FakeTransport()
+
+    monkeypatch.setattr(httpx_module, "AsyncClient", RealConstructorClient)
+
+    from ludex_agent.graph.provider import _ResponsesBackend
+    backend = _ResponsesBackend(
+        model="gpt-5.5",
+        endpoint="https://opencode.ai/zen/v1/responses",
+        timeout_seconds=60,
+        route=ModelRoute(protocol="responses"),
+    )
+    result = await backend.complete(
+        "p", api_key="sk-zen", deadline=time.monotonic() + 5
+    )
+    assert seen_urls == ["https://opencode.ai/zen/v1/responses"]
+    assert result.usage.model == "gpt-5.5"
+    assert result.usage.input_tokens == 1

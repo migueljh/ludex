@@ -2569,6 +2569,10 @@ de la integración MON-11/D44).** Dos correcciones sobre D43:
    abortado nunca publica winrate, `ProviderMixError` → internal-defect.
    Fase que toca open_code_zen exige `--zen-auto-reload-confirmed`
    (auto-reload desactivado); sin confirmación, no hay requests.
+   L-02: la disponibilidad por provider es `min(cap_usd,
+   balance_usd - leave_usd)` — el margen de saldo mínimo NO se resta dos
+   veces. Con la autorización real (Zen 11/10/1 y Kimi 6/5.50/0.50) los
+   límites efectivos son exactamente 10.00 y 5.50 (no 9.00/5.00).
 
 ## D45 — el respaldo de Encore rival en `_find_action_line` confirma con la repetición forzada, no con su propio anuncio (MON-21, hallazgo de MON-11 R4)
 

@@ -1159,8 +1159,15 @@ class _ResponsesBackend(ProviderBackend):
         }
         if self.route.max_tokens is not None:
             body["max_output_tokens"] = self.route.max_tokens
+        # L-01 (MON-20): httpx.AsyncClient NO acepta `max_retries` (en
+        # 0.28.1 lanza TypeError: kwarg inesperado). El retry de
+        # infraestructura se controla con el transporte:
+        # `AsyncHTTPTransport(retries=0)` — firma verificada contra la
+        # librería instalada. La clasificacion de errores corre aguas
+        # arriba en `_classified`, igual que con cualquier otro backend.
         async with httpx.AsyncClient(
-            timeout=self.timeout_seconds, max_retries=0
+            timeout=self.timeout_seconds,
+            transport=httpx.AsyncHTTPTransport(retries=0),
         ) as client:
             response = await client.post(
                 self.endpoint,

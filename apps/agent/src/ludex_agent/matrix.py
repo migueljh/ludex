@@ -297,11 +297,16 @@ def plan_budget(
     """Ordena por costo estimado ascendente y aplica hard-stop por provider.
 
     Reglas (addendum MON-20): un modelo pago solo se inicia si su reserva
-    (smoke + 2 batallas) entra en el cap ANTES de quemar el saldo. Si no
-    alcanza: `pending-budget` (nunca unsupported/incompatible/externally-
-    limited) preservando protocolo/ruta/costo. `free` siempre entra. Rows
-    sin costo estimado se clasifican `pending-budget` (no se puede probar
-    que cuesten cero).
+    (smoke + 2 batallas) entra en la disponibilidad ANTES de quemar el
+    saldo. Si no alcanza: `pending-budget` (nunca
+    unsupported/incompatible/externally-limited) preservando
+    protocolo/ruta/costo. `free` siempre entra. Rows sin costo estimado se
+    clasifican `pending-budget` (no se puede probar que cuesten cero).
+
+    L-02 (MON-20): la disponibilidad es `min(cap_usd, balance_usd -
+    leave_usd)` -- el margen de saldo mínimo NO se resta dos veces. Con la
+    autorizacion real (Zen 11/10/1 y Kimi 6/5.50/0.50) los limites
+    efectivos son exactamente 10.00 y 5.50.
     """
     ordered = sorted(
         rows,
@@ -332,8 +337,8 @@ def plan_budget(
             continue
         used = spent.get(row.provider, Decimal("0"))
         reserve = (row.estimated_smoke_usd or Decimal(0)) + row.estimated_cost_usd
-        allowed = spec.cap_usd - spec.leave_usd
-        if used + reserve > allowed or used + reserve > spec.balance_usd:
+        allowed = min(spec.cap_usd, spec.balance_usd - spec.leave_usd)
+        if used + reserve > allowed:
             result.append(_as_status(
                 row, "pending-budget",
                 f"no alcanza el presupuesto: reserva {reserve} vs "
