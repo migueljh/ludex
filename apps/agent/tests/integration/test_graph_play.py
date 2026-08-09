@@ -7,6 +7,8 @@ from poke_env import AccountConfiguration
 from poke_env.player import RandomPlayer
 from sqlalchemy import text
 
+from _dex_template import disposable_dex_clone
+from _disposable import verified_engine
 from ludex_agent.cli import _battle_against_or_failure, _persist_one
 from ludex_agent.config import load_settings
 from ludex_agent.db.context_repository import PostgresContextRepository
@@ -22,9 +24,38 @@ from ludex_agent.graph.provider import (
 from ludex_agent.graph.workflow import build_decision_graph
 from ludex_agent.showdown.client import LudexPlayer, local_server_configuration
 
+# MON-11 (R3): igual que test_play.py -- TEST_DATABASE_URL (clon
+# descartable) + DATABASE_URL (unica fuente admitida, READ-ONLY, para el
+# dex). Este archivo ademas usa `PostgresContextRepository` (pokemon/moves/
+# items/learnsets reales, no solo `generations`), así que necesita el clon
+# completo de `_dex_template.py`, no una base vacía.
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"), reason="necesita la base levantada"
+    not os.environ.get("TEST_DATABASE_URL") or not os.environ.get("DATABASE_URL"),
+    reason="necesita TEST_DATABASE_URL (clon descartable) + DATABASE_URL "
+    "(fuente read-only del dex) + el server local de showdown",
 )
+
+
+@pytest.fixture(scope="module")
+async def dex_clone():
+    """Reapunta `DATABASE_URL` a un clon descartable del dex durante toda
+    la vida del modulo -- las 4 funciones de test de este archivo abren su
+    propia conexion via `load_settings().database_url`, así que ninguna
+    llega a ver la base compartida. Mismo mecanismo que `test_play.py`."""
+    base = os.environ["TEST_DATABASE_URL"]
+    shared = os.environ["DATABASE_URL"]
+    async with disposable_dex_clone(base, shared) as url:
+        anterior = os.environ.get("DATABASE_URL")
+        os.environ["DATABASE_URL"] = url
+        try:
+            engine = await verified_engine(load_settings().database_url)
+            await engine.dispose()
+            yield url
+        finally:
+            if anterior is None:
+                os.environ.pop("DATABASE_URL", None)
+            else:
+                os.environ["DATABASE_URL"] = anterior
 
 
 class FirstLegalGraph:
@@ -36,6 +67,11 @@ class FirstLegalGraph:
 
 
 class AlwaysIllegalProvider:
+    """F2-08 (MON-13, integrado a esta rama en R1): `DecisionProvider.
+    complete` devuelve un `CompletionEnvelope`, no un dict -- `decide()`
+    lee `envelope.usage`/`.provider`/`.model`/`.latency_ms` para la
+    metadata que persiste en `trajectory_steps` (D38)."""
+
     async def complete(self, prompt, *, deadline, turn_id):
         return CompletionEnvelope(
             payload={
@@ -133,7 +169,7 @@ async def _delete_test_battles(repo, tags):
 
 
 @pytest.mark.asyncio
-async def test_diez_batallas_fake_persisten_camino_y_acciones_de_su_mascara():
+async def test_diez_batallas_fake_persisten_camino_y_acciones_de_su_mascara(dex_clone):
     settings = load_settings()
     server = local_server_configuration(settings.showdown_ws_url)
     suffix = str(time.time_ns())[-8:]
@@ -187,7 +223,7 @@ async def test_diez_batallas_fake_persisten_camino_y_acciones_de_su_mascara():
 
 
 @pytest.mark.asyncio
-async def test_respuesta_ilegal_dos_veces_juega_y_persiste_fallback():
+async def test_respuesta_ilegal_dos_veces_juega_y_persiste_fallback(dex_clone):
     settings = load_settings()
     server = local_server_configuration(settings.showdown_ws_url)
     suffix = str(time.time_ns())[-8:]
@@ -267,7 +303,7 @@ async def test_respuesta_ilegal_dos_veces_juega_y_persiste_fallback():
 
 
 @pytest.mark.asyncio
-async def test_shadow_tag_reconcilia_unavailable_sin_persistir_ni_premiar_switch():
+async def test_shadow_tag_reconcilia_unavailable_sin_persistir_ni_premiar_switch(dex_clone):
     settings = load_settings()
     server = local_server_configuration(settings.showdown_ws_url)
     suffix = str(time.time_ns())[-8:]
@@ -337,7 +373,7 @@ async def test_shadow_tag_reconcilia_unavailable_sin_persistir_ni_premiar_switch
 
 
 @pytest.mark.asyncio
-async def test_invalid_move_99_reintenta_inline_sin_crear_un_step_fantasma():
+async def test_invalid_move_99_reintenta_inline_sin_crear_un_step_fantasma(dex_clone):
     settings = load_settings()
     server = local_server_configuration(settings.showdown_ws_url)
     suffix = str(time.time_ns())[-8:]

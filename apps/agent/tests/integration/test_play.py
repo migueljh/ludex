@@ -4,6 +4,8 @@ import re
 import pytest
 from sqlalchemy import text
 
+from _dex_template import disposable_dex_clone
+from _disposable import verified_engine
 from ludex_agent.config import load_settings
 from ludex_agent.cli import play
 from ludex_agent.db.repository import BattleRepository
@@ -11,10 +13,43 @@ from ludex_agent.db.session import make_engine, session_factory
 from ludex_agent.showdown.client import PokeEnvVocabulary
 from ludex_agent.state.schema import STATE_SCHEMA_VERSION
 
+# MON-11 (R3): TEST_DATABASE_URL (clon descartable del dex, ver
+# _dex_template.py) + DATABASE_URL (unica fuente admitida, READ-ONLY, para
+# cargar generations/pokemon/moves/items/learnsets en la plantilla). Este
+# archivo juega batallas REALES y las persiste, pero nunca contra
+# DATABASE_URL: `dex_clone` (abajo) reapunta la variable a un clon efimero
+# antes de que `jugadas` juegue una sola batalla.
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"),
-    reason="necesita postgres y el server local de showdown",
+    not os.environ.get("TEST_DATABASE_URL") or not os.environ.get("DATABASE_URL"),
+    reason="necesita TEST_DATABASE_URL (clon descartable) + DATABASE_URL "
+    "(fuente read-only del dex) + el server local de showdown",
 )
+
+
+@pytest.fixture(scope="module")
+async def dex_clone():
+    """Clona la plantilla sanitizada del dex y reapunta `DATABASE_URL` al
+    clon durante toda la vida del modulo -- `jugadas` y las 11 funciones de
+    test que abren su propia conexion via `load_settings().database_url`
+    dependen de esto, directa o transitivamente, así que ninguna llega a
+    ver la base compartida."""
+    base = os.environ["TEST_DATABASE_URL"]
+    shared = os.environ["DATABASE_URL"]
+    async with disposable_dex_clone(base, shared) as url:
+        anterior = os.environ.get("DATABASE_URL")
+        os.environ["DATABASE_URL"] = url
+        try:
+            # Verificacion runtime ANTES de jugar o persistir una sola
+            # fila: `current_database()` sobre la conexion real que
+            # `load_settings()` resuelve ahora.
+            engine = await verified_engine(load_settings().database_url)
+            await engine.dispose()
+            yield url
+        finally:
+            if anterior is None:
+                os.environ.pop("DATABASE_URL", None)
+            else:
+                os.environ["DATABASE_URL"] = anterior
 
 
 def _normalizar(texto: str) -> str:
@@ -446,12 +481,15 @@ def _objetivos_de_transform(
 
 
 @pytest.fixture(scope="module")
-async def jugadas():
+async def jugadas(dex_clone):
     # I6 (review final): esta fixture juega batallas REALES contra el server
-    # local y las persiste en el MISMO Postgres que el dataset de
-    # entrenamiento. `source="test"` las marca sinteticas (D19,
-    # migracion 20260727000007) para que sean excluibles con
-    # `source <> 'test'` en vez de mezclarse en silencio.
+    # local y las persiste. `source="test"` las marca sinteticas (D19,
+    # migracion 20260727000007).
+    # MON-11 (R3): antes se persistia en el MISMO Postgres que el dataset de
+    # entrenamiento (la base compartida), confiando en `source='test'` para
+    # que quedaran excluibles. Ahora `dex_clone` ya reapunto `DATABASE_URL`
+    # a un clon descartable del dex ANTES de que esta linea juegue nada: la
+    # base compartida nunca ve estas filas, ni siquiera marcadas.
     return await play(2, "gen6randombattle", source="test")
 
 
@@ -875,6 +913,64 @@ def _firma_de_reemplazo_forzado(
     return None
 
 
+def _imprimir_diagnostico_sin_firma(
+    *, tag: str, indice: int, turno: int, rol: str | None, estado: dict,
+    legal_actions: list, action_taken: dict | None, previa: tuple | None,
+    protocolo_tag: list[tuple[int, str]],
+) -> None:
+    """R4 (MON-11 BLOCKER 3): diagnóstico completo de un `sin_firma`, impreso
+    ANTES de fallar (y antes de que `dex_clone` dropee el clon al terminar
+    el módulo, mientras la fila todavía existe). El propósito es que la
+    PRÓXIMA vez que esto pase no haga falta reinvestigar a ciegas: la salida
+    trae todo lo que un mecanismo nuevo (no reconocido por
+    `_firma_de_reemplazo_forzado`) necesitaría para identificarse.
+    """
+    print(f"\n[SIN_FIRMA] {tag} decisión {indice} turno {turno} rol={rol}")
+    print(f"  legal_actions: {legal_actions}")
+    print(f"  action_taken (de esta decisión, si ya se resolvió): {action_taken}")
+    if previa is not None:
+        p_indice, p_turno, p_estado, p_legal, p_action = previa
+        print(
+            f"  decisión anterior: índice={p_indice} turno={p_turno} "
+            f"action_taken={p_action} legal_actions={p_legal}"
+        )
+    activos = [p for p in estado.get("opponent", {}).get("pokemon", []) if p.get("active")]
+    print(f"  rival activo en el estado persistido: {activos}")
+
+    ventana = sorted({turno - 1, turno, turno + 1})
+    lineas_ventana = [
+        (t, linea) for t, linea in protocolo_tag if t in ventana
+    ]
+    print(f"  líneas públicas de protocolo, turnos {ventana} (lado {rol}):")
+    for t, linea in lineas_ventana:
+        print(f"    [{t}] {linea}")
+
+    # Intento de identificar el mecanismo: patrones conocidos que
+    # `_firma_de_reemplazo_forzado` NO reconoce hoy, para no tener que
+    # releer la ventana a mano cada vez.
+    candidatos = []
+    drag = f"|drag|{rol}a:" if rol else None
+    for t, linea in lineas_ventana:
+        if t != turno:
+            continue
+        if drag and linea.startswith(drag):
+            candidatos.append(("drag (Roar/Whirlwind/Dragon Tail/Circle Throw/Sand Tomb)", linea))
+        elif "|-activate|" in linea and rol and f"{rol}a:" in linea:
+            candidatos.append(("-activate (posible trapping/ability)", linea))
+        elif linea.startswith(f"|switch|{rol}a:") if rol else False:
+            candidatos.append(("switch SIN '[from] ' -- no debería llegar hasta acá", linea))
+    if candidatos:
+        print("  mecanismo candidato, NO reconocido por _firma_de_reemplazo_forzado:")
+        for etiqueta, linea in candidatos:
+            print(f"    {etiqueta}: {linea}")
+    else:
+        print(
+            "  ningún patrón conocido (drag/-activate/switch-sin-from) en la "
+            "ventana del turno -- mecanismo genuinamente no identificado, "
+            "revisar más allá de esta heurística"
+        )
+
+
 async def test_la_version_de_esquema_esta_en_todas_las_filas(jugadas):
     """Invariante de TODO el dataset (review final): sin filtro de tags.
 
@@ -966,7 +1062,8 @@ async def test_el_rival_persistido_esta_al_dia_con_el_protocolo(jugadas):
                 )
 
             filas = (await s.execute(text(
-                "SELECT b.battle_tag, ts.decision_index, ts.turn_number, ts.state "
+                "SELECT b.battle_tag, ts.decision_index, ts.turn_number, ts.state, "
+                "       ts.legal_actions, ts.action_taken "
                 "FROM trajectory_steps ts "
                 "JOIN trajectories tr ON tr.id = ts.trajectory_id "
                 "JOIN battles b ON b.id = tr.battle_id "
@@ -981,7 +1078,8 @@ async def test_el_rival_persistido_esta_al_dia_con_el_protocolo(jugadas):
             sin_firma = []
             por_mecanismo: dict[str, int] = {}
             turno_previo: dict[str, int] = {}
-            for tag, indice, turno, estado in filas:
+            fila_previa: dict[str, tuple] = {}
+            for tag, indice, turno, estado, legal_actions, action_taken in filas:
                 previo = turno_previo.get(tag)
                 turno_previo[tag] = turno
                 rol = estado.get("player_role")
@@ -1004,10 +1102,25 @@ async def test_el_rival_persistido_esta_al_dia_con_el_protocolo(jugadas):
                     )
                     if firma is None:
                         sin_firma.append((tag, indice, turno))
+                        # R4 (BLOCKER 3, MON-11): diagnostico completo ANTES
+                        # de que el clon descartable se dropee al terminar
+                        # el modulo -- pasos implicados, mascaras, lineas
+                        # publicas alrededor del turno, y un intento de
+                        # identificar el mecanismo (para no re-investigar a
+                        # ciegas la proxima vez que esto pase).
+                        _imprimir_diagnostico_sin_firma(
+                            tag=tag, indice=indice, turno=turno, rol=rol,
+                            estado=estado, legal_actions=legal_actions,
+                            action_taken=action_taken,
+                            previa=fila_previa.get(tag),
+                            protocolo_tag=protocolo.get(tag, []),
+                        )
                     else:
                         excluidas_mitad_de_turno += 1
                         por_mecanismo[firma] = por_mecanismo.get(firma, 0) + 1
+                    fila_previa[tag] = (indice, turno, estado, legal_actions, action_taken)
                     continue
+                fila_previa[tag] = (indice, turno, estado, legal_actions, action_taken)
                 opp = "p2" if rol == "p1" else "p1"
                 real = None
                 for t, linea in protocolo.get(tag, []):

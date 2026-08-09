@@ -1,0 +1,471 @@
+"""MON-11 R3/R4: la plantilla sanitizada del dex y sus clones por corrida.
+
+No juega batallas (eso es `test_play.py`/`test_graph_play.py`, mas lento y
+contra el Showdown local); esto prueba SOLO el mecanismo de la plantilla:
+que trae el dex con conteos exactos, que las tablas mutables arrancan
+vacias, que clonar es independiente, que el guardia rechaza la base
+compartida ANTES de que cualquier cosa pueda jugar o persistir contra
+ella, y (R4, BLOCKER 2) que una plantilla parcial/vieja/rota nunca se
+acepta por la sola existencia de su nombre.
+"""
+
+from __future__ import annotations
+
+import os
+import uuid
+
+import asyncpg
+import pytest
+
+import _dex_template
+from _dex_template import (
+    _DEX_TABLES,
+    _MUTABLE_TABLES,
+    _generation_counts,
+    _template_name,
+    _validate_template,
+    disposable_dex_clone,
+    ensure_dex_template,
+)
+from _disposable import (
+    SharedDatabaseGuardError,
+    _with_database,
+    disposable_database,
+    verified_engine,
+)
+
+requires_databases = pytest.mark.skipif(
+    not os.environ.get("TEST_DATABASE_URL") or not os.environ.get("DATABASE_URL"),
+    reason="necesita TEST_DATABASE_URL (base descartable) y DATABASE_URL "
+    "(unica fuente admitida, read-only, para el dex de referencia)",
+)
+
+
+async def _connect_source():
+    return await asyncpg.connect(
+        os.environ["DATABASE_URL"],
+        server_settings={"default_transaction_read_only": "on"},
+    )
+
+
+async def _maintenance(base: str) -> asyncpg.Connection:
+    return await asyncpg.connect(_with_database(base, "postgres"))
+
+
+async def _seed_minimal_dex(conn: asyncpg.Connection) -> None:
+    """Dex sintético mínimo, con integridad referencial completa, para
+    probar el fingerprint/validación de CONTENIDO (R5, L-03) sin tocar la
+    base compartida -- nunca se usa como plantilla real, sólo como fuente
+    falsa dentro de una base descartable propia."""
+    await conn.execute(
+        "INSERT INTO generations (id, gen_number, label) VALUES (1, 6, 'XY/ORAS')",
+    )
+    await conn.execute(
+        "INSERT INTO pokemon (id, gen_id, showdown_id, dex_num, name, base_species, "
+        "is_default, types, base_stats, abilities, base_species_name) VALUES "
+        "(1, 1, 'bulbasaur', 1, 'Bulbasaur', 'bulbasaur', true, ARRAY['GRASS','POISON'], "
+        "$1::jsonb, $2::jsonb, 'Bulbasaur')",
+        '{"hp": 45, "atk": 49}', '{"0": "overgrow"}',
+    )
+    await conn.execute(
+        "INSERT INTO moves (id, gen_id, showdown_id, name, type, category, power, pp, "
+        "priority, target, flags) VALUES "
+        "(1, 1, 'tackle', 'Tackle', 'NORMAL', 'Physical', 40, 15, 0, 'normal', '{}'::jsonb)",
+    )
+    await conn.execute(
+        "INSERT INTO items (id, gen_id, showdown_id, name, properties) "
+        "VALUES (1, 1, 'leftovers', 'Leftovers', '{}'::jsonb)",
+    )
+    await conn.execute(
+        "INSERT INTO learnsets (pokemon_id, move_id, learn_methods) VALUES (1, 1, $1::jsonb)",
+        '["level-up"]',
+    )
+
+
+async def _drop_database(base: str, name: str) -> None:
+    maintenance = await _maintenance(base)
+    try:
+        await maintenance.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    finally:
+        await maintenance.close()
+
+
+async def _assert_content_mutation_changes_fingerprint_and_invalidates(
+    base: str, mutate_sql: str, label: str,
+) -> None:
+    """R5 (LINEAR_VERDICT L-03): mutar UNA columna no-clave, sin tocar ids
+    ni conteos, tiene que (a) cambiar el nombre fingerprintado y (b) hacer
+    que la plantilla VIEJA (contenido stale) no pase `_validate_template`
+    contra la fuente mutada -- ni siquiera si alguien la fuerza/reutiliza a
+    mano. Corre enteramente contra una base descartable propia (`_disposable.
+    database`), nunca contra `DATABASE_URL`."""
+    async with disposable_database(base) as fake_source_url:
+        conn = await asyncpg.connect(fake_source_url)
+        try:
+            await _seed_minimal_dex(conn)
+        finally:
+            await conn.close()
+
+        template_v1 = await ensure_dex_template(base, fake_source_url)
+        try:
+            conn = await asyncpg.connect(fake_source_url)
+            try:
+                await conn.execute(mutate_sql)
+            finally:
+                await conn.close()
+
+            template_v2 = await ensure_dex_template(base, fake_source_url)
+            try:
+                assert template_v2 != template_v1, (
+                    f"{label}: el nombre fingerprintado no cambió pese a mutar "
+                    "una columna no-clave sin tocar ids/conteos"
+                )
+
+                source_conn = await asyncpg.connect(
+                    fake_source_url, server_settings={"default_transaction_read_only": "on"},
+                )
+                try:
+                    valid, reason = await _validate_template(
+                        _with_database(base, template_v1), source_conn,
+                    )
+                finally:
+                    await source_conn.close()
+                assert not valid, (
+                    f"{label}: la plantilla vieja (contenido stale) validó "
+                    f"igual contra la fuente mutada -- reason={reason!r}"
+                )
+            finally:
+                await _drop_database(base, template_v2)
+        finally:
+            await _drop_database(base, template_v1)
+
+
+@requires_databases
+async def test_ensure_dex_template_trae_conteos_exactos_por_generacion_y_tablas_mutables_vacias():
+    base = os.environ["TEST_DATABASE_URL"]
+    shared = os.environ["DATABASE_URL"]
+    name = await ensure_dex_template(base, shared)
+
+    source = await _connect_source()
+    dest = await asyncpg.connect(_with_database(base, name))
+    try:
+        for table in _DEX_TABLES:
+            source_counts = await _generation_counts(source, table)
+            dest_counts = await _generation_counts(dest, table)
+            assert dest_counts == source_counts, f"{table}: {dest_counts} != {source_counts}"
+            assert sum(source_counts.values()) > 0, f"{table}: la fuente no tiene filas para comparar"
+        for table in _MUTABLE_TABLES:
+            count = await dest.fetchval(f"SELECT count(*) FROM {table}")
+            assert count == 0, f"{table} debería arrancar vacía en la plantilla, tiene {count}"
+    finally:
+        await source.close()
+        await dest.close()
+
+
+@requires_databases
+async def test_disposable_dex_clone_es_independiente_y_se_dropea():
+    base = os.environ["TEST_DATABASE_URL"]
+    shared = os.environ["DATABASE_URL"]
+
+    async with disposable_dex_clone(base, shared) as url:
+        template_name = await ensure_dex_template(base, shared)
+        conn = await asyncpg.connect(url)
+        try:
+            assert await conn.fetchval("SELECT count(*) FROM pokemon") > 0
+            await conn.execute(
+                "INSERT INTO battles (battle_tag, format, p1, p2, played_by, source, identity_key) "
+                "VALUES ('clone-test', 'gen6randombattle', 'A', 'B', 'bot', 'test', 'k1')",
+            )
+            n = await conn.fetchval("SELECT count(*) FROM battles")
+            assert n == 1
+        finally:
+            await conn.close()
+        clone_name = url.rsplit("/", 1)[-1].split("?", 1)[0]
+
+    maintenance = await _maintenance(base)
+    try:
+        exists = await maintenance.fetchval(
+            "SELECT count(*) > 0 FROM pg_database WHERE datname = $1", clone_name,
+        )
+    finally:
+        await maintenance.close()
+    assert not exists, "el clon debe dropearse al salir del context manager"
+
+    # La plantilla en si NUNCA recibe esa fila: cada clon es independiente.
+    template_conn = await asyncpg.connect(_with_database(base, template_name))
+    try:
+        assert await template_conn.fetchval("SELECT count(*) FROM battles") == 0
+    finally:
+        await template_conn.close()
+
+
+@requires_databases
+async def test_db_preexistente_parcial_bajo_el_nombre_fingerprintado_no_es_aceptada(monkeypatch):
+    """R4 BLOCKER 2 -- reproducción de Latwan: `PARTIAL_TEMPLATE_ACCEPTED
+    returned=True generations_table=None`. Una base VACÍA (sin `db/schema.sql`
+    aplicado, sin `generations`) creada bajo el nombre que
+    `ensure_dex_template` buscaría tiene que ser rechazada -- nunca
+    aceptada por la sola existencia del nombre. Se fuerza un nombre único y
+    falso (en vez del fingerprint real) para que este test sea determinista
+    sin importar si la plantilla real ya está publicada por otro test de
+    este mismo archivo."""
+    base = os.environ["TEST_DATABASE_URL"]
+    shared = os.environ["DATABASE_URL"]
+    fake_name = f"ludex_dex_template_{uuid.uuid4().hex[:24]}"
+
+    async def fake_template_name(source):
+        return fake_name
+
+    monkeypatch.setattr(_dex_template, "_template_name", fake_template_name)
+
+    maintenance = await _maintenance(base)
+    try:
+        await maintenance.execute(f'CREATE DATABASE "{fake_name}"')  # SIN aplicar schema.sql
+    finally:
+        await maintenance.close()
+
+    try:
+        with pytest.raises(RuntimeError, match="no pasa la validación"):
+            await ensure_dex_template(base, shared)
+    finally:
+        maintenance = await _maintenance(base)
+        try:
+            await maintenance.execute(f'DROP DATABASE IF EXISTS "{fake_name}" WITH (FORCE)')
+        finally:
+            await maintenance.close()
+
+
+@requires_databases
+async def test_fingerprint_distinto_no_reutiliza_silenciosamente_el_nombre_anterior(monkeypatch):
+    """Si el schema cambia, el nombre de la plantilla cambia -- nunca se
+    reutiliza en silencio una plantilla construida para un schema/dex
+    viejo."""
+    source = await _connect_source()
+    try:
+        name_real = await _template_name(source)
+
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_schema = Path(tmp) / "schema.sql"
+            fake_schema.write_text("-- schema distinto, solo para el fingerprint\n")
+            monkeypatch.setattr(_dex_template, "_SCHEMA_PATH", fake_schema)
+            name_fake = await _template_name(source)
+
+        assert name_fake != name_real
+    finally:
+        await source.close()
+
+
+@requires_databases
+async def test_fallo_a_mitad_de_construccion_no_publica_y_limpia_el_staging(monkeypatch):
+    """R4 BLOCKER 2: una excepción durante la copia del dex no puede dejar
+    ni una plantilla parcial publicada bajo el nombre fingerprintado, ni un
+    staging huérfano."""
+    base = os.environ["TEST_DATABASE_URL"]
+    shared = os.environ["DATABASE_URL"]
+
+    fake_name = f"ludex_dex_template_{uuid.uuid4().hex[:24]}"
+
+    async def fake_template_name(source):
+        return fake_name
+
+    monkeypatch.setattr(_dex_template, "_template_name", fake_template_name)
+
+    real_loader = _dex_template._load_dex_table
+    calls = {"n": 0}
+
+    async def broken_loader(source, dest, table):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("fallo inyectado a mitad de la copia del dex")
+        return await real_loader(source, dest, table)
+
+    monkeypatch.setattr(_dex_template, "_load_dex_table", broken_loader)
+
+    with pytest.raises(RuntimeError, match="fallo inyectado"):
+        await ensure_dex_template(base, shared)
+
+    maintenance = await _maintenance(base)
+    try:
+        published = await maintenance.fetchval(
+            "SELECT count(*) FROM pg_database WHERE datname = $1", fake_name,
+        )
+        staging_orphans = await maintenance.fetchval(
+            "SELECT count(*) FROM pg_database WHERE datname LIKE 'ludex_dex_staging_%'",
+        )
+    finally:
+        await maintenance.close()
+    assert published == 0, "no se puede publicar una plantilla parcial bajo el nombre fingerprintado"
+    assert staging_orphans == 0, "el staging de esta corrida debe limpiarse tras el fallo"
+
+
+# --- R5 (LINEAR_VERDICT L-01/L-03): mutar contenido no-clave, sin tocar
+# ids ni conteos, tiene que cambiar el fingerprint y tumbar la validación
+# de una plantilla stale. Las tres corren enteramente contra una base
+# descartable propia -- nunca DATABASE_URL, nunca se muta la compartida. ---
+
+@requires_databases
+async def test_fingerprint_cambia_si_moves_pp_muta_sin_cambiar_ids_ni_conteos():
+    """Reproducción exacta de Latwan: `moves.pp` 15 -> 16, mismo `id`,
+    mismo conteo por tabla/generación. R4 (conteo+PK) devolvía
+    `FINGERPRINT_UNCHANGED=True` y `_validate_template(...)=(True, "ok")`
+    contra la plantilla vieja -- acá tiene que cambiar el nombre y la
+    plantilla vieja tiene que dejar de validar."""
+    base = os.environ["TEST_DATABASE_URL"]
+    await _assert_content_mutation_changes_fingerprint_and_invalidates(
+        base, "UPDATE moves SET pp = 16 WHERE id = 1", "moves.pp",
+    )
+
+
+@requires_databases
+async def test_fingerprint_cambia_si_un_campo_jsonb_muta_sin_cambiar_ids_ni_conteos():
+    """`pokemon.base_stats` es `jsonb` de verdad (a diferencia de
+    `pokemon.types`, que es `text[]` -- el ejemplo del LINEAR_VERDICT usa
+    "types/base_stats" como si fueran intercambiables; acá se prueba el
+    campo genuinamente `jsonb` para que la aserción sea estricta)."""
+    base = os.environ["TEST_DATABASE_URL"]
+    await _assert_content_mutation_changes_fingerprint_and_invalidates(
+        base,
+        "UPDATE pokemon SET base_stats = '{\"hp\": 99, \"atk\": 49}'::jsonb WHERE id = 1",
+        "pokemon.base_stats (jsonb)",
+    )
+
+
+@requires_databases
+async def test_fingerprint_cambia_si_learnsets_learn_methods_muta_sin_cambiar_ids_ni_conteos():
+    base = os.environ["TEST_DATABASE_URL"]
+    await _assert_content_mutation_changes_fingerprint_and_invalidates(
+        base,
+        "UPDATE learnsets SET learn_methods = '[\"level-up\", \"tm\"]'::jsonb "
+        "WHERE pokemon_id = 1 AND move_id = 1",
+        "learnsets.learn_methods",
+    )
+
+
+@requires_databases
+async def test_snapshot_unico_ignora_escritura_concurrente_entre_fingerprint_y_copia(monkeypatch):
+    """R6 (LINEAR_VERDICT sobre f1a56f83): L-02 corregía el mecanismo
+    (una única transacción `REPEATABLE READ` envolviendo huella + copia +
+    validación) pero no tenía un canario que probara la carrera en sí --
+    mutar `isolation="repeatable_read"` a `"read_committed"` dejaba los 9
+    tests de R5 igual de verdes. Este test coordina DETERMINÍSTICAMENTE,
+    via un hook sobre `_load_dex_table`, una escritura desde OTRA conexión
+    que ocurre DESPUÉS de que `_template_name` ya fijó el snapshot (la
+    huella completa -- las 5 tablas -- ya se calculó antes de que
+    `_load_dex_table` copie una sola fila) pero ANTES de que arranque la
+    copia.
+
+    Corre enteramente contra una fuente dex descartable propia (nunca
+    `DATABASE_URL`); la escritura concurrente ocurre sobre ESA base
+    descartable, no sobre la compartida.
+    """
+    base = os.environ["TEST_DATABASE_URL"]
+
+    async with disposable_database(base) as fake_source_url:
+        conn = await asyncpg.connect(fake_source_url)
+        try:
+            await _seed_minimal_dex(conn)  # moves.pp arranca en 15
+        finally:
+            await conn.close()
+
+        real_loader = _dex_template._load_dex_table
+        injected = {"done": False}
+
+        async def loader_con_escritura_concurrente(source, dest, table):
+            # Se dispara en la PRIMERA llamada de _load_dex_table -- para
+            # entonces `_template_name` (huella de las 5 tablas) ya corrió
+            # dentro de la transaccion `source`, así que el snapshot
+            # `REPEATABLE READ` ya está fijado. La escritura es por OTRA
+            # conexión (`writer`), simulando otra sesión concurrente.
+            if not injected["done"]:
+                injected["done"] = True
+                writer = await asyncpg.connect(fake_source_url)
+                try:
+                    await writer.execute("UPDATE moves SET pp = 16 WHERE id = 1")
+                finally:
+                    await writer.close()
+            return await real_loader(source, dest, table)
+
+        monkeypatch.setattr(_dex_template, "_load_dex_table", loader_con_escritura_concurrente)
+
+        template_v1 = await ensure_dex_template(base, fake_source_url)
+        try:
+            # 1. la plantilla publicada contiene pp=15 (el snapshot ANTERIOR
+            #    a la escritura concurrente).
+            dest_conn = await asyncpg.connect(_with_database(base, template_v1))
+            try:
+                pp_template = await dest_conn.fetchval("SELECT pp FROM moves WHERE id = 1")
+            finally:
+                await dest_conn.close()
+
+            # 2. la fuente actual (fuera de cualquier transacción) contiene
+            #    pp=16 -- la escritura concurrente sí se aplicó de verdad.
+            source_conn = await asyncpg.connect(fake_source_url)
+            try:
+                pp_source = await source_conn.fetchval("SELECT pp FROM moves WHERE id = 1")
+            finally:
+                await source_conn.close()
+
+            assert pp_source == 16, (
+                f"la escritura concurrente no se aplicó a la fuente: pp={pp_source}"
+            )
+            # 3. fingerprint y copia observaron el MISMO snapshot anterior:
+            #    la plantilla, construida DESPUÉS de la escritura
+            #    concurrente en tiempo real, igual quedó en pp=15 -- prueba
+            #    que ni la huella ni la copia vieron el pp=16 que ya existía
+            #    en la fuente para cuando `_load_dex_table` corrió.
+            assert pp_template == 15, (
+                f"la plantilla publicada tiene que reflejar el snapshot ANTERIOR "
+                f"a la escritura concurrente (pp=15) -- fingerprint y copia "
+                f"tienen que haber visto el mismo estado de la fuente; "
+                f"tiene pp={pp_template} (fuente actual: pp={pp_source})"
+            )
+
+            # 4. una segunda llamada posterior, con la fuente YA mutada y sin
+            #    ninguna carrera en el medio, produce OTRO nombre
+            #    fingerprintado y una plantilla con pp=16.
+            monkeypatch.setattr(_dex_template, "_load_dex_table", real_loader)
+            template_v2 = await ensure_dex_template(base, fake_source_url)
+            try:
+                assert template_v2 != template_v1, (
+                    "una corrida posterior, con la fuente ya mutada a pp=16, "
+                    "tiene que producir un nombre fingerprintado distinto"
+                )
+                dest_conn_v2 = await asyncpg.connect(_with_database(base, template_v2))
+                try:
+                    pp_template_v2 = await dest_conn_v2.fetchval(
+                        "SELECT pp FROM moves WHERE id = 1",
+                    )
+                finally:
+                    await dest_conn_v2.close()
+                assert pp_template_v2 == 16, (
+                    f"la segunda plantilla tiene que reflejar la fuente actual "
+                    f"(pp=16), tiene pp={pp_template_v2}"
+                )
+            finally:
+                # 5. limpieza exacta: sólo las bases que este test creó.
+                await _drop_database(base, template_v2)
+        finally:
+            await _drop_database(base, template_v1)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DATABASE_URL"),
+    reason="necesita DATABASE_URL para probar el rechazo (solo lectura: "
+    "SELECT current_database())",
+)
+async def test_verified_engine_rechaza_la_compartida_antes_de_jugar_o_persistir():
+    """El caso que R3 pide probar explicitamente: si `test_play.py` o
+    `test_graph_play.py` apuntaran (por error, o por una reconexion futura)
+    a `DATABASE_URL`, el guardia tiene que fallar ANTES de que se juegue
+    una sola batalla o corra un solo INSERT/DELETE. `verified_engine` ya
+    demostro esto para los tests DB unitarios (R2); esto confirma que el
+    mismo guardia, sobre la MISMA base compartida real, sigue rechazando
+    cuando el llamador es el codigo de tests LIVE."""
+    from ludex_agent.config import load_settings
+
+    shared_url = load_settings().database_url
+    with pytest.raises(SharedDatabaseGuardError, match="ludex"):
+        await verified_engine(shared_url)
