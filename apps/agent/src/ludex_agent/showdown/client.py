@@ -408,6 +408,30 @@ def _find_action_line(
       mismo patron con Volbeat/Thunder Wave). Sin este respaldo, el cursor
       quedaba atrasado en `decision_turn` (nunca se corregia) en vez de
       avanzar al turno donde realmente se resolvio.
+
+      **MON-21 (D45): el anuncio de Encore NO es, por si solo, la
+      resolucion — es la CONFIRMACION de que la repeticion forzada que le
+      sigue, en el MISMO turno, es la resolucion.** La primera version de
+      este respaldo devolvia el cursor apenas encontraba la linea de
+      Encore, dejando SIN CONSUMIR la linea `|move|{side}a:...|` real que
+      Showdown narra a continuacion (la repeticion forzada en si). Bajo
+      Encore + trapping esa linea sobrante queda ahi, disponible, y la
+      SIGUIENTE decision (que bajo esta combinacion esta forzada a elegir el
+      MISMO movimiento — Encore no deja otra opcion y el trapping le saca el
+      cambio) la matchea por `clave` como si fuera su propia resolucion,
+      heredando el turno de la decision ANTERIOR (`battle-gen6randombattle-
+      3349`, decisiones 26/turno23 y 38/turno35, MON-11 R4). Peor: cuando el
+      Encore del rival ocurre DESPUES de que nuestra propia accion de ESTE
+      turno ya se resolvio (nada que confirmar en este bloque — el Encore
+      solo bloqueara la decision futura), no hay ninguna repeticion en el
+      mismo turno que lo confirme, y el respaldo no deberia anclar nada
+      aca: la busqueda tiene que seguir hacia el turno donde la decision
+      encoreada+atrapada realmente se resuelve. Por eso el Encore del rival
+      ya NO fija `respaldo` de forma terminal: queda pendiente
+      (`encore_rival_turno`) y solo se confirma —devolviendo el cursor
+      DESPUES de la linea de repeticion, no antes— si esa repeticion propia
+      aparece en el mismo turno; si el turno cambia sin ella, la busqueda
+      sigue de largo sin anclarse ahi.
     - **La batalla termino antes de que la decision se resolviera**:
       `|win|`/`|tie|` en cualquier punto de la ventana de busqueda. Un
       `|win|`/`|tie|` cierra la trayectoria: no hay decision siguiente que
@@ -469,6 +493,7 @@ def _find_action_line(
     prefix_opp_encore = f"|move|{opp_side}a:"
     respaldo: tuple[int, int] | None = None
     respaldo_turn: int | None = None
+    encore_rival_turno: int | None = None
     request_activo_turn: int | None = None
     se_movio_en: set[int] = set()
     for offset, (turn, line) in enumerate(recorder.entries_from(from_index)):
@@ -491,6 +516,15 @@ def _find_action_line(
             # apropiandose del `|move|...|Encore||[still]` de la decision
             # SIGUIENTE, dos turnos mas adelante).
             break
+        if encore_rival_turno is not None and turn != encore_rival_turno:
+            # MON-21 (D45): el Encore del rival que vimos no tuvo, dentro de
+            # SU PROPIO turno, una repeticion propia que lo confirme -- no
+            # intercepto esta decision (es residuo de una decision anterior
+            # ya resuelta por otro camino, p.ej. un `|move|` real que ya se
+            # ejecuto ANTES de que el rival encoreara). Dejar de tratarlo
+            # como pendiente: no hay que anclar aca, la resolucion real de
+            # esta decision esta mas adelante.
+            encore_rival_turno = None
         if (
             not accion_es_movimiento
             and _request_propio_confirma_activo(line, side, clave)
@@ -518,6 +552,17 @@ def _find_action_line(
                 return turn, from_index + offset + 1
             if line.startswith(prefix_move):
                 se_movio_en.add(turn)
+                if encore_rival_turno == turn:
+                    # MON-21 (D45): esta es la repeticion forzada que el
+                    # Encore del rival, visto antes EN EL MISMO turno,
+                    # anunciaba -- aunque no mencione `clave` (la decision
+                    # elegio otra cosa y Encore la reemplazo por el ultimo
+                    # movimiento usado). Consumir ESTA linea, no la del
+                    # anuncio: dejarla sin consumir es lo que la decision
+                    # SIGUIENTE (forzada, bajo Encore+trapping, a elegir
+                    # exactamente este mismo movimiento) terminaba robando
+                    # como si fuera su propia resolucion.
+                    return turn, from_index + offset + 1
             elif request_activo_turn == turn:
                 return turn, from_index + offset + 1
             elif (
@@ -598,8 +643,15 @@ def _find_action_line(
                 # un turno despues; el respaldo de Encore, sin este chequeo,
                 # se apropiaba del turno de la decision y la busqueda cortaba
                 # ahi, sin llegar nunca al `|switch|` real).
-                respaldo = (turn, from_index + offset + 1)
-                respaldo_turn = turn
+                #
+                # MON-21 (D45): a diferencia de cant/faint/confusion/win/tie,
+                # este anuncio NO fija `respaldo` de forma terminal -- solo
+                # CONFIRMA que la proxima linea `|move|{side}a:...|` en este
+                # mismo turno (arriba, junto a `se_movio_en`) es la
+                # resolucion real. Si esa linea no aparece antes de que el
+                # turno cambie, el chequeo de arriba limpia
+                # `encore_rival_turno` y la busqueda sigue de largo.
+                encore_rival_turno = turn
             elif line.startswith("|win|") or line.startswith("|tie|"):
                 # fix-flaky (D23): la batalla termino antes de que la
                 # decision se resolviera (el rival se remato con retroceso,
