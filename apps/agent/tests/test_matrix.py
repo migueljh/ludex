@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import inspect
+import re
 import time
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -684,68 +686,88 @@ def test_artefactos_de_matriz_no_llevan_secretos_ni_campos_de_env():
     assert "sk-zen" not in serialized
 
 
+_SECRET_PATTERN = re.compile(
+    r"AIza[0-9A-Za-z_-]{20,}|sk-[A-Za-z0-9]{20,}"
+)
+
+
+def _scan_secret_patterns(root: Path) -> list[str]:
+    """UNICA implementacion del scanner de patrones de credencial en
+    territorio de tests (L-03). Recibe un root y devuelve SOLO paths
+    relativos de los archivos JSON infractores; nunca los valores
+    coincidentes (pueden ser material de credencial). Sin exclusiones de
+    nombres: cubre todos los `**/*.json`, incluidos artefactos por modelo
+    y state files de matrix-run."""
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.json")):
+        # MUTACION L-03: reintroducir `if "matrix-run" in path.name:
+        # continue` aca hace que el canario sintetico deje de detectar el
+        # state file y se ponga rojo.
+        if _SECRET_PATTERN.search(path.read_text(encoding="utf-8")):
+            offenders.append(str(path.relative_to(root)))
+    return offenders
+
+
 def test_datos_de_evals_no_contienen_patrones_de_clave_real():
     """Canario de repositorio (L-03): TODOS los JSON de evals — incluidos
-    artefactos y state files de matrix-run — jamás versionan patrones de
-    clave. Se reportan SOLO rutas/nombres, nunca el valor coincidente."""
-    import re
+    artefactos por modelo y state files de matrix-run — jamás versionan
+    patrones de clave. Usa la MISMA funcion de scan que el canario
+    sintetico: no hay una implementacion paralela que pueda divergir."""
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1] / "evals"
-    pattern = re.compile(r"AIza[0-9A-Za-z_-]{20,}|sk-[A-Za-z0-9]{20,}")
-    offenders: list[str] = []
-    for path in sorted(root.rglob("*.json")):
-        if pattern.search(path.read_text(encoding="utf-8")):
-            offenders.append(str(path.relative_to(root)))
+    offenders = _scan_secret_patterns(root)
     # solo nombres/rutas en el mensaje: el valor de la coincidencia no se
     # imprime (podria ser material de credencial)
     assert offenders == [], f"patrones de clave en datos de evals: {offenders}"
 
 
-def test_artefactos_matrix_run_no_contienen_patrones_de_credencial():
-    """Canario L-03: los artefactos y state files de matrix-run (escritos
-    por el ejecutor) no pueden contener patrones de credencial. El valor
-    coincidente NUNCA se imprime."""
-    import re
-    from pathlib import Path
-
-    # cubre los artefactos por modelo (`{round}-{provider}-{model}-matrix.json`)
-    # Y los state files (`{round}-matrix-run-state.json`)
-    root = Path(__file__).resolve().parents[1] / "evals" / "runs"
-    pattern = re.compile(r"AIza[0-9A-Za-z_-]{20,}|sk-[A-Za-z0-9]{20,}")
-    offenders: list[str] = []
-    for path in sorted(root.rglob("*matrix*.json")):
-        if pattern.search(path.read_text(encoding="utf-8")):
-            offenders.append(str(path.relative_to(root)))
-    # solo nombres, nunca valores
-    assert offenders == [], (
-        f"patrones de credencial en artefactos matrix-run: {offenders}"
-    )
-
-
-def test_el_canario_de_scan_detecta_un_patron_de_credencial(tmp_path):
-    """El canario de matrix-run DEBE detectar un patron de credencial en un
-    archivo del directorio de corrida: si escribimos un artefacto con un
-    patron falso, el scan lo reporta (por nombre). El valor falso del
-    fixture no se imprime en ningun caso."""
-    import re
-    from pathlib import Path
-
+def test_canario_sintetico_detecta_exactamente_los_dos_archivos_contaminados(
+    tmp_path,
+):
+    """Canario L-03: el fixture sintetico contiene un artefacto por modelo
+    contaminado, un `matrix-run-state.json` contaminado y un JSON limpio
+    (counterweight). El scan compartido detecta EXACTAMENTE los dos
+    contaminados y no el limpio. Si alguien reintrodujera una exclusion de
+    nombres `matrix-run` en la funcion compartida, el state file dejaria de
+    detectarse y este canario se pondria rojo."""
     root = tmp_path / "runs"
     root.mkdir(parents=True)
     (root / "r1-open_code_zen-mimo-v2.5-free-matrix.json").write_text(
         '{"status": "compatible", "note": "AIzaSy0000000000000000000000000000000x"}'
     )
     (root / "r1-matrix-run-state.json").write_text(
-        '{"open_code_zen/mimo-v2.5-free": {"status": "compatible"}}'
+        '{"open_code_zen/mimo-v2.5-free": {"status": "compatible", '
+        '"detail": "sk-fake000000000000000000000000000000"}'
+        "}"
     )
-    pattern = re.compile(r"AIza[0-9A-Za-z_-]{20,}|sk-[A-Za-z0-9]{20,}")
-    offenders = [
-        str(p.relative_to(root))
-        for p in sorted(root.rglob("*matrix*.json"))
-        if pattern.search(p.read_text(encoding="utf-8"))
+    (root / "r1-google-gemma-4-26b-a4b-it-matrix.json").write_text(
+        '{"status": "compatible", "battles": 2}'
+    )
+
+    offenders = _scan_secret_patterns(root)
+    assert offenders == [
+        "r1-matrix-run-state.json",
+        "r1-open_code_zen-mimo-v2.5-free-matrix.json",
     ]
-    assert offenders == ["r1-open_code_zen-mimo-v2.5-free-matrix.json"]
+
+
+def test_el_scanner_devuelve_solo_paths_nunca_valores(tmp_path):
+    """L-03: el scan comparte una unica funcion que devuelve SOLO
+    paths/nombres. El valor coincidente (material de credencial) no aparece
+    en el resultado ni en el mensaje de asercion."""
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    secret = "AIzaSy0000000000000000000000000000000x"
+    (root / "r1-matrix-run-state.json").write_text(
+        f'{{"model": "x", "note": "{secret}"}}'
+    )
+
+    offenders = _scan_secret_patterns(root)
+    rendered = " ".join(offenders)
+    assert offenders == ["r1-matrix-run-state.json"]
+    assert secret not in rendered
+    assert "AIza" not in rendered
 
 
 @pytest.mark.asyncio
