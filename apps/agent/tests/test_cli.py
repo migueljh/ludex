@@ -1310,3 +1310,43 @@ def test_escritura_parcial_no_reemplaza_el_ultimo_artefacto_valido(tmp_path):
         '{\n  "status": "compatible",\n  "battles": 2\n}\n'
     )
     assert not artifact.with_suffix(".json.tmp").exists()
+
+
+def test_matrix_plan_no_refresh_funciona_offline_sin_claves(tmp_path):
+    """SECURITY HOLD: matrix-plan --no-refresh construye el manifiesto
+    desde el inventario commiteado, SIN red y SIN claves de proveedor en el
+    entorno (solo DATABASE_URL). Cero requests, cero lectura de .env."""
+    import json as _json
+
+    inventory = tmp_path / "inventory.json"
+    inventory.write_text(_json.dumps({
+        "models": {
+            "google": [{"id": "gemma-4-26b-a4b-it", "in_scope": True}],
+            "kimi": [{"id": "kimi-k2.6", "in_scope": True}],
+            "open_code_zen": [
+                {"id": "mimo-v2.5-free", "in_scope": True},
+            ],
+        },
+    }))
+    out = tmp_path / "manifest-out.json"
+    env = {
+        "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+        "LUDEX_PRICING_TABLE": "evals/pricing-2026-08-08.json",
+    }
+    for key in ("GEMINI_API_KEY", "KIMI_API_KEY", "OPEN_CODE_ZEN_API_KEY"):
+        env.pop(key, None)
+    result = CliRunner().invoke(
+        app,
+        ["matrix-plan", "--inventory", str(inventory),
+         "--manifest", str(out), "--no-refresh",
+         "--budget", "evals/budget-2026-08-08.json"],
+        env=env,
+    )
+    assert result.exit_code == 0, result.stdout
+    document = _json.loads(out.read_text())
+    rows = {f"{r['provider']}/{r['model']}": r for r in document["rows"]}
+    assert "google/gemma-4-26b-a4b-it" in rows
+    assert rows["open_code_zen/mimo-v2.5-free"]["tier"] == "free"
+    assert "kimi/kimi-k2.6" in rows
+    assert rows["kimi/kimi-k2.6"]["tier"] == "paid"
+    assert rows["kimi/kimi-k2.6"]["status"] == "ready"

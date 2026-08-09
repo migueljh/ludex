@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import time
 from decimal import Decimal
 
 import pytest
@@ -585,3 +586,129 @@ def test_modelo_fuera_del_catalogo_fresco_se_clasifica_no_se_ejecuta():
     assert by_model["deepseek-v4-flash-free"].status == "compatible"
     assert built == [("open_code_zen", "deepseek-v4-flash-free")]
     assert battle_calls == [2]
+
+
+# --- F2-10B R4 (MON-20): SECURITY HOLD — hardening offline -------------
+
+
+def test_artefactos_de_matriz_no_llevan_secretos_ni_campos_de_env():
+    """El artefacto por modelo tiene un schema cerrado: sin claves, sin
+    variables de entorno, sin mensajes crudos. Si alguien agregara un campo
+    que filtra credenciales, este test se pone rojo."""
+    import json as _json
+
+    from ludex_agent.matrix import MatrixModelResult
+
+    result = MatrixModelResult(
+        provider="open_code_zen", model="mimo-v2.5-free", tier="free",
+        protocol="chat_completions", status="compatible", smoke_ok=True,
+        battles_requested=2, battles_completed=2,
+        effective_provider="open_code_zen", effective_model="mimo-v2.5-free",
+        win_rate="0.5000", completion_latency_ms=None,
+        decision_latency_ms=None, tokens=None, retries=0, rotations=0,
+        quarantined=0, failure_type=None, failure_cause_type=None,
+    )
+    serialized = _json.dumps(result.to_dict())
+    for forbidden in ("api_key", "api-key", "AIza", "sk-", "KIMI_",
+                      "GEMINI_", "OPEN_CODE_ZEN_", "Bearer"):
+        assert forbidden not in serialized, forbidden
+    assert "sk-zen" not in serialized
+
+
+def test_datos_de_evals_no_contienen_patrones_de_clave_real():
+    """Canario de repositorio: los archivos de datos de evals (inventarios,
+    manifiestos, precios, presupuesto) jamás versionan patrones de clave."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "evals"
+    pattern = re.compile(r"AIza[0-9A-Za-z_-]{20,}|sk-[A-Za-z0-9]{20,}")
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.json")):
+        if "runs" in path.parts and "matrix-run" in path.name:
+            continue
+        if pattern.search(path.read_text(encoding="utf-8")):
+            offenders.append(str(path.relative_to(root)))
+    assert offenders == [], f"patrones de clave en datos de evals: {offenders}"
+
+
+@pytest.mark.asyncio
+async def test_responses_backend_429_401_y_403_clasifican_por_senal(monkeypatch):
+    """Fin a fin por la frontera HTTP del backend responses: el
+    raise_for_status de httpx produce el HTTPStatusError y la clasificacion
+    (429 rotacion, 401 cuarentena, 403 credential/model) corre con el
+    cuerpo estructurado."""
+    from ludex_agent.graph.provider import (
+        DecisionMetrics,
+        KeyRotatingProvider,
+        ModelRoute,
+        _ResponsesBackend,
+    )
+
+    class FakeResponse:
+        def __init__(self, status: int, body: dict):
+            self.status_code = status
+            self._body = body
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                import httpx
+                request = httpx.Request("POST", "https://opencode.ai/zen/v1/responses")
+                raise httpx.HTTPStatusError(
+                    "boom", request=request,
+                    response=httpx.Response(self.status_code, request=request, json=self._body),
+                )
+
+        def json(self):
+            return self._body
+
+    class FakeClient:
+        def __init__(self, status, body):
+            self._status, self._body = status, body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            return FakeResponse(self._status, self._body)
+
+    def backend_for(status, body):
+        return _ResponsesBackend(
+            model="gpt-5.5", endpoint="https://opencode.ai/zen/v1/responses",
+            timeout_seconds=60, route=ModelRoute(protocol="responses"),
+        )
+
+    async def classify(status, body):
+        client = FakeClient(status, body)
+        monkeypatch.setattr("ludex_agent.graph.provider.httpx.AsyncClient",
+                            lambda *a, **k: client)
+        metrics = DecisionMetrics()
+        provider = KeyRotatingProvider(
+            "open_code_zen", ("k-bad", "k-ok"), backend_for(status, body),
+            metrics=metrics, transient_retries=0,
+        )
+        try:
+            await provider.complete(
+                "p", deadline=time.monotonic() + 5, turn_id="t"
+            )
+            return "ok"
+        except Exception as exc:  # noqa: BLE001
+            return type(exc).__name__
+
+    # 429 -> rota y termina en ProviderPoolExhausted (2 claves, cooldown)
+    assert await classify(429, {"error": {"code": 429}}) == "ProviderPoolExhausted"
+    # 401 -> cuarentena de la clave, termina exhausted
+    assert await classify(401, {"error": {"message": "bad key"}}) == "ProviderPoolExhausted"
+    # 403 credential-specific (google reason) -> cuarentena
+    body_cred = {"error": {"code": 403, "status": "PERMISSION_DENIED",
+                            "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                                         "reason": "API_KEY_INVALID"}]}}
+    assert await classify(403, body_cred) == "ProviderPoolExhausted"
+    # 403 model-wide -> FatalProviderError inmediato (sin quemar)
+    body_wide = {"error": {"code": 403, "status": "PERMISSION_DENIED",
+                           "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                                        "reason": "ACCESS_DENIED"}]}}
+    assert await classify(403, body_wide) == "FatalProviderError"
