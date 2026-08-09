@@ -344,6 +344,113 @@ async def test_fingerprint_cambia_si_learnsets_learn_methods_muta_sin_cambiar_id
     )
 
 
+@requires_databases
+async def test_snapshot_unico_ignora_escritura_concurrente_entre_fingerprint_y_copia(monkeypatch):
+    """R6 (LINEAR_VERDICT sobre f1a56f83): L-02 corregía el mecanismo
+    (una única transacción `REPEATABLE READ` envolviendo huella + copia +
+    validación) pero no tenía un canario que probara la carrera en sí --
+    mutar `isolation="repeatable_read"` a `"read_committed"` dejaba los 9
+    tests de R5 igual de verdes. Este test coordina DETERMINÍSTICAMENTE,
+    via un hook sobre `_load_dex_table`, una escritura desde OTRA conexión
+    que ocurre DESPUÉS de que `_template_name` ya fijó el snapshot (la
+    huella completa -- las 5 tablas -- ya se calculó antes de que
+    `_load_dex_table` copie una sola fila) pero ANTES de que arranque la
+    copia.
+
+    Corre enteramente contra una fuente dex descartable propia (nunca
+    `DATABASE_URL`); la escritura concurrente ocurre sobre ESA base
+    descartable, no sobre la compartida.
+    """
+    base = os.environ["TEST_DATABASE_URL"]
+
+    async with disposable_database(base) as fake_source_url:
+        conn = await asyncpg.connect(fake_source_url)
+        try:
+            await _seed_minimal_dex(conn)  # moves.pp arranca en 15
+        finally:
+            await conn.close()
+
+        real_loader = _dex_template._load_dex_table
+        injected = {"done": False}
+
+        async def loader_con_escritura_concurrente(source, dest, table):
+            # Se dispara en la PRIMERA llamada de _load_dex_table -- para
+            # entonces `_template_name` (huella de las 5 tablas) ya corrió
+            # dentro de la transaccion `source`, así que el snapshot
+            # `REPEATABLE READ` ya está fijado. La escritura es por OTRA
+            # conexión (`writer`), simulando otra sesión concurrente.
+            if not injected["done"]:
+                injected["done"] = True
+                writer = await asyncpg.connect(fake_source_url)
+                try:
+                    await writer.execute("UPDATE moves SET pp = 16 WHERE id = 1")
+                finally:
+                    await writer.close()
+            return await real_loader(source, dest, table)
+
+        monkeypatch.setattr(_dex_template, "_load_dex_table", loader_con_escritura_concurrente)
+
+        template_v1 = await ensure_dex_template(base, fake_source_url)
+        try:
+            # 1. la plantilla publicada contiene pp=15 (el snapshot ANTERIOR
+            #    a la escritura concurrente).
+            dest_conn = await asyncpg.connect(_with_database(base, template_v1))
+            try:
+                pp_template = await dest_conn.fetchval("SELECT pp FROM moves WHERE id = 1")
+            finally:
+                await dest_conn.close()
+
+            # 2. la fuente actual (fuera de cualquier transacción) contiene
+            #    pp=16 -- la escritura concurrente sí se aplicó de verdad.
+            source_conn = await asyncpg.connect(fake_source_url)
+            try:
+                pp_source = await source_conn.fetchval("SELECT pp FROM moves WHERE id = 1")
+            finally:
+                await source_conn.close()
+
+            assert pp_source == 16, (
+                f"la escritura concurrente no se aplicó a la fuente: pp={pp_source}"
+            )
+            # 3. fingerprint y copia observaron el MISMO snapshot anterior:
+            #    la plantilla, construida DESPUÉS de la escritura
+            #    concurrente en tiempo real, igual quedó en pp=15 -- prueba
+            #    que ni la huella ni la copia vieron el pp=16 que ya existía
+            #    en la fuente para cuando `_load_dex_table` corrió.
+            assert pp_template == 15, (
+                f"la plantilla publicada tiene que reflejar el snapshot ANTERIOR "
+                f"a la escritura concurrente (pp=15) -- fingerprint y copia "
+                f"tienen que haber visto el mismo estado de la fuente; "
+                f"tiene pp={pp_template} (fuente actual: pp={pp_source})"
+            )
+
+            # 4. una segunda llamada posterior, con la fuente YA mutada y sin
+            #    ninguna carrera en el medio, produce OTRO nombre
+            #    fingerprintado y una plantilla con pp=16.
+            monkeypatch.setattr(_dex_template, "_load_dex_table", real_loader)
+            template_v2 = await ensure_dex_template(base, fake_source_url)
+            try:
+                assert template_v2 != template_v1, (
+                    "una corrida posterior, con la fuente ya mutada a pp=16, "
+                    "tiene que producir un nombre fingerprintado distinto"
+                )
+                dest_conn_v2 = await asyncpg.connect(_with_database(base, template_v2))
+                try:
+                    pp_template_v2 = await dest_conn_v2.fetchval(
+                        "SELECT pp FROM moves WHERE id = 1",
+                    )
+                finally:
+                    await dest_conn_v2.close()
+                assert pp_template_v2 == 16, (
+                    f"la segunda plantilla tiene que reflejar la fuente actual "
+                    f"(pp=16), tiene pp={pp_template_v2}"
+                )
+            finally:
+                # 5. limpieza exacta: sólo las bases que este test creó.
+                await _drop_database(base, template_v2)
+        finally:
+            await _drop_database(base, template_v1)
+
+
 @pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
     reason="necesita DATABASE_URL para probar el rechazo (solo lectura: "
