@@ -695,6 +695,7 @@ def _patch_play_dependencies(monkeypatch, agent_type) -> None:
             showdown_ws_url="ws://localhost:8100/showdown/websocket",
             bot_username="Bot",
             database_url="postgresql+asyncpg://x:x@localhost:15432/x",
+            battle_timeout_seconds=5.0,
         ),
     )
     monkeypatch.setattr(cli_module, "_check_showdown_reachable", reachable)
@@ -820,7 +821,16 @@ async def test_play_deadline_real_retorna_vacio_y_limpia_hijas(monkeypatch):
                 raise
 
     _patch_play_dependencies(monkeypatch, FakeAgent)
-    monkeypatch.setattr(cli_module, "BATTLE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        cli_module,
+        "load_settings",
+        lambda: SimpleNamespace(
+            showdown_ws_url="ws://localhost:8100/showdown/websocket",
+            bot_username="Bot",
+            database_url="postgresql+asyncpg://x:x@localhost:15432/x",
+            battle_timeout_seconds=0.01,
+        ),
+    )
 
     try:
         tags = await asyncio.wait_for(
@@ -876,6 +886,7 @@ def _patch_benchmark_command_dependencies(monkeypatch, agent_type) -> None:
             llm_model="fake-model",
             llm_request_timeout_seconds=10,
             decision_budget_seconds=10,
+            battle_timeout_seconds=0.01,
             bot_username="Bot",
             showdown_battle_format="gen6randombattle",
         ),
@@ -916,7 +927,8 @@ def _patch_benchmark_command_dependencies(monkeypatch, agent_type) -> None:
 def test_benchmark_command_deadline_clasificado_y_escribe_final(
     monkeypatch, tmp_path
 ):
-    """El CLI pasa `BATTLE_TIMEOUT_SECONDS`, clasifica el deadline y escribe
+    """El CLI propaga `LUDEX_BATTLE_TIMEOUT_SECONDS` (via settings ->
+    _benchmark_command -> run_benchmark), clasifica el deadline y escribe
     snapshot/ledger final con progreso acumulado."""
 
     class SlowAgent:
@@ -937,17 +949,17 @@ def test_benchmark_command_deadline_clasificado_y_escribe_final(
             await asyncio.Event().wait()
 
     _patch_benchmark_command_dependencies(monkeypatch, SlowAgent)
-    monkeypatch.setattr(cli_module, "BATTLE_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path)
 
     real_run_benchmark = run_benchmark
     timeout_values: list[float | None] = []
 
     async def spy_run_benchmark(*args, timeout=None, **kwargs):
-        expected = cli_module.BATTLE_TIMEOUT_SECONDS
         timeout_values.append(timeout)
-        assert timeout == expected, (
-            f"timeout={timeout!r} != BATTLE_TIMEOUT_SECONDS={expected!r}"
+        assert timeout == 0.01, (
+            f"timeout={timeout!r} != valor configurado 0.01: si alguien "
+            f"vuelve a una constante fija de 180s, la matriz abortaria "
+            f"batallas largas sin respetar el config"
         )
         return await real_run_benchmark(*args, timeout=timeout, **kwargs)
 
@@ -971,6 +983,7 @@ def test_benchmark_command_deadline_clasificado_y_escribe_final(
             "SHOWDOWN_WS_URL": "ws://localhost:8100/showdown/websocket",
             "LUDEX_PROVIDER": "fake",
             "LUDEX_MODEL": "fake-model",
+            "LUDEX_BATTLE_TIMEOUT_SECONDS": "0.01",
         },
     )
 
@@ -1048,6 +1061,7 @@ def test_benchmark_command_transient_con_causa_persiste_tipos_en_json(
             "SHOWDOWN_WS_URL": "ws://localhost:8100/showdown/websocket",
             "LUDEX_PROVIDER": "fake",
             "LUDEX_MODEL": "fake-model",
+            "LUDEX_BATTLE_TIMEOUT_SECONDS": "0.01",
         },
     )
 
@@ -1063,3 +1077,128 @@ def test_benchmark_command_transient_con_causa_persiste_tipos_en_json(
     rendered = artifact.read_text()
     assert "Request timed out" not in rendered
     assert "api.kimi.com" not in rendered
+
+
+def test_benchmark_pasa_battle_timeout_al_comando_interno(monkeypatch):
+    """F2-10B (MON-20): `--battle-timeout` del CLI llega hasta
+    `_benchmark_command`. Si la opcion se ignorara y se usara el default
+    (180) en vez del valor configurado, este test falla."""
+    captured: dict[str, object] = {}
+
+    async def fake_benchmark_command(*, on_progress, battle_timeout_seconds,
+                                     **kwargs):
+        captured["battle_timeout_seconds"] = battle_timeout_seconds
+        metrics = {
+            "turns_total": 2, "calls_total": 2,
+            "input_tokens": 100, "output_tokens": 20,
+            "cached_input_tokens": 0, "reasoning_tokens": 0,
+            "turns_model_invalid": 0, "turns_fallback": 0,
+            "turns_deadline_affected": 0, "key_rotations": 0,
+        }
+        progress = BenchmarkResult(
+            requested=2, completed=0, wins=0, losses=0, ties=0,
+            provider="open_code_zen", model="mimo-v2.5-free",
+        )
+        await on_progress(progress, metrics)
+        return (
+            BenchmarkResult(
+                requested=2, completed=2, wins=1, losses=1, ties=0,
+                provider="open_code_zen", model="mimo-v2.5-free",
+            ),
+            metrics,
+        )
+
+    monkeypatch.setattr(
+        "ludex_agent.cli._benchmark_command", fake_benchmark_command
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark", "--n", "2", "--opponent", "simple_heuristics",
+            "--provider", "open_code_zen", "--model", "mimo-v2.5-free",
+            "--battle-timeout", "1800", "--no-record",
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "LUDEX_PROVIDER": "open_code_zen",
+            "LUDEX_MODEL": "mimo-v2.5-free",
+            "OPEN_CODE_ZEN_API_KEY": "fake-key",
+            "OPEN_CODE_ZEN_BASE_URL": "https://opencode.ai/zen/v1",
+        },
+    )
+    assert result.exit_code == 0
+    assert captured.get("battle_timeout_seconds") == 1800.0
+
+
+def test_benchmark_rechaza_battle_timeout_no_positivo(monkeypatch):
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark", "--n", "1", "--opponent", "random",
+            "--provider", "google", "--model", "gemini-2.5-flash",
+            "--battle-timeout", "0", "--no-record",
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "GEMINI_API_KEY": "fake-key",
+        },
+    )
+    assert result.exit_code != 0
+    assert "positivo" in result.stdout
+
+
+@pytest.mark.asyncio
+async def test_battle_timeout_llega_a_run_benchmark(monkeypatch):
+    """La propagacion NO puede volver a una constante fija: el timeout que
+    recibe run_benchmark tiene que ser exactamente el configurado (1800),
+    no el default productivo (180)."""
+    captured: dict[str, object] = {}
+
+    async def fake_run_benchmark(agent, rival, *, timeout, **kwargs):
+        captured["timeout"] = timeout
+        return BenchmarkResult(
+            requested=2, completed=2, wins=1, losses=1, ties=0,
+            provider="google", model="gemini-2.5-flash",
+        )
+
+    async def fake_reachable(ws_url):
+        return None
+
+    monkeypatch.setattr(cli_module, "run_benchmark", fake_run_benchmark)
+    monkeypatch.setattr(cli_module, "_check_showdown_reachable", fake_reachable)
+    monkeypatch.setattr(
+        cli_module, "local_server_configuration", lambda ws_url: None
+    )
+    monkeypatch.setattr(
+        cli_module, "_benchmark_provider",
+        lambda *a, **k: type("Selected", (), {})() if False else object(),
+    )
+    monkeypatch.setattr(cli_module, "CalcClient", lambda *a, **k: type(
+        "Calc", (), {"aclose": lambda self: asyncio.sleep(0)})())
+    monkeypatch.setattr(cli_module, "PostgresContextRepository", lambda url: type(
+        "Ctx", (), {"aclose": lambda self: asyncio.sleep(0)})())
+    monkeypatch.setattr(cli_module, "build_decision_graph",
+                        lambda *a, **k: None)
+    def fake_player_class(**init_kwargs):
+        class Player:
+            n_won_battles = 1
+            n_lost_battles = 1
+            n_tied_battles = 0
+            battles = []
+        return Player()
+
+    monkeypatch.setattr(cli_module, "LudexPlayer", fake_player_class)
+    monkeypatch.setattr(cli_module, "RandomPlayer", lambda **k: object())
+    monkeypatch.setattr(cli_module, "MaxBasePowerPlayer", lambda **k: object())
+    monkeypatch.setattr(cli_module, "SimpleHeuristicsPlayer", lambda **k: object())
+    monkeypatch.setattr(cli_module, "make_engine", lambda url: type(
+        "Engine", (), {"dispose": lambda self: asyncio.sleep(0)})())
+    monkeypatch.setattr(cli_module, "session_factory", lambda engine: None)
+    monkeypatch.setattr(cli_module, "BattleRepository", lambda factory: None)
+
+    await cli_module._benchmark_command(
+        n=2, opponent="random", concurrency=1, persist=False,
+        provider_name="google", model="gemini-2.5-flash",
+        fmt="gen6randombattle", battle_timeout_seconds=1800.0,
+    )
+    assert captured.get("timeout") == 1800.0

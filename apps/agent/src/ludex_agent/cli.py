@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -40,11 +42,11 @@ from .graph.provider import (
     DecisionMetrics,
     GeminiDecisionProvider,
     ModelRoute,
-    OpenAICompatibleDecisionProvider,
     PinnedResolver,
     ProviderChain,
     ProviderError,
     ProviderSelectionError,
+    build_route_provider,
     load_model_routes,
     model_route,
     provider_keys,
@@ -70,13 +72,6 @@ AGENT_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_LEDGER_PATH = REPO_ROOT / "docs" / "BENCHMARKS.md"
 DEFAULT_RUNS_PATH = AGENT_ROOT / "evals" / "runs"
-
-# Una batalla de gen6randombattle ronda los 60-120 turnos y tarda segundos.
-# Este techo es holgado a proposito: solo existe para que un server colgado
-# no deje el proceso esperando indefinidamente. Es POR BATALLA (minor de la
-# review final: antes era `* n`, presupuestando el lote entero y haciendose
-# cada vez mas probable de saltar cuanto mas grande el lote).
-BATTLE_TIMEOUT_SECONDS = 180
 
 
 def _progress_summary(record: BenchmarkRecord) -> str:
@@ -185,7 +180,7 @@ async def play(n: int, fmt: str, *, source: str = "local") -> list[str]:
             # lote, y la batalla se persiste apenas termina, no despues de
             # jugar las n. Un cuelgue en la batalla 5 de 5 ya no tira a la
             # basura las 4 anteriores, que quedaron commiteadas.
-            battle_timeout = asyncio.timeout(BATTLE_TIMEOUT_SECONDS)
+            battle_timeout = asyncio.timeout(settings.battle_timeout_seconds)
             try:
                 async with battle_timeout:
                     await _battle_against_or_failure(agent, rival)
@@ -356,22 +351,10 @@ def _benchmark_provider(
             keys, model=model, response_schema=DecisionResponse,
             timeout_seconds=timeout, metrics=metrics,
         )
-    elif route is not None and route.protocol == "messages":
-        selected = AnthropicDecisionProvider(
-            keys, name=name, model=model,
-            base_url=os.environ.get(base_env) if base_env else None,
-            response_schema=DecisionResponse, timeout_seconds=timeout,
-            metrics=metrics, route=route,
-        )
-    elif route is not None and route.protocol == "responses":
-        raise RuntimeError(
-            f"{name}/{model}: protocolo responses todavía no implementado"
-        )
     else:
-        selected = OpenAICompatibleDecisionProvider(
-            name, keys, model=model, base_url=os.environ.get(base_env) if base_env else None,
-            response_schema=DecisionResponse, timeout_seconds=timeout,
-            metrics=metrics, route=route,
+        selected = build_route_provider(
+            name, model, base_url=os.environ.get(base_env) if base_env else None,
+            keys=keys, metrics=metrics, timeout_seconds=timeout, route=route,
         )
     # Regla de medición: aunque exista LUDEX_PROVIDER_CHAIN, el benchmark
     # queda fijado al proveedor/modelo elegidos y nunca cruza de proveedor.
@@ -554,6 +537,7 @@ def model_set_command(
 async def _benchmark_command(
     *, n: int, opponent: str, concurrency: int, persist: bool,
     provider_name: str, model: str, fmt: str,
+    battle_timeout_seconds: float,
     on_progress: Callable[
         [BenchmarkResult, Mapping[str, int | None]], Awaitable[None] | None
     ] | None = None,
@@ -624,7 +608,7 @@ async def _benchmark_command(
                 persist_battle=persist_tag if persist else None,
                 provider=provider_name, model=model,
                 on_progress=report_progress,
-                timeout=BATTLE_TIMEOUT_SECONDS,
+                timeout=battle_timeout_seconds,
             )
         except (ProviderError, BenchmarkDeadlineExceeded) as exc:
             completed = (
@@ -665,8 +649,18 @@ def benchmark_command(
     pricing: Path = DEFAULT_PRICING_PATH,
     ledger: Path = DEFAULT_LEDGER_PATH,
     record: bool = True,
+    battle_timeout: float | None = typer.Option(
+        None, "--battle-timeout",
+        help="Deadline por batalla en segundos (default: LUDEX_BATTLE_TIMEOUT_SECONDS o 180). "
+        "La matriz usa 1800. Positivo; independiente del deadline de cada decision.",
+    ),
 ) -> None:
     settings = load_settings()
+    if battle_timeout is not None and battle_timeout <= 0:
+        raise typer.BadParameter("--battle-timeout debe ser un numero positivo")
+    effective_battle_timeout = (
+        battle_timeout or settings.battle_timeout_seconds
+    )
     provider_name = provider or settings.llm_provider
     model_name = model or settings.llm_model
     if not model_name:
@@ -702,6 +696,7 @@ def benchmark_command(
             route=effective_route,
             pricing=pricing_table,
             status="running",
+            battle_timeout_seconds=effective_battle_timeout,
         )
         if record:
             write_run_snapshot(partial, artifact)
@@ -712,6 +707,7 @@ def benchmark_command(
             n=n, opponent=opponent, concurrency=concurrency, persist=persist,
             provider_name=provider_name, model=model_name,
             fmt=fmt or settings.showdown_battle_format,
+            battle_timeout_seconds=effective_battle_timeout,
             on_progress=report_progress,
         ))
     except ProviderSelectionError as exc:
@@ -761,6 +757,7 @@ def benchmark_command(
             route=effective_route,
             pricing=pricing_table,
             status="not-run",
+            battle_timeout_seconds=effective_battle_timeout,
         )
         if record:
             write_run_snapshot(not_run_record, artifact)
@@ -789,6 +786,7 @@ def benchmark_command(
         fmt=fmt or settings.showdown_battle_format,
         route=effective_route,
         pricing=pricing_table,
+        battle_timeout_seconds=effective_battle_timeout,
     )
     typer.echo(
         f"usage_calls={metrics.get('calls_total', 0)} "
@@ -802,6 +800,167 @@ def benchmark_command(
         typer.echo(f"benchmark_record={artifact}")
     if result.failure:
         raise typer.Exit(code=1)
+
+
+@app.command("matrix-plan")
+def matrix_plan_command(
+    inventory: Path = typer.Option(
+        None, "--inventory",
+        help="Inventario baseline commiteado (default: ultimo "
+        "2026*provider-matrix-inventory*.json en evals/runs)",
+    ),
+    manifest: Path = typer.Option(
+        None, "--manifest", help="Archivo de manifiesto de salida",
+    ),
+    budget: Path | None = typer.Option(
+        None, "--budget",
+        help="JSON de presupuesto: {provider: {balance_usd, cap_usd, leave_usd}}",
+    ),
+    overrides: Path | None = typer.Option(
+        None, "--overrides",
+        help="Inventario enriquecido (tier_override/prices/deprecated) que "
+        "matiza el baseline: lo que la tabla de precios no cubre o el tier "
+        "no puede probarse (p.ej. Gemini free-tier no verificado).",
+    ),
+    no_refresh: bool = typer.Option(False, "--no-refresh"),
+) -> None:
+    """Construye el manifiesto reproducible de la matriz SIN consumir cuota.
+
+    Refresca /models (metadata) de google/kimi/open_code_zen, calcula
+    altas/bajas contra el inventario commiteado, y escribe una fila por
+    provider/model con protocolo/ruta, tier, costo estimado y clasificacion
+    (ready / excluded / missing-route / pending-budget). No ejecuta smokes
+    ni batallas: es el plan que Latwan aprueba antes de gastar."
+    """
+    from .matrix import (
+        BudgetSpec,
+        build_manifest,
+        delta_catalog,
+        manifest_to_dict,
+        plan_budget,
+        refresh_models,
+        tier_prices_from_pricing_table,
+    )
+    from .eval_cost import PricingTable
+
+    settings = load_settings()
+    pricing_table = PricingTable.load(
+        Path(os.environ.get(
+            "LUDEX_PRICING_TABLE", DEFAULT_PRICING_PATH
+        ))
+    )
+    tier_prices = tier_prices_from_pricing_table(pricing_table)
+    import asyncio as _asyncio
+
+    previous = {}
+    inventory_path = inventory
+    if inventory_path is None:
+        candidates = sorted(
+            Path(DEFAULT_RUNS_PATH).glob("*provider-matrix-inventory*.json")
+        )
+        if not candidates:
+            raise typer.BadParameter(
+                "no hay inventario baseline en evals/runs; pasalo con --inventory"
+            )
+        inventory_path = candidates[-1]
+    previous = json.loads(inventory_path.read_text(encoding="utf-8"))
+    if overrides is not None:
+        enrichment = json.loads(overrides.read_text(encoding="utf-8"))
+        prev_models = previous.setdefault("models", {})
+        for provider, entries in enrichment.get("models", {}).items():
+            by_id = {
+                entry.get("id"): entry for entry in prev_models.get(provider, [])
+            }
+            for entry in entries:
+                model_id = entry.get("id")
+                if model_id is None:
+                    continue
+                target = by_id.get(model_id)
+                if target is None:
+                    target = {"id": model_id}
+                    by_id[model_id] = target
+                target.update(entry)
+            prev_models[provider] = list(by_id.values())
+
+    budgets: dict[str, BudgetSpec] = {}
+    if budget is not None:
+        raw = json.loads(budget.read_text(encoding="utf-8"))
+        budgets = {
+            name: BudgetSpec(
+                balance_usd=Decimal(str(spec["balance_usd"])),
+                cap_usd=Decimal(str(spec["cap_usd"])),
+                leave_usd=Decimal(str(spec.get("leave_usd", 0))),
+            )
+            for name, spec in raw.items()
+        }
+
+    async def run() -> None:
+        fresh: dict[str, list[str]] = {}
+        if not no_refresh:
+            for provider, (key_env, base_env) in (
+                ("google", ("GEMINI_API_KEY", None)),
+                ("kimi", ("KIMI_API_KEY", "KIMI_BASE_URL")),
+                ("open_code_zen", (
+                    "OPEN_CODE_ZEN_API_KEY", "OPEN_CODE_ZEN_BASE_URL",
+                )),
+            ):
+                key = os.environ.get(key_env, "").strip()
+                base_url = (
+                    os.environ.get(base_env, "").strip()
+                    if base_env else None
+                )
+                if not key:
+                    typer.echo(f"matrix-plan: {provider} sin clave, catalogo no refrescado")
+                    continue
+                models = await refresh_models(
+                    provider, base_url=base_url, api_key=key,
+                    environ=os.environ,
+                )
+                fresh[provider] = models
+                typer.echo(f"matrix-plan: {provider} /models = {len(models)}")
+        else:
+            for provider in ("google", "kimi", "open_code_zen"):
+                prev = previous.get("models", {}).get(provider, [])
+                fresh[provider] = [entry["id"] for entry in prev]
+
+        delta = delta_catalog(
+            {
+                provider: [entry["id"] for entry in previous.get("models", {}).get(provider, [])]
+                for provider in ("google", "kimi", "open_code_zen")
+            },
+            fresh,
+        )
+        for provider, changes in delta.items():
+            typer.echo(
+                f"matrix-plan: delta {provider}: "
+                f"+{len(changes['added'])} -{len(changes['removed'])}"
+            )
+        rows = build_manifest(
+            fresh,
+            previous_inventory=previous,
+            tier_prices=tier_prices,
+        )
+        rows = plan_budget(rows, budgets)
+        target = manifest or (
+            Path(DEFAULT_RUNS_PATH)
+            / f"{datetime.now(timezone.utc).strftime('%Y%m%dt%H%M%Sz')}-matrix-manifest.json"
+        )
+        document = manifest_to_dict(rows)
+        document["delta"] = delta
+        document["baseline_inventory"] = str(inventory_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(document, indent=2, ensure_ascii=False, default=str) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+        by_status: dict[str, int] = {}
+        for row in rows:
+            by_status[row.status] = by_status.get(row.status, 0) + 1
+        typer.echo(f"matrix-plan: {target} rows={len(rows)} {by_status}")
+
+    _asyncio.run(run())
 
 
 if __name__ == "__main__":

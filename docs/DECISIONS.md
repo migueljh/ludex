@@ -2357,3 +2357,77 @@ el modelo que efectivamente ejecutó: `20260808-opencode-claude-haiku-4-5-screen
 (antes `20260808-opencode-mimo-screen`), en archivo, `run_id`, ledger y
 notas. Un artefacto pinneado jamás se identifica por un modelo distinto del
 efectivo.
+
+## D43 — matriz de compatibilidad de proveedores con protocolos declarativos y presupuesto por provider (F2-10B/MON-20)
+
+**Contexto.** MON-20 exige probar en batallas aisladas cada modelo accesible
+de Gemini, Kimi y OpenCode Zen. La documentación oficial de Zen (2026-08-07)
+asigna familias a endpoints distintos: GPT y Grok → `/responses`, Claude y
+Qwen → `/messages`, familias chinas (DeepSeek, MiniMax, GLM, Kimi, MiMo,
+libres) → `/chat/completions`, y Gemini → su endpoint nativo por modelo
+(`/models/<id>`). El repo reconocía `responses` en el schema de rutas pero lo
+rechazaba en runtime, y no había deadline por batalla configurable.
+
+**Decisiones:**
+
+1. **Protocolo por ruta, no por ensayo.** `model-routes.json` declara por
+   provider/model: protocolo, structured output, temperature/thinking,
+   max_tokens, timeout y endpoint opcional. `build_route_provider` es el
+   ÚNICO punto de despacho (responses → backend OpenAI Responses,
+   messages → Anthropic, google → Gemini nativo con base_url del gateway,
+   chat_completions → OpenAI-compatible). Un modelo sin ruta se clasifica
+   `missing-route` en la matriz: NUNCA se prueba "chat_completions y si
+   falla messages" pagando. `responses` usa JSON textual estricto
+   (`text_json`) sometido a la misma validación semántica de D26; el
+   método puede sobreescribirse por ruta (`structured_output`).
+
+2. **Cuarentena de credenciales distinta del cooldown de cuota.** Un
+   401/403 es específico de UNA clave (vencida/revocada): nueva clase
+   `CredentialRejected`; `KeyRotatingProvider` pone esa clave en
+   cuarentena PERMANENTE para el proceso y sigue con la siguiente, con
+   contador propio `keys_quarantined` (no confundir con `key_rotations`,
+   que es de 429/cooldown). Un error model-wide (404, 400, fatal)
+   detiene la corrida en la primera clave: el pool de 11 no se quema en
+   vano (canario). Pool completo rechazado → `ProviderPoolExhausted`
+   ("quarantined"), clasificado `credential/model unavailable` — nunca
+   un falso incompatible.
+
+3. **Fix real: la rotación de Gemini jamas rotaba credenciales.** Los
+   campos reales de `ChatGoogleGenerativeAI` son `google_api_key`,
+   `max_retries`, `timeout` y `base_url`; el código pasaba
+   `api_key`/`retries`/`request_timeout`, que pydantic ignora en silencio
+   (extra=ignore): cada llamada usaba la clave del entorno y las 11 del
+   pool nunca se rotaban de verdad. Se corrigió con TDD y mutación
+   (revertir `google_api_key` rompe el test). `base_url` además habilita
+   el protocolo nativo de Gemini detrás del gateway Zen.
+
+4. **Deadline por batalla configurable.** `LUDEX_BATTLE_TIMEOUT_SECONDS`
+   (default productivo 180, positivo, `--battle-timeout` en CLI), se
+   propaga hasta `run_benchmark` y se persiste en TODOS los artefactos
+   (`battle_timeout_seconds`), sin tocar el deadline compartido de cada
+   decisión (D26). La matriz usa 1800. Mutaciones verificadas: ignorar el
+   valor configurado, persistir otro valor o volver a una constante fija
+   rompen tests.
+
+5. **Matriz dinámica con presupuesto.** `agent matrix-plan` refresca
+   /models (metadata, sin cuota) antes de cada ronda, publica altas/bajas
+   contra el inventario commiteado, y escribe un manifiesto con una fila
+   por provider/model: pin estricto, concurrency=1, persist=false, dos
+   batallas solo si el smoke pasa, tier/precio/costo estimado por modelo.
+   Presupuesto por provider (addendum): orden ascendente por costo,
+   reserva smoke + dos batallas antes de iniciar, hard-stop antes del cap
+   (Zen cap 10 USD dejando 1; Kimi 5.50 dejando 0.50; Gemini solo free
+   tier confirmado). Si el saldo no alcanza → `pending-budget`/`not-run`,
+   NUNCA unsupported/incompatible/externally-limited, preservando
+   protocolo/ruta/costo y sin publicar winrate. Gemini NO se asume gratis:
+   tier por modelo con fuente; sin prueba de costo cero → pending-budget.
+
+**Límite documentado.** El free tier de Gemini no pudo verificarse contra
+la página oficial (no accesible desde esta máquina); las 11 claves son free
+tier según el usuario, pero el tier por modelo queda marcado `unknown`
+(excepto Gemma 4, $0.00 con pesos abiertos) hasta confirmarse en la cuenta
+al ejecutar. `moonshot-v1-auto` y `claude-sonnet-4` (deprecado) no tienen
+precio publicable → pending-budget. `ling-3.0-flash-free` no figura en la
+documentación de Zen → `missing-route` hasta verificación. Los modelos
+deprecados (docs Zen) siguen listados en /models y en scope, marcados como
+deprecados.

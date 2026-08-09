@@ -2,12 +2,15 @@ import asyncio
 import logging
 import time
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from anthropic import APITimeoutError as AnthropicAPITimeoutError
 from openai import APITimeoutError as OpenAIAPITimeoutError
 from pydantic import BaseModel, Field, ValidationError
+
+from ludex_agent.graph.decision import DecisionResponse
 
 from ludex_agent.graph.provider import (
     CompletionEnvelope,
@@ -165,30 +168,67 @@ def test_rutas_de_modelo_eligen_el_protocolo_real():
 
     assert model_route(
         routes, "open_code_zen", "minimax-m2.7"
-    ) == ModelRoute(protocol="chat_completions")
+    ) == ModelRoute(
+        protocol="chat_completions", structured_output="json_schema",
+        timeout_seconds=60,
+    )
     assert model_route(
         routes, "open_code_zen", "deepseek-v4-pro"
-    ) == ModelRoute(protocol="chat_completions")
+    ) == ModelRoute(
+        protocol="chat_completions", structured_output="json_schema",
+        timeout_seconds=60,
+    )
     assert model_route(
         routes, "open_code_zen", "deepseek-v4-flash"
-    ) == ModelRoute(protocol="chat_completions")
+    ) == ModelRoute(
+        protocol="chat_completions", structured_output="json_schema",
+        timeout_seconds=60,
+    )
+    assert model_route(
+        routes, "open_code_zen", "gpt-5.5"
+    ) == ModelRoute(
+        protocol="responses", structured_output="text_json",
+        timeout_seconds=120,
+    )
+    assert model_route(
+        routes, "open_code_zen", "grok-4.5"
+    ) == ModelRoute(
+        protocol="responses", structured_output="text_json",
+        timeout_seconds=120,
+    )
+    assert model_route(
+        routes, "open_code_zen", "claude-haiku-4-5"
+    ) == ModelRoute(
+        protocol="messages", structured_output="text_json",
+        timeout_seconds=60,
+    )
+    assert model_route(
+        routes, "open_code_zen", "gemini-3.6-flash"
+    ) == ModelRoute(
+        protocol="google", structured_output="json_schema",
+        timeout_seconds=60,
+    )
     assert model_route(
         routes, "open_code_zen", "qwen3.5-plus"
     ) == ModelRoute(
-        protocol="messages",
+        protocol="messages", structured_output="text_json",
         max_tokens=1024,
         timeout_seconds=60,
     )
     assert model_route(
         routes, "open_code_zen", "qwen3.6-plus"
-    ) == ModelRoute(protocol="messages")
+    ) == ModelRoute(
+        protocol="messages", structured_output="text_json",
+        timeout_seconds=60,
+    )
     assert model_route(
         routes, "kimi", "kimi-k2.6"
     ) == ModelRoute(
-        protocol="chat_completions",
+        protocol="chat_completions", structured_output="json_schema",
         temperature=1.0,
         thinking="enabled",
         max_tokens=16_000,
+        timeout_seconds=120,
     )
 
 
@@ -1060,3 +1100,310 @@ async def test_pinned_auditor_permite_respuesta_que_coincide_con_el_pin():
         "p", deadline=time.monotonic() + 1, turn_id="t"
     )
     assert envelope.model == "gemini-2.5-flash"
+
+
+# --- F2-10B (MON-20): cuarentena de credenciales, pool de 11 claves y
+# protocolos declarativos ------------------------------------------------
+
+
+def _http_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://provider.example/v1/x")
+    return httpx.HTTPStatusError(
+        "request failed",
+        request=request,
+        response=httpx.Response(status, request=request),
+    )
+
+
+@pytest.mark.asyncio
+async def test_401_cuarentena_solo_esa_clave_y_sigue_con_la_siguiente():
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([_http_error(401), {"ok": True}])
+    provider = KeyRotatingProvider(
+        "google", ("key-bad", "key-ok"), backend, metrics=metrics
+    )
+
+    result = await provider.complete(
+        "p", deadline=time.monotonic() + 1, turn_id="t1"
+    )
+
+    assert result.payload == {"ok": True}
+    assert backend.calls == [("p", "key-bad"), ("p", "key-ok")]
+    assert metrics.snapshot()["keys_quarantined"] == 1
+    assert metrics.snapshot()["key_rotations"] == 0
+    # La clave en cuarentena NO se vuelve a probar en el turno siguiente.
+    backend.responses.append({"ok2": True})
+    await provider.complete("p", deadline=time.monotonic() + 1, turn_id="t2")
+    assert backend.calls == [
+        ("p", "key-bad"), ("p", "key-ok"), ("p", "key-ok"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_403_cuarentena_solo_esa_clave():
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([_http_error(403), {"ok": True}])
+    provider = KeyRotatingProvider(
+        "google", ("key-bad", "key-ok"), backend, metrics=metrics
+    )
+    result = await provider.complete(
+        "p", deadline=time.monotonic() + 1, turn_id="t"
+    )
+    assert result.payload == {"ok": True}
+    assert metrics.snapshot()["keys_quarantined"] == 1
+    assert metrics.snapshot()["turns_quota_affected"] == 0
+
+
+@pytest.mark.asyncio
+async def test_todas_las_claves_401_terminan_en_pool_exhausted_sin_quemar():
+    keys = tuple(f"k{i}" for i in range(11))
+    backend = ScriptedBackend([_http_error(401)] * 11)
+    provider = KeyRotatingProvider(
+        "google", keys, backend, metrics=DecisionMetrics()
+    )
+    with pytest.raises(ProviderPoolExhausted, match="quarantined"):
+        await provider.complete(
+            "p", deadline=time.monotonic() + 5, turn_id="t"
+        )
+    # Exactamente un intento por clave: ninguna se repite.
+    assert len(backend.calls) == 11
+    assert {call[1] for call in backend.calls} == set(keys)
+    assert provider._metrics.snapshot()["keys_quarantined"] == 11
+
+
+@pytest.mark.asyncio
+async def test_error_model_wide_no_quema_el_pool_de_11_claves():
+    """Canario MON-20: un error model-wide (404 de modelo, fatal) detiene
+    la corrida en la PRIMERA clave. Si el codigo rotara sobre las 11, el
+    pool se quemaria en vano y este test fallaria."""
+    keys = tuple(f"k{i}" for i in range(11))
+    backend = ScriptedBackend([_http_error(404)])
+    provider = KeyRotatingProvider(
+        "google", keys, backend, metrics=DecisionMetrics()
+    )
+    with pytest.raises(FatalProviderError):
+        await provider.complete(
+            "p", deadline=time.monotonic() + 5, turn_id="t"
+        )
+    assert len(backend.calls) == 1
+    assert backend.calls[0][1] == keys[0]
+
+
+@pytest.mark.asyncio
+async def test_pool_de_11_claves_rota_429_hasta_encontrar_una_disponible():
+    metrics = DecisionMetrics()
+    responses: list = [QuotaExceeded("quota") for _ in range(10)]
+    responses.append({"ok": True})
+    backend = ScriptedBackend(responses)
+    provider = KeyRotatingProvider(
+        "google", tuple(f"k{i}" for i in range(11)), backend, metrics=metrics
+    )
+    result = await provider.complete(
+        "p", deadline=time.monotonic() + 5, turn_id="t"
+    )
+    assert result.payload == {"ok": True}
+    assert len(backend.calls) == 11
+    assert backend.calls[-1][1] == "k10"
+    assert metrics.snapshot()["key_rotations"] == 10
+    assert metrics.snapshot()["turns_quota_affected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rotacion_comparte_un_mismo_deadline():
+    """Todos los intentos (rotacion incluida) comparten el deadline de la
+    decision: una rotacion no resetea el reloj ni lo extiende."""
+    clock_values = iter([0.0, 1.0, 2.0, 3.0, 99.0, 99.0])
+    metrics = DecisionMetrics()
+
+    class ScriptedClock:
+        def __call__(self) -> float:
+            return next(clock_values)
+
+    backend = ScriptedBackend([QuotaExceeded("q")] * 11)
+    provider = KeyRotatingProvider(
+        "google", tuple(f"k{i}" for i in range(11)), backend,
+        metrics=metrics, clock=ScriptedClock(),
+        quota_cooldown_seconds=60,
+    )
+    with pytest.raises(DecisionDeadlineExceeded):
+        await provider.complete(
+            "p", deadline=2.5, turn_id="t"
+        )
+    # deadline 2.5: t=0 pasa el pase, t=1 intenta la clave 0, t=2 fija el
+    # cooldown de la clave 0, t=3 evalua la clave 1 con remaining<0: la
+    # rotacion NUNCA extiende el deadline compartido.
+    assert len(backend.calls) == 1
+    assert backend.calls[0][1] == "k0"
+    assert metrics.snapshot()["turns_deadline_affected"] == 1
+
+
+def _routes_with(provider: str, model: str, protocol: str, **extra) -> dict:
+    from ludex_agent.graph.provider import ModelRoute
+    return {(provider, model): ModelRoute(protocol=protocol, **extra)}
+
+
+def test_protocolo_responses_elige_backend_responses():
+    from ludex_agent.graph.provider import (
+        OpenAIResponsesDecisionProvider,
+        _ResponsesBackend,
+        build_route_provider,
+    )
+    provider = build_route_provider(
+        "open_code_zen", "gpt-5.5",
+        base_url="https://opencode.ai/zen/v1", keys=("k",),
+        metrics=DecisionMetrics(), timeout_seconds=30,
+        route=ModelRoute(protocol="responses", temperature=0.2),
+    )
+    assert isinstance(provider, OpenAIResponsesDecisionProvider)
+    assert isinstance(provider._backend, _ResponsesBackend)
+
+
+def test_protocolo_google_zen_usa_gemini_con_base_url():
+    from ludex_agent.graph.provider import (
+        GeminiDecisionProvider,
+        build_route_provider,
+    )
+    provider = build_route_provider(
+        "open_code_zen", "gemini-3.6-flash",
+        base_url="https://opencode.ai/zen/v1", keys=("k",),
+        metrics=DecisionMetrics(), timeout_seconds=30,
+        route=ModelRoute(protocol="google"),
+    )
+    assert isinstance(provider, GeminiDecisionProvider)
+    assert provider._backend.base_url == "https://opencode.ai/zen/v1"
+
+
+def test_protocolo_messages_usa_anthropic_y_chat_completions_openai():
+    from ludex_agent.graph.provider import (
+        AnthropicDecisionProvider,
+        OpenAICompatibleDecisionProvider,
+        build_route_provider,
+    )
+    messages = build_route_provider(
+        "open_code_zen", "qwen3.6-plus",
+        base_url="https://opencode.ai/zen/v1", keys=("k",),
+        metrics=DecisionMetrics(), timeout_seconds=30,
+        route=ModelRoute(protocol="messages"),
+    )
+    assert isinstance(messages, AnthropicDecisionProvider)
+    chat = build_route_provider(
+        "open_code_zen", "deepseek-v4-flash",
+        base_url="https://opencode.ai/zen/v1", keys=("k",),
+        metrics=DecisionMetrics(), timeout_seconds=30,
+        route=ModelRoute(protocol="chat_completions"),
+    )
+    assert isinstance(chat, OpenAICompatibleDecisionProvider)
+
+
+@pytest.mark.asyncio
+async def test_backend_google_usa_google_api_key_timeout_y_base_url(monkeypatch):
+    """Los campos reales de ChatGoogleGenerativeAI son `google_api_key`,
+    `max_retries`, `timeout` y `base_url`. Los nombres `api_key`/`retries`/
+    `request_timeout` NO existen: pydantic los ignora en silencio y la
+    rotacion de claves jamas rotaba credenciales reales. Este test fija la
+    regresion: si alguien revierte a `api_key=`, el kwargs capturado no
+    contiene `google_api_key` y el test falla."""
+    captured: dict[str, object] = {}
+
+    class FakeMessage:
+        content = '{"action": "move"}'
+        usage_metadata = {
+            "input_tokens": 1, "output_tokens": 1,
+            "input_token_details": {}, "output_token_details": {},
+        }
+        response_metadata = {"model_name": "gemini-2.5-flash"}
+
+    class FakeModel:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def ainvoke(self, prompt):
+            return FakeMessage()
+
+    import langchain_google_genai
+    monkeypatch.setattr(
+        langchain_google_genai, "ChatGoogleGenerativeAI", FakeModel
+    )
+    backend = _LangChainBackend(
+        kind="google", model="gemini-2.5-flash",
+        response_schema=provider_response_schema(DecisionResponse),
+        timeout_seconds=30, base_url="https://opencode.ai/zen/v1",
+        route=ModelRoute(protocol="google", structured_output="text_json"),
+    )
+    result = await backend.complete(
+        "p", api_key="AIza-pool-key", deadline=time.monotonic() + 5
+    )
+    assert captured.get("google_api_key") == "AIza-pool-key"
+    assert captured.get("max_retries") == 0
+    assert captured.get("timeout") == 30
+    assert captured.get("base_url") == "https://opencode.ai/zen/v1"
+    assert "api_key" not in captured
+    assert result.usage.model == "gemini-2.5-flash"
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_posta_a_responses_y_parsea_usage(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeResponses:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                output_text='{"action": "switch", "target": "pikachu"}',
+                model="gpt-5.5",
+                usage=SimpleNamespace(
+                    input_tokens=100, output_tokens=20,
+                    output_tokens_details=SimpleNamespace(reasoning_tokens=5),
+                ),
+            )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+            self.responses = FakeResponses()
+
+    import openai
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeClient)
+
+    from ludex_agent.graph.provider import _ResponsesBackend
+    backend = _ResponsesBackend(
+        model="gpt-5.5",
+        base_url="https://opencode.ai/zen/v1/responses",
+        timeout_seconds=60,
+        route=ModelRoute(
+            protocol="responses", temperature=0.2, max_tokens=8000,
+        ),
+    )
+    result = await backend.complete(
+        "p", api_key="sk-zen", deadline=time.monotonic() + 5
+    )
+    client_kwargs = captured["client_kwargs"]
+    assert client_kwargs["base_url"] == "https://opencode.ai/zen/v1/responses"
+    assert client_kwargs["api_key"] == "sk-zen"
+    assert client_kwargs["max_retries"] == 0
+    assert captured["model"] == "gpt-5.5"
+    assert captured["input"] == "p"
+    assert captured["temperature"] == 0.2
+    assert captured["max_output_tokens"] == 8000
+    assert result.payload == {"action": "switch", "target": "pikachu"}
+    assert result.usage.input_tokens == 100
+    assert result.usage.output_tokens == 20
+    assert result.usage.reasoning_tokens == 5
+    assert result.usage.model == "gpt-5.5"
+
+
+def test_responses_protocolo_por_defecto_usa_text_json():
+    from ludex_agent.graph.provider import route_structured_output
+    assert route_structured_output(
+        ModelRoute(protocol="responses"), "openai", None
+    ) == "text_json"
+    assert route_structured_output(
+        ModelRoute(protocol="chat_completions"), "openai", None
+    ) == "json_schema"
+    assert route_structured_output(
+        ModelRoute(protocol="messages", structured_output="json_schema"),
+        "openai", "https://zen/v1",
+    ) == "json_schema"
+    assert route_structured_output(
+        ModelRoute(protocol="google"), "google", None
+    ) == "json_schema"

@@ -462,3 +462,43 @@ def test_not_run_conserva_provider_selection_error_sin_causa():
     assert record.failure_type == "ProviderSelectionError"
     assert record.failure_cause_type is None
     assert record.status == "not-run"
+
+
+def test_battle_timeout_se_persiste_en_el_artefacto():
+    """F2-10B (MON-20): el deadline por batalla configurado se persiste en
+    el artefacto. Si el codigo persistiera otro valor (p.ej. un 180 fijo),
+    este test falla."""
+    record = build_benchmark_record(
+        run_id="matriz-1",
+        created_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
+        result=BenchmarkResult(
+            requested=2, completed=0, wins=0, losses=0, ties=0,
+            provider="kimi", model="kimi-k2.6",
+        ),
+        metrics=_metrics(),
+        opponent="simple_heuristics",
+        fmt="gen6randombattle",
+        route=ModelRoute(protocol="chat_completions"),
+        pricing=PricingTable.load(),
+        status="aborted",
+        battle_timeout_seconds=1800.0,
+    )
+    assert record.battle_timeout_seconds == 1800.0
+    assert record.to_json_dict()["battle_timeout_seconds"] == 1800.0
+
+
+def test_battle_timeout_default_si_no_se_pasa():
+    record = build_benchmark_record(
+        run_id="default-timeout",
+        created_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
+        result=BenchmarkResult(
+            requested=1, completed=1, wins=1, losses=0, ties=0,
+            provider="open_code_zen", model="mimo-v2.5-free",
+        ),
+        metrics=_metrics(),
+        opponent="random",
+        fmt="gen6randombattle",
+        route=ModelRoute(protocol="chat_completions"),
+        pricing=PricingTable.load(),
+    )
+    assert record.battle_timeout_seconds == 180.0

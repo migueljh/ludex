@@ -56,6 +56,18 @@ class ProviderPoolExhausted(ProviderError):
     pass
 
 
+class CredentialRejected(ProviderError):
+    """401/403 especificos de UNA clave (vencida, revocada o sin permiso).
+
+    F2-10B (MON-20): a diferencia de `FatalProviderError` (error
+    model-wide: 404, 400 de modelo, fallo inesperado), un 401/403 no
+    detiene la corrida: la clave se pone en CUARENTENA permanente para el
+    proceso y se intenta la siguiente del pool. El mensaje es fijo y no
+    expone la clave; la clasificacion final si el pool se agota de
+    credenciales es `ProviderPoolExhausted` (nunca un falso "incompatible").
+    """
+
+
 class DecisionDeadlineExceeded(ProviderError):
     pass
 
@@ -128,6 +140,8 @@ class ModelRoute:
     thinking: str | None = None
     max_tokens: int | None = None
     timeout_seconds: float | None = None
+    endpoint: str | None = None
+    structured_output: str | None = None
 
 
 DEFAULT_MODEL_ROUTES = (
@@ -145,14 +159,28 @@ def load_model_routes(
         if key in routes:
             raise ValueError(f"ruta de modelo duplicada: {key}")
         protocol = raw["protocol"]
-        if protocol not in {"chat_completions", "messages", "responses"}:
+        if protocol not in {
+            "chat_completions", "messages", "responses", "google",
+        }:
             raise ValueError(f"protocolo de modelo desconocido: {protocol}")
+        structured_output = raw.get("structured_output")
+        if structured_output is not None and structured_output not in {
+            "json_schema", "text_json",
+        }:
+            raise ValueError(
+                f"método de structured output desconocido: {structured_output}"
+            )
+        endpoint = raw.get("endpoint")
+        if endpoint is not None and not endpoint.startswith("http"):
+            raise ValueError(f"endpoint inválido: {endpoint}")
         routes[key] = ModelRoute(
             protocol=protocol,
             temperature=float(raw.get("temperature", 0)),
             thinking=raw.get("thinking"),
             max_tokens=raw.get("max_tokens"),
             timeout_seconds=raw.get("timeout_seconds"),
+            endpoint=endpoint,
+            structured_output=structured_output,
         )
     return routes
 
@@ -179,6 +207,23 @@ def anthropic_sdk_base_url(base_url: str | None) -> str | None:
 
 def structured_output_method(kind: str, base_url: str | None) -> str:
     """Los gateways `messages` no necesariamente implementan tools."""
+    if kind == "anthropic" and base_url is not None:
+        return "text_json"
+    return "json_schema"
+
+
+def route_structured_output(
+    route: ModelRoute | None, kind: str, base_url: str | None
+) -> str:
+    """F2-10B (MON-20): el metodo de structured output es metadata
+    declarativa de la ruta (`structured_output`); si la ruta no lo declara,
+    se deriva del protocolo: `responses` y los gateways `messages` usan JSON
+    textual estricto (misma validacion semantica de D26), todo lo demas usa
+    `json_schema` nativo."""
+    if route is not None and route.structured_output is not None:
+        return route.structured_output
+    if route is not None and route.protocol == "responses":
+        return "text_json"
     if kind == "anthropic" and base_url is not None:
         return "text_json"
     return "json_schema"
@@ -250,6 +295,7 @@ class DecisionMetrics:
             "cached_input_tokens": 0,
             "reasoning_tokens": 0,
             "key_rotations": 0,
+            "keys_quarantined": 0,
             "provider_switches": 0,
             "turns_quota_affected": 0,
             "turns_transient_affected": 0,
@@ -290,6 +336,13 @@ class DecisionMetrics:
 
     def key_rotation(self) -> None:
         self._counts["key_rotations"] += 1
+
+    def key_quarantine(self) -> None:
+        """F2-10B (MON-20): una clave rechazada por 401/403 entra en
+        cuarentena permanente para el proceso. Contador separado de
+        `key_rotations` (429) para que el artefacto distinga rotacion por
+        cuota de descarte de credencial."""
+        self._counts["keys_quarantined"] += 1
 
     def usage(self, usage: CompletionUsage) -> None:
         self._counts["calls_total"] += 1
@@ -457,7 +510,11 @@ def _classified(exc: Exception) -> ProviderError:
     elif status is not None and status >= 500:
         classified = TransientProviderError("provider server error")
     elif status in (401, 403):
-        classified = FatalProviderError("provider authentication failed")
+        # F2-10B (MON-20): 401/403 son especificos de la clave (vencida,
+        # revocada, sin permiso). Se distinguen de los fatales model-wide
+        # (404, 400 de modelo) para que KeyRotatingProvider pueda poner la
+        # clave en cuarentena y seguir con la siguiente sin quemar el pool.
+        classified = CredentialRejected("provider authentication failed")
     elif isinstance(exc, (
         asyncio.TimeoutError,
         TimeoutError,
@@ -549,6 +606,11 @@ class KeyRotatingProvider:
         # clave y nunca se recuperaba, ni siquiera entre batallas del mismo
         # run (ver docs/DECISIONS.md).
         self._cooldown_until: dict[int, float] = {}
+        # F2-10B (MON-20): cuarentena por 401/403, PERMANENTE para el
+        # proceso (a diferencia del cooldown, que es acotado). Una clave
+        # vencida/revocada no vuelve; un error model-wide no quema el pool
+        # porque `FatalProviderError` se propaga de inmediato.
+        self._quarantined: set[int] = set()
 
     def __repr__(self) -> str:
         return (
@@ -567,6 +629,8 @@ class KeyRotatingProvider:
         while True:
             now = self._clock()
             for key_index in range(len(self._keys)):
+                if key_index in self._quarantined:
+                    continue
                 cooldown_until = self._cooldown_until.get(key_index)
                 if cooldown_until is not None and cooldown_until > now:
                     continue
@@ -602,6 +666,15 @@ class KeyRotatingProvider:
                         if isinstance(error, DecisionDeadlineExceeded):
                             self._metrics.deadline(turn_id)
                             raise error from raw
+                        if isinstance(error, CredentialRejected):
+                            # F2-10B: cuarentena solo de ESTA clave; la
+                            # siguiente del pool se intenta en el proximo
+                            # pase. Un pool completo de credenciales
+                            # rechazadas termina en ProviderPoolExhausted,
+                            # nunca en falso incompatible/unsupported.
+                            self._quarantined.add(key_index)
+                            self._metrics.key_quarantine()
+                            break
                         if isinstance(error, QuotaExceeded):
                             self._metrics.quota(turn_id)
                             retry_after = (
@@ -635,7 +708,14 @@ class KeyRotatingProvider:
                 # No debería poder pasar (guardia defensiva): si ninguna
                 # clave está enfriando, el for de arriba tendría que haber
                 # devuelto o lanzado. Falla ruidoso en vez de loopear en
-                # silencio.
+                # silencio. F2-10B: con todo el pool en cuarentena de
+                # credencial, el mensaje lo dice (no es cuota ni
+                # incompatibilidad).
+                if len(self._quarantined) == len(self._keys):
+                    raise ProviderPoolExhausted(
+                        f"{self.name}: all configured keys quarantined "
+                        "(401/403)"
+                    )
                 raise ProviderPoolExhausted(
                     f"{self.name}: all configured keys exhausted"
                 )
@@ -755,11 +835,22 @@ class _LangChainBackend:
         if self.kind == "google":
             from langchain_google_genai import ChatGoogleGenerativeAI
 
-            model = ChatGoogleGenerativeAI(
-                model=self.model, api_key=api_key,
+            # F2-10B (MON-20): los nombres REALES de los campos de
+            # ChatGoogleGenerativeAI son `google_api_key`, `max_retries` y
+            # `timeout`. Los nombres `api_key`/`retries`/`request_timeout`
+            # NO existen: pydantic los ignora en silencio (extra=ignore) y
+            # la llamada caia a la clave del entorno en vez de la del pool,
+            # por lo que la rotacion de 11 claves jamas rotaba credenciales
+            # reales. `base_url` habilita el endpoint nativo de Gemini
+            # detras del gateway de OpenCode Zen (protocolo "google").
+            google_options: dict[str, Any] = dict(
+                model=self.model, google_api_key=api_key,
+                max_retries=0, timeout=self.timeout_seconds,
                 temperature=self.route.temperature,
-                retries=0, request_timeout=self.timeout_seconds,
             )
+            if self.base_url is not None:
+                google_options["base_url"] = self.base_url
+            model = ChatGoogleGenerativeAI(**google_options)
         elif self.kind == "anthropic":
             from langchain_anthropic import ChatAnthropic
 
@@ -786,7 +877,9 @@ class _LangChainBackend:
                 timeout=self.timeout_seconds,
                 extra_body=extra_body or None,
             )
-        output_method = structured_output_method(self.kind, self.base_url)
+        output_method = route_structured_output(
+            self.route, self.kind, self.base_url
+        )
         if output_method == "text_json":
             raw = await model.ainvoke(
                 prompt
@@ -838,12 +931,13 @@ class GeminiDecisionProvider(KeyRotatingProvider):
     def __init__(
         self, keys: Sequence[str], *, model: str, response_schema: type,
         timeout_seconds: float, metrics: DecisionMetrics | None = None,
+        base_url: str | None = None,
     ) -> None:
         super().__init__(
             "google", keys,
             _LangChainBackend(
                 kind="google", model=model, response_schema=response_schema,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=timeout_seconds, base_url=base_url,
             ),
             model=model,
             metrics=metrics,
@@ -861,6 +955,97 @@ class OpenAICompatibleDecisionProvider(KeyRotatingProvider):
             _LangChainBackend(
                 kind="openai", model=model, response_schema=response_schema,
                 timeout_seconds=timeout_seconds, base_url=base_url, route=route,
+            ),
+            model=model,
+            metrics=metrics,
+        )
+
+
+class _ResponsesBackend(ProviderBackend):
+    """Backend del protocolo OpenAI Responses (F2-10B/MON-20).
+
+    Los modelos GPT-5.x y Grok del gateway OpenCode Zen se sirven por
+    `POST {endpoint}/responses` (documentacion oficial de Zen), no por
+    `/chat/completions`. El payload se obtiene del texto de la respuesta
+    (JSON textual estricto, misma validacion semantica de D26) y el usage
+    del objeto `usage` del SDK. Un modelo sin soporte nativo queda como
+    clasificacion explicita de la respuesta, nunca como discovery por
+    ensayo pagado.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        timeout_seconds: float,
+        base_url: str | None,
+        route: ModelRoute,
+    ) -> None:
+        self.model = model
+        self.base_url = base_url
+        self.route = route
+        self.timeout_seconds = (
+            route.timeout_seconds
+            if route.timeout_seconds is not None
+            else timeout_seconds
+        )
+
+    async def complete(
+        self, prompt: str, *, api_key: str, deadline: float
+    ) -> ProviderCompletion:
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=self.base_url,
+            max_retries=0,
+            timeout=self.timeout_seconds,
+        )
+        body: dict[str, Any] = {
+            "model": self.model,
+            "input": prompt,
+            "temperature": self.route.temperature,
+        }
+        if self.route.max_tokens is not None:
+            body["max_output_tokens"] = self.route.max_tokens
+        response = await client.responses.create(**body)
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            raise FatalProviderError(
+                "provider response did not include token usage"
+            )
+        output_details = getattr(usage, "output_tokens_details", None) or {}
+        return ProviderCompletion(
+            payload=text_json_payload(
+                getattr(response, "output_text", "") or ""
+            ),
+            usage=CompletionUsage(
+                input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+                output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+                reasoning_tokens=int(
+                    getattr(output_details, "reasoning_tokens", 0) or 0
+                ),
+                model=getattr(response, "model", None) or self.model,
+            ),
+        )
+
+
+class OpenAIResponsesDecisionProvider(KeyRotatingProvider):
+    def __init__(
+        self, name: str, keys: Sequence[str], *, model: str,
+        base_url: str | None, timeout_seconds: float,
+        metrics: DecisionMetrics | None = None, route: ModelRoute | None = None,
+        response_schema: type | None = None,
+    ) -> None:
+        # `response_schema` se acepta por consistencia de firma con los
+        # demas providers; el protocolo responses valida el JSON textual
+        # (text_json) aguas abajo en `decide`, no en el backend.
+        super().__init__(
+            name, keys,
+            _ResponsesBackend(
+                model=model, base_url=base_url,
+                timeout_seconds=timeout_seconds,
+                route=route or ModelRoute(protocol="responses"),
             ),
             model=model,
             metrics=metrics,
@@ -1038,26 +1223,66 @@ def default_provider_factory(
             keys, model=model_id, response_schema=DecisionResponse,
             timeout_seconds=timeout_seconds, metrics=metrics,
         )
-    if kind == "anthropic":
+    if kind == "anthropic" and route is None:
         return AnthropicDecisionProvider(
             keys, name=name, model=model_id, base_url=base_url,
             response_schema=DecisionResponse, timeout_seconds=timeout_seconds,
             metrics=metrics, route=route,
         )
-    if route is not None and route.protocol == "messages":
-        return AnthropicDecisionProvider(
-            keys, name=name, model=model_id, base_url=base_url,
+    return build_route_provider(
+        name, model_id, base_url=base_url, keys=keys, metrics=metrics,
+        timeout_seconds=timeout_seconds, route=route,
+    )
+
+
+def build_route_provider(
+    name: str,
+    model_id: str,
+    *,
+    base_url: str | None,
+    keys: Sequence[str],
+    metrics: DecisionMetrics,
+    timeout_seconds: float,
+    route: ModelRoute,
+) -> DecisionProvider:
+    """F2-10B (MON-20): unico punto de despacho por PROTOCOLO declarativo
+    de la ruta (nunca condicionales por model_id). Cada protocolo documentado
+    tiene su backend: `responses`, `messages`, `chat_completions` y el
+    nativo de Gemini (`google`) cuando el gateway lo sirve por su endpoint
+    propio. Un protocolo que el repo todavia no implementa se declara en la
+    ruta como tal y se clasifica de forma explicita, jamas como "default
+    chat_completions por ensayo pagado"."""
+    from .decision import DecisionResponse  # evita el ciclo decision<->provider
+
+    if route.protocol == "responses":
+        return OpenAIResponsesDecisionProvider(
+            name, keys, model=model_id, base_url=route.endpoint or base_url,
             response_schema=DecisionResponse, timeout_seconds=timeout_seconds,
             metrics=metrics, route=route,
         )
-    if route is not None and route.protocol == "responses":
-        raise ProviderSelectionError(
-            f"{name}/{model_id}: protocolo responses todavia no implementado"
+    if route.protocol == "google":
+        return GeminiDecisionProvider(
+            keys, model=model_id, response_schema=DecisionResponse,
+            timeout_seconds=timeout_seconds, metrics=metrics,
+            base_url=base_url,
         )
-    return OpenAICompatibleDecisionProvider(
-        name, keys, model=model_id, base_url=base_url,
-        response_schema=DecisionResponse, timeout_seconds=timeout_seconds,
-        metrics=metrics, route=route,
+    if route.protocol == "messages":
+        return AnthropicDecisionProvider(
+            keys, name=name, model=model_id,
+            base_url=route.endpoint or base_url,
+            response_schema=DecisionResponse, timeout_seconds=timeout_seconds,
+            metrics=metrics, route=route,
+        )
+    if route.protocol == "chat_completions":
+        return OpenAICompatibleDecisionProvider(
+            name, keys, model=model_id,
+            base_url=route.endpoint or base_url,
+            response_schema=DecisionResponse, timeout_seconds=timeout_seconds,
+            metrics=metrics, route=route,
+        )
+    raise ProviderSelectionError(
+        f"{name}/{model_id}: protocolo {route.protocol!r} sin backend "
+        "registrado en Ludex"
     )
 
 

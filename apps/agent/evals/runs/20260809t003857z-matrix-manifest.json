@@ -1,0 +1,2329 @@
+{
+  "rows": [
+    {
+      "provider": "google",
+      "model": "antigravity-preview-05-2026",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "antigravity-preview-05-2026"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-2.5-computer-use-preview-10-2025",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:agente de computer-use (drives tools/screens), sin contrato de decision de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-2.5-computer-use-preview-10-2025"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-2.5-flash-image",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:generacion de imagenes (output image), no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-2.5-flash-image"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-2.5-flash-preview-tts",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:text-to-speech (audio output), no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-2.5-flash-preview-tts"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-2.5-pro-preview-tts",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:text-to-speech (audio output), no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-2.5-pro-preview-tts"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3-pro-image",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:generacion de imagenes (output image), no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3-pro-image"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3-pro-image-preview",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:generacion de imagenes (output image), no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3-pro-image-preview"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.1-flash-image",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:generacion de imagenes (output image), no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3.1-flash-image"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.1-flash-image-preview",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:generacion de imagenes (output image), no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3.1-flash-image-preview"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.1-flash-lite-image",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:generacion de imagenes (output image), no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3.1-flash-lite-image"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.1-flash-lite-preview",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3.1-flash-lite-preview"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.1-flash-tts-preview",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:text-to-speech (audio output), no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3.1-flash-tts-preview"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-pro-latest",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-pro-latest"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-robotics-er-1.5-preview",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:modelo de robotica/embodied, no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-robotics-er-1.5-preview"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-robotics-er-1.6-preview",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:modelo de robotica/embodied, no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-robotics-er-1.6-preview"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-robotics-er-2-preview",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:modelo de robotica/embodied, no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-robotics-er-2-preview"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "lyria-3-clip-preview",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:generacion de audio/musica, no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "lyria-3-clip-preview"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "lyria-3-pro-preview",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:generacion de audio/musica, no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "lyria-3-pro-preview"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "google",
+      "model": "nano-banana-pro-preview",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "excluded:generacion de imagenes (output image), no chat de texto",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "nano-banana-pro-preview"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "fuera de scope (razon de capacidad)"
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k2.5",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "unknown",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "kimi",
+        "kimi-k2.5"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "kimi",
+      "model": "moonshot-v1-auto",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "unknown",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "kimi",
+        "moonshot-v1-auto"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "claude-sonnet-4",
+      "protocol": "messages",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "unknown",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "claude-sonnet-4"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "ling-3.0-flash-free",
+      "protocol": null,
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "missing-route",
+      "battles": 0,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "ling-3.0-flash-free"
+      ],
+      "estimated_cost_usd": null,
+      "estimated_smoke_usd": null,
+      "cumulative_cost_usd": null,
+      "classification_note": "sin ruta declarativa: no se ensaya protocolo ni se gasta cuota; clasificacion explicita"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-2.5-flash",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-2.5-flash"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-2.5-flash-lite",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-2.5-flash-lite"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.1-flash-lite",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "unknown",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3.1-flash-lite"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "gemma-4-26b-a4b-it",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemma-4-26b-a4b-it"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://models.dev/"
+    },
+    {
+      "provider": "google",
+      "model": "gemma-4-31b-it",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemma-4-31b-it"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://models.dev/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "big-pickle",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "big-pickle"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "deepseek-v4-flash-free",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "deepseek-v4-flash-free"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "laguna-s-2.1-free",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "laguna-s-2.1-free"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "ling-3.0-tiny-free",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "ling-3.0-tiny-free"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "longcat-2.0-free",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "longcat-2.0-free"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "mimo-v2.5-free",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "mimo-v2.5-free"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "nemotron-3-ultra-free",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "nemotron-3-ultra-free"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "north-mini-code-free",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "north-mini-code-free"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-2.0-flash-lite",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-2.0-flash-lite"
+      ],
+      "estimated_cost_usd": "0.1752",
+      "estimated_smoke_usd": "0.00242",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-2.0-flash-lite-001",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-2.0-flash-lite-001"
+      ],
+      "estimated_cost_usd": "0.1752",
+      "estimated_smoke_usd": "0.00242",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5-nano",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5-nano"
+      ],
+      "estimated_cost_usd": "0.198",
+      "estimated_smoke_usd": "0.0028",
+      "cumulative_cost_usd": "0.2008",
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-2.0-flash",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-2.0-flash"
+      ],
+      "estimated_cost_usd": "0.348",
+      "estimated_smoke_usd": "0.0048",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-2.0-flash-001",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-2.0-flash-001"
+      ],
+      "estimated_cost_usd": "0.348",
+      "estimated_smoke_usd": "0.0048",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "deepseek-v4-flash",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "deepseek-v4-flash"
+      ],
+      "estimated_cost_usd": "0.4536",
+      "estimated_smoke_usd": "0.00616",
+      "cumulative_cost_usd": "0.66056",
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.5-flash",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3.5-flash"
+      ],
+      "estimated_cost_usd": "0.7032",
+      "estimated_smoke_usd": "0.00982",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.6-luna",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.6-luna"
+      ],
+      "estimated_cost_usd": "0.744",
+      "estimated_smoke_usd": "0.0104",
+      "cumulative_cost_usd": "1.41496",
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "qwen3.5-plus",
+      "protocol": "messages",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "qwen3.5-plus"
+      ],
+      "estimated_cost_usd": "0.744",
+      "estimated_smoke_usd": "0.0104",
+      "cumulative_cost_usd": "2.16936",
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.4-nano",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.4-nano"
+      ],
+      "estimated_cost_usd": "0.750",
+      "estimated_smoke_usd": "0.0105",
+      "cumulative_cost_usd": "2.92986",
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "kimi",
+      "model": "moonshot-v1-8k",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "kimi",
+        "moonshot-v1-8k"
+      ],
+      "estimated_cost_usd": "0.84",
+      "estimated_smoke_usd": "0.012",
+      "cumulative_cost_usd": "0.852",
+      "classification_note": "precios: https://platform.moonshot.ai/docs/pricing/chat-v1"
+    },
+    {
+      "provider": "kimi",
+      "model": "moonshot-v1-8k-vision-preview",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "kimi",
+        "moonshot-v1-8k-vision-preview"
+      ],
+      "estimated_cost_usd": "0.84",
+      "estimated_smoke_usd": "0.012",
+      "cumulative_cost_usd": "1.704",
+      "classification_note": "precios: https://platform.moonshot.ai/docs/pricing/chat-v1"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-flash-lite-latest",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-flash-lite-latest"
+      ],
+      "estimated_cost_usd": "0.930",
+      "estimated_smoke_usd": "0.013",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.1-codex-mini",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.1-codex-mini"
+      ],
+      "estimated_cost_usd": "0.990",
+      "estimated_smoke_usd": "0.014",
+      "cumulative_cost_usd": "3.93386",
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "minimax-m2.5",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "minimax-m2.5"
+      ],
+      "estimated_cost_usd": "1.044",
+      "estimated_smoke_usd": "0.0144",
+      "cumulative_cost_usd": "4.99226",
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "minimax-m2.7",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "minimax-m2.7"
+      ],
+      "estimated_cost_usd": "1.044",
+      "estimated_smoke_usd": "0.0144",
+      "cumulative_cost_usd": "6.05066",
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "minimax-m3",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "minimax-m3"
+      ],
+      "estimated_cost_usd": "1.044",
+      "estimated_smoke_usd": "0.0144",
+      "cumulative_cost_usd": "7.10906",
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.5-flash-lite",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3.5-flash-lite"
+      ],
+      "estimated_cost_usd": "1.20",
+      "estimated_smoke_usd": "0.017",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gemini-3.5-flash-lite",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gemini-3.5-flash-lite"
+      ],
+      "estimated_cost_usd": "1.20",
+      "estimated_smoke_usd": "0.017",
+      "cumulative_cost_usd": "8.32606",
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3-flash-preview",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3-flash-preview"
+      ],
+      "estimated_cost_usd": "1.86",
+      "estimated_smoke_usd": "0.026",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gemini-3-flash",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gemini-3-flash"
+      ],
+      "estimated_cost_usd": "1.86",
+      "estimated_smoke_usd": "0.026",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 1.886 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "qwen3.6-plus",
+      "protocol": "messages",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "qwen3.6-plus"
+      ],
+      "estimated_cost_usd": "1.86",
+      "estimated_smoke_usd": "0.026",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 1.886 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "kimi-k2.5",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "kimi-k2.5"
+      ],
+      "estimated_cost_usd": "2.16",
+      "estimated_smoke_usd": "0.03",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 2.19 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.4-mini",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.4-mini"
+      ],
+      "estimated_cost_usd": "2.790",
+      "estimated_smoke_usd": "0.039",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 2.829 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "grok-build-0.1",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "grok-build-0.1"
+      ],
+      "estimated_cost_usd": "3.24",
+      "estimated_smoke_usd": "0.044",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 3.284 vs disponible 0.67394"
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k2.6",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "kimi",
+        "kimi-k2.6"
+      ],
+      "estimated_cost_usd": "3.330",
+      "estimated_smoke_usd": "0.046",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 3.376 vs disponible 3.296"
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k2.7-code",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "kimi",
+        "kimi-k2.7-code"
+      ],
+      "estimated_cost_usd": "3.330",
+      "estimated_smoke_usd": "0.046",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 3.376 vs disponible 3.296"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "kimi-k2.6",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "kimi-k2.6"
+      ],
+      "estimated_cost_usd": "3.330",
+      "estimated_smoke_usd": "0.046",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 3.376 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "kimi-k2.7-code",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "kimi-k2.7-code"
+      ],
+      "estimated_cost_usd": "3.330",
+      "estimated_smoke_usd": "0.046",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 3.376 vs disponible 0.67394"
+    },
+    {
+      "provider": "kimi",
+      "model": "moonshot-v1-32k",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "kimi",
+        "moonshot-v1-32k"
+      ],
+      "estimated_cost_usd": "3.36",
+      "estimated_smoke_usd": "0.046",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 3.406 vs disponible 3.296"
+    },
+    {
+      "provider": "kimi",
+      "model": "moonshot-v1-32k-vision-preview",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "kimi",
+        "moonshot-v1-32k-vision-preview"
+      ],
+      "estimated_cost_usd": "3.36",
+      "estimated_smoke_usd": "0.046",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 3.406 vs disponible 3.296"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "glm-5",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "glm-5"
+      ],
+      "estimated_cost_usd": "3.384",
+      "estimated_smoke_usd": "0.0464",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 3.4304 vs disponible 0.67394"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-2.5-pro",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-2.5-pro"
+      ],
+      "estimated_cost_usd": "3.450",
+      "estimated_smoke_usd": "0.0488",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "claude-haiku-4-5",
+      "protocol": "messages",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "claude-haiku-4-5"
+      ],
+      "estimated_cost_usd": "3.60",
+      "estimated_smoke_usd": "0.05",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 3.65 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5"
+      ],
+      "estimated_cost_usd": "4.230",
+      "estimated_smoke_usd": "0.0598",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 4.2898 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5-codex",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5-codex"
+      ],
+      "estimated_cost_usd": "4.230",
+      "estimated_smoke_usd": "0.0598",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 4.2898 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.1",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.1"
+      ],
+      "estimated_cost_usd": "4.230",
+      "estimated_smoke_usd": "0.0598",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 4.2898 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.1-codex",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.1-codex"
+      ],
+      "estimated_cost_usd": "4.230",
+      "estimated_smoke_usd": "0.0598",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 4.2898 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "glm-5.1",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "glm-5.1"
+      ],
+      "estimated_cost_usd": "4.728",
+      "estimated_smoke_usd": "0.0648",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 4.7928 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "glm-5.2",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "glm-5.2"
+      ],
+      "estimated_cost_usd": "4.728",
+      "estimated_smoke_usd": "0.0648",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 4.7928 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.1-codex-max",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.1-codex-max"
+      ],
+      "estimated_cost_usd": "4.950",
+      "estimated_smoke_usd": "0.07",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 5.020 vs disponible 0.67394"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3-pro-preview",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3-pro-preview"
+      ],
+      "estimated_cost_usd": "5.190",
+      "estimated_smoke_usd": "0.074",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.6-flash",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3.6-flash"
+      ],
+      "estimated_cost_usd": "5.34",
+      "estimated_smoke_usd": "0.074",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-flash-latest",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-flash-latest"
+      ],
+      "estimated_cost_usd": "5.40",
+      "estimated_smoke_usd": "0.075",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gemini-3.6-flash",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gemini-3.6-flash"
+      ],
+      "estimated_cost_usd": "5.40",
+      "estimated_smoke_usd": "0.075",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 5.475 vs disponible 0.67394"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-omni-flash-preview",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-omni-flash-preview"
+      ],
+      "estimated_cost_usd": "5.58",
+      "estimated_smoke_usd": "0.078",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gemini-3.5-flash",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gemini-3.5-flash"
+      ],
+      "estimated_cost_usd": "5.58",
+      "estimated_smoke_usd": "0.078",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 5.658 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "deepseek-v4-pro",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "deepseek-v4-pro"
+      ],
+      "estimated_cost_usd": "5.6376",
+      "estimated_smoke_usd": "0.07656",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 5.71416 vs disponible 0.67394"
+    },
+    {
+      "provider": "kimi",
+      "model": "moonshot-v1-128k",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "kimi",
+        "moonshot-v1-128k"
+      ],
+      "estimated_cost_usd": "6.60",
+      "estimated_smoke_usd": "0.09",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 6.69 vs disponible 3.296"
+    },
+    {
+      "provider": "kimi",
+      "model": "moonshot-v1-128k-vision-preview",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "kimi",
+        "moonshot-v1-128k-vision-preview"
+      ],
+      "estimated_cost_usd": "6.60",
+      "estimated_smoke_usd": "0.09",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 6.69 vs disponible 3.296"
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k2.7-code-highspeed",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "kimi",
+        "kimi-k2.7-code-highspeed"
+      ],
+      "estimated_cost_usd": "6.66",
+      "estimated_smoke_usd": "0.092",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 6.752 vs disponible 3.296"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "grok-4.5",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "grok-4.5"
+      ],
+      "estimated_cost_usd": "6.72",
+      "estimated_smoke_usd": "0.092",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 6.812 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.2",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.2"
+      ],
+      "estimated_cost_usd": "6.930",
+      "estimated_smoke_usd": "0.098",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 7.028 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.2-codex",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.2-codex"
+      ],
+      "estimated_cost_usd": "6.930",
+      "estimated_smoke_usd": "0.098",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 7.028 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.3-codex",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.3-codex"
+      ],
+      "estimated_cost_usd": "6.930",
+      "estimated_smoke_usd": "0.098",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 7.028 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.3-codex-spark",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.3-codex-spark"
+      ],
+      "estimated_cost_usd": "6.930",
+      "estimated_smoke_usd": "0.098",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 7.028 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "claude-sonnet-5",
+      "protocol": "messages",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "claude-sonnet-5"
+      ],
+      "estimated_cost_usd": "7.20",
+      "estimated_smoke_usd": "0.10",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 7.30 vs disponible 0.67394"
+    },
+    {
+      "provider": "google",
+      "model": "deep-research-max-preview-04-2026",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "deep-research-max-preview-04-2026"
+      ],
+      "estimated_cost_usd": "7.44",
+      "estimated_smoke_usd": "0.104",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "deep-research-preview-04-2026",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "deep-research-preview-04-2026"
+      ],
+      "estimated_cost_usd": "7.44",
+      "estimated_smoke_usd": "0.104",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "deep-research-pro-preview-12-2025",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "deep-research-pro-preview-12-2025"
+      ],
+      "estimated_cost_usd": "7.44",
+      "estimated_smoke_usd": "0.104",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.1-pro-preview",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3.1-pro-preview"
+      ],
+      "estimated_cost_usd": "7.44",
+      "estimated_smoke_usd": "0.104",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.1-pro-preview-customtools",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": null,
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "google",
+        "gemini-3.1-pro-preview-customtools"
+      ],
+      "estimated_cost_usd": "7.44",
+      "estimated_smoke_usd": "0.104",
+      "cumulative_cost_usd": null,
+      "classification_note": "sin presupuesto configurado o costo no estimable: no se puede probar costo cero"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gemini-3.1-pro",
+      "protocol": "google",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gemini-3.1-pro"
+      ],
+      "estimated_cost_usd": "7.44",
+      "estimated_smoke_usd": "0.104",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 7.544 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.6-terra",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.6-terra"
+      ],
+      "estimated_cost_usd": "7.44",
+      "estimated_smoke_usd": "0.104",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 7.544 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.4",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.4"
+      ],
+      "estimated_cost_usd": "9.30",
+      "estimated_smoke_usd": "0.13",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 9.43 vs disponible 0.67394"
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k3",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "kimi",
+        "kimi-k3"
+      ],
+      "estimated_cost_usd": "10.80",
+      "estimated_smoke_usd": "0.15",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 10.95 vs disponible 3.296"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "claude-sonnet-4-5",
+      "protocol": "messages",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "claude-sonnet-4-5"
+      ],
+      "estimated_cost_usd": "10.80",
+      "estimated_smoke_usd": "0.15",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 10.95 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "claude-sonnet-4-6",
+      "protocol": "messages",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "claude-sonnet-4-6"
+      ],
+      "estimated_cost_usd": "10.80",
+      "estimated_smoke_usd": "0.15",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 10.95 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "kimi-k3",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "kimi-k3"
+      ],
+      "estimated_cost_usd": "10.80",
+      "estimated_smoke_usd": "0.15",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 10.95 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "claude-opus-4-5",
+      "protocol": "messages",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "claude-opus-4-5"
+      ],
+      "estimated_cost_usd": "18.00",
+      "estimated_smoke_usd": "0.25",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 18.25 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "claude-opus-4-6",
+      "protocol": "messages",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "claude-opus-4-6"
+      ],
+      "estimated_cost_usd": "18.00",
+      "estimated_smoke_usd": "0.25",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 18.25 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "claude-opus-4-7",
+      "protocol": "messages",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "claude-opus-4-7"
+      ],
+      "estimated_cost_usd": "18.00",
+      "estimated_smoke_usd": "0.25",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 18.25 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "claude-opus-4-8",
+      "protocol": "messages",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "claude-opus-4-8"
+      ],
+      "estimated_cost_usd": "18.00",
+      "estimated_smoke_usd": "0.25",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 18.25 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "claude-opus-5",
+      "protocol": "messages",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "claude-opus-5"
+      ],
+      "estimated_cost_usd": "18.00",
+      "estimated_smoke_usd": "0.25",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 18.25 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.5",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.5"
+      ],
+      "estimated_cost_usd": "18.60",
+      "estimated_smoke_usd": "0.26",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 18.86 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.6-sol",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.6-sol"
+      ],
+      "estimated_cost_usd": "18.60",
+      "estimated_smoke_usd": "0.26",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 18.86 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "claude-fable-5",
+      "protocol": "messages",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "claude-fable-5"
+      ],
+      "estimated_cost_usd": "36.00",
+      "estimated_smoke_usd": "0.50",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 36.50 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.4-pro",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.4-pro"
+      ],
+      "estimated_cost_usd": "111.60",
+      "estimated_smoke_usd": "1.56",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 113.16 vs disponible 0.67394"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.5-pro",
+      "protocol": "responses",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "paid",
+      "status": "pending-budget",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "gpt-5.5-pro"
+      ],
+      "estimated_cost_usd": "111.60",
+      "estimated_smoke_usd": "1.56",
+      "cumulative_cost_usd": null,
+      "classification_note": "no alcanza el presupuesto: reserva 113.16 vs disponible 0.67394"
+    }
+  ],
+  "generated_at": "2026-08-09T00:38:57Z",
+  "delta": {
+    "google": {
+      "added": [],
+      "removed": [
+        "aqa",
+        "gemini-embedding-001",
+        "gemini-embedding-2",
+        "gemini-embedding-2-preview",
+        "imagen-4.0-fast-generate-001",
+        "imagen-4.0-generate-001",
+        "imagen-4.0-ultra-generate-001",
+        "veo-3.1-generate-preview"
+      ]
+    },
+    "kimi": {
+      "added": [],
+      "removed": []
+    },
+    "open_code_zen": {
+      "added": [],
+      "removed": []
+    }
+  },
+  "baseline_inventory": "evals/runs/20260808-provider-matrix-inventory.json"
+}
