@@ -2446,3 +2446,84 @@ el `EXISTS` de R4 (el test de cero pasos, y únicamente ese, se pone rojo).
 corpus vacío real de hoy en vez de asumir `training` no vacío -- incluyendo
 un test que fija a propósito que si algún día deja de ser cero hay que
 revisar esa aserción, no relajarla en silencio.
+
+## D45 — el respaldo de Encore rival en `_find_action_line` confirma con la repetición forzada, no con su propio anuncio (MON-21, hallazgo de MON-11 R4)
+
+**Síntoma verificado en vivo** (`battle-gen6randombattle-3349`, capturado
+durante MON-11 R4, fuera del alcance de esa rama): Wobbuffet rival (Shadow
+Tag) atrapa a nuestro activo mientras lo tiene encoreado. Dos decisiones
+consecutivas, forzadas cada turno al ÚNICO movimiento legal (Encore no deja
+otro; el trapping saca el cambio), terminaban con el **mismo**
+`turn_number` que la decisión anterior -- decisión 26/turno 23
+(Mamoswine/Stealth Rock) y decisión 38/turno 35 (Cresselia/Moonblast) --
+sin que `_firma_de_reemplazo_forzado` (D21, `test_play.py`) las reconociera
+como reemplazo forzado legítimo, correctamente: no lo son, la máscara
+persistida es un solo MOVIMIENTO, no una de puros cambios.
+
+**Causa raíz, aislada de forma inequívoca (sin ambigüedad, ver
+docs/DECISIONS.md D22/D23 para el mecanismo base).** El respaldo de Encore
+del rival en `_find_action_line` (`client.py`, agregado en D23 para
+`battle-gen6randombattle-558`/`-581`) devolvía el cursor **apenas
+encontraba** la línea `|move|{opp}a: Caster|Encore|{side}a: Nombre`, sin
+consumir la línea `|move|{side}a:...|` que Showdown narra a continuación,
+en el MISMO turno: la repetición forzada en sí. Bajo Encore ordinario (sin
+trapping) eso no se notaba -- la decisión siguiente casi siempre elige otra
+cosa (puede cambiarse, D23 ya lo protege) y esa línea sobrante nunca
+matchea a nadie. Bajo Encore + trapping, la decisión siguiente está
+forzada al MISMO movimiento -- la única opción legal -- y su búsqueda
+matchea esa línea sobrante como si fuera su propia resolución, heredando el
+`turn_number` de la decisión ANTERIOR en vez de encontrar su propia
+repetición, uno o más turnos más adelante. Verificado de forma
+independiente contra las DOS capturas reales de R4 (trazado a mano línea
+por línea antes de tocar código, luego confirmado con los tests):
+
+- **Mamoswine (decisión 26/turno 23):** el anuncio de Encore aparece en el
+  MISMO turno que la decisión ANTERIOR ya resolvió por un `|move|` real
+  (Stealth Rock, elegida libremente entre 4 opciones) -- no hay ninguna
+  repetición propia en ese turno que lo confirme (la repetición forzada
+  recién ocurre, con `[still]`, un turno después). El respaldo viejo
+  igual anclaba ahí.
+- **Cresselia (decisión 38/turno 35):** el Encore SÍ intercepta a la
+  decisión 37 dentro de su propio turno (caso legítimo de D23: eligió
+  Moonlight, Encore fuerza Moonblast en su lugar) -- pero el cursor viejo
+  quedaba apuntando ANTES de esa línea de Moonblast, no después,
+  dejándola disponible para que la decisión 38 (forzada también a
+  Moonblast por Encore+trapping) la robara.
+
+**Arreglo, en `_find_action_line` (`client.py`).** El anuncio de Encore del
+rival ya no fija un respaldo terminal: queda pendiente
+(`encore_rival_turno`). Sólo se confirma -- devolviendo el cursor DESPUÉS
+de la línea de repetición, no antes -- si esa línea `|move|{side}a:...|`
+propia aparece en el MISMO turno; si el turno cambia sin ella (caso
+Mamoswine), la búsqueda sigue de largo sin anclarse ahí, hasta encontrar la
+repetición real más adelante (dentro de `ACTION_SEARCH_MARGIN_TURNS`, sin
+tocar ese techo). No se relajó ni se robusteció `_firma_de_reemplazo_forzado`
+(sigue exigiendo máscara TODA de switches + firma de protocolo, D21): esta
+clase de decisión sigue, correctamente, sin ser un reemplazo forzado.
+
+**Verificación.** Reproducción determinista que atraviesa el llamador real
+(`LudexPlayer._correct_step_turns`, no una batalla en vivo dependiente de
+que el servidor genere Wobbuffet+Shadow Tag+Encore de nuevo):
+`test_correct_step_turns_encore_mas_trapping_no_hereda_el_turno_de_la_decision_anterior`
+(patrón Mamoswine) y
+`test_correct_step_turns_encore_intercepta_y_la_decision_siguiente_no_hereda_su_linea`
+(patrón Cresselia), ambas con las líneas de protocolo reales de R4.
+Contrapesos exigidos por la aceptación de MON-21, los tres verdes sin
+cambios: Encore ordinario con cambio disponible
+(`test_correct_step_turns_encore_ordinario_con_cambio_disponible_no_se_ve_afectado`),
+trapping sin Encore
+(`test_correct_step_turns_trapped_sin_encore_no_dispara_el_mecanismo_nuevo`),
+y reemplazo forzado real tras debilitamiento (D21), que sigue compartiendo
+turno legítimamente
+(`test_correct_step_turns_reemplazo_forzado_real_tras_debilitamiento_sigue_compartiendo_turno`).
+Mutación dirigida: revertir el fix en `client.py` (dejando solo los tests
+nuevos) pone en rojo exactamente 4 tests -- las 2 reproducciones de arriba
+más 2 tests unitarios de `_find_action_line` cuyo valor de cursor pineado
+cambia con el fix -- y ninguno de los 4 contrapesos; restaurado, suite
+completa de `test_client.py` verde (86/86).
+
+**Limitación conocida, documentada, no resuelta por este arreglo:** el
+resto de los hallazgos de MON-11 R4 (Issues 2-4: carrera de timing en
+`client.py:1509`, ciclo de vida de `CalcClient` bajo reintentos forzados,
+`floetteeternal` no resuelta como alias cosmético) permanecen fuera de
+alcance -- son MON-22/23/24, issues independientes.

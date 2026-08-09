@@ -876,7 +876,15 @@ def test_find_action_line_ancla_en_encore_del_rival():
     D23). Skarmory elige Spikes; el rival lo encorea (prioridad +2) antes de
     que Spikes se ejecute, y Showdown fuerza la repeticion del ultimo
     movimiento usado (Stealth Rock) en su lugar. La accion elegida
-    ('spikes') no aparece en NINGUN lado del protocolo."""
+    ('spikes') no aparece en NINGUN lado del protocolo.
+
+    MON-21 (D45): el indice devuelto es DESPUES de la linea de repeticion
+    (`|move|p1a: Skarmory|Stealth Rock||[still]`, offset 3), no despues del
+    anuncio de Encore (offset 1). La version original de este test pineaba
+    `(26, 2)` -- el cursor que dejaba esa linea de repeticion SIN CONSUMIR,
+    exactamente el hueco que la decision siguiente, bajo Encore+trapping,
+    terminaba robando (ver
+    test_correct_step_turns_encore_mas_trapping_no_hereda_el_turno_de_la_decision_anterior)."""
     recorder = _recorder_con([
         [
             "|turn|26",
@@ -889,7 +897,7 @@ def test_find_action_line_ancla_en_encore_del_rival():
     assert _find_action_line(
         recorder, "p1", {"kind": "move", "id": "spikes"}, 0, max_turn=26,
         actor_species="skarmory",
-    ) == (26, 2)
+    ) == (26, 4)
 
 
 def test_find_action_line_encore_no_bloquea_un_cambio():
@@ -926,6 +934,217 @@ def test_find_action_line_encore_del_rival_no_roba_a_otro_pokemon():
         recorder, "p1", {"kind": "move", "id": "spikes"}, 0, max_turn=9,
         actor_species="skarmory",
     ) is None
+
+
+# --- MON-21: Encore + trapping puede duplicar `turn_number` entre dos
+# decisiones que no son un reemplazo forzado legitimo (D21) -- ver
+# docs/DECISIONS.md D45. Reproduccion minima de las dos capturas reales de
+# MON-11 R4 (`battle-gen6randombattle-3349`, decisiones 26/turno23 y
+# 38/turno35), mas los contrapesos que exige la aceptacion de MON-21. ---
+
+
+def test_find_action_line_encore_sin_repeticion_en_su_turno_no_ancla_ahi():
+    """Reproduccion minima de `battle-gen6randombattle-3349`, decision 26
+    (Mamoswine): el Encore del rival aparece en un turno donde nuestra
+    accion de ESE turno ya se resolvio por otro camino (aca: el cursor
+    arranca DESPUES de esa resolucion, como lo dejaria la decision
+    anterior) -- no hay ninguna repeticion propia que lo confirme dentro
+    del mismo bloque. La decision real (forzada por Encore+trapping a
+    repetir el mismo movimiento) se resuelve un turno mas adelante, y la
+    busqueda tiene que llegar hasta ahi en vez de anclarse en el anuncio."""
+    recorder = _recorder_con([
+        [
+            "|turn|23",
+            "|-sidestart|p2: Rival|move: Stealth Rock",
+            "|move|p2a: Wobbuffet|Encore|p1a: Mamoswine",
+            "|-start|p1a: Mamoswine|Encore",
+        ],
+        [
+            "|turn|24",
+            "|move|p1a: Mamoswine|Stealth Rock||[still]",
+            "|-fail|p1a: Mamoswine",
+        ],
+    ])
+    assert _find_action_line(
+        recorder, "p1", {"kind": "move", "id": "stealthrock"}, 0, max_turn=26,
+        actor_species="mamoswine",
+    ) == (24, 6), (
+        "sin confirmacion en el turno 23, la busqueda tiene que seguir "
+        "hasta la repeticion real del turno 24, no anclarse en el anuncio"
+    )
+
+
+def test_correct_step_turns_encore_mas_trapping_no_hereda_el_turno_de_la_decision_anterior():
+    """Integracion (atraviesa `_correct_step_turns`, el llamador real):
+    reproduccion de `battle-gen6randombattle-3349`, decisiones 25->26
+    (Mamoswine). Decision 25 elige Stealth Rock libremente entre 4
+    movimientos y se resuelve en el turno 23. El rival (Wobbuffet, Shadow
+    Tag) lo encorea ahi mismo. Decision 26 -- Encore + trapping la fuerzan a
+    ofrecer el UNICO movimiento legal, el mismo Stealth Rock -- se resuelve
+    de verdad en el turno 24 (`|move|...||[still]`). ANTES de este fix,
+    ambas quedaban con `turn=23`: un `turn_number` duplicado sin ninguna
+    firma de reemplazo forzado legitima (D21) que lo explique."""
+    player = _player()
+    tag = "battle-x-1"
+    player.recorders[tag] = _recorder_con([
+        [
+            "|turn|23",
+            "|move|p1a: Mamoswine|Stealth Rock|p2a: Wobbuffet",
+            "|-sidestart|p2: Rival|move: Stealth Rock",
+            "|move|p2a: Wobbuffet|Encore|p1a: Mamoswine",
+            "|-start|p1a: Mamoswine|Encore",
+        ],
+        [
+            "|turn|24",
+            "|move|p1a: Mamoswine|Stealth Rock||[still]",
+            "|-fail|p1a: Mamoswine",
+        ],
+    ])
+    player._sides[tag] = "p1"
+    player.steps[tag] = [
+        {"turn": 23, "decision_turn": 23, "state": {}, "actor_species": "mamoswine",
+         "action_taken": {"kind": "move", "id": "stealthrock"}},
+        {"turn": 23, "decision_turn": 23, "state": {}, "actor_species": "mamoswine",
+         "action_taken": {"kind": "move", "id": "stealthrock"}},
+    ]
+
+    player._correct_step_turns(tag)
+
+    assert [s["turn"] for s in player.steps[tag]] == [23, 24], (
+        "la decision 26 (Encore+trapping) tiene que resolverse en SU propio "
+        "turno (24), no heredar el turno de la decision 25 (23)"
+    )
+
+
+def test_correct_step_turns_encore_intercepta_y_la_decision_siguiente_no_hereda_su_linea():
+    """Integracion: reproduccion de `battle-gen6randombattle-3349`,
+    decisiones 37->38 (Cresselia). Decision 37 elige Moonlight entre 6
+    opciones, pero el Encore del rival (prioridad +2) intercepta ANTES de
+    que se ejecute y fuerza la repeticion de Moonblast, el ultimo
+    movimiento usado -- se resuelve en el turno 35 via el respaldo de
+    Encore (D23). Decision 38 -- Encore + trapping la fuerzan a Moonblast
+    unico -- se resuelve de verdad en el turno 36. ANTES de este fix, el
+    respaldo de la decision 37 dejaba la linea de Moonblast SIN CONSUMIR y
+    la decision 38 la robaba, quedando tambien en turno 35."""
+    player = _player()
+    tag = "battle-x-1"
+    player.recorders[tag] = _recorder_con([
+        [
+            "|turn|35",
+            "|move|p2a: Wobbuffet|Encore|p1a: Cresselia",
+            "|-start|p1a: Cresselia|Encore",
+            "|move|p1a: Cresselia|Moonblast|p2a: Wobbuffet",
+        ],
+        [
+            "|turn|36",
+            "|move|p1a: Cresselia|Moonblast|p2a: Wobbuffet",
+        ],
+    ])
+    player._sides[tag] = "p1"
+    player.steps[tag] = [
+        {"turn": 35, "decision_turn": 35, "state": {}, "actor_species": "cresselia",
+         "action_taken": {"kind": "move", "id": "moonlight"}},
+        {"turn": 35, "decision_turn": 35, "state": {}, "actor_species": "cresselia",
+         "action_taken": {"kind": "move", "id": "moonblast"}},
+    ]
+
+    player._correct_step_turns(tag)
+
+    assert [s["turn"] for s in player.steps[tag]] == [35, 36], (
+        "la decision 38 (Encore+trapping, forzada a Moonblast) tiene que "
+        "encontrar SU PROPIA repeticion en el turno 36, no heredar la "
+        "linea que ya resolvio a la decision 37 en el turno 35"
+    )
+
+
+def test_correct_step_turns_encore_ordinario_con_cambio_disponible_no_se_ve_afectado():
+    """Contrapeso (aceptacion MON-21): Encore SIN trapping. El pokemon
+    encoreado puede cambiarse libremente (D23) -- este mecanismo nuevo no
+    se activa para una decision de CAMBIO (`accion_es_movimiento=False`),
+    asi que un Encore ordinario con salida disponible tiene que seguir
+    resolviendo cada decision en su propio turno, sin compartir nada."""
+    player = _player()
+    tag = "battle-x-1"
+    player.recorders[tag] = _recorder_con([
+        [
+            "|turn|22",
+            "|move|p2a: Shuckle|Encore|p1a: Gourgeist",
+            "|-start|p1a: Gourgeist|Encore",
+        ],
+        ["|turn|23", "|switch|p1a: Kangaskhan|Kangaskhan-Mega, L71, F|267/267"],
+        ["|turn|24", "|move|p1a: Kangaskhan|Return|p2a: Shuckle"],
+    ])
+    player._sides[tag] = "p1"
+    player.steps[tag] = [
+        {"turn": 22, "decision_turn": 22, "state": {}, "actor_species": "gourgeist",
+         "action_taken": {"kind": "switch", "species": "kangaskhanmega"}},
+        {"turn": 23, "decision_turn": 23, "state": {}, "actor_species": "kangaskhanmega",
+         "action_taken": {"kind": "move", "id": "return"}},
+    ]
+
+    player._correct_step_turns(tag)
+
+    assert [s["turn"] for s in player.steps[tag]] == [23, 24], (
+        "un cambio bajo Encore sigue resolviendose en su propio turno, sin "
+        "interaccion con el respaldo de repeticion forzada"
+    )
+
+
+def test_correct_step_turns_trapped_sin_encore_no_dispara_el_mecanismo_nuevo():
+    """Contrapeso (aceptacion MON-21): trapping SIN Encore. Con varios
+    movimientos legales (nunca colapsados a uno solo) y ninguna linea
+    `|move|{opp}a:...|Encore|...` en el protocolo, el respaldo de Encore
+    nunca se activa -- cada decision matchea por su propio `|move|` real,
+    sin ninguna interaccion con `encore_rival_turno`."""
+    player = _player()
+    tag = "battle-x-1"
+    player.recorders[tag] = _recorder_con([
+        ["|turn|9", "|move|p1a: Wobbuffet|Counter|p2a: Y"],
+        ["|turn|10", "|move|p1a: Wobbuffet|Mirror Coat|p2a: Y"],
+    ])
+    player._sides[tag] = "p1"
+    player.steps[tag] = [
+        {"turn": 9, "decision_turn": 9, "state": {}, "actor_species": "wobbuffet",
+         "action_taken": {"kind": "move", "id": "counter"}},
+        {"turn": 9, "decision_turn": 9, "state": {}, "actor_species": "wobbuffet",
+         "action_taken": {"kind": "move", "id": "mirrorcoat"}},
+    ]
+
+    player._correct_step_turns(tag)
+
+    assert [s["turn"] for s in player.steps[tag]] == [9, 10]
+
+
+def test_correct_step_turns_reemplazo_forzado_real_tras_debilitamiento_sigue_compartiendo_turno():
+    """Contrapeso (aceptacion MON-21): un reemplazo forzado REAL (D21, tras
+    un debilitamiento) sigue compartiendo `turn_number` con la decision
+    anterior -- eso es LEGITIMO (D21) y este fix no lo toca: no hay ningun
+    Encore de por medio, `encore_rival_turno` nunca se setea."""
+    player = _player()
+    tag = "battle-x-1"
+    player.recorders[tag] = _recorder_con([
+        [
+            "|turn|12",
+            "|move|p2a: Y|Earthquake|p1a: Garchomp",
+            "|-damage|p1a: Garchomp|0 fnt",
+            "|faint|p1a: Garchomp",
+            "|switch|p1a: Latios|Latios, L84, M|278/278",
+        ],
+    ])
+    player._sides[tag] = "p1"
+    player.steps[tag] = [
+        {"turn": 12, "decision_turn": 12, "state": {}, "actor_species": "garchomp",
+         "action_taken": {"kind": "move", "id": "earthquake"}},
+        {"turn": 12, "decision_turn": 12, "state": {}, "actor_species": None,
+         "action_taken": {"kind": "switch", "species": "latios"}},
+    ]
+
+    player._correct_step_turns(tag)
+
+    assert [s["turn"] for s in player.steps[tag]] == [12, 12], (
+        "el reemplazo forzado tras un debilitamiento SI comparte turno "
+        "legitimamente (D21) -- este fix no debe alterar ese caso"
+    )
 
 
 def test_find_action_line_ancla_en_win():
