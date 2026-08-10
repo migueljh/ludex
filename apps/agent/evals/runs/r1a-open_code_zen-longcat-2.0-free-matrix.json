@@ -1,0 +1,39 @@
+{
+  "provider": "open_code_zen",
+  "model": "longcat-2.0-free",
+  "tier": "free",
+  "protocol": "chat_completions",
+  "status": "compatible",
+  "smoke_ok": true,
+  "battles_requested": 0,
+  "battles_completed": 0,
+  "effective_provider": "open_code_zen",
+  "effective_model": "longcat-2.0-free",
+  "win_rate": null,
+  "completion_latency_ms": {
+    "count": 1,
+    "total": 13817,
+    "p50": 13817,
+    "p95": 13817,
+    "max": 13817
+  },
+  "decision_latency_ms": {
+    "count": 0,
+    "total": null,
+    "p50": null,
+    "p95": null,
+    "max": null
+  },
+  "tokens": {
+    "input_tokens": 66,
+    "output_tokens": 487,
+    "cached_input_tokens": 0,
+    "reasoning_tokens": 410
+  },
+  "retries": 0,
+  "rotations": 0,
+  "quarantined": 0,
+  "failure_type": null,
+  "failure_cause_type": null,
+  "note": "smoke ok (sin batallas: R1B pendiente de MON-23)"
+}

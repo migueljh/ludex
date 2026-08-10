@@ -1,0 +1,39 @@
+{
+  "provider": "google",
+  "model": "gemma-4-26b-a4b-it",
+  "tier": "free",
+  "protocol": "google",
+  "status": "compatible",
+  "smoke_ok": true,
+  "battles_requested": 0,
+  "battles_completed": 0,
+  "effective_provider": "google",
+  "effective_model": "gemma-4-26b-a4b-it",
+  "win_rate": null,
+  "completion_latency_ms": {
+    "count": 1,
+    "total": 4626,
+    "p50": 4626,
+    "p95": 4626,
+    "max": 4626
+  },
+  "decision_latency_ms": {
+    "count": 0,
+    "total": null,
+    "p50": null,
+    "p95": null,
+    "max": null
+  },
+  "tokens": {
+    "input_tokens": 56,
+    "output_tokens": 37,
+    "cached_input_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  "retries": 0,
+  "rotations": 0,
+  "quarantined": 0,
+  "failure_type": null,
+  "failure_cause_type": null,
+  "note": "smoke ok (sin batallas: R1B pendiente de MON-23)"
+}

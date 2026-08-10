@@ -1,0 +1,22 @@
+{
+  "provider": "open_code_zen",
+  "model": "laguna-s-2.1-free",
+  "tier": "free",
+  "protocol": "chat_completions",
+  "status": "unsupported-protocol",
+  "smoke_ok": false,
+  "battles_requested": 0,
+  "battles_completed": 0,
+  "effective_provider": null,
+  "effective_model": null,
+  "win_rate": null,
+  "completion_latency_ms": null,
+  "decision_latency_ms": null,
+  "tokens": null,
+  "retries": 0,
+  "rotations": 0,
+  "quarantined": 0,
+  "failure_type": "FatalProviderError",
+  "failure_cause_type": "BadRequestError",
+  "note": "smoke fallido (FatalProviderError)"
+}
