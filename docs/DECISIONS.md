@@ -2527,3 +2527,107 @@ resto de los hallazgos de MON-11 R4 (Issues 2-4: carrera de timing en
 `client.py:1509`, ciclo de vida de `CalcClient` bajo reintentos forzados,
 `floetteeternal` no resuelta como alias cosmético) permanecen fuera de
 alcance -- son MON-22/23/24, issues independientes.
+
+## D46 — `LudexPlayer` posee el ciclo de vida de sus decisiones; una barrera terminal las drena antes de cerrar `CalcClient` (MON-23)
+
+**Síntoma verificado** (issue original): `test_respuesta_ilegal_dos_veces_juega_y_persiste_fallback`
+producía, en corridas en vivo, `RuntimeError: Cannot send a request, as the
+client has been closed` y `httpx.ReadError` durante `calc_damage`. Observado
+en 2 de 7 corridas completas de `test_graph_play.py`.
+
+**Causa raíz, demostrada por inspección del poke-env real instalado
+(`.venv/.../poke_env/`), no por hipótesis.** `choose_move` corre como task
+fire-and-forget de `PSClient.listen()` (`asyncio.create_task` por frame de
+websocket, `ps_client.py:260`), agendada en `POKE_LOOP` -- el event loop
+único del proceso que corre en su propio thread daemon
+(`poke_env/concurrency.py`). `battle_against()` es OTRA task, agendada por
+separado vía `handle_threaded_coroutines`/`run_coroutine_threadsafe` sobre
+el MISMO `POKE_LOOP`: **hermana, no madre**, de la task que corre
+`choose_move -> run_graph -> calc_damage`. Cuando el `asyncio.timeout(45)`
+del test cancela `battle_against`, esa cancelación llega hasta la task de
+`_battle_against` y se detiene ahí: la task de `listen()` que puede seguir
+ejecutando `calc_damage` en ese mismo instante no es tocada. El test entra
+a `finally: await calculator.aclose()` mientras esa decisión huérfana sigue
+usando el mismo `CalcClient`.
+
+Por qué no puede pasar sin el timeout externo en la MISMA batalla: el lock
+por batalla de `PSClient` (`ps_client.py:171-174`) serializa todos los
+mensajes de un mismo `battle_tag` -- el mensaje que resuelve el fin de la
+batalla no puede procesarse hasta que la task de la decisión anterior
+(que sostiene el lock durante todo `calc_damage`) libere el lock. El único
+punto de fuga es la cancelación externa de la task hermana, que nunca
+alcanza a la decisión.
+
+Evidencia que descarta timeout pressure como causa primaria:
+`httpx.ReadError` hereda de `NetworkError`/`TransportError`, no de
+`TimeoutException` (`httpx.ReadTimeout` sí). Si la causa fuera
+`CalcClient.timeout_seconds` insuficiente, la excepción esperable sería
+`ReadTimeout`, no `ReadError`. Reproducido de forma determinística con las
+primitivas reales de poke-env (`POKE_LOOP`, `run_coroutine_threadsafe`)
+contra un servidor HTTP controlado: request en vuelo -> `httpx.ReadError`;
+request enviada después de `aclose()` -> el `RuntimeError` textual exacto
+del síntoma reportado.
+
+**Dirección rechazada:** aumentar `timeout_seconds` (no ataca la causa,
+ver evidencia de arriba); `asyncio.shield` de la request huérfana (deja
+trabajo desperdiciado corriendo indefinidamente sin resolver el cierre);
+un `httpx.AsyncClient` por decisión (cambia el perfil de performance sin
+necesidad); leer/tocar `PSClient._active_tasks` (API interna de poke-env,
+no expuesta, no pensada para esto).
+
+**Arreglo:** `LudexPlayer` posee su propio registro de decisiones en
+vuelo (`_decision_tasks: set[asyncio.Task]`), independiente de
+`PSClient._active_tasks`. `_admit_decision()` es la primera línea
+síncrona del cuerpo de la coroutine que `choose_move` devuelve
+(`run_random`/`run_graph`, vía `asyncio.current_task()`): si
+`_decisions_closed` ya es `True`, levanta `DecisionsClosedError` antes de
+tocar proyección/grafo/calc -- nunca hay una decisión tardía que alcance
+calc. `drain_inflight_decisions()` es la barrera pública, terminal e
+idempotente: agenda `_drain_on_poke_loop()` en `ps_client.loop` vía
+`run_coroutine_threadsafe` (cross-loop-safe, mismo patrón que
+`_background_failure`/`wait_for_background_failure` ya existente), que
+cierra la admisión y captura el conjunto de tasks en vuelo como UN bloque
+síncrono sin `await` entre medio (atómico respecto de `_admit_decision`:
+en un loop de un solo hilo, dos bloques síncronos nunca se intercalan),
+cancela cada task y espera su finalización con
+`asyncio.gather(..., return_exceptions=True)` ANTES de retornar. Los
+callers que comparten `CalcClient`/`ContextRepository` con el grafo
+(`cli.py::_benchmark_command`, el test en vivo de `test_graph_play.py`)
+invocan la barrera en su `finally`, antes de `calculator.aclose()` y de
+cerrar el context repository.
+
+**Evidencia de regresión (mutación dirigida en
+`apps/agent/tests/showdown/test_client.py` y `test_cli.py`):** quitar
+`task.cancel()` en `_drain_on_poke_loop` pone en rojo las dos
+reproducciones de topología real (una por timing, otra porque la
+decisión huérfana termina con `CalcProtocolError` en vez de cancelación
+limpia); quitar el `await asyncio.gather(...)` pone en rojo la
+reproducción de la carrera real de `CalcClient` (la barrera retorna antes
+de que la decisión termine); permitir admisión tardía (saltear el chequeo
+de `_decisions_closed`) pone en rojo el test de admisión tardía
+(`ProjectionTimeoutError` en vez de `DecisionsClosedError`, prueba que la
+decisión intentó avanzar); reordenar `aclose()` antes de la barrera en
+`_benchmark_command` pone en rojo el test de orden del caller productivo.
+Las cuatro mutaciones se revirtieron después de confirmar rojo; suite
+focal completa verde (277 passed, 37 skipped) tras cada reversión.
+
+**Gate en vivo:** `test_respuesta_ilegal_dos_veces_juega_y_persiste_fallback`
+corrido dos veces contra Postgres/Showdown/calc reales. Una corrida
+efectivamente excedió los 45s (falla pre-existente y fuera de alcance de
+MON-23: la duración de la batalla bajo `AlwaysIllegalProvider`, no el
+ciclo de vida de `CalcClient`) pero el log mostró `CancelledError
+intercepted` -- la decisión huérfana se canceló limpio, sin
+`RuntimeError`/`ReadError` -- confirmando el arreglo bajo la condición
+real que dispara el defecto. La segunda corrida completó normal en 37.8s,
+verde.
+
+**Limitación conocida, no resuelta por este arreglo:** la duración
+variable de la batalla bajo `AlwaysIllegalProvider` (a veces excede los
+45s del test) es una falla pre-existente, independiente del ciclo de vida
+de `CalcClient`, y queda fuera de alcance -- aumentar ese timeout externo
+no fue autorizado y no habría atacado la causa raíz de MON-23. El mismo
+patrón estructural (`asyncio.timeout` envolviendo `battle_against`/
+`run_benchmark` con `aclose()` en el `finally`) existe también en
+`cli.py::play()` (`BATTLE_TIMEOUT_SECONDS=180`, vía
+`_battle_against_or_failure`), que no construye `CalcClient` y por lo
+tanto no está expuesto a este defecto -- no requirió cambios.
