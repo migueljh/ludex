@@ -47,6 +47,14 @@ class ChoiceProtocolError(RuntimeError):
     """El protocolo de choices perdio una correlacion que Ludex necesita."""
 
 
+class DecisionsClosedError(RuntimeError):
+    """Una decision intento admitirse despues de `drain_inflight_decisions`.
+
+    D46: la barrera es terminal para la instancia. Cualquier `choose_move`
+    cuya coroutine arranca despues de que la barrera cerro la admision falla
+    ruidosamente ACA, antes de tocar proyeccion, grafo o calc."""
+
+
 @dataclass
 class OutboundCommand:
     sequence: int
@@ -842,11 +850,95 @@ class LudexPlayer(RandomPlayer):
         self._background_failure: concurrent.futures.Future[Exception] = (
             concurrent.futures.Future()
         )
+        # D46/MON-23: ownership propio del ciclo de vida de una decision.
+        # `choose_move` corre como task fire-and-forget de `listen()` en
+        # `ps_client.loop` (POKE_LOOP en produccion), hermana -- no hija --
+        # de la task de `battle_against`. Cancelar `battle_against` nunca
+        # cancela esta task; sin este registro nadie sabe si una decision
+        # (proyeccion, grafo/calc, ejecucion) sigue en vuelo cuando un
+        # caller cierra `CalcClient`. Registrado/liberado desde DENTRO de la
+        # coroutine que `choose_move` devuelve (`run_random`/`run_graph`),
+        # nunca via `PSClient._active_tasks`.
+        self._decision_tasks: set[asyncio.Task[Any]] = set()
+        # Terminal: una vez True, ninguna decision nueva se admite. Sólo se
+        # lee/escribe desde codigo que corre en `ps_client.loop`
+        # (`_admit_decision`, que corre dentro de la decision misma; y
+        # `_drain_on_poke_loop`, agendada ahi vía `run_coroutine_threadsafe`)
+        # -- nunca hay dos escritores concurrentes de threads distintos.
+        self._decisions_closed = False
+        # Idempotencia cross-loop de `drain_inflight_decisions`, mismo patron
+        # que `_background_failure`: un `concurrent.futures.Future` no esta
+        # atado a ningun loop, así que un segundo llamador (de cualquier
+        # loop) puede esperar el MISMO drenaje en vez de disparar otro.
+        self._drain_future: concurrent.futures.Future[None] | None = None
 
     async def wait_for_background_failure(self) -> Exception:
         return await asyncio.shield(
             asyncio.wrap_future(self._background_failure)
         )
+
+    def _admit_decision(self) -> asyncio.Task[Any]:
+        """Registra la task ACTUAL como decision en vuelo.
+
+        Debe ser la primera linea sincronica del cuerpo de la coroutine que
+        `choose_move` devuelve, antes de tocar proyeccion/grafo/calc. Es
+        atomica respecto de `_drain_on_poke_loop` porque ninguna de las dos
+        funciones yieldea el loop entre chequear `_decisions_closed` y
+        actuar sobre `_decision_tasks`: en un loop de asyncio de un solo
+        hilo, dos bloques sincronicos nunca se intercalan, así que no puede
+        colarse una decision nueva entre que el drenaje cierra la admision y
+        captura su foto del conjunto.
+        """
+        if self._decisions_closed:
+            raise DecisionsClosedError(
+                "LudexPlayer ya cerro la admision de decisiones "
+                "(drain_inflight_decisions ya corrio); esta decision no "
+                "puede alcanzar calc"
+            )
+        task = asyncio.current_task()
+        assert task is not None, (
+            "_admit_decision solo se puede llamar desde dentro de una task"
+        )
+        self._decision_tasks.add(task)
+        return task
+
+    def _release_decision(self, task: asyncio.Task[Any]) -> None:
+        self._decision_tasks.discard(task)
+
+    async def _drain_on_poke_loop(self) -> None:
+        """Cuerpo real del drenaje. Corre ENTERO en `ps_client.loop`.
+
+        Cerrar la admision y capturar el conjunto en vuelo son un solo
+        bloque sincronico (sin `await` entre medio): ninguna decision que
+        recien esté arrancando puede ver `_decisions_closed is False` y
+        registrarse despues de que esta funcion ya tomó su foto.
+        """
+        self._decisions_closed = True
+        pending = list(self._decision_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def drain_inflight_decisions(self) -> None:
+        """Barrera publica, terminal, idempotente y cross-loop-safe.
+
+        Cierra la admision de decisiones nuevas, cancela toda decision en
+        vuelo (proyeccion, grafo/calc, ejecucion incluidos, porque todo eso
+        vive dentro de la MISMA coroutine que `_admit_decision` registro) y
+        espera su finalizacion antes de retornar. Los callers que comparten
+        `CalcClient`/`ContextRepository` con el grafo de decision DEBEN
+        invocarla antes de cerrarlos (D46/MON-23).
+
+        Es seguro llamarla mas de una vez (idempotente) y con cero
+        decisiones en vuelo (conjunto vacio). Es terminal: despues de la
+        primera vez, esta instancia nunca vuelve a admitir decisiones.
+        """
+        if self._drain_future is None:
+            self._drain_future = asyncio.run_coroutine_threadsafe(
+                self._drain_on_poke_loop(), self.ps_client.loop
+            )
+        await asyncio.wrap_future(self._drain_future)
 
     def _publish_background_failure(self, exc: Exception) -> None:
         if not self._background_failure.done():
@@ -1300,12 +1392,16 @@ class LudexPlayer(RandomPlayer):
             )
 
             async def run_random() -> Any:
-                step["state"] = await self._resolve_state(
-                    tag, snapshot, step=step, cursor=cursor, retry=retry,
-                    opponent_side=opponent_side, vocabulary=vocabulary,
-                    deadline=deadline,
-                )
-                return order
+                task = self._admit_decision()
+                try:
+                    step["state"] = await self._resolve_state(
+                        tag, snapshot, step=step, cursor=cursor, retry=retry,
+                        opponent_side=opponent_side, vocabulary=vocabulary,
+                        deadline=deadline,
+                    )
+                    return order
+                finally:
+                    self._release_decision(task)
 
             return run_random()
 
@@ -1366,49 +1462,55 @@ class LudexPlayer(RandomPlayer):
         )
 
         async def run_graph() -> Any:
-            projected = await self._resolve_state(
-                tag, snapshot, step=step, cursor=cursor, retry=retry,
-                opponent_side=opponent_side, vocabulary=vocabulary,
-                deadline=deadline,
-            )
-            # MISMA referencia para el proveedor y para la fila: por
-            # construccion no pueden representar puntos distintos.
-            step["state"] = projected
-            graph_input = {
-                "raw_state": projected,
-                "turn_id": f"{tag}:{index}",
-                "deadline": deadline,
-            }
-            result = await self.decision_graph.ainvoke(graph_input)
-            action = result["action"]
-            # F2-09 (D39): adapter explícito del resultado del grafo a la
-            # ejecución de poke-env. NO es un nodo LangGraph: el mapa
-            # accion->BattleOrder se captura SÍNCRONO antes del primer await
-            # y poke-env exige el BattleOrder como retorno de choose_move.
-            # `None` (fuera de la máscara capturada) se convierte en error.
-            order = execute_action(action, action_orders)
-            if order is None:
-                raise RuntimeError(
-                    f"decision graph returned action outside captured mask: {action!r}"
+            # D46/MON-23: primera linea sincronica, antes de tocar
+            # proyeccion/grafo/calc. Ver `_admit_decision`.
+            task = self._admit_decision()
+            try:
+                projected = await self._resolve_state(
+                    tag, snapshot, step=step, cursor=cursor, retry=retry,
+                    opponent_side=opponent_side, vocabulary=vocabulary,
+                    deadline=deadline,
                 )
-            step["action_taken"] = action
-            step["action_path"] = result["action_path"]
-            step["reasoning"] = result.get("reasoning")
-            # F2-08 (D38): metadata de la decision canónica, desde el resultado
-            # del grafo (que sale del envelope de la llamada LLM aceptada,
-            # nunca de estado compartido) hasta el step que persiste
-            # `_persist_one`. La ruta random no pasa por aca y queda NULL.
-            # El resultado del grafo SIEMPRE trae estas claves (decide las
-            # emite en ambos caminos, llm y fallback); `get` con default None
-            # protege a un grafo fake que no las conozca.
-            for key in (
-                "rationale", "confidence", "alternatives", "target",
-                "provider", "model", "decision_latency_ms",
-                "input_tokens", "output_tokens", "cached_input_tokens",
-                "reasoning_tokens",
-            ):
-                step[key] = result.get(key)
-            return order
+                # MISMA referencia para el proveedor y para la fila: por
+                # construccion no pueden representar puntos distintos.
+                step["state"] = projected
+                graph_input = {
+                    "raw_state": projected,
+                    "turn_id": f"{tag}:{index}",
+                    "deadline": deadline,
+                }
+                result = await self.decision_graph.ainvoke(graph_input)
+                action = result["action"]
+                # F2-09 (D39): adapter explícito del resultado del grafo a la
+                # ejecución de poke-env. NO es un nodo LangGraph: el mapa
+                # accion->BattleOrder se captura SÍNCRONO antes del primer await
+                # y poke-env exige el BattleOrder como retorno de choose_move.
+                # `None` (fuera de la máscara capturada) se convierte en error.
+                order = execute_action(action, action_orders)
+                if order is None:
+                    raise RuntimeError(
+                        f"decision graph returned action outside captured mask: {action!r}"
+                    )
+                step["action_taken"] = action
+                step["action_path"] = result["action_path"]
+                step["reasoning"] = result.get("reasoning")
+                # F2-08 (D38): metadata de la decision canónica, desde el resultado
+                # del grafo (que sale del envelope de la llamada LLM aceptada,
+                # nunca de estado compartido) hasta el step que persiste
+                # `_persist_one`. La ruta random no pasa por aca y queda NULL.
+                # El resultado del grafo SIEMPRE trae estas claves (decide las
+                # emite en ambos caminos, llm y fallback); `get` con default None
+                # protege a un grafo fake que no las conozca.
+                for key in (
+                    "rationale", "confidence", "alternatives", "target",
+                    "provider", "model", "decision_latency_ms",
+                    "input_tokens", "output_tokens", "cached_input_tokens",
+                    "reasoning_tokens",
+                ):
+                    step[key] = result.get(key)
+                return order
+            finally:
+                self._release_decision(task)
 
         return run_graph()
 

@@ -949,6 +949,9 @@ def test_benchmark_command_deadline_clasificado_y_escribe_final(
         async def wait_for_background_failure(self):
             await asyncio.Event().wait()
 
+        async def drain_inflight_decisions(self):
+            pass
+
     _patch_benchmark_command_dependencies(monkeypatch, SlowAgent)
     monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path)
 
@@ -1037,6 +1040,9 @@ def test_benchmark_command_transient_con_causa_persiste_tipos_en_json(
 
         async def wait_for_background_failure(self):
             await asyncio.Event().wait()
+
+        async def drain_inflight_decisions(self):
+            pass
 
     _patch_benchmark_command_dependencies(monkeypatch, FailingAgent)
 
@@ -1350,3 +1356,74 @@ def test_matrix_plan_no_refresh_funciona_offline_sin_claves(tmp_path):
     assert "kimi/kimi-k2.6" in rows
     assert rows["kimi/kimi-k2.6"]["tier"] == "paid"
     assert rows["kimi/kimi-k2.6"]["status"] == "ready"
+
+
+def test_benchmark_command_drena_decisiones_antes_de_cerrar_calc_y_contexto(
+    monkeypatch, tmp_path
+):
+    """D46/MON-23: `_benchmark_command` debe drenar las decisiones en vuelo
+    del agente ANTES de cerrar `CalcClient` y el context repository.
+
+    `run_benchmark`/`battle_against` corren como task HERMANA de la que
+    procesa `choose_move -> calc_damage` en `ps_client.loop`: cancelar o
+    terminar esa task no cancela una decision huerfana. Sin drenar primero,
+    una decision asi puede seguir usando `CalcClient` despues de cerrado
+    (`RuntimeError`/`httpx.ReadError`, el sintoma verificado del issue).
+    Este test no reproduce la carrera de red (eso lo cubre
+    `test_client.py`); prueba el CONTRATO DE ORDEN que el caller productivo
+    tiene que respetar."""
+    order: list[str] = []
+
+    class SpyAgent:
+        def __init__(self, **kwargs) -> None:
+            self.n_won_battles = 0
+            self.n_lost_battles = 0
+            self.n_tied_battles = 0
+            self.battles: dict[str, object] = {}
+
+        async def battle_against(self, rival, n_battles=1):
+            self.battles[f"battle-{len(self.battles)}"] = object()
+            self.n_won_battles += 1
+
+        async def wait_for_background_failure(self):
+            await asyncio.Event().wait()
+
+        async def drain_inflight_decisions(self):
+            order.append("drain")
+
+    class SpyCalcClient:
+        async def aclose(self):
+            order.append("calc_aclose")
+
+    class SpyContextRepo:
+        async def aclose(self):
+            order.append("context_aclose")
+
+    _patch_benchmark_command_dependencies(monkeypatch, SpyAgent)
+    monkeypatch.setattr(cli_module, "CalcClient", lambda *a, **k: SpyCalcClient())
+    monkeypatch.setattr(
+        cli_module, "PostgresContextRepository", lambda *a, **k: SpyContextRepo()
+    )
+    monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark",
+            "--n", "1",
+            "--opponent", "random",
+            "--provider", "fake",
+            "--model", "fake-model",
+            "--run-id", "test-drain-order",
+            "--ledger", str(tmp_path / "ledger.md"),
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "SHOWDOWN_WS_URL": "ws://localhost:8100/showdown/websocket",
+            "LUDEX_PROVIDER": "fake",
+            "LUDEX_MODEL": "fake-model",
+        },
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert order == ["drain", "calc_aclose", "context_aclose"], order
