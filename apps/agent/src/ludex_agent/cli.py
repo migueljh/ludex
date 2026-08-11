@@ -50,6 +50,8 @@ from .graph.provider import (
     load_model_routes,
     model_route,
     provider_keys,
+    _http_status_chain,
+    _structured_provider_error_code,
 )
 from .graph.workflow import build_decision_graph
 from .eval_cost import DEFAULT_PRICING_PATH, PricingTable
@@ -633,6 +635,8 @@ async def _benchmark_command(
             # `KeyRotatingProvider` lo re-lanza con `raise error from raw`.
             # Persistimos SOLO los nombres de clase, nunca el mensaje crudo.
             failure_type, failure_cause_type = failure_classification(exc)
+            # L-03 (R1A): http_status y provider_error_code (solo campo
+            # estructurado permitido) cuando existen; jamas texto libre.
             result = BenchmarkResult(
                 requested=n, completed=completed,
                 wins=agent.n_won_battles, losses=agent.n_lost_battles,
@@ -640,6 +644,8 @@ async def _benchmark_command(
                 model=model, failure=f"{type(exc).__name__}: {exc}",
                 failure_type=failure_type,
                 failure_cause_type=failure_cause_type,
+                http_status=_http_status_chain(exc),
+                provider_error_code=_structured_provider_error_code(exc),
             )
     finally:
         await calculator.aclose()
@@ -743,6 +749,7 @@ def benchmark_command(
             "turns_total": 0, "calls_total": 0, "input_tokens": 0,
             "output_tokens": 0, "cached_input_tokens": 0,
             "reasoning_tokens": 0, "key_rotations": 0,
+            "keys_quarantined": 0, "transient_retries_executed": 0,
             "provider_switches": 0, "turns_quota_affected": 0,
             "turns_transient_affected": 0, "turns_deadline_affected": 0,
             "turns_model_invalid": 0, "turns_fallback": 0,

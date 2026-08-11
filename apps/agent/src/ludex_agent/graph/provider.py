@@ -298,6 +298,7 @@ class DecisionMetrics:
             "reasoning_tokens": 0,
             "key_rotations": 0,
             "keys_quarantined": 0,
+            "transient_retries_executed": 0,
             "provider_switches": 0,
             "turns_quota_affected": 0,
             "turns_transient_affected": 0,
@@ -345,6 +346,15 @@ class DecisionMetrics:
         `key_rotations` (429) para que el artefacto distinga rotacion por
         cuota de descarte de credencial."""
         self._counts["keys_quarantined"] += 1
+
+    def transient_retry(self) -> None:
+        """L-01 (R1A): UN RETRY ejecutado de verdad, por reintento de
+        infraestructura. `turns_transient_affected` (deduplicado por turno)
+        dice si un turno se vio afectado; este contador dice CUANTAS veces
+        se reintento. El artefacto de Ling decia retries=0 aunque el smoke
+        reintento el 503: `retries` del artefacto sale de aca, no del
+        dedupe."""
+        self._counts["transient_retries_executed"] += 1
 
     def usage(self, usage: CompletionUsage) -> None:
         self._counts["calls_total"] += 1
@@ -572,6 +582,22 @@ def _credential_specific_rejection(exc: Exception) -> bool:
     return False
 
 
+def _structured_provider_error_code(exc: Exception) -> str | None:
+    """L-03 (R1A): codigo de error del proveedor SOLO desde campos
+    estructurados permitidos (`error.code` de openai/anthropic,
+    `error.details[].reason` de google). Nunca desde texto libre del
+    mensaje: puede arrastrar URLs, secretos o nombres de variables.
+    Sin body estructurado -> None (nada que persistir)."""
+    body = _structured_body(exc)
+    if body is None:
+        return None
+    code = _openai_code(body)
+    if code is not None:
+        return code
+    reasons = _google_reasons(body)
+    return reasons[0] if reasons else None
+
+
 # Gemini (google.rpc.RetryInfo) manda un `retry_delay` estructurado en el
 # 429, pero `langchain_google_genai` lo aplana a texto antes de que nos
 # llegue -- lo confirma su propio docstring
@@ -628,8 +654,17 @@ def _classified(exc: Exception) -> ProviderError:
         )
     elif status is not None and status >= 500:
         classified = TransientProviderError("provider server error")
-    elif status == 401:
-        # 401 es, por definicion, rechazo de la credencial: rota.
+    elif status == 401 and _credential_specific_rejection(exc):
+        # L-02 (R1A): un 401 solo es rechazo de NUESTRA credencial cuando
+        # una senal ESTRUCTURADA allowlisted lo demuestra (p.ej.
+        # `error.code=invalid_api_key`). R1A demostro que Zen puede devolver
+        # 401 originado en el provider upstream de un modelo mientras la
+        # misma credencial funciona en modelos vecinos: cuarentenar ahi es
+        # incorrecto y convierte indisponibilidad del modelo en
+        # ProviderPoolExhausted. 401 sin esa senal (o marcado como
+        # upstream/model-wide) es FatalProviderError: sin rotacion ni
+        # cuarentena, detiene en la primera clave. Nunca se decide por
+        # texto libre.
         classified = CredentialRejected("provider authentication failed")
     elif status == 403 and _credential_specific_rejection(exc):
         # 403 SOLO rota si una senal estructurada demuestra rechazo de
@@ -638,7 +673,7 @@ def _classified(exc: Exception) -> ProviderError:
         # FatalProviderError -> se detiene en la primera clave y no quema
         # el pool de 11.
         classified = CredentialRejected("provider authentication failed")
-    elif status in (403, 404):
+    elif status in (401, 403, 404):
         classified = FatalProviderError(
             "provider permission or model unavailable"
         )
@@ -747,6 +782,13 @@ class KeyRotatingProvider:
             f"key_count={len(self._keys)})"
         )
 
+    def metrics_snapshot(self) -> dict[str, int | None]:
+        """L-01 (R1A): snapshot actual de las metricas del provider. La
+        matriz toma un snapshot ANTES y DESPUES del smoke y persiste el
+        DELTA en el artefacto, incluso cuando el smoke falla: jamas se
+        fijan retries/rotations/quarantined en cero por omision."""
+        return self._metrics.snapshot()
+
     async def complete(
         self, prompt: str, *, deadline: float, turn_id: str
     ) -> CompletionEnvelope:
@@ -757,6 +799,10 @@ class KeyRotatingProvider:
         started_at = self._clock()
         while True:
             now = self._clock()
+            # L-03 (R1A): el ultimo rechazo de credencial queda enganchado
+            # como causa del pool exhausted, para que la evidencia (clase
+            # original + `__cause__`) siga disponible en vivo.
+            quarantine_error: Exception | None = None
             for key_index in range(len(self._keys)):
                 if key_index in self._quarantined:
                     continue
@@ -804,6 +850,7 @@ class KeyRotatingProvider:
                             # incompatible/unsupported.
                             self._quarantined.add(key_index)
                             self._metrics.key_quarantine()
+                            quarantine_error = error
                             break
                         if isinstance(error, QuotaExceeded):
                             self._metrics.quota(turn_id)
@@ -821,6 +868,10 @@ class KeyRotatingProvider:
                             self._metrics.transient(turn_id)
                             if transient_attempts < self._transient_retries:
                                 transient_attempts += 1
+                                # L-01 (R1A): un retry REAL ejecutado; el
+                                # artefacto del smoke 503 de Ling debe
+                                # reflejarlo (ver DecisionMetrics.transient_retry).
+                                self._metrics.transient_retry()
                                 continue
                         raise error from raw
 
@@ -845,7 +896,7 @@ class KeyRotatingProvider:
                     raise ProviderPoolExhausted(
                         f"{self.name}: all configured keys quarantined "
                         "(401/403)"
-                    )
+                    ) from quarantine_error
                 raise ProviderPoolExhausted(
                     f"{self.name}: all configured keys exhausted"
                 )
@@ -872,6 +923,10 @@ class ProviderChain:
         self._providers = tuple(providers)
         self._allow_cross_provider = allow_cross_provider
         self._metrics = metrics or DecisionMetrics()
+
+    def metrics_snapshot(self) -> dict[str, int | None]:
+        """L-01 (R1A): igual que `KeyRotatingProvider.metrics_snapshot`."""
+        return self._metrics.snapshot()
 
     async def complete(
         self, prompt: str, *, deadline: float, turn_id: str

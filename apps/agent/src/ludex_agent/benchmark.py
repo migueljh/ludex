@@ -67,6 +67,12 @@ class BenchmarkResult:
     # SOLO nombres de clase (ver `failure_classification`).
     failure_type: str | None = None
     failure_cause_type: str | None = None
+    # L-03 (R1A): evidencia durable y sanitizada ampliada. `http_status` es
+    # el status HTTP cuando existe y `provider_error_code` sale SOLO de
+    # campos estructurados permitidos (ver `_structured_provider_error_code`
+    # en graph/provider.py); nunca mensajes, URLs, headers ni secretos.
+    http_status: int | None = None
+    provider_error_code: str | None = None
 
     @property
     def comparable(self) -> bool:

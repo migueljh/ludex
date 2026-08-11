@@ -29,6 +29,8 @@ from .graph.provider import (
     ModelRoute,
     load_model_routes,
     model_route,
+    _http_status_chain,
+    _structured_provider_error_code,
 )
 
 logger = logging.getLogger(__name__)
@@ -424,6 +426,14 @@ class MatrixModelResult:
     failure_type: str | None
     failure_cause_type: str | None
     note: str | None = None
+    # L-03 (R1A): evidencia durable y sanitizada. `failure_stage` dice si el
+    # fallo ocurrio en `smoke` o en `battle`; `http_status` es el status
+    # HTTP cuando existe; `provider_error_code` sale SOLO de campos
+    # estructurados permitidos (nunca de mensajes, URLs, headers, bodies
+    # completos, nombres/valores de variables ni secretos).
+    failure_stage: str | None = None
+    http_status: int | None = None
+    provider_error_code: str | None = None
 
     @property
     def final(self) -> bool:
@@ -510,6 +520,9 @@ async def run_matrix_round(
                 failure_type=prior.failure_type,
                 failure_cause_type=prior.failure_cause_type,
                 note="ya finalizado en una corrida anterior: no se repite",
+                failure_stage=prior.failure_stage,
+                http_status=prior.http_status,
+                provider_error_code=prior.provider_error_code,
             ))
             if on_result is not None:
                 on_result(results[-1])
@@ -552,6 +565,11 @@ async def run_matrix_round(
                 failure_cause_type=(
                     type(exc.__cause__).__name__ if exc.__cause__ else None
                 ),
+                # L-03 (R1A): no es un fallo de smoke ni de batalla, pero la
+                # evidencia sanitizada disponible se conserva si existe.
+                failure_stage=None,
+                http_status=_http_status_chain(exc),
+                provider_error_code=_structured_provider_error_code(exc),
                 note="fallo del runner de la matriz, no del modelo",
             )
         results.append(result)
@@ -593,6 +611,18 @@ async def _run_one(
         return _smoke_failed(
             row, "missing-route", exc
         )
+
+    # L-01 (R1A): snapshot ANTES del smoke; el delta (nunca zeros fijos)
+    # llega al artefacto tanto en exito como en fallo.
+    before = _provider_metrics_snapshot(provider)
+
+    def _fail(status: str, exc: BaseException, *, note: str | None = None,
+              smoke_ok: bool = False) -> MatrixModelResult:
+        return _smoke_failed(
+            row, status, exc, note=note, smoke_ok=smoke_ok,
+            metrics=_metrics_delta(before, _provider_metrics_snapshot(provider)),
+        )
+
     try:
         envelope = await provider.complete(
             _SMOKE_PROMPT,
@@ -600,9 +630,9 @@ async def _run_one(
             turn_id=f"matrix-smoke:{row.provider}:{row.model}",
         )
     except ProviderPoolExhausted as exc:
-        return _smoke_failed(row, "credential/model unavailable", exc)
+        return _fail("credential/model unavailable", exc)
     except CredentialRejected as exc:
-        return _smoke_failed(row, "credential/model unavailable", exc)
+        return _fail("credential/model unavailable", exc)
     except ProviderError as exc:
         # FatalProviderError: endpoint/protocolo/modelo rechazado (la clase
         # exacta se preserva en failure_type). Transitorio o deadline:
@@ -612,12 +642,12 @@ async def _run_one(
             if isinstance(exc, FatalProviderError)
             else "externally-limited"
         )
-        return _smoke_failed(row, status, exc)
+        return _fail(status, exc)
     try:
         DecisionResponse.model_validate(envelope.payload)
     except (ValueError, TypeError) as exc:
-        return _smoke_failed(
-            row, "invalid-semantic-response", exc,
+        return _fail(
+            "invalid-semantic-response", exc,
             note="la respuesta del modelo no valida el contrato DecisionResponse",
         )
 
@@ -632,7 +662,7 @@ async def _run_one(
         # ProviderMixError (mezcla efectiva) aborta la corrida del modelo.
         status = "internal-defect" if type(exc).__name__ == "ProviderMixError" \
             else "externally-limited"
-        return _smoke_failed(row, status, exc, smoke_ok=True)
+        return _fail(status, exc, smoke_ok=True)
 
     completed = getattr(result, "completed", 0)
     requested = getattr(result, "requested", 0)
@@ -667,11 +697,18 @@ async def _run_one(
             "cached_input_tokens": int(metrics.get("cached_input_tokens", 0)),
             "reasoning_tokens": int(metrics.get("reasoning_tokens", 0)),
         },
-        retries=int(metrics.get("turns_transient_affected", 0)),
+        # L-01 (R1A): `retries` es el conteo REAL de reintentos ejecutados
+        # (`transient_retries_executed`), no el dedupe por turno.
+        retries=int(metrics.get("transient_retries_executed", 0)),
         rotations=int(metrics.get("key_rotations", 0)),
         quarantined=int(metrics.get("keys_quarantined", 0)),
         failure_type=getattr(result, "failure_type", None),
         failure_cause_type=getattr(result, "failure_cause_type", None),
+        # L-03 (R1A): la fase de batalla y la evidencia sanitizada via
+        # BenchmarkResult cuando existen.
+        failure_stage="battle" if failure is not None else None,
+        http_status=getattr(result, "http_status", None),
+        provider_error_code=getattr(result, "provider_error_code", None),
         note=None if status == "compatible" else (
             "batallas parciales o abortadas: sin winrate comparable"
         ),
@@ -693,21 +730,99 @@ def _smoke_failed(
     *,
     note: str | None = None,
     smoke_ok: bool = False,
+    metrics: Mapping[str, int | None] | None = None,
 ) -> MatrixModelResult:
+    """L-01 (R1A): el delta real de DecisionMetrics del provider llega al
+    artefacto incluso cuando el smoke falla: retries/rotations/quarantined
+    jamas vuelven a fijarse en cero por omision (el artefacto de North decia
+    quarantined=0 con el pool agotado por rechazo de credencial, y el de
+    Ling retries=0 con el 503 reintentado). Sin `metrics` (proveedor que no
+    expone snapshot o error antes de construirlo) no hay delta y quedan en
+    cero, que es la verdad: no hubo metricas.
+
+    L-03 (R1A): `failure_stage` (`smoke` o `battle`), `http_status` y
+    `provider_error_code` (solo campos estructurados permitidos) se
+    persisten de forma sanitizada; el mensaje, la URL, los headers, el body
+    completo y los secretos jamas salen del proceso."""
     return MatrixModelResult(
         provider=row.provider, model=row.model, tier=row.tier,
         protocol=row.protocol, status=status, smoke_ok=smoke_ok,
         battles_requested=0, battles_completed=0,
         effective_provider=None, effective_model=None,
-        win_rate=None, completion_latency_ms=None,
-        decision_latency_ms=None, tokens=None,
-        retries=0, rotations=0, quarantined=0,
+        win_rate=None,
+        completion_latency_ms=(
+            _latency_slice(metrics, "completion_latency_ms")
+            if metrics is not None else None
+        ),
+        decision_latency_ms=(
+            _latency_slice(metrics, "decision_latency_ms")
+            if metrics is not None else None
+        ),
+        tokens=(
+            {
+                "input_tokens": int(metrics.get("input_tokens", 0)),
+                "output_tokens": int(metrics.get("output_tokens", 0)),
+                "cached_input_tokens": int(
+                    metrics.get("cached_input_tokens", 0)
+                ),
+                "reasoning_tokens": int(metrics.get("reasoning_tokens", 0)),
+            }
+            if metrics is not None else None
+        ),
+        retries=(
+            int(metrics.get("transient_retries_executed", 0))
+            if metrics is not None else 0
+        ),
+        rotations=(
+            int(metrics.get("key_rotations", 0))
+            if metrics is not None else 0
+        ),
+        quarantined=(
+            int(metrics.get("keys_quarantined", 0))
+            if metrics is not None else 0
+        ),
         failure_type=type(exc).__name__,
         failure_cause_type=(
             type(exc.__cause__).__name__ if exc.__cause__ else None
         ),
+        failure_stage="battle" if smoke_ok else "smoke",
+        http_status=_http_status_chain(exc),
+        provider_error_code=_structured_provider_error_code(exc),
         note=note or f"smoke fallido ({type(exc).__name__})",
     )
+
+
+def _provider_metrics_snapshot(provider: Any) -> dict[str, int | None] | None:
+    """L-01 (R1A): snapshot de las metricas del provider via
+    `metrics_snapshot()` (KeyRotatingProvider/ProviderChain). Proveedores
+    sin metricas (fakes, no expuestos) devuelven None: no hay delta que
+    reportar."""
+    snapshot = getattr(provider, "metrics_snapshot", None)
+    if not callable(snapshot):
+        return None
+    return snapshot()
+
+
+def _metrics_delta(
+    before: Mapping[str, int | None] | None,
+    after: Mapping[str, int | None] | None,
+) -> dict[str, int | None] | None:
+    """L-01 (R1A): delta entre dos snapshots. Contadores (int) restan; los
+    percentiles sin muestras siguen None. Sin snapshot inicial o final no
+    hay delta."""
+    if before is None or after is None:
+        return None
+    keys = sorted(set(before) | set(after))
+    delta: dict[str, int | None] = {}
+    for key in keys:
+        start, end = before.get(key), after.get(key)
+        if isinstance(start, int) and isinstance(end, int):
+            delta[key] = end - start
+        elif end is not None:
+            delta[key] = end
+        else:
+            delta[key] = None
+    return delta
 
 
 def _latency_slice(

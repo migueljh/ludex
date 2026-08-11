@@ -389,13 +389,15 @@ class _FakeSmokeProvider:
 
 
 def _ok_battles(completed=2, requested=2, wins=1, failure=None,
-                failure_type=None, provider="fake", model="fake-model"):
+                failure_type=None, provider="fake", model="fake-model",
+                http_status=None, error_code=None):
     from ludex_agent.benchmark import BenchmarkResult
     return (
         BenchmarkResult(
             requested=requested, completed=completed, wins=wins,
             losses=completed - wins, ties=0, provider=provider, model=model,
             failure=failure, failure_type=failure_type,
+            http_status=http_status, provider_error_code=error_code,
         ),
         {
             "turns_total": 4, "calls_total": 6,
@@ -422,16 +424,19 @@ def _ok_battles(completed=2, requested=2, wins=1, failure=None,
 async def _run(rows, *, tier="free", refresh=None, previous=None,
                battle_failure=None, battle_failure_type=None,
                battles_completed=2, battles_requested=2, battles_wins=1,
-               smoke_error=None, smoke_payload=None):
+               smoke_error=None, smoke_payload=None, build_provider=None,
+               battle_http_status=None, battle_error_code=None):
     from ludex_agent.matrix import run_matrix_round
     from ludex_agent.graph.provider import ProviderError
 
     built: list[tuple[str, str]] = []
     battle_calls: list[int] = []
 
-    def build_provider(provider, model):
+    def default_build_provider(provider, model):
         built.append((provider, model))
         return _FakeSmokeProvider(error=smoke_error, payload=smoke_payload)
+
+    effective_build = build_provider or default_build_provider
 
     async def run_battles(provider, model, *, n, battle_timeout_seconds,
                           fmt, opponent):
@@ -440,6 +445,7 @@ async def _run(rows, *, tier="free", refresh=None, previous=None,
             completed=battles_completed, requested=battles_requested,
             wins=battles_wins, failure=battle_failure,
             failure_type=battle_failure_type,
+            http_status=battle_http_status, error_code=battle_error_code,
         )
 
     async def _refresh():
@@ -452,7 +458,7 @@ async def _run(rows, *, tier="free", refresh=None, previous=None,
         rows=rows, tier=tier, battle_timeout_seconds=1800,
         fmt="gen6randombattle", opponent="simple_heuristics",
         smoke_deadline_seconds=120,
-        build_provider=build_provider, run_battles=run_battles,
+        build_provider=effective_build, run_battles=run_battles,
         refresh_catalog=_refresh if refresh is not None else None,
         previous=previous,
     )
@@ -838,8 +844,11 @@ async def test_responses_backend_429_401_y_403_clasifican_por_senal(monkeypatch)
 
     # 429 -> rota y termina en ProviderPoolExhausted (2 claves, cooldown)
     assert await classify(429, {"error": {"code": 429}}) == "ProviderPoolExhausted"
-    # 401 -> cuarentena de la clave, termina exhausted
-    assert await classify(401, {"error": {"message": "bad key"}}) == "ProviderPoolExhausted"
+    # 401 CON code estructurado allowlisted -> cuarentena, pool exhausted
+    assert await classify(401, {"error": {"code": "invalid_api_key"}}) == "ProviderPoolExhausted"
+    # 401 SIN senal estructurada (solo mensaje) -> FatalProviderError, sin
+    # cuarentena ni rotacion (L-02/R1A: puede ser el provider upstream).
+    assert await classify(401, {"error": {"message": "bad key"}}) == "FatalProviderError"
     # 403 credential-specific (google reason) -> cuarentena
     body_cred = {"error": {"code": 403, "status": "PERMISSION_DENIED",
                             "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
@@ -892,3 +901,198 @@ def test_plan_budget_ignorar_el_saldo_minimo_pondria_rojo_el_canario():
     })
     assert planned[0].status == "pending-budget"
     assert "no alcanza" in (planned[0].classification_note or "")
+
+
+# --- LATWAN R1A REVIEW (MON-20): L-01 metricas reales, L-03 evidencia
+# durable sanitizada ------------------------------------------------
+
+
+def _keyed_provider(provider_name, model, error_factory, *, keys=("k",),
+                    transient_retries=0):
+    """Provider real con metrics y backend que siempre lanza el error
+    construido por `error_factory` (una clave por 401 credential, 503, ...).
+    Devuelve (provider, metrics, backend) para inspeccion del delta."""
+    import httpx as _httpx
+    from ludex_agent.graph.provider import (
+        DecisionMetrics, KeyRotatingProvider,
+    )
+
+    request = _httpx.Request(
+        "POST", f"https://opencode.ai/zen/v1/chat/completions"
+    )
+    metrics = DecisionMetrics()
+
+    class Backend:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, prompt, *, api_key, deadline):
+            self.calls += 1
+            raise error_factory(request)
+
+    backend = Backend()
+    provider = KeyRotatingProvider(
+        provider_name, keys, backend, metrics=metrics,
+        transient_retries=transient_retries,
+    )
+    return provider, metrics, backend
+
+
+def test_smoke_fallido_reporta_quarantined_real_de_north():
+    """L-01 (R1A): canario North. El artefacto de North decia
+    quarantined=0 mientras el checkpoint afirmaba cuarentena +
+    ProviderPoolExhausted. El delta real de DecisionMetrics del provider
+    debe reportar 1: un 401 con senal estructurada pone la unica clave en
+    cuarentena y el pool agotado se clasifica credential/model unavailable.
+    Con el comportamiento rechazado (zeros fijos en `_smoke_failed`) este
+    test se pone rojo."""
+    import asyncio
+    import httpx as _httpx
+    from ludex_agent.graph.provider import KeyRotatingProvider
+
+    def _401(request):
+        return _httpx.HTTPStatusError(
+            "unauthorized", request=request,
+            response=_httpx.Response(401, request=request, json={
+                "error": {"code": "invalid_api_key"},
+            }),
+        )
+
+    provider, metrics, backend = _keyed_provider(
+        "open_code_zen", "north-mini-code-free", _401, keys=("k",),
+    )
+
+    def build_provider(provider_name, model):
+        return provider
+
+    rows = [_ready_row("open_code_zen", "north-mini-code-free", "free")]
+    results, _, battle_calls = asyncio.run(_run(
+        rows, build_provider=build_provider,
+    ))
+    result = results[0]
+    assert result.status == "credential/model unavailable"
+    assert result.failure_type == "ProviderPoolExhausted"
+    assert result.quarantined == 1
+    assert result.rotations == 0
+    assert result.retries == 0
+    assert result.failure_stage == "smoke"
+    assert backend.calls == 1
+    assert battle_calls == []
+
+
+def test_smoke_503_refleja_los_retries_reales():
+    """L-01 (R1A): el artefacto de Ling decia retries=0 aunque el smoke
+    reintento el 503. El delta real debe reflejar los retries ejecutados:
+    con transient_retries=2 -> 3 intentos, 2 retries. Con el
+    comportamiento rechazado (zeros fijos) este test se pone rojo."""
+    import asyncio
+    import httpx as _httpx
+
+    def _503(request):
+        return _httpx.HTTPStatusError(
+            "boom", request=request,
+            response=_httpx.Response(503, request=request),
+        )
+
+    provider, metrics, backend = _keyed_provider(
+        "open_code_zen", "ling-3.0-tiny-free", _503, keys=("k",),
+        transient_retries=2,
+    )
+
+    def build_provider(provider_name, model):
+        return provider
+
+    rows = [_ready_row("open_code_zen", "ling-3.0-tiny-free", "free")]
+    results, _, battle_calls = asyncio.run(_run(
+        rows, build_provider=build_provider,
+    ))
+    result = results[0]
+    assert result.status == "externally-limited"
+    assert result.failure_type == "TransientProviderError"
+    assert result.retries == 2
+    assert result.rotations == 0
+    assert result.quarantined == 0
+    assert backend.calls == 3
+    assert battle_calls == []
+
+
+def test_artefacto_fallido_persiste_solo_evidencia_sanitizada():
+    """L-03 (R1A): failure_stage, http_status y provider_error_code entran
+    al artefacto; el mensaje crudo, la URL, los headers, el body completo y
+    los secretos del error jamas se persisten. El error de ejemplo trae una
+    URL con query de clave y un mensaje con nombre de variable de entorno:
+    nada de eso puede aparecer serializado."""
+    import asyncio
+    import json as _json
+    import httpx as _httpx
+
+    secret = "sk-zen-abcdefghijklmnopqrstuvwxyz0123456789"
+
+    def _400(request):
+        return _httpx.HTTPStatusError(
+            "boom", request=request,
+            response=_httpx.Response(400, request=request, json={
+                "error": {
+                    "message": (
+                        "invalid request at "
+                        "https://opencode.ai/zen/v1/chat/completions"
+                        f"?api_key={secret} (OPEN_CODE_ZEN_API_KEY)"
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "invalid_request_error",
+                },
+            }),
+        )
+
+    provider, metrics, backend = _keyed_provider(
+        "open_code_zen", "big-pickle", _400, keys=("k",),
+    )
+
+    def build_provider(provider_name, model):
+        return provider
+
+    rows = [_ready_row("open_code_zen", "big-pickle", "free")]
+    results, _, _ = asyncio.run(_run(rows, build_provider=build_provider))
+    result = results[0]
+    assert result.status == "unsupported-protocol"
+    assert result.failure_stage == "smoke"
+    assert result.http_status == 400
+    assert result.provider_error_code == "invalid_request_error"
+    serialized = _json.dumps(result.to_dict())
+    for forbidden in (secret, "api_key=", "opencode.ai", "OPEN_CODE_ZEN_",
+                      "invalid request at", "sk-zen"):
+        assert forbidden not in serialized, forbidden
+
+
+def test_fallo_de_batalla_etiqueta_failure_stage_battle():
+    """L-03 (R1A): un fallo en la fase de batalla lleva failure_stage=battle
+    y la evidencia sanitizada de http_status/provider_error_code via el
+    BenchmarkResult cuando existen."""
+    import asyncio
+
+    rows = [_ready_row("open_code_zen", "mimo-v2.5-free", "free")]
+    results, _, _ = asyncio.run(_run(
+        rows,
+        battles_completed=1, battles_requested=2,
+        battle_failure="TransientProviderError: provider server error",
+        battle_failure_type="TransientProviderError",
+        battle_http_status=503, battle_error_code="server_error",
+    ))
+    result = results[0]
+    assert result.status == "aborted"
+    assert result.failure_stage == "battle"
+    assert result.http_status == 503
+    assert result.provider_error_code == "server_error"
+    assert result.win_rate is None
+
+
+def test_smoke_exitoso_no_lleva_failure_stage():
+    import asyncio
+
+    rows = [_ready_row("open_code_zen", "mimo-v2.5-free", "free")]
+    results, _, _ = asyncio.run(_run(rows))
+    result = results[0]
+    assert result.status == "compatible"
+    assert result.failure_stage is None
+    assert result.http_status is None
+    assert result.provider_error_code is None
