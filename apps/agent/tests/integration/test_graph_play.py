@@ -297,6 +297,12 @@ async def test_respuesta_ilegal_dos_veces_juega_y_persiste_fallback(dex_clone):
                     "WHERE battle_tag = ANY(:tags) AND source='test'"
                 ), {"tags": tags})
                 await session.commit()
+        # D46/MON-23: drenar decisiones en vuelo ANTES de cerrar CalcClient.
+        # `agent.battle_against(...)` corre como task hermana de la que
+        # procesa `choose_move -> calc_damage` en `ps_client.loop`: el
+        # `asyncio.timeout(45)` de arriba puede cancelar/expirar SIN tocar
+        # esa decision huerfana, que seguiria usando `calculator` ya cerrado.
+        await agent.drain_inflight_decisions()
         await calculator.aclose()
         await context_repository.aclose()
         await engine.dispose()

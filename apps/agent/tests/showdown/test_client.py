@@ -1,12 +1,16 @@
 import asyncio
 import logging
 import random
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from poke_env.concurrency import POKE_LOOP
 from poke_env.data import GenData
 
+from ludex_agent.graph.calc import CalcClient
 from ludex_agent.graph.provider import (
     CompletionEnvelope,
     CompletionUsage,
@@ -2507,3 +2511,257 @@ async def test_la_metadata_efectiva_cambia_por_turno_hasta_el_step():
     assert tercer_paso["rationale"] == (
         "deterministic fallback after two invalid model responses"
     )
+
+
+# --- D46/MON-23: barrera terminal de lifecycle para decisiones en vuelo ---
+#
+# `choose_move` corre como task fire-and-forget de `listen()` en
+# `ps_client.loop` (POKE_LOOP en produccion), HERMANA -- no hija -- de la
+# task de `battle_against`/`run_benchmark` (ver `poke_env/concurrency.py` y
+# `player.py:battle_against`). Cancelar o timeoutear ese wrapper nunca
+# cancela una decision (proyeccion + grafo/calc + ejecucion) que siga en
+# vuelo: son tasks independientes en el mismo loop. `drain_inflight_decisions`
+# cierra la admision, cancela y espera toda decision registrada; los
+# callers que comparten `CalcClient`/context repository con el grafo deben
+# invocarla ANTES de cerrarlos.
+
+
+def _run_on_pokeloop(coro):
+    """Agenda `coro` en `POKE_LOOP` (el loop real de poke-env, en su propio
+    thread) y devuelve el `concurrent.futures.Future`. Mismo mecanismo que
+    `poke_env.concurrency.handle_threaded_coroutines`, pero reteniendo el
+    future para poder inspeccionar el resultado de una decision huerfana."""
+    return asyncio.run_coroutine_threadsafe(coro, POKE_LOOP)
+
+
+async def _await_on_pokeloop(coro) -> None:
+    await asyncio.wrap_future(_run_on_pokeloop(coro))
+
+
+def _serialize_stub(battle):
+    return {
+        "turn": battle.turn,
+        "opponent": {"pokemon": []},
+        "field": {
+            "weather": {}, "field_effects": {},
+            "my_side": {}, "opponent_side": {},
+        },
+        "legal_actions": [
+            {"kind": "move", "id": move.id} for move in battle.available_moves
+        ],
+    }
+
+
+class _SlowGraph:
+    """Simula `calc_damage` bajo carga: tarda, y solo termina "normal" si
+    nadie la cancela antes."""
+
+    def __init__(self, hold_seconds: float = 5.0) -> None:
+        self.hold_seconds = hold_seconds
+        self.started = threading.Event()
+        self.finished_normally = False
+
+    async def ainvoke(self, graph_input):
+        self.started.set()
+        await asyncio.sleep(self.hold_seconds)
+        self.finished_normally = True
+        return {"action": {"kind": "move", "id": "tackle"}, "action_path": "llm"}
+
+
+async def test_drenaje_cancela_una_decision_en_vuelo_con_topologia_de_tasks_hermanas():
+    """Reproduccion roja de la topologia real: sin la barrera, esta decision
+    queda huerfana. La task de `choose_move` corre en POKE_LOOP, hermana de
+    un wrapper tipo `battle_against` que se cancela por timeout SIN
+    tocarla. Solo `drain_inflight_decisions` la cancela y la espera."""
+    tag = "battle-drain-sibling-1"
+    move = SimpleNamespace(id="tackle")
+    battle = _fake_battle(battle_tag=tag, available_moves=[move])
+    graph = _SlowGraph(hold_seconds=5.0)
+    player = _player(decision_graph=graph, decision_budget_seconds=60)
+
+    with patch.object(client_module, "serialize_battle", _serialize_stub):
+        pending = player.choose_move(battle)
+        # Topologia real: la coroutine corre como task en ps_client.loop,
+        # NUNCA en el loop del test (que aqui hace de "caller").
+        decision_future = _run_on_pokeloop(pending)
+        await _await_on_pokeloop(player.frame_inbox.publish(tag, ("|upkeep",)))
+        assert graph.started.wait(timeout=2), "la decision nunca arranco"
+
+        # Un wrapper hermano tipo `battle_against`, sin relacion con la
+        # decision, se cancela por timeout -- como en el test real
+        # (`asyncio.timeout(45)` sobre `agent.battle_against(...)`).
+        async def sibling_wrapper():
+            await asyncio.sleep(30)
+
+        sibling_future = _run_on_pokeloop(sibling_wrapper())
+        try:
+            async with asyncio.timeout(0.1):
+                await asyncio.wrap_future(sibling_future)
+        except TimeoutError:
+            pass
+        finally:
+            sibling_future.cancel()
+
+        # Cancelar al hermano NO toca a la decision: sigue viva. Esto es
+        # exactamente la causa raiz del CHECKPOINT: si este assert fallara
+        # (la decision se cancelara sola), no habria bug que arreglar.
+        await asyncio.sleep(0.05)
+        assert not decision_future.done(), (
+            "cancelar la task hermana no deberia cancelar la decision; si "
+            "esto falla, algo mas -- no la barrera -- la esta deteniendo"
+        )
+
+        t0 = time.monotonic()
+        await player.drain_inflight_decisions()
+        elapsed = time.monotonic() - t0
+        # La barrera tiene que retornar SOLO despues de que la decision
+        # cancelada termino de verdad, no apenas dispararle `.cancel()`.
+        assert decision_future.done(), (
+            "drain_inflight_decisions() retorno sin esperar a que la "
+            "decision cancelada terminara"
+        )
+
+    assert elapsed < 2.0, (
+        f"la barrera tardo {elapsed:.2f}s: deberia cancelar, no esperar los "
+        f"{graph.hold_seconds}s completos del grafo lento"
+    )
+    assert graph.finished_normally is False
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wrap_future(decision_future)
+
+
+class _CalcTouchingGraph:
+    """Grafo minimo que llama `CalcClient.calculate` DE VERDAD -- no un
+    doble de la carrera, para ejercitar httpx/asyncio reales, igual que
+    `calc_damage` en produccion."""
+
+    def __init__(self, calculator: CalcClient) -> None:
+        self.calculator = calculator
+        self.started = threading.Event()
+
+    async def ainvoke(self, graph_input):
+        self.started.set()
+        await self.calculator.calculate({
+            "gen": 6,
+            "attacker": {"species": "eevee", "level": 100},
+            "defender": {"species": "eevee", "level": 100},
+            "move": {"name": "tackle"},
+        })
+        return {"action": {"kind": "move", "id": "tackle"}, "action_path": "llm"}
+
+
+async def _slow_http_handler(reader, writer, *, delay: float) -> None:
+    try:
+        await reader.readuntil(b"\r\n\r\n")
+    except Exception:
+        pass
+    await asyncio.sleep(delay)
+    body = b'{"status":"ok"}'
+    resp = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"Connection: close\r\n\r\n" + body
+    )
+    try:
+        writer.write(resp)
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+
+
+async def test_drenaje_evita_la_carrera_real_de_calcclient_contra_una_decision_en_vuelo():
+    """Repite el mecanismo EXACTO del sintoma verificado en MON-23: una
+    llamada real de `CalcClient` a mitad de vuelo, en POKE_LOOP, cuando el
+    caller ya se rindio. Con la barrera ANTES de `aclose`, la decision
+    termina LIMPIO (`CancelledError`) y nunca ve `RuntimeError: ... client
+    has been closed` ni `httpx.ReadError` -- los dos sintomas reportados."""
+    tag = "battle-drain-calc-1"
+    move = SimpleNamespace(id="tackle")
+    battle = _fake_battle(battle_tag=tag, available_moves=[move])
+
+    # Servidor propio, controlado: responde recien a los 3s, para que la
+    # request quede en vuelo con certeza cuando llamamos a la barrera.
+    server = await asyncio.start_server(
+        lambda r, w: _slow_http_handler(r, w, delay=3.0), "127.0.0.1", 0
+    )
+    port = server.sockets[0].getsockname()[1]
+
+    calculator = CalcClient(f"http://127.0.0.1:{port}", timeout_seconds=30)
+    graph = _CalcTouchingGraph(calculator)
+    player = _player(decision_graph=graph, decision_budget_seconds=60)
+
+    async with server:
+        asyncio.create_task(server.serve_forever())
+        with patch.object(client_module, "serialize_battle", _serialize_stub):
+            pending = player.choose_move(battle)
+            decision_future = _run_on_pokeloop(pending)
+            await _await_on_pokeloop(player.frame_inbox.publish(tag, ("|upkeep",)))
+            assert graph.started.wait(timeout=2), "la decision nunca arranco"
+            # Tiempo real para que la request HTTP salga al socket: la
+            # carrera que reproduce el issue es contra una request YA EN
+            # VUELO, no una que todavia no se mando.
+            await asyncio.sleep(0.2)
+
+            await player.drain_inflight_decisions()
+            # La garantia que importa: cuando la barrera retorna, la
+            # decision YA terminó -- no simplemente fue marcada para
+            # cancelarse. Si esto no vale, `aclose()` de abajo puede correr
+            # en paralelo con la request todavia en vuelo.
+            assert decision_future.done(), (
+                "drain_inflight_decisions() retorno sin esperar a que la "
+                "decision terminara"
+            )
+            await calculator.aclose()
+
+        surfaced: BaseException | None = None
+        if decision_future.done() and not decision_future.cancelled():
+            surfaced = decision_future.exception()
+
+    assert surfaced is None, (
+        f"la decision huerfana no debe surgir con otra excepcion que no sea "
+        f"cancelacion limpia: {type(surfaced).__name__}: {surfaced}"
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wrap_future(decision_future)
+
+
+class _NeverCalledGraph:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def ainvoke(self, graph_input):
+        self.calls += 1  # pragma: no cover -- nunca deberia correr
+        return {"action": {"kind": "move", "id": "tackle"}, "action_path": "llm"}
+
+
+async def test_drenaje_conjunto_vacio_es_idempotente_y_bloquea_admision_tardia():
+    """Tres requisitos del DESIGN VERDICT en un solo flujo:
+
+    1. drenar sin ninguna decision en vuelo no falla (conjunto vacio);
+    2. una decision cuya coroutine arranca DESPUES del drenaje jamas llega
+       al grafo/calc, y falla ruidosamente con `DecisionsClosedError`
+       (canario de admision);
+    3. llamar la barrera una segunda vez es un no-op seguro (idempotencia,
+       terminal para la instancia).
+    """
+    tag = "battle-drain-late-1"
+    move = SimpleNamespace(id="tackle")
+    battle = _fake_battle(battle_tag=tag, available_moves=[move])
+    graph = _NeverCalledGraph()
+    player = _player(decision_graph=graph)
+
+    # 1. Conjunto vacio.
+    await player.drain_inflight_decisions()
+    assert player._decisions_closed is True
+
+    # 2. Admision tardia: la coroutine arranca DESPUES del drenaje.
+    pending = player.choose_move(battle)
+    with pytest.raises(client_module.DecisionsClosedError):
+        await pending
+    assert graph.calls == 0, "una decision tardia no puede alcanzar el grafo/calc"
+
+    # 3. Idempotencia.
+    await player.drain_inflight_decisions()
+    await player.drain_inflight_decisions()

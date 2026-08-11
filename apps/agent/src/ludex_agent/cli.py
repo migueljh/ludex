@@ -646,6 +646,12 @@ async def _benchmark_command(
                 failure_cause_type=failure_cause_type,
             )
     finally:
+        # D46/MON-23: la decision en vuelo de la ultima batalla corre como
+        # task hermana de `run_benchmark`/`battle_against` en
+        # `ps_client.loop`; cancelar/timeoutear ese wrapper NO la toca.
+        # Hay que drenarla antes de cerrar `CalcClient`/el context
+        # repository o una decision huerfana puede usarlos ya cerrados.
+        await agent.drain_inflight_decisions()
         await calculator.aclose()
         await context_repository.aclose()
         await engine.dispose()
