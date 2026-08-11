@@ -1192,6 +1192,10 @@ async def test_battle_timeout_llega_a_run_benchmark(monkeypatch):
             n_lost_battles = 1
             n_tied_battles = 0
             battles = []
+
+            async def drain_inflight_decisions(self):
+                return None
+
         return Player()
 
     monkeypatch.setattr(cli_module, "LudexPlayer", fake_player_class)
