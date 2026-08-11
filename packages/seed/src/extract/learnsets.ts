@@ -1,4 +1,4 @@
-import { isAvailable, type ModdedDex } from "./dex.js";
+import { isAvailableForExtraction, type ModdedDex } from "./dex.js";
 import type { LearnMethod, LearnMethodName, LearnsetRow } from "../types.js";
 
 const METHOD_BY_LETTER: Record<string, LearnMethodName> = {
@@ -61,9 +61,9 @@ function inheritanceChain(dex: ModdedDex, speciesId: string): string[] {
 }
 
 export async function extractLearnsets(dex: ModdedDex): Promise<LearnsetRow[]> {
-  const species = dex.species.all().filter((s) => isAvailable(dex, s));
+  const species = dex.species.all().filter((s) => isAvailableForExtraction(dex, s, "species"));
   const legalMoveIds = new Set(
-    dex.moves.all().filter((m) => isAvailable(dex, m)).map((m) => m.id),
+    dex.moves.all().filter((m) => isAvailableForExtraction(dex, m, "move")).map((m) => m.id),
   );
 
   // Cache: la mega y la base comparten cadena, no vale la pena releer el archivo.
