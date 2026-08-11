@@ -186,16 +186,23 @@ aceptación §9), para poder comparar tras un bump de versión del paquete:
 
 | tabla       | gen 6 | gen 9 |
 |-------------|------:|------:|
-| pokemon     |   834 |   874 |
-| moves       |   618 |   685 |
+| pokemon     |   835 |   874 |
+| moves       |   619 |   685 |
 | items       |   283 |   248 |
 | abilities   |   191 |   310 |
 | type_chart  |   324 |   361 |
-| learnsets   | 62198 | 65624 |
+| learnsets   | 62253 | 65642 |
 
-**Nota: por qué gen 6 da 618 movimientos y no los 621 del dex nacional hasta
-ORAS.** Los 618 son los usables. Los 5 que faltan para 621 están en la data
-del paquete pero el filtro `isAvailable` (D6) los excluye correctamente:
+**Superseded por D47 (MON-24) para el caso puntual de Floette-Eterna/Light of
+Ruin.** La fila de gen 6 de arriba (835/619/62253) ya refleja ese arreglo;
+834/618/62198 eran los valores originales de esta decisión, antes de D47. El
+resto de esta nota describe el estado ANTERIOR a D47 -- queda para registro
+de por qué el conteo cambió, no es el criterio vigente.
+
+**Nota histórica: por qué gen 6 daba 618 movimientos y no los 621 del dex
+nacional hasta ORAS.** Los 618 eran los usables antes de D47. Los 3 que
+faltaban para 621 estaban en la data del paquete pero el filtro `isAvailable`
+(D6) los excluía:
 
 - `thousandarrows`, `thousandwaves` (firma de Zygarde-Completo) y
   `lightofruin` (firma de Floette-Eterna): `gen=6` pero
@@ -205,7 +212,16 @@ del paquete pero el filtro `isAvailable` (D6) los excluye correctamente:
   proyecto CAP de Smogon, no movimientos reales.
 
 618 + 3 unobtainables = 621 del dex nacional; los 2 CAP no cuentan en ninguna
-suma contra el dex nacional. Nadie vuelva a investigar esta diferencia.
+suma contra el dex nacional.
+
+**Lo que cambió con D47:** `lightofruin` SÍ es battle-legal en
+`gen6randombattle` -- es el movimiento propio de Floette-Eterna en el
+catálogo estándar random-battle del paquete pineado -- pese a su
+`isNonstandard` real-world; ahora se seedea. `thousandarrows`/
+`thousandwaves` siguen excluidos: ningún set estándar de gen 6 los
+referencia. 619 usables + 2 unobtainables no referenciados = 621 del dex
+nacional, mismo total. Nadie vuelva a investigar esta diferencia salvo que el
+paquete cambie de versión.
 
 Motivo: son los mismos conteos que `seedGeneration` imprime y que
 `seed_runs` (D4) persiste por corrida. Tenerlos también acá, fijos al lado de
@@ -1448,8 +1464,13 @@ La corrección final:
   en `pokemon` no produce resultado y se raises `LookupError`.
 - **Fallo ruidoso, nunca descarte silencioso.** Si no hay fila directa y la
   forma no es miembro explícito de `cosmeticFormes`, se lanza `LookupError`.
-  Canarios: `floetteeternal` gen6, `pikachupartner` gen6, `pikachuworld`
-  gen6, `charizardgmax` gen6, `gholdengo` gen6.
+  Canarios (vigentes): `pikachupartner` gen6, `pikachuworld` gen6,
+  `charizardgmax` gen6, `gholdengo` gen6. `floetteeternal` gen6 **dejó de
+  ser canario de este fallo tras D47** (MON-24): sigue sin ser cosmética
+  (el criterio de arriba no cambió), pero ahora tiene fila directa en
+  Postgres, así que resuelve en vez de fallar. `floetteeternal` bajo
+  generaciones cuyo catálogo random-battle no la referencia (p.ej. gen 9)
+  sigue fallando ruidoso, mismo mecanismo que siempre.
 - **El `showdown_id` visible se conserva** sólo tras una resolución
   cosmética válida, para que la proyección correlacione por especie
   revelada.
@@ -1457,8 +1478,12 @@ La corrección final:
 Medido: 332 apariciones afectadas (276 propias + 56 rivales) bajo
 `state_schema_version=2`. Las 5 formas cosméticas (vivillontundra,
 florgesyellow, florgesorange, sawsbucksummer, unowno) se resuelven a su base
-vía `cosmeticFormes`. `floetteeternal` (38 apariciones) y las formas de gen
-posterior quedan como canarios del fallo ruidoso.
+vía `cosmeticFormes`. Las formas de gen posterior (`pikachupartner`,
+`pikachuworld`, `charizardgmax`, `gholdengo`) quedan como canarios del fallo
+ruidoso. `floetteeternal` (38 apariciones) quedó como canario del fallo
+ruidoso hasta D47 (MON-24); desde D47 tiene fila directa vía la excepción
+tipada de `packages/seed/src/extract/dex.ts::isAvailableForExtraction` y ya
+no cae en esta rama.
 
 **Exclusiones diferidas.** Quedan explícitamente fuera de F2-06: round
 availability (la ronda activa se agrega en una rebanada posterior), perfiles
@@ -2631,3 +2656,137 @@ patrón estructural (`asyncio.timeout` envolviendo `battle_against`/
 `cli.py::play()` (`BATTLE_TIMEOUT_SECONDS=180`, vía
 `_battle_against_or_failure`), que no construye `CalcClient` y por lo
 tanto no está expuesto a este defecto -- no requirió cambios.
+
+## D47 — `isNonstandard:"Unobtainable"` referenciado por el catálogo random-battle de la misma generación es battle-legal (MON-24, supersede el caso Floette-Eterna de D12/D32)
+
+**Síntoma verificado.** Una batalla `gen6randombattle` con Floette-Eterna
+podía fallar en `context_repository.py:329` con `LookupError`: "especie
+visible no seedeada ni forma cosmética: `floetteeternal`" (MON-11 R4, 2 de
+7 corridas en vivo).
+
+**Causa raíz, verificada contra las dos fuentes pineadas, no inferida.**
+`isNonstandard:"Unobtainable"` describe obtenibilidad real-world (una
+distribución de evento ya terminada), no legalidad de batalla del
+simulador. Inspeccionando `data/random-battles/gen6/sets.json` del paquete
+`pokemon-showdown@0.11.10` pineado (`packages/seed/node_modules`, el mismo
+`dist/` que corre en el contenedor `showdown`, tag `v0.11.10`):
+
+- `floetteeternal` es la **única** clave de la línea Floette en ese
+  catálogo: no existe una entrada `"floette"` (base) en absoluto. La única
+  forma en que la línea de Floette aparece en `gen6randombattle` es como
+  Floette-Eterna.
+- Su set trae `movepool` con `lightofruin`, su movimiento de firma.
+- Floette-Eterna NO es cosmética: `baseStats` distintos de la base
+  (BST 551 contra 371) y una sola ability (`Flower Veil`, sin la oculta
+  `Symbiosis` de la base). D32 tenía razón en rechazarla como alias
+  cosmético; el problema nunca fue el criterio de `cosmeticFormes`, fue que
+  la especie no tenía NINGUNA fila en `pokemon`.
+- Barrido completo de las 483 especies del catálogo de gen 6 contra
+  `isNonstandard`: `floetteeternal` es la única marcada `Unobtainable`. De
+  los 273 movimientos únicos referenciados en los movepools, `lightofruin`
+  es el único `Unobtainable`. `thousandarrows`/`thousandwaves` comparten el
+  mismo `isNonstandard` que `lightofruin` pero **ningún** set de gen 6 los
+  usa; `paleowave`/`shadowstrike` son `CAP`, no `Unobtainable`.
+
+**Arreglo.** `packages/seed/src/extract/dex.ts::isAvailableForExtraction`
+agrega una excepción tipada y declarativa sobre `isAvailable` (que NO
+cambió): admite una entrada `isNonstandard:"Unobtainable"` sólo si las
+CUATRO condiciones se cumplen a la vez -- `entry.gen <= dex.gen`,
+`isNonstandard === "Unobtainable"` exacto, el id está en el catálogo
+random-battle estándar de esa MISMA generación, y el tipo de entidad
+coincide (`species`/`move`, conjuntos independientes: un movimiento nunca
+entra por aparecer como clave de especie del catálogo, ni al revés).
+`packages/seed/src/extract/random-battle-catalog.ts` carga ese catálogo
+desde el paquete pineado (nunca cwd, vía
+`require.resolve("pokemon-showdown/package.json")`), soporta el shape
+`sets.json` (gen 2-7, 9: `{especie: {sets: [{movepool}]}}`) y el shape más
+viejo `data.json` (gen 1, 8: `{especie: {...listas de movimientos
+reconocidas}}` -- la unión validada de TODAS las listas presentes en la
+entrada, nunca sólo `moves`; ver la corrección L-01 más abajo), y falla
+ruidosamente ante archivo ausente o shape no reconocido -- nunca amplía
+disponibilidad por defecto. Aplicado en `extractSpecies`, `extractMoves`, y
+los dos conjuntos (`species`/`legalMoveIds`) que usa `extractLearnsets`.
+`extractItems`/`extractAbilities` (`simple.ts`) conservan la frontera
+`isAvailable` sin cambios: no hay evidencia de que el mismo patrón les
+aplique.
+
+**Corrección L-01 (LINEAR_VERDICT CHANGES_REQUESTED sobre `76c630a`).** La
+primera versión de `movesFromDataShape` asumía que el shape `data.json`
+era únicamente `{especie: {moves: string[]}}`. Es falso: gen 1 tiene
+además `comboMoves`/`essentialMoves`/`exclusiveMoves`, y gen 8 tiene
+`doublesMoves`/`noDynamaxMoves` -- y 12 entradas Gmax de gen 8
+(`venusaurgmax` entre ellas) **no tienen `moves` en absoluto**, sólo
+`doublesMoves`, así que `loadRandomBattleCatalog(8)` reventaba
+directamente. Medido contra el paquete real: gen 1 sólo-`moves` = 47,
+unión completa = 69; gen 8 sólo-`moves` = 294, unión completa = 351.
+`movesFromDataShape` ahora une todas las listas reconocidas presentes
+(`moves`, `comboMoves`, `essentialMoves`, `exclusiveMoves`,
+`doublesMoves`, `noDynamaxMoves` -- la unión completa entre generaciones,
+sin ramificar por generación en el flujo productivo) y exige al menos una;
+un campo que no es ni lista reconocida ni escalar conocido (`level`,
+`doublesLevel`), o una lista reconocida con tipo inválido, sigue fallando
+ruidoso. `parseCatalogData` quedó exportado como función pura para poder
+probar shapes sintéticos inválidos sin tocar el filesystem. Mutación
+dirigida: restaurar el comportamiento previo (`new Set(entry.moves)`, sin
+unión ni validación de campos) pone en rojo la colección completa de
+`random-battle-catalog.test.ts` (revienta al cargar `loadRandomBattleCatalog(8)`
+por `venusaurgmax` sin `moves`); revertida, suite de extracción completa
+verde (113/113).
+
+**No se tocó `context_repository.py` ni la lógica de D32.** La resolución
+cosmética (`cosmeticFormes` explícito) sigue exactamente igual; lo único
+que cambió es que ahora existe una fila directa para `floetteeternal` en
+`pokemon`, así que el camino de "fila directa siempre gana" (ya existente)
+la resuelve sola.
+
+**Evidencia de regresión, mutación dirigida
+(`packages/seed/test/extract/dex.test.ts`,`species.test.ts`,`moves.test.ts`,
+`learnsets.test.ts`,`random-battle-catalog.test.ts`):** quitar la excepción
+por completo pone en rojo 10 tests (conteos y casos positivos); admitir
+todo `Unobtainable` sin mirar el catálogo pone en rojo la distribución de
+`power_kind` y el contrapeso de `thousandarrows`/`thousandwaves` (mismo
+`isNonstandard` que `lightofruin`, pero no referenciados); cruzar las
+allowlists de especies/movimientos pone en rojo 11 tests; omitir
+`lightofruin` del conjunto legal de `extractLearnsets` pone en rojo el
+canario de las 55 filas de herencia de Floette-Eterna; usar el catálogo de
+otra generación (gen 9) pone en rojo los mismos 10 tests que quitar la
+excepción, porque gen 9 no referencia a Floette. Las cinco mutaciones se
+revirtieron después de confirmar rojo; suite de extracción completa verde
+(95/95) tras cada reversión, sin marcadores de mutación residuales
+(`git diff` limpio).
+
+**Conteos verificados por SQL contra una base descartable** (creada,
+verificada por `current_database()`, sembrada y eliminada; la base
+compartida nunca se tocó -- `SELECT count(*) FROM pokemon WHERE gen_id=1`
+contra `ludex` siguió dando 834 después de esta ronda): gen 6 pasa de
+834/618/62198 a **835/619/62253** (pokemon/moves/learnsets); gen 9 no
+cambia (874/685/65642) porque su catálogo random-battle no referencia a
+Floette. `floetteeternal` aporta exactamente 55 filas de learnset,
+incluida `lightofruin`. `ContextRepository.load_battle_context` contra esa
+misma base resuelve Floette-Eterna con sus stats/ability reales (no los de
+`floette`) y `lightofruin` en su learnset; bajo gen 9 sigue fallando
+ruidoso (`LookupError`), igual que `pikachupartner`/`pikachuworld`/
+`charizardgmax` bajo gen 6 -- ninguno de esos canarios de D32 se movió.
+
+**Documentación actualizada.** D12: tabla de gen 6 y nota de los 618
+movimientos, con la nota histórica preservada y marcada como estado previo
+a este arreglo. D32: el canario `floetteeternal` se retira de la lista de
+`LookupError` esperados con una nota explícita de por qué (D47), sin tocar
+el criterio de `cosmeticFormes` ni los demás canarios.
+`.claude/showdown-data/SKILL.md` documenta la excepción tipada. D33
+(dataset-audit) no se tocó: audita filas ya grabadas del corpus histórico,
+una pregunta distinta de si el simulador puede generar la especie hoy, y
+`floetteeternal` sigue siendo -correctamente- el canario de esa frontera
+para los datos ya existentes.
+
+**Limitación conocida y explícita.** Este arreglo cambia el código de
+extracción y lo verifica contra una base descartable; **no reseedea la
+base compartida `ludex`**.
+`test_floetteeternal_no_es_cosmetica_pero_tiene_fila_directa_por_d47`
+(`apps/agent/tests/db/test_context_repository.py`) va a fallar contra la
+base compartida hasta que alguien corra `pnpm seed --gen 6` ahí -- es la
+señal correcta de que falta ese paso operativo, no una regresión de este
+cambio. No se investigó si el mismo
+patrón (`Unobtainable` referenciado por un catálogo random-battle)
+aplica a `items`/`abilities` en alguna generación; `simple.ts` queda sin
+tocar por falta de evidencia (alcance explícito del DESIGN VERDICT).

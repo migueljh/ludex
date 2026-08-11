@@ -1,4 +1,4 @@
-import { isAvailable, type ModdedDex } from "./dex.js";
+import { isAvailableForExtraction, type ModdedDex } from "./dex.js";
 import type { MoveRow, PowerKind } from "../types.js";
 
 /**
@@ -38,7 +38,7 @@ function dedupeById(dex: ModdedDex, moves: readonly { id: string; name: string }
 }
 
 export function extractMoves(dex: ModdedDex): MoveRow[] {
-  const available = dex.moves.all().filter((m) => isAvailable(dex, m));
+  const available = dex.moves.all().filter((m) => isAvailableForExtraction(dex, m, "move"));
   return (dedupeById(dex, available) as typeof available)
     .map((m) => ({
       showdownId: m.id,

@@ -7,7 +7,7 @@ description: Trampas conocidas del paquete npm pokemon-showdown y de @smogon/cal
 
 Conocimiento verificado contra `pokemon-showdown@0.11.10` y `@smogon/calc@0.11.0`.
 Nada de esto se deduce leyendo la API: todo costó una sesión de debugging.
-Las decisiones formales viven en `docs/DECISIONS.md` (D2, D3, D4, D6, D10, D12, D14, D15, D16).
+Las decisiones formales viven en `docs/DECISIONS.md` (D2, D3, D4, D6, D10, D12, D14, D15, D16, D47).
 
 ## Regla cero
 
@@ -42,6 +42,54 @@ entry.gen <= dex.gen && !entry.isNonstandard
 Está en `packages/seed/src/extract/dex.ts` como `isAvailable`. Cualquier extractor
 nuevo tiene que usarlo. Esto excluye además CAP (`isNonstandard: 'CAP'`) y cosas
 inobtenibles (`'Unobtainable'`), que es lo correcto para un torneo.
+
+**Excepción tipada para `Unobtainable` battle-legal en random battles (D47,
+MON-24).** `isNonstandard: 'Unobtainable'` describe obtenibilidad real-world
+(una distribución de evento ya terminada), **no** legalidad de batalla del
+simulador. `floetteeternal` es la única forma en que la línea de Floette
+aparece en `gen6randombattle`: no hay una entrada `"floette"` base en
+`data/random-battles/gen6/sets.json` del paquete pineado, y `lightofruin` es
+su movimiento de firma en ese mismo set. `isAvailable` en sí **no cambió**
+(sigue siendo el filtro base en todo `packages/seed`); en su lugar,
+`extractSpecies`/`extractMoves`/`extractLearnsets` usan
+`isAvailableForExtraction(dex, entry, kind)`, que admite una entrada
+`Unobtainable` sólo si las cuatro condiciones se cumplen a la vez:
+
+```ts
+entry.gen <= dex.gen
+  && entry.isNonstandard === "Unobtainable"   // exacto: CAP/Future no cuentan
+  && catalogoDeEsaGeneracion[kind].has(entry.id)  // referenciada por SU catálogo
+  // kind ("species" | "move") separa los dos conjuntos: nunca se cruzan
+```
+
+El catálogo (`packages/seed/src/extract/random-battle-catalog.ts`) se lee del
+paquete pineado (nunca de `cwd`, vía
+`require.resolve("pokemon-showdown/package.json")`), soporta el shape
+`sets.json` (`{especie: {sets: [{movepool: string[]}]}}`, gen 2-7 y 9) y el
+shape más viejo `data.json` (gen 1 y 8), y **falla ruidosamente** ante
+archivo ausente o shape no reconocido — nunca amplía disponibilidad en
+silencio.
+
+**`data.json` NO es sólo `{especie: {moves: string[]}}` (L-01, corregido
+tras `LINEAR_VERDICT` sobre `76c630a`).** Una entrada trae la UNIÓN
+validada de todas las listas de movimientos reconocidas presentes —
+nunca sólo `moves`, que a veces ni siquiera está: 12 entradas Gmax de gen 8
+(`venusaurgmax` entre ellas) sólo tienen `doublesMoves`. Campos reconocidos
+por generación: gen 1 usa `moves`/`comboMoves`/`essentialMoves`/
+`exclusiveMoves`; gen 8 usa `moves`/`doublesMoves`/`noDynamaxMoves`;
+`level`/`doublesLevel` son escalares, se ignoran sin validar. Medido: gen 1
+sólo-`moves` = 47 movimientos, unión completa = 69; gen 8 sólo-`moves` =
+294, unión completa = 351. Un campo que no es ni lista reconocida ni
+escalar conocido, o una lista reconocida con tipo inválido, revienta — la
+unión completa entre generaciones se valida siempre, sin ramificar por
+generación en el flujo productivo.
+
+`thousandarrows`/`thousandwaves` comparten el mismo `isNonstandard` que
+`lightofruin` pero ningún set estándar de gen 6 los usa, así que siguen
+excluidos: la excepción es "está en el catálogo de ESTA generación", no
+"es Unobtainable". `items`/`abilities` (`simple.ts`) conservan
+`isAvailable` sin esta excepción — no hay evidencia todavía de que el
+mismo patrón les aplique.
 
 ## Learnsets: la parte más delicada del repo
 
@@ -132,20 +180,23 @@ mata" cuando sí lo mataba.
 
 | tabla      | gen 6 | gen 9 |
 |------------|------:|------:|
-| pokemon    |   834 |   874 |
-| moves      |   618 |   685 |
+| pokemon    |   835 |   874 |
+| moves      |   619 |   685 |
 | items      |   283 |   248 |
 | abilities  |   191 |   310 |
 | type_chart |   324 |   361 |
-| learnsets  | 62198 | 65642 |
+| learnsets  | 62253 | 65642 |
 
 Verificaciones independientes que confirman que el filtro por generación anda:
 `abilities` gen 6 = 191 es exactamente el número de habilidades hasta Delta Stream, y
 `type_chart` es 18² en gen 6 y 19² en gen 9 (entra el tipo Astral).
 
-**Los 618 movimientos de gen 6 contra los 621 del dex nacional ya están explicados**
-(D12): tres inobtenibles (`thousandarrows`, `thousandwaves`, `lightofruin`) y dos CAP
-(`paleowave`, `shadowstrike`). **No volver a investigar esta diferencia.**
+**Los 619 movimientos de gen 6 contra los 621 del dex nacional ya están explicados**
+(D12/D47): `floetteeternal`/`lightofruin` se seedean desde D47 (battle-legal en
+`gen6randombattle` pese a `isNonstandard: 'Unobtainable'`, ver arriba). Dos
+inobtenibles no referenciados por ningún catálogo (`thousandarrows`,
+`thousandwaves`) y dos CAP (`paleowave`, `shadowstrike`) siguen fuera.
+**No volver a investigar esta diferencia.**
 
 ## Al agregar una generación nueva
 
