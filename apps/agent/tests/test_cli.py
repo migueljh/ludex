@@ -1319,16 +1319,19 @@ def test_matrix_run_refresca_catalogo_sin_referencia_indefinida(
     monkeypatch.setattr(
         "ludex_agent.matrix.run_matrix_round", fake_run_matrix_round
     )
+    # Hermetico: conftest carga el .env real; esta ronda no expone
+    # Gemini/Kimi al proceso, asi que el refresh solo puede tocar zen.
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://x:x@localhost:15432/x")
+    monkeypatch.setenv("OPEN_CODE_ZEN_API_KEY", "fake-key")
+    monkeypatch.setenv("OPEN_CODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
+    for secret_env in ("GEMINI_API_KEY", "GEMINI_API_KEYS", "GOOGLE_API_KEY",
+                       "GOOGLE_API_KEYS", "KIMI_API_KEY", "KIMI_BASE_URL"):
+        monkeypatch.delenv(secret_env, raising=False)
 
     result = CliRunner().invoke(
         app,
         ["matrix-run", "--manifest", str(manifest), "--tier", "free",
          "--round", "test-refresh", "--zen-auto-reload-confirmed"],
-        env={
-            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
-            "OPEN_CODE_ZEN_API_KEY": "fake-key",
-            "OPEN_CODE_ZEN_BASE_URL": "https://opencode.ai/zen/v1",
-        },
     )
     assert result.exit_code == 0, result.stdout
     # el refresh_catalog REAL del CLI se invoco sin NameError y refresco
