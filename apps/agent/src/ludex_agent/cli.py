@@ -1020,7 +1020,9 @@ def matrix_run_command(
     - artefacto atomico por modelo + estado de reanudacion;
     - un parcial/abortado nunca publica winrate comparable.
     """
-    from .matrix import ManifestRow, MatrixModelResult, run_matrix_round
+    from .matrix import (
+        ManifestRow, MatrixModelResult, refresh_models, run_matrix_round
+    )
 
     settings = load_settings()
     if battle_timeout <= 0:

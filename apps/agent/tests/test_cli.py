@@ -1288,6 +1288,55 @@ def test_matrix_run_exige_tier_y_auto_reload_para_zen(tmp_path):
     assert "auto-reload" in sin_confirm.stdout
 
 
+def test_matrix_run_refresca_catalogo_sin_referencia_indefinida(
+    tmp_path, monkeypatch
+):
+    """ADDENDUM R1B (MON-20): `matrix-run` llama a `refresh_models` en su
+    refresh de catalogo; el import faltante en `matrix_run_command` hacia
+    crashear el CLI con NameError en el primer refresh (descubierto en la
+    ejecucion R1B, latente desde R3 -- `matrix-run` nunca se habia
+    ejecutado en vivo con el runner commiteado). El refresh del CLI tiene
+    que poder ejecutarse: sin esta cobertura, el defecto vuelve a ser
+    silencioso hasta la proxima corrida real."""
+    manifest = _manifest_document(tmp_path)
+    calls: list[str] = []
+    invoked: dict[str, object] = {}
+
+    async def fake_refresh(provider, *, base_url, api_key, environ,
+                           client=None):
+        calls.append(provider)
+        return ["mimo-v2.5-free"]
+
+    async def fake_run_matrix_round(**kwargs):
+        # el refresh_catalog REAL del CLI corre dentro de la invocacion,
+        # con el env del CliRunner activo
+        fresh = await kwargs["refresh_catalog"]()
+        invoked["fresh"] = fresh
+        invoked["tier"] = kwargs["tier"]
+        return []
+
+    monkeypatch.setattr("ludex_agent.matrix.refresh_models", fake_refresh)
+    monkeypatch.setattr(
+        "ludex_agent.matrix.run_matrix_round", fake_run_matrix_round
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["matrix-run", "--manifest", str(manifest), "--tier", "free",
+         "--round", "test-refresh", "--zen-auto-reload-confirmed"],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "OPEN_CODE_ZEN_API_KEY": "fake-key",
+            "OPEN_CODE_ZEN_BASE_URL": "https://opencode.ai/zen/v1",
+        },
+    )
+    assert result.exit_code == 0, result.stdout
+    # el refresh_catalog REAL del CLI se invoco sin NameError y refresco
+    # solo open_code_zen (google/kimi no tienen clave en este env)
+    assert invoked["fresh"] == {"open_code_zen": ["mimo-v2.5-free"]}
+    assert calls == ["open_code_zen"]
+
+
 def test_matrix_run_rechaza_battle_timeout_no_positivo(tmp_path):
     manifest = _manifest_document(tmp_path)
     result = CliRunner().invoke(
