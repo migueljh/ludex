@@ -1855,3 +1855,55 @@ async def test_chat_completions_json_schema_si_usa_with_structured_output(monkey
     assert captured["structured_method"] == "json_schema"
     assert captured["structured_include_raw"] is True
     assert result.payload["action"]["id"] == "tackle"
+
+
+# --- LATWAN OFFLINE REVIEW (MON-20): L-05 provider_error_code acotado ---
+
+
+def test_provider_error_code_acepta_solo_identificadores_acotados():
+    """L-05 (OFFLINE): que el valor provenga de un campo estructurado no lo
+    vuelve seguro. Solo identificadores acotados
+    `^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$` se conservan; URL, slash,
+    whitespace, query, valores largos, patrones de secreto o nombres de
+    variables de entorno -> None COMPLETO, nunca truncado."""
+    # Codigos reales permitidos
+    assert _structured_provider_error_code(
+        _openai_401("invalid_api_key")
+    ) == "invalid_api_key"
+    assert _structured_provider_error_code(
+        _openai_401("invalid_request_error")
+    ) == "invalid_request_error"
+    assert _structured_provider_error_code(
+        _google_403("API_KEY_INVALID")
+    ) == "API_KEY_INVALID"
+    assert _structured_provider_error_code(
+        _openai_401("server_error")
+    ) == "server_error"
+    # URL + query + clave falsa dentro del campo estructurado
+    assert _structured_provider_error_code(_openai_401(
+        "https://provider.invalid/?api_key=sk-FAKE_SECRET-abc"
+    )) is None
+    # Reason de Google inseguro (slash/whitespace) tambien -> None
+    assert _structured_provider_error_code(_google_403(
+        "https://provider.invalid/x"
+    )) is None
+    assert _structured_provider_error_code(_google_403(
+        "API_KEY_INVALID https://evil"
+    )) is None
+    # whitespace y valores largos
+    assert _structured_provider_error_code(_openai_401("bad code")) is None
+    assert _structured_provider_error_code(_openai_401("x" * 200)) is None
+    # nombre de variable de entorno del proyecto
+    assert _structured_provider_error_code(
+        _openai_401("OPEN_CODE_ZEN_API_KEY")
+    ) is None
+    assert _structured_provider_error_code(
+        _openai_401("GEMINI_API_KEYS")
+    ) is None
+    # patrones de secreto dentro del identificador permitido
+    assert _structured_provider_error_code(_openai_401(
+        "sk-zen-abcdefghijklmnopqrstuvwxyz0123456789"
+    )) is None
+    assert _structured_provider_error_code(_openai_401(
+        "AIzaSyD-000000000000000000000"
+    )) is None

@@ -803,21 +803,49 @@ def _provider_metrics_snapshot(provider: Any) -> dict[str, int | None] | None:
     return snapshot()
 
 
+# L-06 (OFFLINE): los percentiles NO se restan nunca (matematicamente
+# invalido: p50(after) - p50(before) no es un percentil de nada). Con
+# baseline fresco (count=0) los gauges del snapshot posterior SON la unica
+# poblacion y se copian; con baseline con muestras los gauges quedan None
+# (no comparables) y solo contadores/count/total/tokens se diferencian.
+_LATENCY_PREFIXES = ("completion_latency_ms", "decision_latency_ms")
+_LATENCY_GAUGE_KEYS = frozenset({
+    f"{prefix}_{gauge}"
+    for prefix in _LATENCY_PREFIXES
+    for gauge in ("p50", "p95", "max")
+})
+
+
 def _metrics_delta(
     before: Mapping[str, int | None] | None,
     after: Mapping[str, int | None] | None,
 ) -> dict[str, int | None] | None:
-    """L-01 (R1A): delta entre dos snapshots. Contadores (int) restan; los
-    percentiles sin muestras siguen None. Sin snapshot inicial o final no
-    hay delta."""
+    """L-01 (R1A) + L-06 (OFFLINE): delta entre dos snapshots.
+
+    - Contadores, tokens, `count` y `total` se calculan por diferencia.
+    - `max/p50/p95` solo se copian del snapshot posterior cuando el baseline
+      tiene count=0 (la poblacion posterior es la unica). Con baseline con
+      muestras previas los gauges quedan None (no comparables): jamas se
+      publican percentiles inventados (p50(after)-p50(before) = 50 en el
+      ejemplo de Latwan no significa nada).
+    - Sin snapshot inicial o final no hay delta (None).
+    """
     if before is None or after is None:
         return None
+    dirty = any(
+        isinstance(before.get(f"{prefix}_count"), int)
+        and before[f"{prefix}_count"] > 0
+        for prefix in _LATENCY_PREFIXES
+    )
     keys = sorted(set(before) | set(after))
     delta: dict[str, int | None] = {}
     for key in keys:
         start, end = before.get(key), after.get(key)
         if isinstance(start, int) and isinstance(end, int):
-            delta[key] = end - start
+            if dirty and key in _LATENCY_GAUGE_KEYS:
+                delta[key] = None
+            else:
+                delta[key] = end - start
         elif end is not None:
             delta[key] = end
         else:

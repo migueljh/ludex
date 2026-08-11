@@ -582,20 +582,61 @@ def _credential_specific_rejection(exc: Exception) -> bool:
     return False
 
 
+# L-05 (OFFLINE): que el valor de `provider_error_code` provenga de un
+# campo estructurado no lo vuelve seguro. Solo identificadores acotados se
+# persisten; URL, slash, whitespace, query, valores largos, patrones de
+# secreto o nombres de variables de entorno -> None COMPLETO, nunca
+# truncado.
+_SAFE_ERROR_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def _known_env_var_names() -> frozenset[str]:
+    """Nombres de variables de entorno que el proyecto conoce (proveedores,
+    settings, base). Un valor estructurado que sea exactamente uno de estos
+    nombres es una fuga, no un codigo de error: -> None."""
+    names: set[str] = set()
+    for primary, pool, base in _config._PROVIDERS.values():
+        for env in (primary, pool, base):
+            if env:
+                names.add(env)
+    names.update({
+        "GOOGLE_API_KEY", "GOOGLE_API_KEYS",
+        "DATABASE_URL", "TEST_DATABASE_URL",
+        "CALC_BASE_URL", "SHOWDOWN_WS_URL",
+        "LUDEX_PROVIDER", "LUDEX_MODEL", "LUDEX_PRICING_TABLE",
+        "LUDEX_BATTLE_TIMEOUT_SECONDS", "LUDEX_DECISION_BUDGET_SECONDS",
+        "LUDEX_LLM_REQUEST_TIMEOUT_SECONDS",
+    })
+    return frozenset(names)
+
+
+_KNOWN_ENV_VAR_NAMES = _known_env_var_names()
+
+
 def _structured_provider_error_code(exc: Exception) -> str | None:
-    """L-03 (R1A): codigo de error del proveedor SOLO desde campos
-    estructurados permitidos (`error.code` de openai/anthropic,
-    `error.details[].reason` de google). Nunca desde texto libre del
-    mensaje: puede arrastrar URLs, secretos o nombres de variables.
-    Sin body estructurado -> None (nada que persistir)."""
+    """L-03 (R1A) + L-05 (OFFLINE): codigo de error del proveedor SOLO
+    desde campos estructurados permitidos (`error.code` de openai/anthropic,
+    `error.details[].reason` de google) Y acotado a un identificador seguro
+    `^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`. URL, slash, whitespace, query,
+    valores largos, patrones de secreto o nombres de variables de entorno
+    -> None COMPLETO, nunca truncado: un valor inseguro no se persiste ni
+    parcialmente."""
     body = _structured_body(exc)
     if body is None:
         return None
     code = _openai_code(body)
-    if code is not None:
-        return code
-    reasons = _google_reasons(body)
-    return reasons[0] if reasons else None
+    if code is None:
+        reasons = _google_reasons(body)
+        code = reasons[0] if reasons else None
+    if code is None:
+        return None
+    if not _SAFE_ERROR_CODE_RE.fullmatch(code):
+        return None
+    if code in _KNOWN_ENV_VAR_NAMES:
+        return None
+    if any(pattern.search(code) for pattern, _ in _SECRET_PATTERNS):
+        return None
+    return code
 
 
 # Gemini (google.rpc.RetryInfo) manda un `retry_delay` estructurado en el

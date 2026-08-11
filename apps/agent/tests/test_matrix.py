@@ -1096,3 +1096,182 @@ def test_smoke_exitoso_no_lleva_failure_stage():
     assert result.failure_stage is None
     assert result.http_status is None
     assert result.provider_error_code is None
+
+
+# --- LATWAN OFFLINE REVIEW (MON-20): L-05 y L-06 ------------------------
+
+
+def test_artefacto_rechaza_codigo_estructurado_inseguro():
+    """L-05 (OFFLINE): un `error.code` estructurado con URL + query + clave
+    falsa NO se persiste: provider_error_code queda None y la serializacion
+    del artefacto no contiene la URL, `api_key=`, `sk-` ni el valor falso."""
+    import asyncio
+    import json as _json
+    import httpx as _httpx
+
+    fake = "https://provider.invalid/?api_key=sk-FAKE_SECRET-abc"
+
+    def _400(request):
+        return _httpx.HTTPStatusError(
+            "boom", request=request,
+            response=_httpx.Response(400, request=request, json={
+                "error": {"message": "nope", "type": "invalid_request_error",
+                          "code": fake},
+            }),
+        )
+
+    provider, metrics, backend = _keyed_provider(
+        "open_code_zen", "big-pickle", _400, keys=("k",),
+    )
+
+    def build_provider(provider_name, model):
+        return provider
+
+    rows = [_ready_row("open_code_zen", "big-pickle", "free")]
+    results, _, _ = asyncio.run(_run(rows, build_provider=build_provider))
+    result = results[0]
+    assert result.provider_error_code is None
+    serialized = _json.dumps(result.to_dict())
+    for forbidden in (fake, "provider.invalid", "api_key=", "sk-FAKE",
+                      "sk-", "OPEN_CODE_ZEN_"):
+        assert forbidden not in serialized, forbidden
+
+
+def test_benchmark_result_serializado_no_filtra_el_valor_falso():
+    """L-05 (OFFLINE): lo que llega a BenchmarkResult ya paso por
+    `_structured_provider_error_code` (cli.py); serializar el resultado no
+    puede contener URL, `api_key=`, `sk-` ni el valor falso."""
+    import json as _json
+    from dataclasses import asdict
+
+    import httpx as _httpx
+
+    from ludex_agent.benchmark import BenchmarkResult
+    from ludex_agent.graph.provider import (
+        _http_status_chain, _structured_provider_error_code,
+    )
+
+    request = _httpx.Request("POST", "https://provider.example/v1/x")
+    leaky = _httpx.HTTPStatusError(
+        "boom", request=request,
+        response=_httpx.Response(400, request=request, json={
+            "error": {"code": "https://provider.invalid/?api_key=sk-FAKE_SECRET-abc"},
+        }),
+    )
+    code = _structured_provider_error_code(leaky)
+    assert code is None
+    result = BenchmarkResult(
+        requested=2, completed=0, wins=0, losses=0, ties=0,
+        provider="open_code_zen", model="x",
+        failure="FatalProviderError: provider permission or model unavailable",
+        failure_type="FatalProviderError",
+        failure_cause_type="BadRequestError",
+        http_status=_http_status_chain(leaky),
+        provider_error_code=code,
+    )
+    serialized = _json.dumps(asdict(result))
+    for forbidden in ("provider.invalid", "api_key=", "sk-FAKE", "sk-"):
+        assert forbidden not in serialized, forbidden
+
+
+def test_delta_de_metricas_baseline_fresco_reporta_metricas_reales():
+    """L-06 (OFFLINE): con baseline fresco (sin muestras de latencia), el
+    delta reporta las metricas reales posteriores: contadores/tokens/count/
+    total por diferencia y max/p50/p95 copiados del snapshot posterior (la
+    unica poblacion existente)."""
+    from ludex_agent.matrix import _metrics_delta
+
+    before = {
+        "completion_latency_ms_count": 0,
+        "completion_latency_ms_total": None,
+        "completion_latency_ms_p50": None,
+        "completion_latency_ms_p95": None,
+        "completion_latency_ms_max": None,
+        "decision_latency_ms_count": 0,
+        "decision_latency_ms_total": None,
+        "decision_latency_ms_p50": None,
+        "decision_latency_ms_p95": None,
+        "decision_latency_ms_max": None,
+        "turns_transient_affected": 0, "key_rotations": 0,
+        "keys_quarantined": 0, "transient_retries_executed": 0,
+        "input_tokens": 0, "output_tokens": 0,
+    }
+    after = {
+        "completion_latency_ms_count": 2,
+        "completion_latency_ms_total": 300,
+        "completion_latency_ms_p50": 150,
+        "completion_latency_ms_p95": 195,
+        "completion_latency_ms_max": 200,
+        "decision_latency_ms_count": 0,
+        "decision_latency_ms_total": None,
+        "decision_latency_ms_p50": None,
+        "decision_latency_ms_p95": None,
+        "decision_latency_ms_max": None,
+        "turns_transient_affected": 1, "key_rotations": 3,
+        "keys_quarantined": 2, "transient_retries_executed": 2,
+        "input_tokens": 100, "output_tokens": 20,
+    }
+    delta = _metrics_delta(before, after)
+    assert delta is not None
+    assert delta["completion_latency_ms_count"] == 2
+    assert delta["completion_latency_ms_total"] == 300
+    assert delta["completion_latency_ms_max"] == 200
+    assert delta["completion_latency_ms_p50"] == 150
+    assert delta["completion_latency_ms_p95"] == 195
+    assert delta["key_rotations"] == 3
+    assert delta["keys_quarantined"] == 2
+    assert delta["transient_retries_executed"] == 2
+    assert delta["input_tokens"] == 100
+    assert delta["decision_latency_ms_count"] == 0
+
+
+def test_delta_de_metricas_baseline_con_muestras_deja_gauges_no_comparables():
+    """L-06 (OFFLINE): el ejemplo exacto de Latwan. Restar percentiles da
+    max=100/p50=50/p95=95, matematicamente invalido: jamas se publica.
+    Con baseline con muestras previas, los gauges max/p50/p95 quedan None
+    (no comparables) y los contadores siguen calculandose por diferencia.
+    Mutar a 'restar todos los ints' pone este canario rojo."""
+    from ludex_agent.matrix import _metrics_delta
+
+    before = {
+        "completion_latency_ms_count": 1,
+        "completion_latency_ms_total": 100,
+        "completion_latency_ms_p50": 100,
+        "completion_latency_ms_p95": 100,
+        "completion_latency_ms_max": 100,
+        "decision_latency_ms_count": 0,
+        "decision_latency_ms_total": None,
+        "decision_latency_ms_p50": None,
+        "decision_latency_ms_p95": None,
+        "decision_latency_ms_max": None,
+        "key_rotations": 0, "keys_quarantined": 0,
+        "transient_retries_executed": 0, "input_tokens": 0,
+    }
+    after = {
+        "completion_latency_ms_count": 2,
+        "completion_latency_ms_total": 300,
+        "completion_latency_ms_p50": 150,
+        "completion_latency_ms_p95": 195,
+        "completion_latency_ms_max": 200,
+        "decision_latency_ms_count": 0,
+        "decision_latency_ms_total": None,
+        "decision_latency_ms_p50": None,
+        "decision_latency_ms_p95": None,
+        "decision_latency_ms_max": None,
+        "key_rotations": 0, "keys_quarantined": 0,
+        "transient_retries_executed": 0, "input_tokens": 0,
+    }
+    delta = _metrics_delta(before, after)
+    assert delta is not None
+    # jamas los percentiles inventados del ejemplo de Latwan
+    assert not (
+        delta["completion_latency_ms_max"] == 100
+        and delta["completion_latency_ms_p50"] == 50
+        and delta["completion_latency_ms_p95"] == 95
+    )
+    assert delta["completion_latency_ms_max"] is None
+    assert delta["completion_latency_ms_p50"] is None
+    assert delta["completion_latency_ms_p95"] is None
+    # contadores, count y total siguen calculandose por diferencia
+    assert delta["completion_latency_ms_count"] == 1
+    assert delta["completion_latency_ms_total"] == 200
