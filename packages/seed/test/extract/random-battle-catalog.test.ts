@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { loadRandomBattleCatalog } from "../../src/extract/random-battle-catalog.js";
+import {
+  loadRandomBattleCatalog, parseCatalogData,
+} from "../../src/extract/random-battle-catalog.js";
 
 // MON-24/D47: el catálogo estándar random-battle de cada generación (el
 // mismo `sets.json`/`data.json` que trae el paquete pineado `pokemon-showdown`)
@@ -75,13 +77,102 @@ describe("loadRandomBattleCatalog gen 9 (shape sets.json, catálogo distinto)", 
   });
 });
 
-describe("loadRandomBattleCatalog gen 1 (shape data.json)", () => {
-  it("resuelve el shape data.json ({especie: {level, moves: string[]}}) sin reventar", () => {
-    const catalog = loadRandomBattleCatalog(1);
+// --- L-01 (CORRECTION PACKET, LINEAR_VERDICT CHANGES_REQUESTED sobre
+// 76c630a): el shape "data.json" (gen 1, 8) NO es solo `{especie: {moves}}`.
+// Una entrada puede traer varias listas de movimientos reconocidas ademas
+// de (o en vez de) `moves`: gen 1 tiene `comboMoves`/`essentialMoves`/
+// `exclusiveMoves`; gen 8 tiene `doublesMoves`/`noDynamaxMoves`, y varios
+// Gmax de gen 8 (`venusaurgmax` entre ellos) NO TIENEN `moves` en absoluto,
+// solo `doublesMoves`. Conteos verificados independientemente contra
+// pokemon-showdown@0.11.10 (node -e directo sobre los data.json reales, no
+// supuestos): gen 1 `moves` solo = 47, union completa = 69; gen 8 `moves`
+// solo = 294, union completa = 351.
+
+describe("loadRandomBattleCatalog gen 1 (shape data.json, campos multiples)", () => {
+  const catalog = loadRandomBattleCatalog(1);
+
+  it("resuelve el shape data.json sin reventar", () => {
     expect(catalog.speciesIds.size).toBeGreaterThan(0);
     expect(catalog.moveIds.size).toBeGreaterThan(0);
-    // bulbasaur es una entrada real y estable del data.json de gen 1.
     expect(catalog.speciesIds.has("bulbasaur")).toBe(true);
+  });
+
+  it("produce 69 movimientos unicos (union completa, no solo el campo moves)", () => {
+    expect(catalog.moveIds.size).toBe(69);
+  });
+
+  it("canario: incluye movimientos que SOLO estan en comboMoves/essentialMoves, no en moves", () => {
+    // charmander (gen1/data.json): moves=[counter,seismictoss,slash];
+    // essentialMoves=[bodyslam,fireblast]; comboMoves=[bodyslam,fireblast,
+    // submission,swordsdance]. "submission" no esta en moves ni en
+    // essentialMoves: solo lo trae comboMoves. Si el parser solo uniera
+    // `moves`, faltaria sin que ningun conteo total lo hiciera obvio salvo
+    // por casualidad.
+    expect(catalog.moveIds.has("submission")).toBe(true);
+    expect(catalog.moveIds.has("bodyslam")).toBe(true);
+  });
+});
+
+describe("loadRandomBattleCatalog gen 8 (shape data.json, entradas solo-doublesMoves)", () => {
+  it("completa sin excepcion", () => {
+    expect(() => loadRandomBattleCatalog(8)).not.toThrow();
+  });
+
+  const catalog = loadRandomBattleCatalog(8);
+
+  it("acepta una entrada real sin `moves`, solo `doublesMoves` (venusaurgmax)", () => {
+    expect(catalog.speciesIds.has("venusaurgmax")).toBe(true);
+    // earthpower/energyball/leechseed/protect/sleeppowder/sludgebomb son el
+    // doublesMoves real de venusaurgmax: si el parser exigiera `moves` esta
+    // entrada nunca se hubiera podido leer sin reventar antes de llegar aca.
+    expect(catalog.moveIds.has("earthpower")).toBe(true);
+    expect(catalog.moveIds.has("sludgebomb")).toBe(true);
+  });
+
+  it("produce 351 movimientos unicos (union completa: moves+doublesMoves+noDynamaxMoves)", () => {
+    expect(catalog.moveIds.size).toBe(351);
+  });
+});
+
+describe("sweep gen 1..9: todo catalogo carga sin reventar y no vacio", () => {
+  for (let gen = 1; gen <= 9; gen++) {
+    it(`gen ${gen}`, () => {
+      const catalog = loadRandomBattleCatalog(gen);
+      expect(catalog.speciesIds.size).toBeGreaterThan(0);
+      expect(catalog.moveIds.size).toBeGreaterThan(0);
+    });
+  }
+});
+
+describe("parseCatalogData: shape data.json invalido falla ruidoso", () => {
+  it("una lista reconocida presente pero mal tipada revienta", () => {
+    expect(() =>
+      parseCatalogData("<test>", {
+        algunaespecie: { moves: ["tackle"], comboMoves: "no-es-un-array" },
+      }),
+    ).toThrow(/comboMoves/);
+  });
+
+  it("una entrada sin ninguna lista de movimientos reconocida revienta", () => {
+    expect(() =>
+      parseCatalogData("<test>", { algunaespecie: { level: 50 } }),
+    ).toThrow(/ninguna lista/);
+  });
+
+  it("un campo desconocido (ni lista reconocida ni escalar conocido) revienta", () => {
+    expect(() =>
+      parseCatalogData("<test>", {
+        algunaespecie: { moves: ["tackle"], campoInventado: ["algo"] },
+      }),
+    ).toThrow(/desconocido/);
+  });
+
+  it("el shape sets.json real sigue funcionando sin cambios (no se rompio nada)", () => {
+    expect(() =>
+      parseCatalogData("<test>", {
+        algunaespecie: { sets: [{ movepool: ["tackle"] }] },
+      }),
+    ).not.toThrow();
   });
 });
 
