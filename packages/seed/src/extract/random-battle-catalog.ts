@@ -65,14 +65,103 @@ function movesFromSetsShape(filePath: string, speciesId: string, entry: Record<s
   return moves;
 }
 
-/** Shape "data.json" (gen 1, 8): { [speciesId]: { moves: string[] } }. */
+/**
+ * Campos de LISTA DE MOVIMIENTOS reconocidos del shape "data.json". La union
+ * completa entre generaciones: gen 1 usa moves/comboMoves/essentialMoves/
+ * exclusiveMoves, gen 8 usa moves/doublesMoves/noDynamaxMoves. Ninguna
+ * entrada real mezcla campos de una generacion con los de otra, asi que
+ * listar la union entera y validarla contra lo que HAYA en cada entrada es
+ * seguro y evita ramificar por generacion en el flujo productivo (L-01: no
+ * hardcodear una generacion aca).
+ *
+ * Medido contra pokemon-showdown@0.11.10: `moves` NO siempre esta presente
+ * -- 12 entradas Gmax de gen 8 (venusaurgmax entre ellas) solo traen
+ * `doublesMoves`. Por eso la union exige al menos UNA lista reconocida, no
+ * `moves` especificamente.
+ */
+const DATA_JSON_MOVE_LIST_FIELDS = [
+  "moves", "comboMoves", "essentialMoves", "exclusiveMoves",
+  "doublesMoves", "noDynamaxMoves",
+] as const;
+
+/** Campos escalares reconocidos del shape "data.json": no son listas de
+ * movimientos: se ignoran sin error, nunca se validan como string[]. */
+const DATA_JSON_SCALAR_FIELDS = ["level", "doublesLevel"] as const;
+
+const DATA_JSON_KNOWN_FIELDS = new Set<string>([
+  ...DATA_JSON_MOVE_LIST_FIELDS, ...DATA_JSON_SCALAR_FIELDS,
+]);
+
+/**
+ * Shape "data.json" (gen 1, 8): { [speciesId]: { moves?, comboMoves?,
+ * essentialMoves?, exclusiveMoves?, doublesMoves?, noDynamaxMoves?, level?,
+ * doublesLevel? } }. Une TODAS las listas de movimientos reconocidas
+ * presentes en la entrada -- nunca solo `moves` (L-01). Un campo que no es
+ * ni lista reconocida ni escalar reconocido, o una lista reconocida con
+ * tipo invalido, falla ruidoso: nunca se ignora en silencio, porque eso
+ * podria excluir movimientos legales sin que ningun conteo lo delate.
+ */
 function movesFromDataShape(filePath: string, speciesId: string, entry: Record<string, unknown>): Set<string> {
-  if (!isStringArray(entry.moves)) {
+  for (const field of Object.keys(entry)) {
+    if (!DATA_JSON_KNOWN_FIELDS.has(field)) {
+      throw new Error(
+        `catalogo random-battle invalido en ${filePath}: "${speciesId}" tiene un campo desconocido "${field}"`,
+      );
+    }
+  }
+  const moves = new Set<string>();
+  let foundRecognizedList = false;
+  for (const field of DATA_JSON_MOVE_LIST_FIELDS) {
+    if (!(field in entry)) continue;
+    foundRecognizedList = true;
+    const value = entry[field];
+    if (!isStringArray(value)) {
+      throw new Error(
+        `catalogo random-battle invalido en ${filePath}: "${speciesId}".${field} no es string[]`,
+      );
+    }
+    for (const moveId of value) moves.add(moveId);
+  }
+  if (!foundRecognizedList) {
     throw new Error(
-      `catalogo random-battle invalido en ${filePath}: "${speciesId}".moves no es string[]`,
+      `catalogo random-battle invalido en ${filePath}: "${speciesId}" no tiene ninguna lista ` +
+        `de movimientos reconocida (${DATA_JSON_MOVE_LIST_FIELDS.join(", ")})`,
     );
   }
-  return new Set(entry.moves);
+  return moves;
+}
+
+/**
+ * Procesa el catalogo YA PARSEADO de un archivo (JSON valido, todavia sin
+ * tipar). Separado de la lectura de disco para poder probar shapes
+ * sintéticos invalidos sin tocar el filesystem (ver
+ * `random-battle-catalog.test.ts`).
+ */
+export function parseCatalogData(
+  filePath: string, parsed: unknown,
+): { speciesIds: Set<string>; moveIds: Set<string> } {
+  if (!isPlainObject(parsed)) {
+    throw new Error(`catalogo random-battle invalido en ${filePath}: la raiz no es un objeto`);
+  }
+
+  const speciesIds = new Set<string>();
+  const moveIds = new Set<string>();
+  for (const [speciesId, value] of Object.entries(parsed)) {
+    if (!isPlainObject(value)) {
+      throw new Error(
+        `catalogo random-battle invalido en ${filePath}: la entrada "${speciesId}" no es un objeto`,
+      );
+    }
+    speciesIds.add(speciesId);
+    const moves = "sets" in value
+      ? movesFromSetsShape(filePath, speciesId, value)
+      : movesFromDataShape(filePath, speciesId, value);
+    for (const moveId of moves) moveIds.add(moveId);
+  }
+  if (speciesIds.size === 0) {
+    throw new Error(`catalogo random-battle vacio en ${filePath}: 0 especies referenciadas`);
+  }
+  return { speciesIds, moveIds };
 }
 
 function parseCatalogFile(filePath: string): { speciesIds: Set<string>; moveIds: Set<string> } {
@@ -88,36 +177,7 @@ function parseCatalogFile(filePath: string): { speciesIds: Set<string>; moveIds:
   } catch (err) {
     throw new Error(`catalogo random-battle invalido (JSON malformado) en ${filePath}: ${(err as Error).message}`);
   }
-  if (!isPlainObject(parsed)) {
-    throw new Error(`catalogo random-battle invalido en ${filePath}: la raiz no es un objeto`);
-  }
-
-  const speciesIds = new Set<string>();
-  const moveIds = new Set<string>();
-  for (const [speciesId, value] of Object.entries(parsed)) {
-    if (!isPlainObject(value)) {
-      throw new Error(
-        `catalogo random-battle invalido en ${filePath}: la entrada "${speciesId}" no es un objeto`,
-      );
-    }
-    speciesIds.add(speciesId);
-    let moves: Set<string>;
-    if ("sets" in value) {
-      moves = movesFromSetsShape(filePath, speciesId, value);
-    } else if ("moves" in value) {
-      moves = movesFromDataShape(filePath, speciesId, value);
-    } else {
-      throw new Error(
-        `catalogo random-battle invalido en ${filePath}: "${speciesId}" no tiene "sets" ni "moves" ` +
-          `(shape desconocido; nunca se amplia disponibilidad por defecto)`,
-      );
-    }
-    for (const moveId of moves) moveIds.add(moveId);
-  }
-  if (speciesIds.size === 0) {
-    throw new Error(`catalogo random-battle vacio en ${filePath}: 0 especies referenciadas`);
-  }
-  return { speciesIds, moveIds };
+  return parseCatalogData(filePath, parsed);
 }
 
 /**
