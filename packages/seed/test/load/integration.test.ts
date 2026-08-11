@@ -3,9 +3,12 @@ import type { Pool } from "pg";
 import { createPool } from "../../src/load/client.js";
 import { seedGeneration } from "../../src/cli.js";
 
+// D47/MON-24: pokemon 835 (+floetteeternal), moves 619 (+lightofruin),
+// learnsets 62253 (+55, el learnset de floetteeternal). items/abilities/
+// typeChart no cambian: la excepcion tipada no los toca (verdict item 8).
 const GEN6_COUNTS = {
-  pokemon: 834, moves: 618, items: 283, abilities: 191, typeChart: 324,
-  learnsets: 62198,
+  pokemon: 835, moves: 619, items: 283, abilities: 191, typeChart: 324,
+  learnsets: 62253,
 };
 
 describe("seedGeneration", () => {
@@ -101,7 +104,7 @@ describe("seedGeneration", () => {
       WHERE g.gen_number IN (6, 9)
       GROUP BY g.gen_number ORDER BY g.gen_number`);
     expect(rows).toEqual([
-      { gen_number: 6, c: 834 },
+      { gen_number: 6, c: 835 },
       { gen_number: 9, c: 874 },
     ]);
   }, 900_000);

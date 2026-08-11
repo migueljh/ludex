@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { isAvailable, loadGen } from "../../src/extract/dex.js";
+import { isAvailable, isAvailableForExtraction, loadGen } from "../../src/extract/dex.js";
 import { extractLearnsets, parseLearnCode } from "../../src/extract/learnsets.js";
 import type { LearnsetRow } from "../../src/types.js";
 
@@ -97,11 +97,23 @@ describe("extractLearnsets gen 6", () => {
   });
 
   it("no genera filas para movimientos fuera de la generacion", () => {
+    // D47/MON-24: el conjunto de movimientos legales de extractLearnsets usa
+    // isAvailableForExtraction (con la excepcion de catalogo), no isAvailable
+    // a secas -- por eso el test se mide con el mismo criterio, si no
+    // lightofruin (legitimamente incluido) lo haria fallar en falso.
     const dex = loadGen(6);
     const gen6MoveIds = new Set(
-      dex.moves.all().filter((m) => isAvailable(dex, m)).map((m) => m.id),
+      dex.moves.all()
+        .filter((m) => isAvailableForExtraction(dex, m, "move"))
+        .map((m) => m.id),
     );
     expect(rows.every((r) => gen6MoveIds.has(r.moveId))).toBe(true);
+  });
+
+  it("D47/MON-24: floetteeternal aporta 55 filas de learnset, incluida lightofruin", () => {
+    const floetteEternalRows = rows.filter((r) => r.speciesId === "floetteeternal");
+    expect(floetteEternalRows).toHaveLength(55);
+    expect(of("floetteeternal", "lightofruin")).toBeDefined();
   });
 
   it("no repite el par (especie, movimiento)", () => {
@@ -117,7 +129,9 @@ describe("extractLearnsets gen 6", () => {
     // baseSpecies (las 48 megas de gen 6 quedandose sin movimientos) o la de
     // prevo. Sin esta asercion la regresion pasa con los tests en verde.
     expect(rows.length).toBeGreaterThan(49321);
-    expect(rows).toHaveLength(62198);
+    // D47/MON-24: 62253 = 62198 + 55 (el learnset de floetteeternal, heredado
+    // de floette mas su propio lightofruin).
+    expect(rows).toHaveLength(62253);
   });
 });
 
@@ -244,7 +258,9 @@ describe("D14: herencia aditiva de formas", () => {
   });
 
   it("los totales por generación nunca bajan del baseline", () => {
-    expect(extracted.get(6)).toHaveLength(62_198);
+    // D47/MON-24: gen 6 sube a 62_253 (+55 de floetteeternal); gen 9 no
+    // cambia, su catálogo random-battle no referencia a Floette.
+    expect(extracted.get(6)).toHaveLength(62_253);
     expect(extracted.get(9)).toHaveLength(65_642);
   });
 });
