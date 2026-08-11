@@ -66,14 +66,30 @@ El catálogo (`packages/seed/src/extract/random-battle-catalog.ts`) se lee del
 paquete pineado (nunca de `cwd`, vía
 `require.resolve("pokemon-showdown/package.json")`), soporta el shape
 `sets.json` (`{especie: {sets: [{movepool: string[]}]}}`, gen 2-7 y 9) y el
-shape más viejo `data.json` (`{especie: {moves: string[]}}`, gen 1 y 8), y
-**falla ruidosamente** ante archivo ausente o shape no reconocido — nunca
-amplía disponibilidad en silencio. `thousandarrows`/`thousandwaves`
-comparten el mismo `isNonstandard` que `lightofruin` pero ningún set
-estándar de gen 6 los usa, así que siguen excluidos: la excepción es "está
-en el catálogo de ESTA generación", no "es Unobtainable". `items`/
-`abilities` (`simple.ts`) conservan `isAvailable` sin esta excepción — no
-hay evidencia todavía de que el mismo patrón les aplique.
+shape más viejo `data.json` (gen 1 y 8), y **falla ruidosamente** ante
+archivo ausente o shape no reconocido — nunca amplía disponibilidad en
+silencio.
+
+**`data.json` NO es sólo `{especie: {moves: string[]}}` (L-01, corregido
+tras `LINEAR_VERDICT` sobre `76c630a`).** Una entrada trae la UNIÓN
+validada de todas las listas de movimientos reconocidas presentes —
+nunca sólo `moves`, que a veces ni siquiera está: 12 entradas Gmax de gen 8
+(`venusaurgmax` entre ellas) sólo tienen `doublesMoves`. Campos reconocidos
+por generación: gen 1 usa `moves`/`comboMoves`/`essentialMoves`/
+`exclusiveMoves`; gen 8 usa `moves`/`doublesMoves`/`noDynamaxMoves`;
+`level`/`doublesLevel` son escalares, se ignoran sin validar. Medido: gen 1
+sólo-`moves` = 47 movimientos, unión completa = 69; gen 8 sólo-`moves` =
+294, unión completa = 351. Un campo que no es ni lista reconocida ni
+escalar conocido, o una lista reconocida con tipo inválido, revienta — la
+unión completa entre generaciones se valida siempre, sin ramificar por
+generación en el flujo productivo.
+
+`thousandarrows`/`thousandwaves` comparten el mismo `isNonstandard` que
+`lightofruin` pero ningún set estándar de gen 6 los usa, así que siguen
+excluidos: la excepción es "está en el catálogo de ESTA generación", no
+"es Unobtainable". `items`/`abilities` (`simple.ts`) conservan
+`isAvailable` sin esta excepción — no hay evidencia todavía de que el
+mismo patrón les aplique.
 
 ## Learnsets: la parte más delicada del repo
 

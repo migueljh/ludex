@@ -191,7 +191,7 @@ aceptación §9), para poder comparar tras un bump de versión del paquete:
 | items       |   283 |   248 |
 | abilities   |   191 |   310 |
 | type_chart  |   324 |   361 |
-| learnsets   | 62253 | 65624 |
+| learnsets   | 62253 | 65642 |
 
 **Superseded por D47 (MON-24) para el caso puntual de Floette-Eterna/Light of
 Ruin.** La fila de gen 6 de arriba (835/619/62253) ya refleja ese arreglo;
@@ -2660,9 +2660,9 @@ tanto no está expuesto a este defecto -- no requirió cambios.
 ## D47 — `isNonstandard:"Unobtainable"` referenciado por el catálogo random-battle de la misma generación es battle-legal (MON-24, supersede el caso Floette-Eterna de D12/D32)
 
 **Síntoma verificado.** Una batalla `gen6randombattle` con Floette-Eterna
-podía fallar en `context_repository.py:329` con `LookupError: especie
-visible no seedeada ni forma cosmética: floetteeternal` (MON-11 R4, 2 de 7
-corridas en vivo).
+podía fallar en `context_repository.py:329` con `LookupError`: "especie
+visible no seedeada ni forma cosmética: `floetteeternal`" (MON-11 R4, 2 de
+7 corridas en vivo).
 
 **Causa raíz, verificada contra las dos fuentes pineadas, no inferida.**
 `isNonstandard:"Unobtainable"` describe obtenibilidad real-world (una
@@ -2700,13 +2700,38 @@ entra por aparecer como clave de especie del catálogo, ni al revés).
 desde el paquete pineado (nunca cwd, vía
 `require.resolve("pokemon-showdown/package.json")`), soporta el shape
 `sets.json` (gen 2-7, 9: `{especie: {sets: [{movepool}]}}`) y el shape más
-viejo `data.json` (gen 1, 8: `{especie: {moves}}`), y falla ruidosamente
-ante archivo ausente o shape no reconocido -- nunca amplía disponibilidad
-por defecto. Aplicado en `extractSpecies`, `extractMoves`, y los dos
-conjuntos (`species`/`legalMoveIds`) que usa `extractLearnsets`.
+viejo `data.json` (gen 1, 8: `{especie: {...listas de movimientos
+reconocidas}}` -- la unión validada de TODAS las listas presentes en la
+entrada, nunca sólo `moves`; ver la corrección L-01 más abajo), y falla
+ruidosamente ante archivo ausente o shape no reconocido -- nunca amplía
+disponibilidad por defecto. Aplicado en `extractSpecies`, `extractMoves`, y
+los dos conjuntos (`species`/`legalMoveIds`) que usa `extractLearnsets`.
 `extractItems`/`extractAbilities` (`simple.ts`) conservan la frontera
 `isAvailable` sin cambios: no hay evidencia de que el mismo patrón les
 aplique.
+
+**Corrección L-01 (LINEAR_VERDICT CHANGES_REQUESTED sobre `76c630a`).** La
+primera versión de `movesFromDataShape` asumía que el shape `data.json`
+era únicamente `{especie: {moves: string[]}}`. Es falso: gen 1 tiene
+además `comboMoves`/`essentialMoves`/`exclusiveMoves`, y gen 8 tiene
+`doublesMoves`/`noDynamaxMoves` -- y 12 entradas Gmax de gen 8
+(`venusaurgmax` entre ellas) **no tienen `moves` en absoluto**, sólo
+`doublesMoves`, así que `loadRandomBattleCatalog(8)` reventaba
+directamente. Medido contra el paquete real: gen 1 sólo-`moves` = 47,
+unión completa = 69; gen 8 sólo-`moves` = 294, unión completa = 351.
+`movesFromDataShape` ahora une todas las listas reconocidas presentes
+(`moves`, `comboMoves`, `essentialMoves`, `exclusiveMoves`,
+`doublesMoves`, `noDynamaxMoves` -- la unión completa entre generaciones,
+sin ramificar por generación en el flujo productivo) y exige al menos una;
+un campo que no es ni lista reconocida ni escalar conocido (`level`,
+`doublesLevel`), o una lista reconocida con tipo inválido, sigue fallando
+ruidoso. `parseCatalogData` quedó exportado como función pura para poder
+probar shapes sintéticos inválidos sin tocar el filesystem. Mutación
+dirigida: restaurar el comportamiento previo (`new Set(entry.moves)`, sin
+unión ni validación de campos) pone en rojo la colección completa de
+`random-battle-catalog.test.ts` (revienta al cargar `loadRandomBattleCatalog(8)`
+por `venusaurgmax` sin `moves`); revertida, suite de extracción completa
+verde (113/113).
 
 **No se tocó `context_repository.py` ni la lógica de D32.** La resolución
 cosmética (`cosmeticFormes` explícito) sigue exactamente igual; lo único
@@ -2756,11 +2781,12 @@ para los datos ya existentes.
 
 **Limitación conocida y explícita.** Este arreglo cambia el código de
 extracción y lo verifica contra una base descartable; **no reseedea la
-base compartida `ludex`**. `test_floetteeternal_no_es_cosmetica_pero_
-tiene_fila_directa_por_d47` (`apps/agent/tests/db/test_context_repository.py`)
-va a fallar contra la base compartida hasta que alguien corra
-`pnpm seed --gen 6` ahí -- es la señal correcta de que falta ese paso
-operativo, no una regresión de este cambio. No se investigó si el mismo
+base compartida `ludex`**.
+`test_floetteeternal_no_es_cosmetica_pero_tiene_fila_directa_por_d47`
+(`apps/agent/tests/db/test_context_repository.py`) va a fallar contra la
+base compartida hasta que alguien corra `pnpm seed --gen 6` ahí -- es la
+señal correcta de que falta ese paso operativo, no una regresión de este
+cambio. No se investigó si el mismo
 patrón (`Unobtainable` referenciado por un catálogo random-battle)
 aplica a `items`/`abilities` en alguna generación; `simple.ts` queda sin
 tocar por falta de evidencia (alcance explícito del DESIGN VERDICT).
