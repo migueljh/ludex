@@ -1,0 +1,88 @@
+{
+  "rows": [
+    {
+      "provider": "open_code_zen",
+      "model": "big-pickle",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "big-pickle"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "deepseek-v4-flash-free",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "deepseek-v4-flash-free"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "laguna-s-2.1-free",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "text_json",
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "laguna-s-2.1-free"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "north-mini-code-free",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "free",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "north-mini-code-free"
+      ],
+      "estimated_cost_usd": "0",
+      "estimated_smoke_usd": "0",
+      "cumulative_cost_usd": null,
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    }
+  ],
+  "generated_at": "20260812t214659z",
+  "round": "R1B RETRY",
+  "derived_from": "r1b-matrix-manifest.json",
+  "authorization": "LATWAN OFFLINE ACCEPTANCE MON-20 R1B RETRY @282a551"
+}

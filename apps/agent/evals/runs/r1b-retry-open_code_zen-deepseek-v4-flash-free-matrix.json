@@ -1,0 +1,45 @@
+{
+  "provider": "open_code_zen",
+  "model": "deepseek-v4-flash-free",
+  "tier": "free",
+  "protocol": "chat_completions",
+  "status": "aborted",
+  "smoke_ok": true,
+  "battles_requested": 2,
+  "battles_completed": 0,
+  "effective_provider": "open_code_zen",
+  "effective_model": "deepseek-v4-flash-free",
+  "win_rate": null,
+  "completion_latency_ms": {
+    "count": 1,
+    "total": 121461,
+    "p50": 121461,
+    "p95": 121461,
+    "max": 121461
+  },
+  "decision_latency_ms": {
+    "count": 1,
+    "total": 121463,
+    "p50": 121463,
+    "p95": 121463,
+    "max": 121463
+  },
+  "tokens": {
+    "input_tokens": 47959,
+    "output_tokens": 3373,
+    "cached_input_tokens": 47872,
+    "reasoning_tokens": 3309
+  },
+  "retries": 2,
+  "rotations": 4,
+  "quarantined": 0,
+  "failure_type": "ProviderPoolExhausted",
+  "failure_cause_type": null,
+  "battles_wins": 0,
+  "battles_losses": 0,
+  "battles_ties": 0,
+  "note": "batallas parciales o abortadas: sin winrate comparable",
+  "failure_stage": "battle",
+  "http_status": null,
+  "provider_error_code": null
+}
