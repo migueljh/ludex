@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -24,7 +24,9 @@ from poke_env.player import (
 
 from .benchmark import (
     BenchmarkDeadlineExceeded,
+    BenchmarkFailure,
     BenchmarkResult,
+    InternalCleanupError,
     ShowdownUnavailableError,
     failure_classification,
     run_benchmark,
@@ -552,7 +554,7 @@ def model_set_command(
     _asyncio.run(run())
 
 
-async def _close_player_sockets(agent: Any, rival: Any) -> None:
+async def _close_player_sockets(agent: Any, rival: Any) -> list[BaseException]:
     """L-01 (post-R1B): cierra los PSClient de AMBOS players via la API real
     de poke-env (`ps_client.stop_listening()`, async y cross-loop: agenda el
     cierre en el POKE_LOOP propio de poke-env y espera; `Player` no ofrece
@@ -560,12 +562,13 @@ async def _close_player_sockets(agent: Any, rival: Any) -> None:
     listener tasks en el POKE_LOOP global, acumulandose entre modelos de
     una misma ronda de la matriz.
 
-    Reglas:
-    - ambos players se intentan aunque uno falle;
-    - los errores de cierre se registran y NO se propagan: un cierre que
-      falla no puede ocultar la excepcion primaria del benchmark ni impedir
-      el cierre de calc/repository/engine.
+    L-01 (correccion LATWAN): devuelve los errores de cierre de cada player
+    (jamas los traga): la frontera estructurada decide — con primaria en
+    vuelo se preserva; sin primaria, un cierre fallido impide reportar
+    `compatible`. `CancelledError` NO se traga como fallo ordinario: se
+    propaga.
     """
+    errors: list[BaseException] = []
     for player in (agent, rival):
         ps_client = getattr(player, "ps_client", None)
         stop = getattr(ps_client, "stop_listening", None)
@@ -573,12 +576,143 @@ async def _close_player_sockets(agent: Any, rival: Any) -> None:
             continue
         try:
             await stop()
+        except asyncio.CancelledError:
+            raise
         except BaseException as exc:  # noqa: BLE001
             logger.warning(
                 "fallo al cerrar PSClient de %r: %s",
                 getattr(player, "username", type(player).__name__),
                 type(exc).__name__,
             )
+            errors.append(exc)
+    return errors
+
+
+async def _structured_cleanup(
+    agent: Any,
+    rival: Any,
+    calculator: Any,
+    context_repository: Any,
+    engine: Any,
+) -> list[BaseException]:
+    """L-01 (correccion LATWAN): frontera estructurada del cleanup del
+    benchmark.
+
+    Intenta SIEMPRE y EN ORDEN: drain de decisiones en vuelo (D46) →
+    PSClient del agent → PSClient del rival → CalcClient → context
+    repository → engine. Cada tramo se intenta aunque los anteriores fallen
+    y devuelve los errores de todos los pasos (jamas se tragan): sin
+    excepcion primaria, un fallo de cleanup impide reportar `compatible`.
+
+    `CancelledError` se propaga: un cierre interrumpido por cancelacion no
+    se convierte en fallo ordinario de cleanup. Recursos que no llegaron a
+    crearse (None) se saltan.
+    """
+    errors: list[BaseException] = []
+
+    async def attempt(label: str, step: Any) -> None:
+        if step is None:
+            return
+        try:
+            await step()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001
+            logger.warning("cleanup %s fallo: %s", label, type(exc).__name__)
+            errors.append(exc)
+
+    # D46/MON-23: la decision en vuelo de la ultima batalla corre como task
+    # hermana de `run_benchmark`/`battle_against` en `ps_client.loop`;
+    # cancelar/timeoutear ese wrapper NO la toca. Hay que drenarla antes de
+    # cerrar `CalcClient`/el context repository o una decision huerfana
+    # puede usarlos ya cerrados.
+    await attempt(
+        "drain", agent.drain_inflight_decisions if agent is not None else None
+    )
+    errors.extend(await _close_player_sockets(agent, rival))
+    await attempt("calc", calculator.aclose if calculator is not None else None)
+    await attempt(
+        "context",
+        context_repository.aclose
+        if context_repository is not None else None,
+    )
+    await attempt("engine", engine.dispose if engine is not None else None)
+    return errors
+
+
+def _partial_benchmark_result(
+    exc: BaseException,
+    agent: Any,
+    *,
+    requested: int,
+    provider: str,
+    model: str,
+) -> BenchmarkResult:
+    """L-02 (correccion LATWAN): resultado parcial TIPADO de un fallo del
+    benchmark en la frontera de `_benchmark_command`.
+
+    Preserva el progreso REAL (requested/completed/W/L/T desde los
+    contadores del agente — jamas ceros inventados), la identidad efectiva
+    (provider/model pinneados, los mismos que el smoke ya verifico) y la
+    evidencia sanitizada de la excepcion (`failure_type`/
+    `failure_cause_type` via `failure_classification`; `http_status`/
+    `provider_error_code` solo de campos estructurados). Sin agente (fallo
+    antes de crearlo, p.ej. el preflight de Showdown) el progreso es 0, que
+    es la verdad: no hubo batallas.
+    """
+    if agent is None:
+        completed = wins = losses = ties = 0
+    else:
+        completed = (
+            agent.n_won_battles + agent.n_lost_battles + agent.n_tied_battles
+        )
+        wins = agent.n_won_battles
+        losses = agent.n_lost_battles
+        ties = agent.n_tied_battles
+    failure_type, failure_cause_type = failure_classification(exc)
+    return BenchmarkResult(
+        requested=requested, completed=completed, wins=wins, losses=losses,
+        ties=ties, provider=provider, model=model,
+        failure=f"{type(exc).__name__}: {exc}",
+        failure_type=failure_type, failure_cause_type=failure_cause_type,
+        http_status=_http_status_chain(exc),
+        provider_error_code=_structured_provider_error_code(exc),
+    )
+
+
+def _cleanup_failure_result(
+    agent: Any,
+    errors: Sequence[BaseException],
+    *,
+    requested: int,
+    provider: str,
+    model: str,
+) -> BenchmarkResult:
+    """L-01 (correccion LATWAN): sin excepcion primaria, un fallo del
+    cleanup NO puede dejar la corrida `compatible`: se emite un
+    `BenchmarkResult` con `failure_type=InternalCleanupError` (marcador
+    clasificado que la matriz traduce a `internal-defect`), mensaje
+    sanitizado fijo (jamas mensajes crudos de los pasos) y la clase de la
+    causa real del primer paso fallido como `failure_cause_type`. El
+    progreso real y la identidad efectiva se preservan.
+    """
+    completed = (
+        agent.n_won_battles + agent.n_lost_battles + agent.n_tied_battles
+        if agent is not None else 0
+    )
+    wins = agent.n_won_battles if agent is not None else 0
+    losses = agent.n_lost_battles if agent is not None else 0
+    ties = agent.n_tied_battles if agent is not None else 0
+    first = errors[0]
+    return BenchmarkResult(
+        requested=requested, completed=completed, wins=wins, losses=losses,
+        ties=ties, provider=provider, model=model,
+        failure="internal defect: fallo el cierre de recursos del benchmark",
+        failure_type=InternalCleanupError.__name__,
+        failure_cause_type=type(first).__name__,
+        http_status=_http_status_chain(first),
+        provider_error_code=_structured_provider_error_code(first),
+    )
 
 
 async def _benchmark_command(
@@ -600,34 +734,6 @@ async def _benchmark_command(
     selected = _benchmark_provider(
         provider_name, model, settings.llm_request_timeout_seconds, metrics
     )
-    await _check_showdown_reachable(settings.showdown_ws_url)
-    calculator = CalcClient(
-        os.environ.get("CALC_BASE_URL", "http://127.0.0.1:8200"),
-        timeout_seconds=settings.llm_request_timeout_seconds,
-    )
-    context_repository = PostgresContextRepository(settings.database_url)
-    # F2-09 (D28): el benchmark fija provider/model al inicio y el resolver
-    # pinneado audita cada envelope: cualquier mezcla efectiva dentro de la
-    # corrida aborta con ProviderMixError.
-    pinned = PinnedResolver(
-        selected, provider_name, model, enforce_pin=True,
-    )
-    graph = build_decision_graph(
-        calculator, pinned, metrics, context_repository
-    )
-    suffix = str(time.time_ns())[-8:]
-    common = {
-        "server_configuration": server,
-        "battle_format": fmt,
-        "log_level": 40,
-        "max_concurrent_battles": concurrency,
-    }
-    agent = LudexPlayer(
-        account_configuration=AccountConfiguration(f"Bench{suffix}", None),
-        decision_graph=graph,
-        decision_budget_seconds=settings.decision_budget_seconds,
-        **common,
-    )
     opponent_types = {
         "random": RandomPlayer,
         "max_base_power": MaxBasePowerPlayer,
@@ -635,25 +741,60 @@ async def _benchmark_command(
     }
     if opponent not in opponent_types:
         raise RuntimeError(f"oponente desconocido: {opponent}")
-    rival = opponent_types[opponent](
-        account_configuration=AccountConfiguration(f"Opp{suffix}", None),
-        **common,
-    )
-    engine = make_engine(settings.database_url)
-    factory = session_factory(engine)
-    repo = BattleRepository(factory) if persist else None
-
-    async def persist_tag(tag: str) -> None:
-        assert repo is not None
-        await _persist_one(agent, repo, tag, fmt, "local")
-
-    async def report_progress(result: BenchmarkResult) -> None:
-        if on_progress is not None:
-            pending = on_progress(result, metrics.snapshot())
-            if pending is not None:
-                await pending
-
+    agent: Any | None = None
+    rival: Any | None = None
+    calculator: Any | None = None
+    context_repository: Any | None = None
+    engine: Any | None = None
+    result: BenchmarkResult | None = None
+    primary: BaseException | None = None
     try:
+        await _check_showdown_reachable(settings.showdown_ws_url)
+        calculator = CalcClient(
+            os.environ.get("CALC_BASE_URL", "http://127.0.0.1:8200"),
+            timeout_seconds=settings.llm_request_timeout_seconds,
+        )
+        context_repository = PostgresContextRepository(settings.database_url)
+        # F2-09 (D28): el benchmark fija provider/model al inicio y el
+        # resolver pinneado audita cada envelope: cualquier mezcla
+        # efectiva dentro de la corrida aborta con ProviderMixError.
+        pinned = PinnedResolver(
+            selected, provider_name, model, enforce_pin=True,
+        )
+        graph = build_decision_graph(
+            calculator, pinned, metrics, context_repository
+        )
+        suffix = str(time.time_ns())[-8:]
+        common = {
+            "server_configuration": server,
+            "battle_format": fmt,
+            "log_level": 40,
+            "max_concurrent_battles": concurrency,
+        }
+        agent = LudexPlayer(
+            account_configuration=AccountConfiguration(f"Bench{suffix}", None),
+            decision_graph=graph,
+            decision_budget_seconds=settings.decision_budget_seconds,
+            **common,
+        )
+        rival = opponent_types[opponent](
+            account_configuration=AccountConfiguration(f"Opp{suffix}", None),
+            **common,
+        )
+        engine = make_engine(settings.database_url)
+        factory = session_factory(engine)
+        repo = BattleRepository(factory) if persist else None
+
+        async def persist_tag(tag: str) -> None:
+            assert repo is not None
+            await _persist_one(agent, repo, tag, fmt, "local")
+
+        async def report_progress(result: BenchmarkResult) -> None:
+            if on_progress is not None:
+                pending = on_progress(result, metrics.snapshot())
+                if pending is not None:
+                    await pending
+
         try:
             result = await run_benchmark(
                 agent, rival, n=n, persist=persist,
@@ -668,8 +809,8 @@ async def _benchmark_command(
                 + agent.n_tied_battles
             )
             # R3 (MON-15): evidencia durable y sanitizada del fallo. El
-            # error clasificado (`TransientProviderError`, etc.) conserva su
-            # `__cause__` original (p.ej. `APITimeoutError`) porque
+            # error clasificado (`TransientProviderError`, etc.) conserva
+            # su `__cause__` original (p.ej. `APITimeoutError`) porque
             # `KeyRotatingProvider` lo re-lanza con `raise error from raw`.
             # Persistimos SOLO los nombres de clase, nunca el mensaje crudo.
             failure_type, failure_cause_type = failure_classification(exc)
@@ -685,22 +826,35 @@ async def _benchmark_command(
                 http_status=_http_status_chain(exc),
                 provider_error_code=_structured_provider_error_code(exc),
             )
-    finally:
-        # D46/MON-23: la decision en vuelo de la ultima batalla corre como
-        # task hermana de `run_benchmark`/`battle_against` en
-        # `ps_client.loop`; cancelar/timeoutear ese wrapper NO la toca.
-        # Hay que drenarla antes de cerrar `CalcClient`/el context
-        # repository o una decision huerfana puede usarlos ya cerrados.
-        await agent.drain_inflight_decisions()
-        # L-01 (post-R1B): cerrar AMBOS PSClient (agent y rival) via la API
-        # real `ps_client.stop_listening()` antes de los recursos. D46 solo
-        # drena decisiones; sin este cierre cada benchmark abortado fuga 2
-        # websockets + listeners en el POKE_LOOP global. El cierre no puede
-        # impedir ni ocultar el cierre de calc/repository/engine.
-        await _close_player_sockets(agent, rival)
-        await calculator.aclose()
-        await context_repository.aclose()
-        await engine.dispose()
+    except BaseException as exc:
+        primary = exc
+    # L-01 (correccion LATWAN): frontera estructurada del cleanup. Se
+    # intentan SIEMPRE y en orden drain → ambos players → calc → contexto →
+    # engine, aunque cualquiera falle; los errores de los pasos se recogen,
+    # nunca se tragan.
+    try:
+        cleanup_errors = await _structured_cleanup(
+            agent, rival, calculator, context_repository, engine,
+        )
+    except asyncio.CancelledError:
+        raise
+    if primary is not None:
+        # La primaria se preserva SIEMPRE: cancelacion, KeyboardInterrupt y
+        # SystemExit se re-lanzan tal cual (jamas se convierten en un fallo
+        # de cleanup); el resto viaja como BenchmarkFailure con resultado
+        # parcial tipado y su causa original intacta en `__cause__`.
+        if isinstance(primary, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+            raise primary
+        partial = _partial_benchmark_result(
+            primary, agent, requested=n,
+            provider=provider_name, model=model,
+        )
+        raise BenchmarkFailure(partial) from primary
+    if cleanup_errors and (result is None or result.failure is None):
+        result = _cleanup_failure_result(
+            agent, cleanup_errors, requested=n,
+            provider=provider_name, model=model,
+        )
     return result, metrics.snapshot()
 
 

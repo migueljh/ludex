@@ -3076,3 +3076,48 @@ garantiza al construir un provider nuevo por fila); un baseline sucio queda
     batallas 0.4536, hard cap de ronda 0.60); `plan_budget` falla cerrado
     ante una reserva que exceda el cap. R1C sigue NO AUTORIZADA; no existe
     artefacto de resultado.
+
+**Addendum post-corrección LATWAN (OFFLINE, 2026-08-12) — blockers L-01 y L-02:**
+
+11. **Frontera estructurada del cleanup (L-01).** El `finally` lineal de
+    `_benchmark_command` (cli.py) se reemplaza por `_structured_cleanup`:
+    intenta SIEMPRE y EN ORDEN drain (D46) → PSClient del agent → PSClient
+    del rival → CalcClient → context repository → engine, aunque cualquier
+    tramo falle; los errores de los pasos se recogen y devuelven, jamas se
+    tragan. Reglas de salida: (a) con excepción primaria en vuelo se
+    preserva — `CancelledError`/`KeyboardInterrupt`/`SystemExit` se
+    re-lanzan tal cual, el resto viaja como `BenchmarkFailure` con su causa
+    original en `__cause__`; (b) sin primaria, un fallo de cleanup NO puede
+    dejar la corrida `compatible`: se emite un resultado
+    `failure_type=InternalCleanupError` (marcador clasificado, mensaje
+    sanitizado fijo, clase de la causa real del primer paso como
+    `failure_cause_type`) que la matriz traduce a `internal-defect`; el
+    progreso real y la identidad efectiva se preservan. `CancelledError`
+    nunca se traga como fallo ordinario. `engine.dispose()` queda observado
+    explícitamente en los canarios de orden (antes las listas terminaban en
+    `context_aclose`). Motivo: un fallo de drain o Calc podía ocultar la
+    primaria, abandonar los tramos posteriores y (vía el `BaseException`
+    tragado en `_close_player_sockets`) permitir reportar `compatible` con
+    websockets vivos.
+
+12. **Resultado parcial tipado post-smoke (L-02).** `_matrix._battle_failed`
+    ya no fija `battles_completed=0`, `effective_provider=None` ni
+    `effective_model=None` para todo fallo: la frontera real de
+    `_benchmark_command` envuelve toda excepción no clasificada de
+    `run_benchmark` (p.ej. `ConnectionClosedError` en la batalla 2) en
+    `BenchmarkFailure` (benchmark.py) con un `BenchmarkResult` PARCIAL —
+    campo tipado, no atributos ad hoc sobre excepciones genéricas — con
+    `requested`/`completed`/W/L/T reales desde los contadores del agente,
+    provider/model efectivos (el pin), y evidencia sanitizada
+    (`failure_type`/`failure_cause_type`/`http_status`/
+    `provider_error_code`). `_battle_failed` lee el partial cuando existe y
+    cae al pin de la fila cuando no (preflight de Showdown antes de crear
+    players: completed=0, identidad del smoke preservada). `MatrixModelResult`
+    agrega `battles_wins`/`battles_losses`/`battles_ties` (aditivo; los
+    artefactos históricos no se regeneran). Canario vinculante: batalla 1
+    completa, batalla 2 lanza `ConnectionClosedError` → requested=2,
+    completed=1, identidad = pin, stage=battle, externally-limited,
+    winrate=None; counterweight preflight → completed=0 con identidad
+    preservada. Mutaciones demostradas: completed=0, borrar
+    effective_provider/model, perder W/L/T o métricas parciales ponen los
+    canarios rojos.

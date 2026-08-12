@@ -425,6 +425,11 @@ class MatrixModelResult:
     quarantined: int
     failure_type: str | None
     failure_cause_type: str | None
+    # L-02 (correccion LATWAN): W/L/T reales de la corrida parcial, cuando
+    # existen; None en resultados construidos sin datos de batalla.
+    battles_wins: int | None = None
+    battles_losses: int | None = None
+    battles_ties: int | None = None
     note: str | None = None
     # L-03 (R1A): evidencia durable y sanitizada. `failure_stage` dice si el
     # fallo ocurrio en `smoke` o en `battle`; `http_status` es el status
@@ -510,6 +515,9 @@ async def run_matrix_round(
                 smoke_ok=prior.smoke_ok,
                 battles_requested=prior.battles_requested,
                 battles_completed=prior.battles_completed,
+                battles_wins=prior.battles_wins,
+                battles_losses=prior.battles_losses,
+                battles_ties=prior.battles_ties,
                 effective_provider=prior.effective_provider,
                 effective_model=prior.effective_model,
                 win_rate=prior.win_rate,
@@ -534,6 +542,7 @@ async def run_matrix_round(
                 provider=row.provider, model=row.model, tier=row.tier,
                 protocol=row.protocol, status="removed-from-catalog",
                 smoke_ok=False, battles_requested=0, battles_completed=0,
+                battles_wins=0, battles_losses=0, battles_ties=0,
                 effective_provider=None, effective_model=None,
                 win_rate=None, completion_latency_ms=None,
                 decision_latency_ms=None, tokens=None,
@@ -557,6 +566,7 @@ async def run_matrix_round(
                 provider=row.provider, model=row.model, tier=row.tier,
                 protocol=row.protocol, status="internal-defect",
                 smoke_ok=False, battles_requested=0, battles_completed=0,
+                battles_wins=0, battles_losses=0, battles_ties=0,
                 effective_provider=None, effective_model=None,
                 win_rate=None, completion_latency_ms=None,
                 decision_latency_ms=None, tokens=None,
@@ -698,6 +708,12 @@ async def _run_one(
         status = "internal-defect"
     elif failure_type == "BenchmarkDeadlineExceeded":
         status = "externally-limited"
+    elif failure_type == "InternalCleanupError":
+        # L-01 (correccion LATWAN): sin excepcion primaria, un fallo del
+        # cierre de recursos del benchmark (drain/players/calc/contexto/
+        # engine) jamas puede quedar `compatible`: internal-defect
+        # sanitizado, con el progreso real preservado.
+        status = "internal-defect"
     elif failure is not None:
         status = "aborted"
     elif completed == requested:
@@ -705,13 +721,16 @@ async def _run_one(
     else:
         status = "externally-limited"
     win_rate = None
+    wins = getattr(result, "wins", 0)
+    losses = getattr(result, "losses", 0)
+    ties = getattr(result, "ties", 0)
     if status == "compatible" and completed:
-        wins = getattr(result, "wins", 0)
         win_rate = f"{wins / completed:.4f}"
     return MatrixModelResult(
         provider=row.provider, model=row.model, tier=row.tier,
         protocol=row.protocol, status=status, smoke_ok=True,
         battles_requested=requested, battles_completed=completed,
+        battles_wins=wins, battles_losses=losses, battles_ties=ties,
         effective_provider=getattr(result, "provider", None),
         effective_model=getattr(result, "model", None),
         win_rate=win_rate,
@@ -774,6 +793,7 @@ def _smoke_failed(
         provider=row.provider, model=row.model, tier=row.tier,
         protocol=row.protocol, status=status, smoke_ok=smoke_ok,
         battles_requested=0, battles_completed=0,
+        battles_wins=0, battles_losses=0, battles_ties=0,
         effective_provider=None, effective_model=None,
         win_rate=None,
         completion_latency_ms=(
@@ -825,12 +845,17 @@ def _battle_infrastructure_status(exc: BaseException) -> str:
     - `ShowdownUnavailableError` (RuntimeError from OSError del preflight
       local) -> externally-limited;
     - cualquier otra excepcion post-smoke -> internal-defect (con la fase
-      preservada, ver `_battle_failed`)."""
+      preservada, ver `_battle_failed`).
+
+    L-02 (correccion LATWAN): un `BenchmarkFailure` (envuelve la excepcion
+    original de la frontera del benchmark) se mira a traves de su `__cause__`:
+    la clasificacion sigue el fallo real, no el wrapper."""
     from websockets.exceptions import ConnectionClosedError
 
-    from .benchmark import ShowdownUnavailableError
+    from .benchmark import BenchmarkFailure, ShowdownUnavailableError
 
-    if isinstance(exc, (ConnectionClosedError, ShowdownUnavailableError)):
+    cause = exc.__cause__ if isinstance(exc, BenchmarkFailure) else exc
+    if isinstance(cause, (ConnectionClosedError, ShowdownUnavailableError)):
         return "externally-limited"
     return "internal-defect"
 
@@ -845,16 +870,54 @@ def _battle_failed(
     """L-02 (post-R1B): fallo en la fase de BATTLE tras un smoke verde.
 
     Conserva la fase real y la evidencia: `smoke_ok=True`,
-    `failure_stage="battle"`, `battles_requested=BATTLES_PER_MODEL` (el
-    objetivo, no batallas iniciadas), `battles_completed=0`, las metricas
-    del smoke disponibles (delta del provider) y la clase/causa
-    sanitizadas. Nunca pasa por el `except Exception` exterior de
-    `run_matrix_round`, que reinicia todo a false/0/None."""
+    `failure_stage="battle"`, las metricas del smoke disponibles (delta del
+    provider) y la clase/causa sanitizadas. Nunca pasa por el `except
+    Exception` exterior de `run_matrix_round`, que reinicia todo a
+    false/0/None.
+
+    L-02 (correccion LATWAN): si `exc` es un `BenchmarkFailure` de la
+    frontera real del benchmark, su resultado parcial TIPADO manda:
+    `battles_requested`/`battles_completed` reales (jamas ceros inventados),
+    W/L/T reales, identidad efectiva (provider/model pinneados, los mismos
+    que el smoke ya verifico) y la evidencia sanitizada del fallo. Sin
+    partial (fallo directo sin pasar por la frontera, o preflight de
+    Showdown antes de crear players) el progreso es 0 — que es la verdad —
+    y la identidad efectiva sigue siendo el pin de la fila."""
+    from .benchmark import BenchmarkFailure
+
+    partial = exc.result if isinstance(exc, BenchmarkFailure) else None
+    if partial is not None:
+        battles_requested = partial.requested
+        battles_completed = partial.completed
+        battles_wins = partial.wins
+        battles_losses = partial.losses
+        battles_ties = partial.ties
+        effective_provider = partial.provider or row.provider
+        effective_model = partial.model or row.model
+        failure_type = partial.failure_type
+        failure_cause_type = partial.failure_cause_type
+        http_status = partial.http_status
+        provider_error_code = partial.provider_error_code
+    else:
+        battles_requested = BATTLES_PER_MODEL
+        battles_completed = 0
+        battles_wins = battles_losses = battles_ties = 0
+        effective_provider = row.provider
+        effective_model = row.model
+        failure_type = type(exc).__name__
+        failure_cause_type = (
+            type(exc.__cause__).__name__ if exc.__cause__ else None
+        )
+        http_status = _http_status_chain(exc)
+        provider_error_code = _structured_provider_error_code(exc)
     return MatrixModelResult(
         provider=row.provider, model=row.model, tier=row.tier,
         protocol=row.protocol, status=status, smoke_ok=True,
-        battles_requested=BATTLES_PER_MODEL, battles_completed=0,
-        effective_provider=None, effective_model=None,
+        battles_requested=battles_requested,
+        battles_completed=battles_completed,
+        battles_wins=battles_wins, battles_losses=battles_losses,
+        battles_ties=battles_ties,
+        effective_provider=effective_provider, effective_model=effective_model,
         win_rate=None,
         completion_latency_ms=(
             _latency_slice(metrics, "completion_latency_ms")
@@ -887,13 +950,11 @@ def _battle_failed(
             int(metrics.get("keys_quarantined", 0))
             if metrics is not None else 0
         ),
-        failure_type=type(exc).__name__,
-        failure_cause_type=(
-            type(exc.__cause__).__name__ if exc.__cause__ else None
-        ),
+        failure_type=failure_type,
+        failure_cause_type=failure_cause_type,
         failure_stage="battle",
-        http_status=_http_status_chain(exc),
-        provider_error_code=_structured_provider_error_code(exc),
+        http_status=http_status,
+        provider_error_code=provider_error_code,
         note="fallo en fase de batalla tras smoke verde: sin winrate comparable",
     )
 

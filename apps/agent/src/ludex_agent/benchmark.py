@@ -60,6 +60,44 @@ def failure_classification(
     )
 
 
+class BenchmarkFailure(Exception):
+    """Fallo del benchmark con resultado parcial TIPADO (L-02, correccion
+    LATWAN).
+
+    `_benchmark_command` envuelve toda excepcion no clasificada de
+    `run_benchmark` (p.ej. `ConnectionClosedError` de Showdown en la batalla
+    2) en `BenchmarkFailure`, transportando un `BenchmarkResult` parcial con
+    el progreso REAL (`requested`/`completed`/W/L/T desde los contadores del
+    agente), la identidad efectiva (provider/model pinneados) y la evidencia
+    sanitizada (`failure_type`/`failure_cause_type`/`http_status`/
+    `provider_error_code`).
+
+    No es un atributo ad hoc sobre una excepcion generica: el resultado
+    parcial es un campo tipado (`result`) de una clase propia de la frontera.
+    La excepcion original queda como `__cause__` — la primaria se preserva y
+    `failure_classification`/`_http_status_chain`/`_structured_provider_error_code`
+    siguen la cadena.
+    """
+
+    def __init__(self, result: BenchmarkResult) -> None:
+        super().__init__(result.failure or "benchmark failure")
+        self.result = result
+
+
+class InternalCleanupError(RuntimeError):
+    """Marcador clasificado (nunca se lanza): fallo del cierre de recursos
+    del benchmark (drain / PSClient de ambos players / CalcClient / context
+    repository / engine) SIN excepcion primaria en vuelo (L-01, correccion
+    LATWAN).
+
+    Su nombre de clase (sanitizado) se persiste como `failure_type` del
+    resultado para que la matriz lo clasifique `internal-defect`: una
+    corrida con cleanup fallido jamas puede quedar `compatible`. La clase de
+    la causa real del primer paso fallido se preserva como
+    `failure_cause_type`.
+    """
+
+
 @dataclass(frozen=True)
 class BenchmarkResult:
     requested: int
