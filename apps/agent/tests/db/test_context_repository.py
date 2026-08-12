@@ -404,13 +404,41 @@ async def test_charizardmegax_usa_fila_directa_no_charizard():
 
 
 @pytest.mark.asyncio
-async def test_floetteeternal_no_es_cosmetica_y_falla_ruidosamente():
+async def test_floetteeternal_no_es_cosmetica_pero_tiene_fila_directa_por_d47():
+    """D47/MON-24: floetteeternal sigue sin ser cosmética (D32 sigue vigente:
+    stats/ability propios, no los de floette) pero ahora tiene fila directa
+    en Postgres -- es la única forma en que la línea Floette aparece en
+    gen6randombattle (packages/seed/src/extract/dex.ts::isAvailableForExtraction).
+    Requiere que la base este re-seedeada con el fix de D47 (`pnpm seed --gen 6`);
+    contra una base vieja este test falla y esa es la señal correcta de que
+    falta el re-seed, no una regresión de `context_repository.py`."""
+    async with _repository() as repository:
+        context = await repository.load_battle_context(
+            gen_number=6, own_species=("floetteeternal",), opponent_species=(),
+        )
+    mon = _species(context, "own", "floetteeternal")
+    assert mon["showdown_id"] == "floetteeternal"
+    assert mon["base_species"] == "floette"
+    assert mon["forme"] == "Eternal"
+    # NO son los stats de floette (hp54/atk45/def47/spa75/spd98/spe52): fila
+    # directa, no alias cosmético.
+    assert mon["base_stats"] == {
+        "hp": 74, "atk": 65, "def": 67, "spa": 125, "spd": 128, "spe": 92,
+    }
+    assert mon["abilities"] == {"0": "Flower Veil"}
+    assert _move(mon, "lightofruin")["name"] == "Light of Ruin"
+
+
+@pytest.mark.asyncio
+async def test_floetteeternal_gen9_sigue_fallando_ruidosamente():
+    """D47/MON-24: la excepción es generation-scoped, no una allowlist global.
+    El catálogo random-battle de gen 9 no referencia a Floette (no se usa en
+    gen9randombattle): floetteeternal sigue sin fila ahí, mismo canario de
+    fallo cerrado que antes."""
     async with _repository() as repository:
         with pytest.raises(LookupError, match="floetteeternal"):
             await repository.load_battle_context(
-                gen_number=6,
-                own_species=("floetteeternal",),
-                opponent_species=(),
+                gen_number=9, own_species=("floetteeternal",), opponent_species=(),
             )
 
 

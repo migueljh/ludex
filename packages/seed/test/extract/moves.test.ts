@@ -8,7 +8,10 @@ const byId = (id: string) => gen6.find((m) => m.showdownId === id)!;
 
 describe("extractMoves", () => {
   it("devuelve los conteos conocidos, ya deduplicados", () => {
-    expect(gen6).toHaveLength(618);
+    // D47/MON-24: 619 = 618 + lightofruin (isNonstandard:'Unobtainable',
+    // pero es el movimiento propio de floetteeternal en el catálogo estándar
+    // random-battle de gen 6).
+    expect(gen6).toHaveLength(619);
     expect(gen9).toHaveLength(685);
   });
 
@@ -61,14 +64,16 @@ describe("extractMoves", () => {
   });
 
   it("fija la distribucion medida de power_kind (pokemon-showdown@0.11.10)", () => {
-    // Valores medidos sobre los 618/685 movimientos unicos; no estimados.
+    // Valores medidos sobre los 619/685 movimientos unicos; no estimados.
+    // D47/MON-24: lightofruin es category Special, basePower 140, sin
+    // basePowerCallback ni damage -> powerKind 'standard' (335 + 1 = 336).
     const dist = (rows: typeof gen6) => {
       const d: Record<string, number> = {};
       for (const m of rows) d[m.powerKind] = (d[m.powerKind] ?? 0) + 1;
       return d;
     };
     expect(dist(gen6)).toEqual({
-      status: 225, standard: 335, variable: 38, special: 16, fixed_damage: 4,
+      status: 225, standard: 336, variable: 38, special: 16, fixed_damage: 4,
     });
     expect(dist(gen9)).toEqual({
       standard: 416, status: 214, variable: 39, special: 14, fixed_damage: 2,
@@ -77,5 +82,27 @@ describe("extractMoves", () => {
 
   it("no repite showdownId", () => {
     expect(new Set(gen6.map((m) => m.showdownId)).size).toBe(gen6.length);
+  });
+
+  it("D47/MON-24: lightofruin entra con fila directa y sus datos reales", () => {
+    const move = byId("lightofruin");
+    expect(move.name).toBe("Light of Ruin");
+    expect(move.type).toBe("Fairy");
+    expect(move.category).toBe("Special");
+    expect(move.power).toBe(140);
+    expect(move.accuracy).toBe(90);
+    expect(move.pp).toBe(5);
+    expect(move.powerKind).toBe("standard");
+  });
+
+  it("D47/MON-24: lightofruin NO aparece en gen 9 (su catálogo no lo referencia)", () => {
+    expect(gen9.some((m) => m.showdownId === "lightofruin")).toBe(false);
+  });
+
+  it("D47/MON-24: sigue excluyendo Unobtainable no referenciado y CAP", () => {
+    expect(gen6.some((m) => m.showdownId === "thousandarrows")).toBe(false);
+    expect(gen6.some((m) => m.showdownId === "thousandwaves")).toBe(false);
+    expect(gen6.some((m) => m.showdownId === "paleowave")).toBe(false);
+    expect(gen6.some((m) => m.showdownId === "shadowstrike")).toBe(false);
   });
 });

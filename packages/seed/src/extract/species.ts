@@ -1,4 +1,4 @@
-import { isAvailable, type ModdedDex } from "./dex.js";
+import { isAvailableForExtraction, type ModdedDex } from "./dex.js";
 import type { SpeciesRow } from "../types.js";
 
 /** Showdown usa "" en vez de null para forme y prevo. */
@@ -8,7 +8,7 @@ const orNull = (value: string | undefined | null): string | null =>
 export function extractSpecies(dex: ModdedDex): SpeciesRow[] {
   return dex.species
     .all()
-    .filter((s) => isAvailable(dex, s))
+    .filter((s) => isAvailableForExtraction(dex, s, "species"))
     .map((s) => ({
       showdownId: s.id,
       dexNum: s.num,
