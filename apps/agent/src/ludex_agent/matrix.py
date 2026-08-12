@@ -634,14 +634,20 @@ async def _run_one(
     except CredentialRejected as exc:
         return _fail("credential/model unavailable", exc)
     except ProviderError as exc:
-        # FatalProviderError: endpoint/protocolo/modelo rechazado (la clase
-        # exacta se preserva en failure_type). Transitorio o deadline:
-        # limite externo.
-        status = (
-            "unsupported-protocol"
-            if isinstance(exc, FatalProviderError)
-            else "externally-limited"
-        )
+        # L-04 (post-R1B): `FatalProviderError` con HTTP 401/403 upstream/
+        # model-wide (sin senal key-specific; el provider ya no rota ni
+        # cuarentena) es `credential/model unavailable`; la categoria
+        # `unsupported-protocol` queda reservada para rechazo de
+        # protocolo/structured output (p.ej. HTTP 400 de response_format).
+        # Transitorio o deadline: limite externo.
+        if isinstance(exc, FatalProviderError) and _http_status_chain(exc) in (401, 403):
+            status = "credential/model unavailable"
+        else:
+            status = (
+                "unsupported-protocol"
+                if isinstance(exc, FatalProviderError)
+                else "externally-limited"
+            )
         return _fail(status, exc)
     try:
         DecisionResponse.model_validate(envelope.payload)
@@ -662,7 +668,27 @@ async def _run_one(
         # ProviderMixError (mezcla efectiva) aborta la corrida del modelo.
         status = "internal-defect" if type(exc).__name__ == "ProviderMixError" \
             else "externally-limited"
-        return _fail(status, exc, smoke_ok=True)
+        return _battle_failed(
+            row, exc, status=status,
+            metrics=_metrics_delta(
+                before, _provider_metrics_snapshot(provider)
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        # L-02/L-03 (post-R1B): TODO fallo despues de un smoke verde
+        # conserva la fase real (smoke_ok=True, stage=battle,
+        # battles_requested=2 objetivo) y la evidencia sanitizada; no cae
+        # en el `except Exception` exterior de `run_matrix_round` que
+        # reinicia todo a false/0/None. Infraestructura local
+        # (ConnectionClosed de Showdown, ShowdownUnavailableError) es
+        # `externally-limited`; una excepcion interna genuina sigue siendo
+        # `internal-defect` pero con la fase preservada.
+        return _battle_failed(
+            row, exc, status=_battle_infrastructure_status(exc),
+            metrics=_metrics_delta(
+                before, _provider_metrics_snapshot(provider)
+            ),
+        )
 
     completed = getattr(result, "completed", 0)
     requested = getattr(result, "requested", 0)
@@ -789,6 +815,86 @@ def _smoke_failed(
         http_status=_http_status_chain(exc),
         provider_error_code=_structured_provider_error_code(exc),
         note=note or f"smoke fallido ({type(exc).__name__})",
+    )
+
+
+def _battle_infrastructure_status(exc: BaseException) -> str:
+    """L-03 (post-R1B): infraestructura LOCAL no es incompatibilidad del
+    modelo:
+    - `ConnectionClosedError` de Showdown durante batalla -> externally-limited;
+    - `ShowdownUnavailableError` (RuntimeError from OSError del preflight
+      local) -> externally-limited;
+    - cualquier otra excepcion post-smoke -> internal-defect (con la fase
+      preservada, ver `_battle_failed`)."""
+    from websockets.exceptions import ConnectionClosedError
+
+    from .benchmark import ShowdownUnavailableError
+
+    if isinstance(exc, (ConnectionClosedError, ShowdownUnavailableError)):
+        return "externally-limited"
+    return "internal-defect"
+
+
+def _battle_failed(
+    row: ManifestRow,
+    exc: BaseException,
+    *,
+    status: str,
+    metrics: Mapping[str, int | None] | None,
+) -> MatrixModelResult:
+    """L-02 (post-R1B): fallo en la fase de BATTLE tras un smoke verde.
+
+    Conserva la fase real y la evidencia: `smoke_ok=True`,
+    `failure_stage="battle"`, `battles_requested=BATTLES_PER_MODEL` (el
+    objetivo, no batallas iniciadas), `battles_completed=0`, las metricas
+    del smoke disponibles (delta del provider) y la clase/causa
+    sanitizadas. Nunca pasa por el `except Exception` exterior de
+    `run_matrix_round`, que reinicia todo a false/0/None."""
+    return MatrixModelResult(
+        provider=row.provider, model=row.model, tier=row.tier,
+        protocol=row.protocol, status=status, smoke_ok=True,
+        battles_requested=BATTLES_PER_MODEL, battles_completed=0,
+        effective_provider=None, effective_model=None,
+        win_rate=None,
+        completion_latency_ms=(
+            _latency_slice(metrics, "completion_latency_ms")
+            if metrics is not None else None
+        ),
+        decision_latency_ms=(
+            _latency_slice(metrics, "decision_latency_ms")
+            if metrics is not None else None
+        ),
+        tokens=(
+            {
+                "input_tokens": int(metrics.get("input_tokens", 0)),
+                "output_tokens": int(metrics.get("output_tokens", 0)),
+                "cached_input_tokens": int(
+                    metrics.get("cached_input_tokens", 0)
+                ),
+                "reasoning_tokens": int(metrics.get("reasoning_tokens", 0)),
+            }
+            if metrics is not None else None
+        ),
+        retries=(
+            int(metrics.get("transient_retries_executed", 0))
+            if metrics is not None else 0
+        ),
+        rotations=(
+            int(metrics.get("key_rotations", 0))
+            if metrics is not None else 0
+        ),
+        quarantined=(
+            int(metrics.get("keys_quarantined", 0))
+            if metrics is not None else 0
+        ),
+        failure_type=type(exc).__name__,
+        failure_cause_type=(
+            type(exc.__cause__).__name__ if exc.__cause__ else None
+        ),
+        failure_stage="battle",
+        http_status=_http_status_chain(exc),
+        provider_error_code=_structured_provider_error_code(exc),
+        note="fallo en fase de batalla tras smoke verde: sin winrate comparable",
     )
 
 

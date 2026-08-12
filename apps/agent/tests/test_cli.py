@@ -15,6 +15,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from poke_env import AccountConfiguration
 from ludex_agent import cli as cli_module
 from ludex_agent.benchmark import BenchmarkDeadlineExceeded, BenchmarkResult, run_benchmark
 from ludex_agent.graph.provider import FatalProviderError, TransientProviderError
@@ -1429,6 +1430,20 @@ def test_benchmark_command_drena_decisiones_antes_de_cerrar_calc_y_contexto(
     `test_client.py`); prueba el CONTRATO DE ORDEN que el caller productivo
     tiene que respetar."""
     order: list[str] = []
+    stop_counts: dict[str, int] = {}
+
+    class SpyPSClient:
+        def __init__(self, name: str, fail: bool = False) -> None:
+            self._name = name
+            self._fail = fail
+            self.stop_calls = 0
+
+        def stop_listening(self):
+            self.stop_calls += 1
+            stop_counts[self._name] = self.stop_calls
+            order.append(f"{self._name}_stop")
+            if self._fail:
+                raise RuntimeError(f"{self._name} close failed")
 
     class SpyAgent:
         def __init__(self, **kwargs) -> None:
@@ -1436,6 +1451,7 @@ def test_benchmark_command_drena_decisiones_antes_de_cerrar_calc_y_contexto(
             self.n_lost_battles = 0
             self.n_tied_battles = 0
             self.battles: dict[str, object] = {}
+            self.ps_client = SpyPSClient("agent")
 
         async def battle_against(self, rival, n_battles=1):
             self.battles[f"battle-{len(self.battles)}"] = object()
@@ -1447,6 +1463,10 @@ def test_benchmark_command_drena_decisiones_antes_de_cerrar_calc_y_contexto(
         async def drain_inflight_decisions(self):
             order.append("drain")
 
+    class SpyRival:
+        def __init__(self, **kwargs) -> None:
+            self.ps_client = SpyPSClient("rival")
+
     class SpyCalcClient:
         async def aclose(self):
             order.append("calc_aclose")
@@ -1456,6 +1476,9 @@ def test_benchmark_command_drena_decisiones_antes_de_cerrar_calc_y_contexto(
             order.append("context_aclose")
 
     _patch_benchmark_command_dependencies(monkeypatch, SpyAgent)
+    monkeypatch.setattr(cli_module, "RandomPlayer", SpyRival)
+    monkeypatch.setattr(cli_module, "MaxBasePowerPlayer", SpyRival)
+    monkeypatch.setattr(cli_module, "SimpleHeuristicsPlayer", SpyRival)
     monkeypatch.setattr(cli_module, "CalcClient", lambda *a, **k: SpyCalcClient())
     monkeypatch.setattr(
         cli_module, "PostgresContextRepository", lambda *a, **k: SpyContextRepo()
@@ -1482,4 +1505,197 @@ def test_benchmark_command_drena_decisiones_antes_de_cerrar_calc_y_contexto(
     )
 
     assert result.exit_code == 0, result.stdout
-    assert order == ["drain", "calc_aclose", "context_aclose"], order
+    # L-01 (post-R1B): lifecycle completo — drain D46, cierre de AMBOS
+    # players (stop_listening) y recién despues calc/contexto.
+    assert order == [
+        "drain", "agent_stop", "rival_stop", "calc_aclose", "context_aclose",
+    ], order
+    # cada PSClient se cierra exactamente UNA vez
+    assert stop_counts == {"agent": 1, "rival": 1}, stop_counts
+
+
+def test_fallo_al_cerrar_un_player_no_impide_cerrar_el_resto_ni_oculta_la_primaria(
+    monkeypatch,
+):
+    """L-01 (post-R1B): si el cierre del primer player falla, el segundo y
+    calc/contexto/engine se cierran igual; y el error del cleanup jamas
+    oculta la excepcion primaria del benchmark."""
+    order: list[str] = []
+
+    class SpyPSClient:
+        def __init__(self, name: str, fail: bool = False) -> None:
+            self._name = name
+            self._fail = fail
+
+        def stop_listening(self):
+            order.append(f"{self._name}_stop")
+            if self._fail:
+                raise RuntimeError(f"{self._name} close failed")
+
+    class SpyAgent:
+        def __init__(self, **kwargs) -> None:
+            self.n_won_battles = 0
+            self.n_lost_battles = 0
+            self.n_tied_battles = 0
+            self.battles: dict[str, object] = {}
+            self.ps_client = SpyPSClient("agent", fail=True)
+
+        async def drain_inflight_decisions(self):
+            order.append("drain")
+
+    class SpyRival:
+        def __init__(self, **kwargs) -> None:
+            self.ps_client = SpyPSClient("rival")
+
+    class SpyCalcClient:
+        async def aclose(self):
+            order.append("calc_aclose")
+
+    class SpyContextRepo:
+        async def aclose(self):
+            order.append("context_aclose")
+
+    async def boom(*args, **kwargs):
+        raise ValueError("primary boom")
+
+    _patch_benchmark_command_dependencies(monkeypatch, SpyAgent)
+    monkeypatch.setattr(cli_module, "run_benchmark", boom)
+    monkeypatch.setattr(cli_module, "RandomPlayer", SpyRival)
+    monkeypatch.setattr(cli_module, "MaxBasePowerPlayer", SpyRival)
+    monkeypatch.setattr(cli_module, "SimpleHeuristicsPlayer", SpyRival)
+    monkeypatch.setattr(cli_module, "CalcClient", lambda *a, **k: SpyCalcClient())
+    monkeypatch.setattr(
+        cli_module, "PostgresContextRepository", lambda *a, **k: SpyContextRepo()
+    )
+
+    with pytest.raises(ValueError, match="primary boom"):
+        asyncio.run(cli_module._benchmark_command(
+            n=1, opponent="random", concurrency=1, persist=False,
+            provider_name="fake", model="fake-model",
+            fmt="gen6randombattle", battle_timeout_seconds=0.01,
+        ))
+    # el fallo del cierre del agent NO impide cerrar rival + recursos
+    assert order == [
+        "drain", "agent_stop", "rival_stop", "calc_aclose", "context_aclose",
+    ], order
+
+
+@pytest.mark.asyncio
+async def test_cierre_de_players_termina_websockets_y_listeners_en_pokeloop_real():
+    """L-01 (post-R1B): con el POKE_LOOP real de poke-env, cerrar via
+    `ps_client.stop_listening()` deja los websockets cerrados y los futures
+    de `listen()` terminados: no quedan listeners acumulados entre
+    benchmarks (la fuga de la ronda R1B)."""
+    import websockets
+    from websockets.asyncio.server import serve as ws_serve
+
+    from ludex_agent.showdown.client import (
+        LudexPlayer,
+        local_server_configuration,
+    )
+    accepted = 0
+    accepted_event = asyncio.Event()
+
+    async def handler(websocket):
+        nonlocal accepted
+        accepted += 1
+        if accepted == 2:
+            accepted_event.set()
+        try:
+            await websocket.wait_closed()
+        except Exception:  # noqa: BLE001
+            pass
+
+    server = await ws_serve(handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    url = f"ws://127.0.0.1:{port}/showdown/websocket"
+    common = {
+        "server_configuration": local_server_configuration(url),
+        "battle_format": "gen6randombattle",
+        "log_level": 40,
+    }
+    agent = LudexPlayer(
+        account_configuration=AccountConfiguration("LC1", None), **common
+    )
+    rival = cli_module.SimpleHeuristicsPlayer(
+        account_configuration=AccountConfiguration("LC2", None), **common
+    )
+    try:
+        await asyncio.wait_for(accepted_event.wait(), timeout=10)
+        # `self.websocket` se asigna dentro de `listen()` tras el handshake;
+        # esperar a que AMBOS esten seteados (poll breve).
+        for _ in range(200):
+            if (
+                getattr(agent.ps_client, "websocket", None) is not None
+                and getattr(rival.ps_client, "websocket", None) is not None
+            ):
+                break
+            await asyncio.sleep(0.01)
+        assert agent.ps_client.websocket is not None
+        assert rival.ps_client.websocket is not None
+        assert agent.ps_client.websocket.state.name == "OPEN"
+        assert rival.ps_client.websocket.state.name == "OPEN"
+        assert not agent.ps_client._listening_coroutine.done()
+        assert not rival.ps_client._listening_coroutine.done()
+
+        await cli_module._close_player_sockets(agent, rival)
+
+        assert agent.ps_client.websocket.state.name == "CLOSED"
+        assert rival.ps_client.websocket.state.name == "CLOSED"
+        # los futures de listen() terminan: no quedan listeners colgados
+        await asyncio.wait_for(
+            asyncio.gather(
+                asyncio.wrap_future(agent.ps_client._listening_coroutine),
+                asyncio.wrap_future(rival.ps_client._listening_coroutine),
+            ),
+            timeout=10,
+        )
+        assert agent.ps_client._listening_coroutine.done()
+        assert rival.ps_client._listening_coroutine.done()
+    finally:
+        await cli_module._close_player_sockets(agent, rival)
+        server.close()
+        await server.wait_closed()
+
+
+def test_benchmark_sin_credenciales_valida_antes_de_tocar_showdown_y_emite_not_run(
+    monkeypatch, tmp_path
+):
+    """L-05 (post-R1B): sin KIMI_API_KEY, la seleccion/validacion local de
+    credenciales ocurre ANTES del chequeo de Showdown: el comando produce
+    artefacto not-run con `failure_type=ProviderSelectionError` y exit 2
+    SIN intentar abrir conexion a Showdown (aunque estuviera apagado)."""
+    showdown_calls: list[str] = []
+
+    def reachable(url):
+        showdown_calls.append(url)
+        raise AssertionError("no deberia comprobarse Showdown sin credenciales")
+
+    monkeypatch.setattr(cli_module, "_check_showdown_reachable", reachable)
+    monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path)
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark", "--n", "1", "--opponent", "random",
+            "--provider", "kimi", "--model", "kimi-k2.6",
+            "--run-id", "test-not-run-hermetic",
+            "--ledger", str(tmp_path / "ledger.md"),
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "LUDEX_PROVIDER": "kimi",
+        },
+    )
+    assert result.exit_code == 2, result.stdout
+    assert "credential unavailable" in result.stdout
+    assert showdown_calls == [], (
+        "la validacion de credenciales debe preceder al chequeo de Showdown"
+    )
+    # artefacto not-run emitido con la clasificacion correcta
+    artifact = tmp_path / "test-not-run-hermetic.json"
+    assert artifact.exists()
+    record = json.loads(artifact.read_text())
+    assert record["status"] == "not-run"
+    assert record["failure_type"] == "ProviderSelectionError"

@@ -3026,3 +3026,53 @@ sin causa enganchada (no es rechazo de credencial). El delta de latencias
 solo es válido con un `DecisionMetrics` fresco por modelo (la matriz lo
 garantiza al construir un provider nuevo por fila); un baseline sucio queda
 `None` (fail-closed).
+
+**Addendum post-R1B (LATWAN DESIGN VERDICT) — corrección offline implementada:**
+
+5. **Lifecycle completo del benchmark (L-01).** `_benchmark_command` ahora
+   cierra AMBOS PSClient (agent y rival) via la API real
+   `ps_client.stop_listening()` (async, cross-loop sobre el POKE_LOOP de
+   poke-env; `Player` no ofrece `close()`), después del drain D46 y ANTES de
+   cerrar calc/repository/engine. El cierre intenta ambos players aunque uno
+   falle y nunca oculta la excepción primaria ni impide el cierre de los
+   recursos. Motivo: cada benchmark abortado fugaba 2 websockets + sus
+   listener tasks en el POKE_LOOP global, acumulándose entre modelos de una
+   misma ronda de la matriz. Canarios: orden drain → ambos players → recursos;
+   un solo `stop_listening` por player; fallo de un player no impide el resto;
+   reproducción con el POKE_LOOP real (websockets CLOSED + listeners done).
+
+6. **Separación entre fallo de infraestructura y compatibilidad del modelo
+   (L-03).** `ConnectionClosedError` de Showdown durante batalla y la
+   indisponibilidad local comprobada (`ShowdownUnavailableError`, un
+   `RuntimeError from OSError` del preflight `_check_showdown_reachable`)
+   se clasifican `externally-limited` con stage=battle, nunca
+   `internal-defect` ni incompatibilidad del modelo. Clase/causa preservadas
+   sanitizadas; sin retry automático ni ajuste de ping.
+
+7. **Preservación de fase post-smoke (L-02).** Todo fallo después de un
+   smoke verde conserva `smoke_ok=True`, `failure_stage="battle"`,
+   `battles_requested=2` (objetivo, no batallas iniciadas — finding #4 del
+   TECH LEAD), `battles_completed=0`, las métricas del smoke disponibles
+   (delta del provider) y la clase/causa sanitizadas. Una excepción interna
+   genuina sigue siendo `internal-defect` pero con la fase preservada; el
+   `except Exception` exterior de `run_matrix_round` queda solo para fallos
+   pre-smoke.
+
+8. **Clasificación 401/403 model-wide (L-04).** `FatalProviderError` con
+   HTTP 401/403 upstream/model-wide (sin señal key-specific; el provider ya
+   no rota ni cuarentena) → `credential/model unavailable`;
+   `unsupported-protocol` queda reservado para rechazo de
+   protocolo/structured output (HTTP 400 de response_format). Solo por
+   status HTTP estructurado, nunca texto libre.
+
+9. **not-run hermético (L-05).** La selección/validación local de
+   credenciales precede al chequeo de Showdown en `_benchmark_command`: sin
+   credenciales el comando emite artefacto `not-run`
+   (`failure_type=ProviderSelectionError`, exit 2) sin tocar Showdown. El
+   chequeo de Showdown no se debilita cuando las credenciales existen.
+
+10. **Presupuesto R1C (L-06).** El manifiesto unitario no ejecutado corrige
+    su `cumulative_cost_usd` stale (0.66056 → 0.45976 = smoke 0.00616 + 2
+    batallas 0.4536, hard cap de ronda 0.60); `plan_budget` falla cerrado
+    ante una reserva que exceda el cap. R1C sigue NO AUTORIZADA; no existe
+    artefacto de resultado.

@@ -25,6 +25,7 @@ from poke_env.player import (
 from .benchmark import (
     BenchmarkDeadlineExceeded,
     BenchmarkResult,
+    ShowdownUnavailableError,
     failure_classification,
     run_benchmark,
 )
@@ -123,7 +124,10 @@ async def _check_showdown_reachable(ws_url: str) -> None:
         writer.close()
         await writer.wait_closed()
     except (OSError, asyncio.TimeoutError) as exc:
-        raise RuntimeError(
+        # L-03 (post-R1B): clase propia para la indisponibilidad LOCAL de
+        # Showdown (RuntimeError from OSError): la matriz la clasifica
+        # `externally-limited`, nunca internal-defect ni incompatibilidad.
+        raise ShowdownUnavailableError(
             f"No se pudo conectar a Showdown en {host}:{port} ({exc}). "
             "Levantar el server local con: "
             "docker compose --profile local up -d showdown"
@@ -548,6 +552,35 @@ def model_set_command(
     _asyncio.run(run())
 
 
+async def _close_player_sockets(agent: Any, rival: Any) -> None:
+    """L-01 (post-R1B): cierra los PSClient de AMBOS players via la API real
+    de poke-env (`ps_client.stop_listening()`, async y cross-loop: agenda el
+    cierre en el POKE_LOOP propio de poke-env y espera; `Player` no ofrece
+    close()). Sin esto, cada benchmark abortado fuga 2 websockets + sus
+    listener tasks en el POKE_LOOP global, acumulandose entre modelos de
+    una misma ronda de la matriz.
+
+    Reglas:
+    - ambos players se intentan aunque uno falle;
+    - los errores de cierre se registran y NO se propagan: un cierre que
+      falla no puede ocultar la excepcion primaria del benchmark ni impedir
+      el cierre de calc/repository/engine.
+    """
+    for player in (agent, rival):
+        ps_client = getattr(player, "ps_client", None)
+        stop = getattr(ps_client, "stop_listening", None)
+        if stop is None:
+            continue
+        try:
+            await stop()
+        except BaseException as exc:  # noqa: BLE001
+            logger.warning(
+                "fallo al cerrar PSClient de %r: %s",
+                getattr(player, "username", type(player).__name__),
+                type(exc).__name__,
+            )
+
+
 async def _benchmark_command(
     *, n: int, opponent: str, concurrency: int, persist: bool,
     provider_name: str, model: str, fmt: str,
@@ -557,12 +590,17 @@ async def _benchmark_command(
     ] | None = None,
 ) -> tuple[BenchmarkResult, dict[str, int | None]]:
     settings = load_settings()
-    await _check_showdown_reachable(settings.showdown_ws_url)
     server = local_server_configuration(settings.showdown_ws_url)
     metrics = DecisionMetrics()
+    # L-05 (post-R1B): la seleccion/validacion local de credenciales ocurre
+    # ANTES del chequeo de Showdown: sin credenciales el comando emite
+    # not-run (ProviderSelectionError, exit 2) sin depender de que el server
+    # local este arriba. El chequeo de Showdown sigue vigente cuando las
+    # credenciales existen (no se debilita).
     selected = _benchmark_provider(
         provider_name, model, settings.llm_request_timeout_seconds, metrics
     )
+    await _check_showdown_reachable(settings.showdown_ws_url)
     calculator = CalcClient(
         os.environ.get("CALC_BASE_URL", "http://127.0.0.1:8200"),
         timeout_seconds=settings.llm_request_timeout_seconds,
@@ -654,6 +692,12 @@ async def _benchmark_command(
         # Hay que drenarla antes de cerrar `CalcClient`/el context
         # repository o una decision huerfana puede usarlos ya cerrados.
         await agent.drain_inflight_decisions()
+        # L-01 (post-R1B): cerrar AMBOS PSClient (agent y rival) via la API
+        # real `ps_client.stop_listening()` antes de los recursos. D46 solo
+        # drena decisiones; sin este cierre cada benchmark abortado fuga 2
+        # websockets + listeners en el POKE_LOOP global. El cierre no puede
+        # impedir ni ocultar el cierre de calc/repository/engine.
+        await _close_player_sockets(agent, rival)
         await calculator.aclose()
         await context_repository.aclose()
         await engine.dispose()

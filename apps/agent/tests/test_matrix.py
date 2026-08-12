@@ -364,6 +364,8 @@ def _ready_row(provider, model, tier, protocol="chat_completions") -> ManifestRo
 
 class _FakeSmokeProvider:
     def __init__(self, error=None, payload=None):
+        from ludex_agent.graph.provider import DecisionMetrics
+
         self.error = error
         self.payload = payload or {
             "action": {"kind": "move", "id": "thunderbolt"},
@@ -373,6 +375,13 @@ class _FakeSmokeProvider:
             "alternatives": [],
         }
         self.calls: list[str] = []
+        self._metrics = DecisionMetrics()
+
+    def metrics_snapshot(self) -> dict:
+        # L-02 (post-R1B): como el provider real, expone sus metricas; el
+        # delta del smoke llega al artefacto incluso cuando la batalla
+        # falla despues.
+        return self._metrics.snapshot()
 
     async def complete(self, prompt, *, deadline, turn_id):
         self.calls.append(turn_id)
@@ -381,9 +390,13 @@ class _FakeSmokeProvider:
         from ludex_agent.graph.provider import (
             CompletionEnvelope, CompletionUsage,
         )
+        self._metrics.usage(
+            CompletionUsage(input_tokens=10, output_tokens=5)
+        )
+        self._metrics.completion_latency(1.0)
         return CompletionEnvelope(
             payload=self.payload, provider="fake", model="fake-model",
-            usage=CompletionUsage(input_tokens=1, output_tokens=1),
+            usage=CompletionUsage(input_tokens=10, output_tokens=5),
             latency_ms=1.0,
         )
 
@@ -425,7 +438,8 @@ async def _run(rows, *, tier="free", refresh=None, previous=None,
                battle_failure=None, battle_failure_type=None,
                battles_completed=2, battles_requested=2, battles_wins=1,
                smoke_error=None, smoke_payload=None, build_provider=None,
-               battle_http_status=None, battle_error_code=None):
+               battle_http_status=None, battle_error_code=None,
+               battle_raise=None):
     from ludex_agent.matrix import run_matrix_round
     from ludex_agent.graph.provider import ProviderError
 
@@ -441,6 +455,8 @@ async def _run(rows, *, tier="free", refresh=None, previous=None,
     async def run_battles(provider, model, *, n, battle_timeout_seconds,
                           fmt, opponent):
         battle_calls.append(n)
+        if battle_raise is not None:
+            raise battle_raise
         return _ok_battles(
             completed=battles_completed, requested=battles_requested,
             wins=battles_wins, failure=battle_failure,
@@ -1275,3 +1291,200 @@ def test_delta_de_metricas_baseline_con_muestras_deja_gauges_no_comparables():
     # contadores, count y total siguen calculandose por diferencia
     assert delta["completion_latency_ms_count"] == 1
     assert delta["completion_latency_ms_total"] == 200
+
+
+# --- MON-20 post-R1B (LATWAN DESIGN VERDICT): L-02 fase post-smoke,
+# L-03 infraestructura local, L-04 North y L-06 presupuesto R1C ----------
+
+
+def _fatal_with_http(status: int) -> Exception:
+    """FatalProviderError con causa HTTPStatusError controlada (sin texto
+    libre: solo la cadena de status)."""
+    import httpx as _httpx
+
+    from ludex_agent.graph.provider import FatalProviderError
+
+    request = _httpx.Request(
+        "POST", "https://opencode.ai/zen/v1/chat/completions"
+    )
+    raw = _httpx.HTTPStatusError(
+        "boom", request=request,
+        response=_httpx.Response(status, request=request, json={
+            "error": {"message": "nope"},
+        }),
+    )
+    try:
+        raise FatalProviderError("provider permission or model unavailable") from raw
+    except FatalProviderError as exc:
+        return exc
+
+
+def test_fallo_de_batalla_por_connection_closed_conserva_fase_y_es_externo():
+    """L-02/L-03 (post-R1B): smoke verde + `ConnectionClosedError` de
+    Showdown durante la batalla -> `externally-limited`, stage=battle,
+    smoke_ok=True, battles_requested=2 (objetivo), metricas del smoke
+    conservadas, clase/causa sanitizadas. Con el comportamiento anterior
+    (except externo que resetea) este test se pone rojo."""
+    import asyncio
+
+    from websockets.exceptions import ConnectionClosedError
+
+    rows = [_ready_row("open_code_zen", "deepseek-v4-flash-free", "free")]
+    results, _, battle_calls = asyncio.run(_run(
+        rows, battle_raise=ConnectionClosedError(None, None),
+    ))
+    result = results[0]
+    assert result.status == "externally-limited"
+    assert result.smoke_ok is True
+    assert result.failure_stage == "battle"
+    assert result.battles_requested == 2
+    assert result.battles_completed == 0
+    assert result.failure_type == "ConnectionClosedError"
+    assert result.win_rate is None
+    # metricas del smoke conservadas (delta del provider)
+    assert result.tokens is not None
+    assert result.completion_latency_ms is not None
+    assert battle_calls == [2]
+
+
+def test_fallo_de_batalla_por_showdown_no_disponible_conserva_fase_y_es_externo():
+    """L-02/L-03 (post-R1B): smoke verde + indisponibilidad local de
+    Showdown (`ShowdownUnavailableError` desde `_check_showdown_reachable`,
+    `RuntimeError from OSError`) -> `externally-limited`, stage=battle,
+    clase y causa preservadas (RuntimeError/OSError), sin mensajes."""
+    import asyncio
+
+    from ludex_agent.benchmark import ShowdownUnavailableError
+
+    try:
+        raise OSError("connection refused")
+    except OSError as exc:
+        try:
+            raise ShowdownUnavailableError(
+                "No se pudo conectar a Showdown en localhost:8100"
+            ) from exc
+        except ShowdownUnavailableError as wrapped:
+            showdown_error = wrapped
+
+    rows = [_ready_row("open_code_zen", "laguna-s-2.1-free", "free")]
+    results, _, _ = asyncio.run(_run(rows, battle_raise=showdown_error))
+    result = results[0]
+    assert result.status == "externally-limited"
+    assert result.smoke_ok is True
+    assert result.failure_stage == "battle"
+    assert result.battles_requested == 2
+    # ShowdownUnavailableError ES un RuntimeError; la causa OSError se
+    # preserva como clase, nunca el mensaje.
+    assert isinstance(result.failure_type, str)
+    assert result.failure_type == "ShowdownUnavailableError"
+    assert result.failure_cause_type == "OSError"
+    assert result.win_rate is None
+
+
+def test_fallo_interno_genuino_post_smoke_sigue_siendo_internal_defect_con_fase():
+    """L-02 (post-R1B): una excepcion interna genuina despues del smoke
+    verde SIGUE siendo `internal-defect`, pero conserva smoke_ok=True,
+    stage=battle y battles_requested=2; no se convierte en
+    externally-limited ni resetea la fase."""
+    import asyncio
+
+    rows = [_ready_row("open_code_zen", "mimo-v2.5-free", "free")]
+    results, _, _ = asyncio.run(_run(
+        rows, battle_raise=ValueError("bug interno del runner"),
+    ))
+    result = results[0]
+    assert result.status == "internal-defect"
+    assert result.smoke_ok is True
+    assert result.failure_stage == "battle"
+    assert result.battles_requested == 2
+    assert result.failure_type == "ValueError"
+    assert result.win_rate is None
+
+
+def test_fatal_401_upstream_se_clasifica_credential_model_unavailable():
+    """L-04 (post-R1B): `FatalProviderError` con HTTP 401 upstream/
+    model-wide (sin senal key-specific) -> `credential/model unavailable`,
+    con cero rotacion y cero cuarentena (el provider real ya no rota: solo
+    se reclasifica la categoria del artefacto)."""
+    import asyncio
+
+    rows = [_ready_row("open_code_zen", "north-mini-code-free", "free")]
+    results, _, _ = asyncio.run(_run(rows, smoke_error=_fatal_with_http(401)))
+    result = results[0]
+    assert result.status == "credential/model unavailable"
+    assert result.smoke_ok is False
+    assert result.http_status == 401
+    assert result.rotations == 0
+    assert result.quarantined == 0
+
+
+def test_fatal_403_upstream_se_clasifica_credential_model_unavailable():
+    import asyncio
+
+    rows = [_ready_row("open_code_zen", "north-mini-code-free", "free")]
+    results, _, _ = asyncio.run(_run(rows, smoke_error=_fatal_with_http(403)))
+    assert results[0].status == "credential/model unavailable"
+    assert results[0].http_status == 403
+
+
+def test_fatal_400_structured_output_sigue_siendo_unsupported_protocol():
+    """L-04 (post-R1B): HTTP 400 por structured output/response_format
+    sigue siendo `unsupported-protocol`; la categoria queda reservada para
+    el rechazo de protocolo, no para la credencial."""
+    import asyncio
+
+    rows = [_ready_row("open_code_zen", "big-pickle", "free")]
+    results, _, _ = asyncio.run(_run(rows, smoke_error=_fatal_with_http(400)))
+    assert results[0].status == "unsupported-protocol"
+    assert results[0].http_status == 400
+
+
+def test_manifiesto_unitario_r1c_dentro_del_cap_y_sin_cumulative_stale():
+    """L-06 (post-R1B): el manifiesto unitario R1C declara smoke 0.00616 +
+    2 batallas 0.4536 = 0.45976 <= 0.60 y NO conserva el cumulative stale
+    0.66056 del plan original. plan_budget falla cerrado si la reserva
+    excede el cap de ronda."""
+    import json as _json
+    from decimal import Decimal
+    from pathlib import Path
+
+    from ludex_agent.matrix import BudgetSpec, ManifestRow, plan_budget
+
+    budget = {
+        "open_code_zen": BudgetSpec(
+            balance_usd=Decimal("1"), cap_usd=Decimal("0.60"),
+            leave_usd=Decimal("0"),
+        ),
+    }
+
+    def unit_row(cost: str, smoke: str) -> ManifestRow:
+        return ManifestRow(
+            provider="open_code_zen", model="deepseek-v4-flash",
+            protocol="chat_completions", endpoint=None,
+            structured_output="json_schema", tier="paid", status="ready",
+            battles=2, concurrency=1, persist=False,
+            pin=("open_code_zen", "deepseek-v4-flash"),
+            estimated_cost_usd=Decimal(cost),
+            estimated_smoke_usd=Decimal(smoke),
+        )
+
+    dentro = plan_budget([unit_row("0.4536", "0.00616")], budget)
+    assert dentro[0].status == "ready"
+    assert dentro[0].cumulative_cost_usd == Decimal("0.45976")
+
+    sobre = plan_budget([unit_row("0.6", "0.01")], budget)
+    assert sobre[0].status == "pending-budget"
+    assert "no alcanza" in (sobre[0].classification_note or "")
+
+    # Canario repo: el manifiesto r1b/r1c commiteado cumple el contrato
+    manifest = _json.loads((
+        Path(__file__).resolve().parents[1] / "evals" / "runs"
+        / "r1c-matrix-manifest.json"
+    ).read_text(encoding="utf-8"))
+    row = manifest["rows"][0]
+    assert row["model"] == "deepseek-v4-flash"
+    assert row["estimated_smoke_usd"] == "0.00616"
+    assert row["estimated_cost_usd"] == "0.4536"
+    assert row["cumulative_cost_usd"] == "0.45976"
+    total = Decimal(row["estimated_smoke_usd"]) + Decimal(row["estimated_cost_usd"])
+    assert total <= Decimal("0.60")
