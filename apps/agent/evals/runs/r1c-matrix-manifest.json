@@ -1,0 +1,28 @@
+{
+  "rows": [
+    {
+      "provider": "open_code_zen",
+      "model": "deepseek-v4-flash",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "deepseek-v4-flash"
+      ],
+      "estimated_cost_usd": "0.4536",
+      "estimated_smoke_usd": "0.00616",
+      "cumulative_cost_usd": "0.66056",
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    }
+  ],
+  "generated_at": "2026-08-11T23:07:47Z",
+  "round": "R1C",
+  "derived_from": "20260810t143252z-matrix-manifest.json",
+  "authorization": "LATWAN ADDENDUM MON-20 R1C (deepseek-v4-flash paid, max 0.60 USD)"
+}
