@@ -17,7 +17,12 @@ from types import SimpleNamespace
 import pytest
 from poke_env import AccountConfiguration
 from ludex_agent import cli as cli_module
-from ludex_agent.benchmark import BenchmarkDeadlineExceeded, BenchmarkResult, run_benchmark
+from ludex_agent.benchmark import (
+    BenchmarkDeadlineExceeded,
+    BenchmarkFailure,
+    BenchmarkResult,
+    run_benchmark,
+)
 from ludex_agent.graph.provider import FatalProviderError, TransientProviderError
 from typer.testing import CliRunner
 
@@ -1421,6 +1426,11 @@ def test_benchmark_command_drena_decisiones_antes_de_cerrar_calc_y_contexto(
     """D46/MON-23: `_benchmark_command` debe drenar las decisiones en vuelo
     del agente ANTES de cerrar `CalcClient` y el context repository.
 
+    L-01 (correccion LATWAN): la frontera estructurada termina SIEMPRE en
+    `engine.dispose()`, que queda observado en el orden (los canarios
+    anteriores no lo observaban). Si alguien omitiera el tramo engine, este
+    canario se pone rojo.
+
     `run_benchmark`/`battle_against` corren como task HERMANA de la que
     procesa `choose_move -> calc_damage` en `ps_client.loop`: cancelar o
     terminar esa task no cancela una decision huerfana. Sin drenar primero,
@@ -1438,7 +1448,7 @@ def test_benchmark_command_drena_decisiones_antes_de_cerrar_calc_y_contexto(
             self._fail = fail
             self.stop_calls = 0
 
-        def stop_listening(self):
+        async def stop_listening(self):
             self.stop_calls += 1
             stop_counts[self._name] = self.stop_calls
             order.append(f"{self._name}_stop")
@@ -1475,6 +1485,10 @@ def test_benchmark_command_drena_decisiones_antes_de_cerrar_calc_y_contexto(
         async def aclose(self):
             order.append("context_aclose")
 
+    class SpyEngine:
+        async def dispose(self):
+            order.append("engine_dispose")
+
     _patch_benchmark_command_dependencies(monkeypatch, SpyAgent)
     monkeypatch.setattr(cli_module, "RandomPlayer", SpyRival)
     monkeypatch.setattr(cli_module, "MaxBasePowerPlayer", SpyRival)
@@ -1483,6 +1497,7 @@ def test_benchmark_command_drena_decisiones_antes_de_cerrar_calc_y_contexto(
     monkeypatch.setattr(
         cli_module, "PostgresContextRepository", lambda *a, **k: SpyContextRepo()
     )
+    monkeypatch.setattr(cli_module, "make_engine", lambda url: SpyEngine())
     monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path)
 
     result = CliRunner().invoke(
@@ -1506,9 +1521,10 @@ def test_benchmark_command_drena_decisiones_antes_de_cerrar_calc_y_contexto(
 
     assert result.exit_code == 0, result.stdout
     # L-01 (post-R1B): lifecycle completo — drain D46, cierre de AMBOS
-    # players (stop_listening) y recién despues calc/contexto.
+    # players (stop_listening) y recién despues calc/contexto/engine.
     assert order == [
         "drain", "agent_stop", "rival_stop", "calc_aclose", "context_aclose",
+        "engine_dispose",
     ], order
     # cada PSClient se cierra exactamente UNA vez
     assert stop_counts == {"agent": 1, "rival": 1}, stop_counts
@@ -1519,7 +1535,11 @@ def test_fallo_al_cerrar_un_player_no_impide_cerrar_el_resto_ni_oculta_la_primar
 ):
     """L-01 (post-R1B): si el cierre del primer player falla, el segundo y
     calc/contexto/engine se cierran igual; y el error del cleanup jamas
-    oculta la excepcion primaria del benchmark."""
+    oculta la excepcion primaria del benchmark.
+
+    L-01 (correccion LATWAN): la primaria viaja como `BenchmarkFailure` con
+    resultado parcial tipado (el fallo del cleanup tampoco la reemplaza), y
+    el tramo `engine.dispose()` queda observado en el orden."""
     order: list[str] = []
 
     class SpyPSClient:
@@ -1527,7 +1547,7 @@ def test_fallo_al_cerrar_un_player_no_impide_cerrar_el_resto_ni_oculta_la_primar
             self._name = name
             self._fail = fail
 
-        def stop_listening(self):
+        async def stop_listening(self):
             order.append(f"{self._name}_stop")
             if self._fail:
                 raise RuntimeError(f"{self._name} close failed")
@@ -1555,6 +1575,10 @@ def test_fallo_al_cerrar_un_player_no_impide_cerrar_el_resto_ni_oculta_la_primar
         async def aclose(self):
             order.append("context_aclose")
 
+    class SpyEngine:
+        async def dispose(self):
+            order.append("engine_dispose")
+
     async def boom(*args, **kwargs):
         raise ValueError("primary boom")
 
@@ -1567,17 +1591,462 @@ def test_fallo_al_cerrar_un_player_no_impide_cerrar_el_resto_ni_oculta_la_primar
     monkeypatch.setattr(
         cli_module, "PostgresContextRepository", lambda *a, **k: SpyContextRepo()
     )
+    monkeypatch.setattr(cli_module, "make_engine", lambda url: SpyEngine())
 
-    with pytest.raises(ValueError, match="primary boom"):
+    with pytest.raises(BenchmarkFailure, match="primary boom") as excinfo:
         asyncio.run(cli_module._benchmark_command(
             n=1, opponent="random", concurrency=1, persist=False,
             provider_name="fake", model="fake-model",
             fmt="gen6randombattle", battle_timeout_seconds=0.01,
         ))
+    # la primaria se preserva como causa del BenchmarkFailure
+    assert isinstance(excinfo.value.__cause__, ValueError)
+    assert "primary boom" in str(excinfo.value.__cause__)
     # el fallo del cierre del agent NO impide cerrar rival + recursos
     assert order == [
         "drain", "agent_stop", "rival_stop", "calc_aclose", "context_aclose",
+        "engine_dispose",
     ], order
+
+
+def _benchmark_spy_resources(
+    monkeypatch,
+    build_agent,
+    *,
+    agent_stop_error: BaseException | None = None,
+    calc_error: BaseException | None = None,
+    context_error: BaseException | None = None,
+    engine_error: BaseException | None = None,
+) -> list[str]:
+    """Monta la cadena de recursos de `_benchmark_command` con spies que
+    registran el ORDEN de cierre y pueden fallar por tramo (fallo del primer
+    player, de Calc, del context repository o de engine). `build_agent`
+    recibe el rig `{"order": [...]}` para que el agente registre su drain.
+    Devuelve el orden observado."""
+    rig: dict[str, list[str]] = {"order": []}
+
+    class SpyPSClient:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        async def stop_listening(self):
+            rig["order"].append(f"{self._name}_stop")
+            if self._name == "agent" and agent_stop_error is not None:
+                raise agent_stop_error
+
+    class SpyRival:
+        def __init__(self, **kwargs) -> None:
+            self.ps_client = SpyPSClient("rival")
+
+    class SpyCalcClient:
+        async def aclose(self):
+            rig["order"].append("calc_aclose")
+            if calc_error is not None:
+                raise calc_error
+
+    class SpyContextRepo:
+        async def aclose(self):
+            rig["order"].append("context_aclose")
+            if context_error is not None:
+                raise context_error
+
+    class SpyEngine:
+        async def dispose(self):
+            rig["order"].append("engine_dispose")
+            if engine_error is not None:
+                raise engine_error
+
+    def agent_factory(**kwargs):
+        agent = build_agent(rig)
+        agent.ps_client = SpyPSClient("agent")
+        return agent
+
+    _patch_benchmark_command_dependencies(monkeypatch, agent_factory)
+    monkeypatch.setattr(cli_module, "RandomPlayer", SpyRival)
+    monkeypatch.setattr(cli_module, "MaxBasePowerPlayer", SpyRival)
+    monkeypatch.setattr(cli_module, "SimpleHeuristicsPlayer", SpyRival)
+    monkeypatch.setattr(cli_module, "CalcClient", lambda *a, **k: SpyCalcClient())
+    monkeypatch.setattr(
+        cli_module, "PostgresContextRepository", lambda *a, **k: SpyContextRepo()
+    )
+    monkeypatch.setattr(cli_module, "make_engine", lambda url: SpyEngine())
+    return rig["order"]
+
+
+_FULL_CLEANUP_ORDER = [
+    "drain", "agent_stop", "rival_stop", "calc_aclose", "context_aclose",
+    "engine_dispose",
+]
+
+
+def _boom_agent_factory(drain_error: BaseException | None = None):
+    def build_agent(rig: dict[str, list[str]]):
+        class BoomAgent:
+            n_won_battles = 0
+            n_lost_battles = 0
+            n_tied_battles = 0
+            battles: dict[str, object] = {}
+
+            async def drain_inflight_decisions(self):
+                rig["order"].append("drain")
+                if drain_error is not None:
+                    raise drain_error
+
+        return BoomAgent()
+
+    return build_agent
+
+
+def test_cleanup_drain_fallido_no_oculta_la_primaria_y_cierra_el_resto(
+    monkeypatch,
+):
+    """L-01 (correccion LATWAN): si el drain falla, los players, calc,
+    contexto y engine se intentan igual, y la primaria del benchmark se
+    preserva como `__cause__` del `BenchmarkFailure`."""
+    order = _benchmark_spy_resources(
+        monkeypatch, _boom_agent_factory(drain_error=RuntimeError("drain cleanup"))
+    )
+
+    async def boom(*args, **kwargs):
+        raise ValueError("primary boom")
+
+    monkeypatch.setattr(cli_module, "run_benchmark", boom)
+
+    with pytest.raises(BenchmarkFailure, match="primary boom") as excinfo:
+        asyncio.run(cli_module._benchmark_command(
+            n=1, opponent="random", concurrency=1, persist=False,
+            provider_name="fake", model="fake-model",
+            fmt="gen6randombattle", battle_timeout_seconds=0.01,
+        ))
+    # todos los tramos posteriores al drain fallido se intentaron
+    assert order == _FULL_CLEANUP_ORDER, order
+    # la primaria viaja intacta como causa
+    assert isinstance(excinfo.value.__cause__, ValueError)
+    # el resultado parcial tipado conserva progreso real (0 batallas) e
+    # identidad efectiva (el pin)
+    partial = excinfo.value.result
+    assert partial.requested == 1
+    assert partial.completed == 0
+    assert partial.provider == "fake"
+    assert partial.model == "fake-model"
+    assert partial.failure_type == "ValueError"
+
+
+def test_cleanup_primer_player_fallido_no_oculta_la_primaria_y_cierra_el_resto(
+    monkeypatch,
+):
+    """L-01 (correccion LATWAN): si el cierre del primer player falla, el
+    segundo y calc/contexto/engine se intentan igual; la primaria no se
+    reemplaza por el error del cierre."""
+    order = _benchmark_spy_resources(
+        monkeypatch, _boom_agent_factory(),
+        agent_stop_error=RuntimeError("agent close failed"),
+    )
+
+    async def boom(*args, **kwargs):
+        raise ValueError("primary boom")
+
+    monkeypatch.setattr(cli_module, "run_benchmark", boom)
+
+    with pytest.raises(BenchmarkFailure, match="primary boom") as excinfo:
+        asyncio.run(cli_module._benchmark_command(
+            n=1, opponent="random", concurrency=1, persist=False,
+            provider_name="fake", model="fake-model",
+            fmt="gen6randombattle", battle_timeout_seconds=0.01,
+        ))
+    assert order == _FULL_CLEANUP_ORDER, order
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
+def test_cleanup_calc_fallido_no_oculta_la_primaria_y_cierra_el_resto(
+    monkeypatch,
+):
+    """L-01 (correccion LATWAN): si `CalcClient.aclose()` falla, context
+    repository y engine se intentan igual (el caso 2 de la reproduccion de
+    Latwan) y la primaria se preserva."""
+    order = _benchmark_spy_resources(
+        monkeypatch, _boom_agent_factory(),
+        calc_error=RuntimeError("calc cleanup"),
+    )
+
+    async def boom(*args, **kwargs):
+        raise ValueError("primary boom")
+
+    monkeypatch.setattr(cli_module, "run_benchmark", boom)
+
+    with pytest.raises(BenchmarkFailure, match="primary boom") as excinfo:
+        asyncio.run(cli_module._benchmark_command(
+            n=1, opponent="random", concurrency=1, persist=False,
+            provider_name="fake", model="fake-model",
+            fmt="gen6randombattle", battle_timeout_seconds=0.01,
+        ))
+    assert order == _FULL_CLEANUP_ORDER, order
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
+def test_cleanup_context_fallido_no_oculta_la_primaria_y_cierra_engine(
+    monkeypatch,
+):
+    order = _benchmark_spy_resources(
+        monkeypatch, _boom_agent_factory(),
+        context_error=RuntimeError("context cleanup"),
+    )
+
+    async def boom(*args, **kwargs):
+        raise ValueError("primary boom")
+
+    monkeypatch.setattr(cli_module, "run_benchmark", boom)
+
+    with pytest.raises(BenchmarkFailure, match="primary boom") as excinfo:
+        asyncio.run(cli_module._benchmark_command(
+            n=1, opponent="random", concurrency=1, persist=False,
+            provider_name="fake", model="fake-model",
+            fmt="gen6randombattle", battle_timeout_seconds=0.01,
+        ))
+    # context fallido no impide el tramo engine (el ultimo)
+    assert order == _FULL_CLEANUP_ORDER, order
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
+def test_cleanup_engine_fallido_no_oculta_la_primaria(monkeypatch):
+    order = _benchmark_spy_resources(
+        monkeypatch, _boom_agent_factory(),
+        engine_error=RuntimeError("engine cleanup"),
+    )
+
+    async def boom(*args, **kwargs):
+        raise ValueError("primary boom")
+
+    monkeypatch.setattr(cli_module, "run_benchmark", boom)
+
+    with pytest.raises(BenchmarkFailure, match="primary boom") as excinfo:
+        asyncio.run(cli_module._benchmark_command(
+            n=1, opponent="random", concurrency=1, persist=False,
+            provider_name="fake", model="fake-model",
+            fmt="gen6randombattle", battle_timeout_seconds=0.01,
+        ))
+    assert order == _FULL_CLEANUP_ORDER, order
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
+def _two_battles_agent_factory(drain_error: BaseException | None = None):
+    def build_agent(rig: dict[str, list[str]]):
+        class TwoBattlesAgent:
+            n_won_battles = 0
+            n_lost_battles = 0
+            n_tied_battles = 0
+            battles: dict[str, object] = {}
+
+            async def battle_against(self, rival, n_battles=1):
+                self.battles[f"battle-{len(self.battles)}"] = object()
+                self.n_won_battles += 1
+
+            async def wait_for_background_failure(self):
+                await asyncio.Event().wait()
+
+            async def drain_inflight_decisions(self):
+                rig["order"].append("drain")
+                if drain_error is not None:
+                    raise drain_error
+
+        return TwoBattlesAgent()
+
+    return build_agent
+
+
+def test_benchmark_exitoso_con_cleanup_fallido_termina_internal_defect_sanitizado(
+    monkeypatch,
+):
+    """L-01 (correccion LATWAN): el benchmark termina bien (2/2) pero el
+    cleanup falla (drain). Sin excepcion primaria, la corrida NO puede
+    quedar `compatible`: `_benchmark_command` devuelve un resultado
+    `InternalCleanupError` sanitizado con el progreso real preservado."""
+    order = _benchmark_spy_resources(
+        monkeypatch,
+        _two_battles_agent_factory(drain_error=RuntimeError("drain cleanup")),
+    )
+
+    result, _ = asyncio.run(cli_module._benchmark_command(
+        n=2, opponent="random", concurrency=1, persist=False,
+        provider_name="fake", model="fake-model",
+        fmt="gen6randombattle", battle_timeout_seconds=0.01,
+    ))
+    # los tramos posteriores al drain fallido se intentaron
+    assert order == _FULL_CLEANUP_ORDER, order
+    # nunca compatible: internal-defect sanitizado con progreso real
+    assert result.failure_type == "InternalCleanupError"
+    assert result.failure_cause_type == "RuntimeError"
+    assert result.failure is not None
+    assert "drain cleanup" not in result.failure, result.failure
+    assert not result.comparable
+    assert result.completed == 2
+    assert result.requested == 2
+    assert result.provider == "fake"
+    assert result.model == "fake-model"
+
+
+def test_benchmark_exitoso_con_cierre_de_player_fallido_no_es_compatible(
+    monkeypatch,
+):
+    """L-01 (correccion LATWAN, punto 4): antes, `_close_player_sockets`
+    tragaba el fallo del cierre y la corrida podia reportar `compatible` con
+    websockets vivos. Ahora un cierre fallido sin primaria tambien termina
+    `InternalCleanupError`."""
+    order = _benchmark_spy_resources(
+        monkeypatch, _two_battles_agent_factory(),
+        agent_stop_error=RuntimeError("agent close failed"),
+    )
+
+    result, _ = asyncio.run(cli_module._benchmark_command(
+        n=2, opponent="random", concurrency=1, persist=False,
+        provider_name="fake", model="fake-model",
+        fmt="gen6randombattle", battle_timeout_seconds=0.01,
+    ))
+    assert order == _FULL_CLEANUP_ORDER, order
+    assert result.failure_type == "InternalCleanupError"
+    assert result.failure_cause_type == "RuntimeError"
+    assert not result.comparable
+    assert result.completed == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelacion_externa_preserva_cancelled_error_y_ejecuta_cleanup(
+    monkeypatch,
+):
+    """L-01 (correccion LATWAN, punto 5): la cancelacion externa NO se
+    traga como fallo ordinario ni se convierte en `InternalCleanupError`: el
+    `CancelledError` se preserva y el cleanup estructurado se ejecuta igual
+    (todos los tramos)."""
+    order: list[str] = []
+
+    def build_hanging(rig: dict[str, list[str]]):
+        class HangingAgent:
+            n_won_battles = 0
+            n_lost_battles = 0
+            n_tied_battles = 0
+            battles: dict[str, object] = {}
+
+            async def battle_against(self, rival, n_battles=1):
+                await asyncio.Event().wait()
+
+            async def wait_for_background_failure(self):
+                await asyncio.Event().wait()
+
+            async def drain_inflight_decisions(self):
+                rig["order"].append("drain")
+
+        return HangingAgent()
+
+    order = _benchmark_spy_resources(monkeypatch, build_hanging)
+
+    task = asyncio.create_task(cli_module._benchmark_command(
+        n=2, opponent="random", concurrency=1, persist=False,
+        provider_name="fake", model="fake-model",
+        fmt="gen6randombattle", battle_timeout_seconds=60.0,
+    ))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+    # el cleanup estructurado corrio completo, incluso bajo cancelacion
+    assert order == _FULL_CLEANUP_ORDER, order
+
+
+def test_benchmark_command_batalla_2_connection_closed_preserva_progreso_e_identidad(
+    monkeypatch,
+):
+    """L-02 (correccion LATWAN, canario vinculante): smoke verde (ya paso,
+    esto es `_benchmark_command`), batalla 1 termina, batalla 2 lanza
+    `ConnectionClosedError`. La frontera real conserva un resultado parcial
+    TIPADO (`BenchmarkFailure.result`) con requested=2, completed=1, W/L/T
+    reales, provider/model efectivos iguales al pin, stage battle y
+    evidencia sanitizada — jamas ceros inventados."""
+    from websockets.exceptions import ConnectionClosedError
+
+    def build_battle_failing(rig: dict[str, list[str]]):
+        class BattleFailingAgent:
+            n_won_battles = 0
+            n_lost_battles = 0
+            n_tied_battles = 0
+            battles: dict[str, object] = {}
+
+            async def battle_against(self, rival, n_battles=1):
+                if len(self.battles) >= 1:
+                    raise ConnectionClosedError(None, None)
+                self.battles["battle-0"] = object()
+                self.n_won_battles += 1
+
+            async def wait_for_background_failure(self):
+                await asyncio.Event().wait()
+
+            async def drain_inflight_decisions(self):
+                rig["order"].append("drain")
+
+        return BattleFailingAgent()
+
+    order = _benchmark_spy_resources(monkeypatch, build_battle_failing)
+
+    with pytest.raises(BenchmarkFailure) as excinfo:
+        asyncio.run(cli_module._benchmark_command(
+            n=2, opponent="random", concurrency=1, persist=False,
+            provider_name="fake", model="fake-model",
+            fmt="gen6randombattle", battle_timeout_seconds=0.01,
+        ))
+    # la primaria real se preserva como causa del wrapper tipado
+    assert isinstance(excinfo.value.__cause__, ConnectionClosedError)
+    partial = excinfo.value.result
+    # progreso real: no se inventa ni se borra
+    assert partial.requested == 2
+    assert partial.completed == 1
+    assert partial.wins == 1
+    assert partial.losses == 0
+    assert partial.ties == 0
+    # identidad efectiva igual al pin
+    assert partial.provider == "fake"
+    assert partial.model == "fake-model"
+    # evidencia sanitizada
+    assert partial.failure_type == "ConnectionClosedError"
+    assert partial.failure_cause_type is None
+    assert order == _FULL_CLEANUP_ORDER, order
+
+
+def test_benchmark_command_preflight_showdown_fallido_preserva_identidad_sin_progreso(
+    monkeypatch,
+):
+    """L-02 (correccion LATWAN, counterweight): el preflight de Showdown
+    falla ANTES de crear players. La frontera conserva completed=0 (no hubo
+    batallas), stage battle y la identidad efectiva ya demostrada por el
+    smoke (provider/model del pin); jamas vuelve a None."""
+    from ludex_agent.benchmark import ShowdownUnavailableError
+
+    async def unreachable(url):
+        try:
+            raise OSError("connection refused")
+        except OSError as exc:
+            raise ShowdownUnavailableError(
+                "No se pudo conectar a Showdown en localhost:8100"
+            ) from exc
+
+    # player/resource spies: nada deberia crearse ni cerrarse. El preflight
+    # se reemplaza DESPUES (el helper de parches lo pisa).
+    _benchmark_spy_resources(monkeypatch, _boom_agent_factory())
+    monkeypatch.setattr(cli_module, "_check_showdown_reachable", unreachable)
+
+    with pytest.raises(BenchmarkFailure) as excinfo:
+        asyncio.run(cli_module._benchmark_command(
+            n=2, opponent="random", concurrency=1, persist=False,
+            provider_name="fake", model="fake-model",
+            fmt="gen6randombattle", battle_timeout_seconds=0.01,
+        ))
+    assert isinstance(excinfo.value.__cause__, ShowdownUnavailableError)
+    partial = excinfo.value.result
+    assert partial.requested == 2
+    assert partial.completed == 0
+    # identidad efectiva del pin preservada (demostrada por el smoke)
+    assert partial.provider == "fake"
+    assert partial.model == "fake-model"
+    assert partial.failure_type == "ShowdownUnavailableError"
 
 
 @pytest.mark.asyncio

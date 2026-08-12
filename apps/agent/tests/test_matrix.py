@@ -439,7 +439,7 @@ async def _run(rows, *, tier="free", refresh=None, previous=None,
                battles_completed=2, battles_requested=2, battles_wins=1,
                smoke_error=None, smoke_payload=None, build_provider=None,
                battle_http_status=None, battle_error_code=None,
-               battle_raise=None):
+               battle_raise=None, battle_wrapped=None):
     from ludex_agent.matrix import run_matrix_round
     from ludex_agent.graph.provider import ProviderError
 
@@ -455,6 +455,15 @@ async def _run(rows, *, tier="free", refresh=None, previous=None,
     async def run_battles(provider, model, *, n, battle_timeout_seconds,
                           fmt, opponent):
         battle_calls.append(n)
+        if battle_wrapped is not None:
+            # `battle_wrapped` es (partial, exc): la frontera real del
+            # benchmark lanza `BenchmarkFailure(partial) from exc`.
+            partial, raw = battle_wrapped
+            from ludex_agent.benchmark import BenchmarkFailure
+            try:
+                raise raw
+            except BaseException as caught:
+                raise BenchmarkFailure(partial) from caught
         if battle_raise is not None:
             raise battle_raise
         return _ok_battles(
@@ -1324,7 +1333,10 @@ def test_fallo_de_batalla_por_connection_closed_conserva_fase_y_es_externo():
     Showdown durante la batalla -> `externally-limited`, stage=battle,
     smoke_ok=True, battles_requested=2 (objetivo), metricas del smoke
     conservadas, clase/causa sanitizadas. Con el comportamiento anterior
-    (except externo que resetea) este test se pone rojo."""
+    (except externo que resetea) este test se pone rojo.
+
+    L-02 (correccion LATWAN): la identidad efectiva del pin se preserva
+    (el smoke ya la demando) y W/L/T quedan en 0 (no hubo batalla)."""
     import asyncio
 
     from websockets.exceptions import ConnectionClosedError
@@ -1339,6 +1351,12 @@ def test_fallo_de_batalla_por_connection_closed_conserva_fase_y_es_externo():
     assert result.failure_stage == "battle"
     assert result.battles_requested == 2
     assert result.battles_completed == 0
+    assert result.battles_wins == 0
+    assert result.battles_losses == 0
+    assert result.battles_ties == 0
+    # identidad efectiva = pin, jamas None (el smoke ya la demostro)
+    assert result.effective_provider == "open_code_zen"
+    assert result.effective_model == "deepseek-v4-flash-free"
     assert result.failure_type == "ConnectionClosedError"
     assert result.win_rate is None
     # metricas del smoke conservadas (delta del provider)
@@ -1347,11 +1365,81 @@ def test_fallo_de_batalla_por_connection_closed_conserva_fase_y_es_externo():
     assert battle_calls == [2]
 
 
+def test_batalla_2_fallida_con_partial_tipado_conserva_progreso_identidad_y_wlt():
+    """L-02 (correccion LATWAN, canario vinculante): smoke verde, batalla 1
+    termina, batalla 2 lanza `ConnectionClosedError`. La frontera real
+    (`_benchmark_command`) lanza `BenchmarkFailure` con resultado parcial
+    TIPADO; la matriz conserva requested=2, completed=1, W/L/T reales,
+    provider/model efectivos iguales al pin, stage=battle,
+    externally-limited y winrate=None. Mutar `_battle_failed` a
+    completed=0, borrar effective_provider/model o perder W/L/T pone este
+    canario rojo."""
+    import asyncio
+
+    from websockets.exceptions import ConnectionClosedError
+
+    from ludex_agent.benchmark import BenchmarkResult
+
+    rows = [_ready_row("open_code_zen", "deepseek-v4-flash-free", "free")]
+    partial = BenchmarkResult(
+        requested=2, completed=1, wins=1, losses=0, ties=0,
+        provider="open_code_zen", model="deepseek-v4-flash-free",
+        failure="ConnectionClosedError: server disconnected",
+        failure_type="ConnectionClosedError", failure_cause_type=None,
+    )
+    results, _, battle_calls = asyncio.run(_run(
+        rows, battle_wrapped=(partial, ConnectionClosedError(None, None)),
+    ))
+    result = results[0]
+    assert result.status == "externally-limited"
+    assert result.smoke_ok is True
+    assert result.failure_stage == "battle"
+    assert result.battles_requested == 2
+    assert result.battles_completed == 1
+    assert result.battles_wins == 1
+    assert result.battles_losses == 0
+    assert result.battles_ties == 0
+    # identidad efectiva = pin (preservada del resultado parcial tipado)
+    assert result.effective_provider == "open_code_zen"
+    assert result.effective_model == "deepseek-v4-flash-free"
+    assert result.failure_type == "ConnectionClosedError"
+    assert result.win_rate is None
+    # metricas acumuladas del smoke conservadas (delta del provider)
+    assert result.tokens is not None
+    assert result.completion_latency_ms is not None
+    assert battle_calls == [2]
+
+
+def test_cleanup_fallido_marcado_internal_defect_en_la_matriz():
+    """L-01 (correccion LATWAN): un resultado con
+    `failure_type=InternalCleanupError` (cleanup fallido sin primaria) se
+    clasifica `internal-defect` — nunca `aborted` ni `compatible` — y no
+    publica winrate."""
+    import asyncio
+
+    rows = [_ready_row("open_code_zen", "mimo-v2.5-free", "free")]
+    results, _, _ = asyncio.run(_run(
+        rows,
+        battles_completed=2, battles_requested=2,
+        battle_failure="internal defect: fallo el cierre de recursos del benchmark",
+        battle_failure_type="InternalCleanupError",
+    ))
+    result = results[0]
+    assert result.status == "internal-defect"
+    assert result.failure_stage == "battle"
+    assert result.battles_completed == 2
+    assert result.win_rate is None
+
+
 def test_fallo_de_batalla_por_showdown_no_disponible_conserva_fase_y_es_externo():
     """L-02/L-03 (post-R1B): smoke verde + indisponibilidad local de
     Showdown (`ShowdownUnavailableError` desde `_check_showdown_reachable`,
     `RuntimeError from OSError`) -> `externally-limited`, stage=battle,
-    clase y causa preservadas (RuntimeError/OSError), sin mensajes."""
+    clase y causa preservadas (RuntimeError/OSError), sin mensajes.
+
+    L-02 (correccion LATWAN, counterweight): el preflight falla ANTES de
+    crear players: completed=0 (no hubo batallas) y la identidad efectiva
+    ya demostrada por el smoke se preserva (provider/model = pin)."""
     import asyncio
 
     from ludex_agent.benchmark import ShowdownUnavailableError
@@ -1373,6 +1461,10 @@ def test_fallo_de_batalla_por_showdown_no_disponible_conserva_fase_y_es_externo(
     assert result.smoke_ok is True
     assert result.failure_stage == "battle"
     assert result.battles_requested == 2
+    assert result.battles_completed == 0
+    # identidad efectiva del pin preservada (demostrada por el smoke)
+    assert result.effective_provider == "open_code_zen"
+    assert result.effective_model == "laguna-s-2.1-free"
     # ShowdownUnavailableError ES un RuntimeError; la causa OSError se
     # preserva como clase, nunca el mensaje.
     assert isinstance(result.failure_type, str)
