@@ -35,11 +35,13 @@ class BenchmarkDeadlineExceeded(Exception):
 
 
 class ShowdownUnavailableError(RuntimeError):
-    """L-03 (post-R1B): el preflight local de Showdown fallo (indisponibilidad
-    de INFRAESTRUCTURA, no del modelo). Se levanta `from` el OSError real del
-    probe de conexion, que queda como causa preservada en vivo. La matriz lo
-    clasifica `externally-limited` con stage=battle: nunca una
-    incompatibilidad del modelo ni internal-defect."""
+class ShowdownUnavailableError(RuntimeError):
+    """L-03 (post-R1B) + D49 (MON-25): el preflight local de Showdown fallo
+    (indisponibilidad de INFRAESTRUCTURA, no del modelo). Se levanta `from`
+    el OSError/timeout/error de handshake real del probe de protocolo, que
+    queda como causa preservada en vivo. La matriz lo clasifica
+    `externally-limited` con stage=battle: nunca una incompatibilidad del
+    modelo ni internal-defect."""
 
 
 def failure_classification(

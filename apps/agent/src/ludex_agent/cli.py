@@ -12,15 +12,16 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import typer
+import websockets
 from poke_env import AccountConfiguration
 from poke_env.player import (
     MaxBasePowerPlayer,
     RandomPlayer,
     SimpleHeuristicsPlayer,
 )
+from websockets.exceptions import WebSocketException
 
 from .benchmark import (
     BenchmarkDeadlineExceeded,
@@ -107,31 +108,51 @@ def _progress_summary(record: BenchmarkRecord) -> str:
     )
 
 
+_SHOWDOWN_HANDSHAKE_TIMEOUT_SECONDS = 3.0
+_SHOWDOWN_CHALLSTR_PREFIX = "|challstr|"
+
+
+async def _probe_showdown_protocol(ws_url: str) -> None:
+    """Abre el websocket y espera el `|challstr|` real de Showdown.
+
+    `poke_env.ps_client` trata ese mensaje como "confirma conexion al
+    server: podemos loguear" (ps_client.py). Es la señal de protocolo mas
+    temprana y especifica de un Showdown real; un simple accept TCP no la
+    produce.
+    """
+    async with websockets.connect(
+        ws_url, open_timeout=_SHOWDOWN_HANDSHAKE_TIMEOUT_SECONDS
+    ) as ws:
+        while True:
+            frame = await ws.recv()
+            text = frame if isinstance(frame, str) else frame.decode("utf-8", "replace")
+            if any(
+                line.startswith(_SHOWDOWN_CHALLSTR_PREFIX)
+                for line in text.split("\n")
+            ):
+                return
+
+
 async def _check_showdown_reachable(ws_url: str) -> None:
     """Falla en segundos, no en minutos, si el server local no esta arriba.
 
-    Minor triageado a Important en la review final: sin este chequeo, con el
-    server apagado, los tests de integracion (y este runner) tardaban 360s en
-    errar via el timeout del batching en vez de fallar rapido con un mensaje
-    util. `asyncio.open_connection` al host:puerto del websocket es barato y
-    cubre el caso comun (contenedor no levantado).
+    D49 (MON-25): endurecido a handshake real de protocolo. El chequeo
+    anterior (`asyncio.open_connection` + cerrar) daba preflight VERDE
+    contra cualquier listener TCP que aceptara la conexion, hable o no el
+    protocolo de Showdown -- probado empiricamente con un listener mudo
+    (ROOT-CAUSE CHECKPOINT, seccion 7). Mismo presupuesto de 3s que ya
+    tenia el chequeo viejo: no se sube el timeout, se hace mas estricto lo
+    que se exige dentro de el.
     """
-    parts = urlsplit(ws_url.replace("ws://", "http://").replace("wss://", "https://"))
-    host = parts.hostname or "localhost"
-    port = parts.port or 80
     try:
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=3
+        await asyncio.wait_for(
+            _probe_showdown_protocol(ws_url),
+            timeout=_SHOWDOWN_HANDSHAKE_TIMEOUT_SECONDS,
         )
-        writer.close()
-        await writer.wait_closed()
-    except (OSError, asyncio.TimeoutError) as exc:
-        # L-03 (post-R1B): clase propia para la indisponibilidad LOCAL de
-        # Showdown (RuntimeError from OSError): la matriz la clasifica
-        # `externally-limited`, nunca internal-defect ni incompatibilidad.
+    except (OSError, WebSocketException) as exc:
         raise ShowdownUnavailableError(
-            f"No se pudo conectar a Showdown en {host}:{port} ({exc}). "
-            "Levantar el server local con: "
+            f"Showdown en {ws_url} no completo el handshake de protocolo "
+            f"esperado ({exc}). Levantar el server local con: "
             "docker compose --profile local up -d showdown"
         ) from exc
 

@@ -21,6 +21,7 @@ from ludex_agent.benchmark import (
     BenchmarkDeadlineExceeded,
     BenchmarkFailure,
     BenchmarkResult,
+    ShowdownUnavailableError,
     run_benchmark,
 )
 from ludex_agent.graph.provider import FatalProviderError, TransientProviderError
@@ -33,6 +34,7 @@ from ludex_agent.cli import (
     _battle_against_or_failure,
     _battle_outcome,
     _benchmark_provider,
+    _check_showdown_reachable,
     _persist_one,
     _progress_summary,
     app,
@@ -475,6 +477,67 @@ class _FakeRepo:
 # ganador, `final_result='loss'` y `reward=-1`. Estos tests fallan con esa
 # expresion vieja (el rival apareceria como winner, "loss" en vez de "tie",
 # -1 en vez de 0) y pasan con `_battle_outcome`.
+
+
+# --- D49 (MON-25): `_check_showdown_reachable` debe hablar el protocolo
+# de Showdown, no solo abrir un socket TCP. El defecto real (MON-25
+# ROOT-CAUSE CHECKPOINT, seccion 7): un TCP connect desnudo da preflight
+# VERDE contra cualquier listener que acepte la conexion, hable o no el
+# protocolo. Estos dos tests fallan con la implementacion vieja (TCP
+# connect + close) porque esa version nunca lee del socket.
+
+
+async def test_check_showdown_reachable_falla_contra_listener_tcp_mudo():
+    """Listener que acepta la conexion y jamas completa el handshake HTTP
+    de websocket (nunca responde). El viejo TCP-connect-y-cerrar lo
+    aceptaba como sano; el handshake real debe fallar cerrado."""
+
+    async def _mute_handler(reader, writer):
+        await asyncio.sleep(3600)
+
+    server = await asyncio.start_server(_mute_handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        with pytest.raises(ShowdownUnavailableError) as excinfo:
+            await _check_showdown_reachable(
+                f"ws://127.0.0.1:{port}/showdown/websocket"
+            )
+        assert isinstance(excinfo.value.__cause__, OSError)
+    finally:
+        # Sin `await wait_closed()`: `_mute_handler` nunca retorna (es el
+        # punto del test), y desde Python 3.12 `wait_closed()` espera
+        # tambien a que las conexiones activas terminen, no solo al socket
+        # de escucha -- colgaria para siempre.
+        server.close()
+
+
+async def test_check_showdown_reachable_falla_contra_endpoint_http_invalido():
+    """Un endpoint que responde HTTP valido pero rechaza el upgrade a
+    websocket (no es un server de Showdown). Debe fallar, no solo por
+    aceptar la conexion TCP."""
+
+    async def _http_ok_handler(reader, writer):
+        await reader.read(4096)
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+            b"Content-Type: text/plain\r\n\r\nhi"
+        )
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(_http_ok_handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        with pytest.raises(ShowdownUnavailableError) as excinfo:
+            await _check_showdown_reachable(
+                f"ws://127.0.0.1:{port}/showdown/websocket"
+            )
+        from websockets.exceptions import WebSocketException
+
+        assert isinstance(excinfo.value.__cause__, WebSocketException)
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 def test_battle_outcome_victoria():

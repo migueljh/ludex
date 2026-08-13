@@ -3122,7 +3122,7 @@ garantiza al construir un provider nuevo por fila); un baseline sucio queda
     effective_provider/model, perder W/L/T o métricas parciales ponen los
     canarios rojos.
 
-## D49 — MON-20 DIAG-A R2 (review Tasos/Latwan): monitor diagnóstico opt-in del benchmark (`--diagnostic-snapshot-interval`)
+## D51 — MON-20 DIAG-A R2/R3 (review Tasos/Latwan): monitor diagnóstico opt-in del benchmark (`--diagnostic-snapshot-interval`)
 
 La ronda 1 (c143e0b) introdujo `LudexPlayer.decision_snapshot()` (etapas +
 stacks sanitizados de decisiones en vuelo), pero su único caller era el test:
@@ -3196,3 +3196,92 @@ opt-in. Decisiones de esta ronda (commit `c143e0b` + ronda 2):
    2×`decision_budget_seconds`+60 s, detener la corrida SIN reintentar el
    modelo ni rotar claves, clasificar con el snapshot como evidencia y pedir
    veredicto a Latwan. R1C sigue NO AUTORIZADA hasta nuevo veredicto.
+## D49 — `_check_showdown_reachable` endurecido a handshake de protocolo real; el defecto de R1C no era `seasons` (MON-25, LATWAN DESIGN VERDICT sobre ROOT-CAUSE CHECKPOINT)
+
+**Contexto.** MON-25 diagnosticó el bloqueo de ~16 min de MON-20/R1C
+atribuido en los logs a crash-loops del plugin `seasons`. El ROOT-CAUSE
+CHECKPOINT (Linear, 2026-08-13) probó, con reproducción local y timestamps
+sanitizados, que **no hubo crash-loop**: `RestartCount=0`, ningún worker se
+reinició nunca, `seasons` falla open (`getLadderTop` captura el `HttpError`
+y devuelve `null`; la escalada a lockdown es código muerto en
+`crashlogger.ts` de la 0.11.10 pineada), y los ~16 min de R1C ocurrieron
+enteramente en reintentos del gateway del proveedor -- `matrix.py` nunca
+alcanza `run_battles` sin un smoke verde, así que Showdown nunca llegó a
+abrir un websocket en esa ronda. LATWAN aceptó el diagnóstico y autorizó
+un único defecto real, no causal de R1C pero genuino: `_check_showdown_reachable`
+(`apps/agent/src/ludex_agent/cli.py`) era un `asyncio.open_connection` +
+`close()` desnudo -- daba preflight VERDE contra cualquier listener TCP que
+aceptara la conexión, hablara o no el protocolo de Showdown.
+
+**Arreglo.** `_check_showdown_reachable` abre un websocket real contra
+`ws_url` (`websockets.connect(..., open_timeout=3.0)`) y espera, dentro de
+ese mismo presupuesto de 3.0s, un frame que contenga la línea
+`|challstr|` -- el mensaje que `poke_env.ps_client` (la librería que ya usa
+Ludex para jugar) trata como "confirma conexión al server: podemos
+loguear" (`ps_client.py:177-179`). No se subió ningún timeout: el nuevo
+chequeo mantiene el mismo techo de 3.0s del viejo TCP-connect, sólo exige
+más contenido dentro de ese techo. `ShowdownUnavailableError(RuntimeError)`
+se agregó a `benchmark.py` (antes sólo declarada por adelantado en un
+comentario de `matrix.py` en la rama `nebula/mon-20-provider-matrix`, leída
+vía `git show` sin tocar esa rama) y se levanta `from` la causa real
+(`OSError`/`TimeoutError` del handshake mudo, o `websockets.exceptions.WebSocketException`
+del rechazo de protocolo), preservada en vivo.
+
+**El frame real se inspeccionó antes de escribir el fix, no de memoria.**
+Contra el Showdown local pineado: el primer frame trae `|updateuser|` +
+`|customgroups|` + `|formats|` concatenados con `\n` (7618 bytes); el
+segundo frame, separado, es exactamente `|challstr|4|<hex>` (268 bytes).
+El chequeo revisa cada línea de cada frame recibido, no asume que
+`challstr` llega en un frame dedicado.
+
+**Hallazgo de plataforma, no de este código (documentado para quien lo
+retome).** `asyncio.Server.wait_closed()` cambió de semántica en Python
+3.12: además de esperar al cierre del socket de escucha, espera a que
+*todas* las conexiones activas terminen. Un handler de test que nunca
+retorna (`await asyncio.sleep(3600)`, para simular un listener mudo)
+cuelga `wait_closed()` para siempre si se lo espera. Los tests de listener
+mudo en `test_cli.py` hacen sólo `server.close()`, sin `await
+wait_closed()`, con el porqué documentado inline.
+
+**TDD rojo→verde, ejecutado (no narrado).**
+
+- *Canario 1* (`test_check_showdown_reachable_falla_contra_listener_tcp_mudo`):
+  listener que acepta y nunca completa el handshake HTTP. Rojo contra el
+  código viejo (`DID NOT RAISE ShowdownUnavailableError`); verde contra el
+  nuevo (`ShowdownUnavailableError` con `__cause__` `TimeoutError`, subclase
+  de `OSError`).
+- *Canario 2* (`test_check_showdown_reachable_falla_contra_endpoint_http_invalido`):
+  servidor que responde HTTP 200 real pero rechaza el upgrade a websocket.
+  Rojo contra el viejo; verde contra el nuevo (`__cause__`
+  `websockets.exceptions.InvalidStatus`, subclase de `WebSocketException`).
+- *Counterweight* (`tests/integration/test_showdown_reachable.py`, sin DB,
+  gateado en runtime a si el Showdown local real está arriba): pasa sin
+  excepción contra el Showdown pinneado real.
+- *Mutación dirigida*: `git stash` acotado a `cli.py` (restaura exactamente
+  la implementación TCP-connect vieja, dejando benchmark.py/tests
+  intactos), corrida de los dos canarios -> **rojo** (`DID NOT RAISE`,
+  confirmado en los dos), `git stash pop` restaura el fix, canarios vuelven
+  a verde. Suite completa `test_cli.py`: 32/32 verdes, sin regresiones.
+- *Clasificación del caller*: verificado (sin tocar la rama de MON-20) que
+  la lógica real de `_battle_infrastructure_status`
+  (`nebula/mon-20-provider-matrix:apps/agent/src/ludex_agent/matrix.py`,
+  leída vía `git show`) sigue clasificando la excepción real levantada por
+  el nuevo `_check_showdown_reachable` como `externally-limited` --
+  `isinstance(cause, (ConnectionClosedError, ShowdownUnavailableError))` da
+  `True` contra la instancia real capturada en un probe contra un listener
+  mudo.
+
+**No se tocó.** `seasons` no se modificó, desactivó ni reconfiguró (no es
+causal de R1C, D-ROOT-CAUSE CHECKPOINT §2/§4). `exports.routes` en
+`docker/showdown/config.js` no se tocó (el ruido histórico de `CRASH` no
+fue causal; higiene de logs queda fuera de este issue). `ping_interval`/
+`ping_timeout` de poke-env no se tocaron. La rama/worktree de MON-20 no se
+modificó -- todo lo que se necesitó de ella se leyó vía `git show`.
+
+**Limitación conocida.** El counterweight de integración depende de que el
+Showdown local real esté arriba (`docker compose --profile local up -d
+showdown`); se salta en runtime si no lo está, en vez de fallar la suite.
+No se corrió `matrix-run` real de MON-20 con el preflight nuevo (exigiría
+un request pago, prohibido en esta ronda) -- la prueba de que la
+clasificación se preserva es contra la lógica real leída, no contra una
+ejecución end-to-end de la matriz.
