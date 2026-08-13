@@ -1,0 +1,29 @@
+{
+  "rows": [
+    {
+      "provider": "open_code_zen",
+      "model": "deepseek-v4-flash",
+      "protocol": "chat_completions",
+      "endpoint": null,
+      "structured_output": "json_schema",
+      "tier": "paid",
+      "status": "ready",
+      "battles": 2,
+      "concurrency": 1,
+      "persist": false,
+      "pin": [
+        "open_code_zen",
+        "deepseek-v4-flash"
+      ],
+      "estimated_cost_usd": "0.4536",
+      "estimated_smoke_usd": "0.00616",
+      "cumulative_cost_usd": "0.45976",
+      "classification_note": "precios: https://opencode.ai/docs/zen/"
+    }
+  ],
+  "generated_at": "20260813t000317z",
+  "round": "R1C",
+  "derived_from": "r1c-matrix-manifest.json",
+  "authorization": "LATWAN ACCEPTANCE / R1C AUTHORIZATION MON-20 @6ebcf08",
+  "hard_cap_usd": "0.60"
+}
