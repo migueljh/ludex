@@ -3285,3 +3285,45 @@ No se corrió `matrix-run` real de MON-20 con el preflight nuevo (exigiría
 un request pago, prohibido en esta ronda) -- la prueba de que la
 clasificación se preserva es contra la lógica real leída, no contra una
 ejecución end-to-end de la matriz.
+
+## D50 — el opt-in del counterweight de `_check_showdown_reachable` deja de invocar la funcion bajo prueba (MON-25, changes requested por Latwan sobre D49)
+
+**Contexto.** D49 documentó como limitación conocida que el counterweight de
+integración (`tests/integration/test_showdown_reachable.py`) se salta en
+runtime si Showdown local no está arriba. La revisión de Latwan encontró que
+el mecanismo de ese salto era peor que una limitación: `_showdown_up()`
+llamaba a `_check_showdown_reachable()` -- la misma función bajo prueba --
+para decidir el `skipif`. Si el reconocimiento de `|challstr|` en producción
+se rompe, esa llamada de gate también falla, y el `skipif` clasifica la
+regresión como "Showdown no disponible": el test se salta en vez de fallar.
+El counterweight no era independiente del código que verifica y no
+satisfacía verificación por mutación.
+
+**Arreglo.** Se reemplazó el gate por un opt-in explícito por variable de
+entorno (`RUN_SHOWDOWN_INTEGRATION`), sin ningún probe de producto en la
+decisión de skip -- el mismo patrón que ya usan `test_play.py` y
+`test_graph_play.py` con `TEST_DATABASE_URL`/`DATABASE_URL`. Quien corre la
+suite declara a mano que el Showdown local real está arriba; si lo declaró
+y `_check_showdown_reachable` falla igual (por regresión o porque el server
+no estaba arriba de verdad), el test falla, no se salta. Se eliminó
+`_showdown_up()` y el `asyncio.run()` a nivel de módulo que quedó sin uso.
+
+**Mutación dirigida, ejecutada.** Con Showdown local real arriba
+(`docker compose --profile local up -d showdown`, `COMPOSE_PROJECT_NAME=ludex`)
+y `RUN_SHOWDOWN_INTEGRATION=1`:
+
+- Canarios negativos (`test_cli.py::test_check_showdown_reachable_falla_*`,
+  los mismos dos de D49): 2/2 verdes, sin tocar.
+- Counterweight positivo contra código intacto: 1 passed (ejecutado de
+  verdad, no salteado).
+- `_SHOWDOWN_CHALLSTR_PREFIX` mutado a un valor que ninguna línea del
+  protocolo real puede matchear (`cli.py`, restaurado después desde backup):
+  counterweight -> 1 failed, `ShowdownUnavailableError` real levantada desde
+  el `TimeoutError` del handshake que nunca completa. No hubo SKIP.
+- Código restaurado, counterweight -> 1 passed de nuevo.
+- Suite completa `tests/test_cli.py` + el counterweight: 33 passed.
+
+**No se tocó.** El endurecimiento de D49 (`_probe_showdown_protocol`,
+`_check_showdown_reachable`) no cambió. `SHOWDOWN_WS_URL` sigue con el mismo
+default y el mismo rol de configurar la URL, no de gatear el skip. MON-20 y
+la rama de integración no se tocaron.

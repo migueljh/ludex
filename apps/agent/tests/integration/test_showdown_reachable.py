@@ -7,7 +7,6 @@ prueban que un listener mudo o un endpoint HTTP invalido fallan cerrados.
 
 from __future__ import annotations
 
-import asyncio
 import os
 
 import pytest
@@ -16,19 +15,18 @@ from ludex_agent.cli import _check_showdown_reachable
 
 _WS_URL = os.environ.get("SHOWDOWN_WS_URL", "ws://localhost:8100/showdown/websocket")
 
-
-async def _showdown_up(ws_url: str) -> bool:
-    try:
-        await _check_showdown_reachable(ws_url)
-        return True
-    except Exception:
-        return False
-
-
+# MON-25 (changes requested, Latwan): el gate anterior llamaba a
+# `_check_showdown_reachable` para decidir si saltaba el propio test de
+# `_check_showdown_reachable` -- si el chequeo real se rompe, el gate lo
+# clasifica como "no disponible" y el SKIP esconde la regresion en vez de
+# fallarla. El opt-in de abajo no invoca ninguna funcion del producto: quien
+# corre la suite declara a mano que el Showdown local real esta arriba,
+# igual que TEST_DATABASE_URL/DATABASE_URL en test_play.py. Si se declara
+# arriba y el handshake real falla, el test FALLA, nunca se salta.
 pytestmark = pytest.mark.skipif(
-    not asyncio.run(_showdown_up(_WS_URL)),
-    reason=f"necesita el Showdown local real arriba en {_WS_URL} "
-    "(docker compose --profile local up -d showdown)",
+    not os.environ.get("RUN_SHOWDOWN_INTEGRATION"),
+    reason="necesita RUN_SHOWDOWN_INTEGRATION=1 + el Showdown local real "
+    f"arriba en {_WS_URL} (docker compose --profile local up -d showdown)",
 )
 
 
