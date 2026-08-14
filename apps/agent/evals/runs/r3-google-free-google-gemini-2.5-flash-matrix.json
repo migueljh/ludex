@@ -1,0 +1,45 @@
+{
+  "provider": "google",
+  "model": "gemini-2.5-flash",
+  "tier": "free",
+  "protocol": "google",
+  "status": "aborted",
+  "smoke_ok": true,
+  "battles_requested": 2,
+  "battles_completed": 0,
+  "effective_provider": "google",
+  "effective_model": "gemini-2.5-flash",
+  "win_rate": null,
+  "completion_latency_ms": {
+    "count": 1,
+    "total": 42601,
+    "p50": 42601,
+    "p95": 42601,
+    "max": 42601
+  },
+  "decision_latency_ms": {
+    "count": 1,
+    "total": 42602,
+    "p50": 42602,
+    "p95": 42602,
+    "max": 42602
+  },
+  "tokens": {
+    "input_tokens": 45789,
+    "output_tokens": 2182,
+    "cached_input_tokens": 0,
+    "reasoning_tokens": 2082
+  },
+  "retries": 3,
+  "rotations": 0,
+  "quarantined": 0,
+  "failure_type": "TransientProviderError",
+  "failure_cause_type": "ReadTimeout",
+  "battles_wins": 0,
+  "battles_losses": 0,
+  "battles_ties": 0,
+  "note": "batallas parciales o abortadas: sin winrate comparable",
+  "failure_stage": "battle",
+  "http_status": null,
+  "provider_error_code": null
+}

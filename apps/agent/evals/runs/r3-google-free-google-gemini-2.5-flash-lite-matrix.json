@@ -1,0 +1,45 @@
+{
+  "provider": "google",
+  "model": "gemini-2.5-flash-lite",
+  "tier": "free",
+  "protocol": "google",
+  "status": "unsupported-protocol",
+  "smoke_ok": false,
+  "battles_requested": 0,
+  "battles_completed": 0,
+  "effective_provider": null,
+  "effective_model": null,
+  "win_rate": null,
+  "completion_latency_ms": {
+    "count": 0,
+    "total": null,
+    "p50": null,
+    "p95": null,
+    "max": null
+  },
+  "decision_latency_ms": {
+    "count": 0,
+    "total": null,
+    "p50": null,
+    "p95": null,
+    "max": null
+  },
+  "tokens": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cached_input_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  "retries": 0,
+  "rotations": 0,
+  "quarantined": 0,
+  "failure_type": "FatalProviderError",
+  "failure_cause_type": "ChatGoogleGenerativeAIError",
+  "battles_wins": 0,
+  "battles_losses": 0,
+  "battles_ties": 0,
+  "note": "smoke fallido (FatalProviderError)",
+  "failure_stage": "smoke",
+  "http_status": 404,
+  "provider_error_code": null
+}

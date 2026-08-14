@@ -1,0 +1,45 @@
+{
+  "provider": "google",
+  "model": "gemma-4-26b-a4b-it",
+  "tier": "free",
+  "protocol": "google",
+  "status": "aborted",
+  "smoke_ok": true,
+  "battles_requested": 2,
+  "battles_completed": 0,
+  "effective_provider": "google",
+  "effective_model": "gemma-4-26b-a4b-it",
+  "win_rate": null,
+  "completion_latency_ms": {
+    "count": 0,
+    "total": null,
+    "p50": null,
+    "p95": null,
+    "max": null
+  },
+  "decision_latency_ms": {
+    "count": 0,
+    "total": null,
+    "p50": null,
+    "p95": null,
+    "max": null
+  },
+  "tokens": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cached_input_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  "retries": 0,
+  "rotations": 40,
+  "quarantined": 0,
+  "failure_type": "ProviderPoolExhausted",
+  "failure_cause_type": null,
+  "battles_wins": 0,
+  "battles_losses": 0,
+  "battles_ties": 0,
+  "note": "batallas parciales o abortadas: sin winrate comparable",
+  "failure_stage": "battle",
+  "http_status": null,
+  "provider_error_code": null
+}
