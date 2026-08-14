@@ -21,7 +21,9 @@ grafo real con un context repository que se cuelga, sin Docker ni red):
 """
 
 import asyncio
+import json
 import random
+import sys
 import threading
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -31,11 +33,66 @@ from poke_env.concurrency import POKE_LOOP
 from typer.testing import CliRunner
 
 from ludex_agent import cli as cli_module
-from ludex_agent.benchmark import BenchmarkResult
+from ludex_agent.benchmark import BenchmarkFailure, BenchmarkResult
 from ludex_agent.cli import _benchmark_command, app
 from ludex_agent.graph.provider import CompletionEnvelope, CompletionUsage
 from ludex_agent.showdown import client as client_module
 from ludex_agent.showdown.client import LudexPlayer
+
+
+def _hanging_agent_factory(captured, created):
+    """Fabrica del agente REAL (LudexPlayer) con la batalla en vuelo sin
+    server (offline): `battle_against` espera hasta el battle timeout."""
+
+    def agent_factory(**kwargs):
+        agent = LudexPlayer(**kwargs)
+
+        async def hanging_battle(rival, n_battles=1):
+            await asyncio.Event().wait()
+
+        agent.battle_against = hanging_battle
+        captured.append(agent)
+        created.set()
+        return agent
+
+    return agent_factory
+
+
+def _stderr_collector():
+    """Reemplazo de `sys.stderr` que recolecta y avisa cuando aparece el
+    prefijo productivo `LUDEX_SNAPSHOT` (el canal real del emisor por
+    defecto: `typer.echo(err=True)`)."""
+    lines: list[str] = []
+    seen = threading.Event()
+
+    class Collector:
+        def write(self, text):
+            lines.append(text)
+            if "LUDEX_SNAPSHOT" in text:
+                seen.set()
+
+        def flush(self):
+            pass
+
+        def isatty(self):
+            return False
+
+    return Collector(), lines, seen
+
+
+async def _start_hanging_decision(agent, stuck, tag="battle-diag-monitor-1"):
+    """Dispara una decision REAL en POKE_LOOP que se cuelga en el nodo
+    `retrieve_context` (el repo del canario espera una senal)."""
+    move = SimpleNamespace(id="tackle")
+    battle = _fake_battle(battle_tag=tag, available_moves=[move])
+    with patch.object(client_module, "serialize_battle", _stub_serialize):
+        pending = agent.choose_move(battle)
+        decision_future = _run_on_pokeloop(pending)
+        await _await_on_pokeloop(agent.frame_inbox.publish(tag, ("|upkeep",)))
+    assert await asyncio.to_thread(stuck.started.wait, 2), (
+        "la decision nunca llego a retrieve_context"
+    )
+    return decision_future
 
 
 def _fake_battle(**overrides) -> SimpleNamespace:
@@ -375,3 +432,207 @@ async def test_monitor_productivo_emite_snapshot_util_de_decision_colgada(
         task.get_name() == "ludex-snapshot-monitor"
         for task in asyncio.all_tasks()
     ), "el monitor debe estar cancelado y esperado al terminar el benchmark"
+
+
+def _assert_no_monitor_leak() -> None:
+    assert not any(
+        task.get_name() == "ludex-snapshot-monitor"
+        for task in asyncio.all_tasks()
+    ), "el monitor debe estar cancelado y esperado al terminar el benchmark"
+
+
+def _parse_ludex_snapshots(lines: list[str]) -> list[list[dict]]:
+    """Toda linea `LUDEX_SNAPSHOT <json>` del canal productivo, parseada."""
+    snapshots: list[list[dict]] = []
+    for line in lines:
+        for part in line.splitlines():
+            if not part.startswith("LUDEX_SNAPSHOT "):
+                continue
+            payload = part[len("LUDEX_SNAPSHOT "):]
+            parsed = json.loads(payload)
+            assert isinstance(parsed, list), (
+                f"LUDEX_SNAPSHOT debe llevar una lista: {payload[:120]!r}"
+            )
+            snapshots.append(parsed)
+    return snapshots
+
+
+def _assert_sanitized_shape(snapshot: list[dict]) -> None:
+    """Unicamente task_id, stage y frames[{module, function, line}]."""
+    for entry in snapshot:
+        assert set(entry.keys()) <= {"task_id", "stage", "frames"}, (
+            f"campos no permitidos en el snapshot: {sorted(entry)}"
+        )
+        for frame in entry.get("frames", []):
+            assert set(frame.keys()) == {"module", "function", "line"}, (
+                f"frames solo pueden llevar module/function/line: {sorted(frame)}"
+            )
+
+
+@pytest.mark.asyncio
+async def test_canal_productivo_emite_ludex_snapshot_en_stderr_sin_emit_inyectado(
+    monkeypatch, tmp_path
+):
+    """El emisor POR DEFECTO sale por un canal visible y consumible.
+
+    R2 emitia por `logger.info`, pero root y `ludex_agent.cli` tienen nivel
+    efectivo WARNING: el comando real no imprimia nada. Este canario NO
+    inyecta `snapshot_emit`: el monitor usa `_default_snapshot_emit` y la
+    evidencia debe aparecer en stderr con el prefijo exacto `LUDEX_SNAPSHOT`
+    y JSON valido, solo con task_id/stage/frames[{module,function,line}].
+    """
+    stuck = _StuckContextRepository()
+    captured: list[LudexPlayer] = []
+    created = threading.Event()
+    collector, stderr_lines, stderr_event = _stderr_collector()
+    monkeypatch.setattr(sys, "stderr", collector)
+
+    _patch_benchmark_infra(
+        monkeypatch, _hanging_agent_factory(captured, created), stuck
+    )
+
+    bench_task = asyncio.create_task(_benchmark_command(
+        n=1, opponent="random", concurrency=1, persist=False,
+        provider_name="fake", model="fake-model",
+        fmt="gen6randombattle", battle_timeout_seconds=1.5,
+        diagnostic_snapshot_interval=0.02,
+        # SIN snapshot_emit: debe usarse el canal productivo por defecto.
+    ))
+    try:
+        assert await asyncio.to_thread(created.wait, 5), (
+            "el benchmark nunca creo el agente"
+        )
+        decision_future = await _start_hanging_decision(
+            captured[0], stuck, tag="battle-diag-stderr-1"
+        )
+        assert await asyncio.to_thread(stderr_event.wait, 5), (
+            "el canal productivo nunca emitio el prefijo LUDEX_SNAPSHOT "
+            "en stderr; lineas: "
+            + "".join(stderr_lines)[-500:]
+        )
+        stuck.release()
+        await asyncio.wait_for(asyncio.wrap_future(decision_future), timeout=5)
+        result, metrics = await asyncio.wait_for(bench_task, timeout=15)
+    finally:
+        if not bench_task.done():
+            bench_task.cancel()
+            await asyncio.gather(bench_task, return_exceptions=True)
+
+    snapshots = _parse_ludex_snapshots(stderr_lines)
+    assert snapshots, "stderr debe contener lineas LUDEX_SNAPSHOT <json>"
+    for snapshot in snapshots:
+        _assert_sanitized_shape(snapshot)
+    useful = [
+        entry
+        for snapshot in snapshots
+        for entry in snapshot
+        if entry.get("stage") == "retrieve_context"
+        and any(
+            frame.get("function") == "load_battle_context"
+            for frame in entry.get("frames", [])
+        )
+    ]
+    assert useful, "al menos un LUDEX_SNAPSHOT debe mostrar la decision colgada"
+    assert result.failure_type == "BenchmarkDeadlineExceeded", (
+        "el canal por defecto no debe alterar la semantica del benchmark"
+    )
+    _assert_no_monitor_leak()
+
+
+@pytest.mark.asyncio
+async def test_teardown_monitor_con_excepcion_primaria_preserva_la_primaria(
+    monkeypatch, tmp_path
+):
+    """Una excepcion primaria del benchmark cancela y espera el monitor sin
+    ocultarla: el monitor no deja tasks y el BenchmarkFailure conserva la
+    causa original (RuntimeError) como `__cause__`."""
+    stuck = _StuckContextRepository()
+    captured: list[LudexPlayer] = []
+    created = threading.Event()
+    collector, stderr_lines, stderr_event = _stderr_collector()
+    monkeypatch.setattr(sys, "stderr", collector)
+
+    _patch_benchmark_infra(
+        monkeypatch, _hanging_agent_factory(captured, created), stuck
+    )
+
+    bench_task = asyncio.create_task(_benchmark_command(
+        n=1, opponent="random", concurrency=1, persist=False,
+        provider_name="fake", model="fake-model",
+        fmt="gen6randombattle", battle_timeout_seconds=1.5,
+        diagnostic_snapshot_interval=0.02,
+    ))
+    try:
+        assert await asyncio.to_thread(created.wait, 5), (
+            "el benchmark nunca creo el agente"
+        )
+        agent = captured[0]
+        decision_future = await _start_hanging_decision(
+            agent, stuck, tag="battle-diag-primary-1"
+        )
+        # El monitor esta vivo cuando llega la primaria.
+        assert await asyncio.to_thread(stderr_event.wait, 5), (
+            "el monitor no llego a emitir antes de la excepcion primaria"
+        )
+        # Un fallo de fondo (p.ej. ConnectionClosed de Showdown) propaga
+        # como excepcion primaria no clasificada de run_benchmark.
+        agent._publish_background_failure(RuntimeError("primary-exc"))
+        with pytest.raises(BenchmarkFailure) as excinfo:
+            await asyncio.wait_for(bench_task, timeout=15)
+        assert type(excinfo.value.__cause__).__name__ == "RuntimeError", (
+            "la excepcion primaria debe preservarse como causa del wrapper"
+        )
+        assert excinfo.value.result.failure_type == "RuntimeError"
+        # La decision colgada fue drenada por el cleanup, no quedo viva.
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wrap_future(decision_future)
+    finally:
+        if not bench_task.done():
+            bench_task.cancel()
+            await asyncio.gather(bench_task, return_exceptions=True)
+    _assert_no_monitor_leak()
+
+
+@pytest.mark.asyncio
+async def test_teardown_monitor_con_cancelacion_externa_preserva_cancelled(
+    monkeypatch, tmp_path
+):
+    """Cancelar el benchmark desde afuera cancela y espera el monitor, y el
+    `CancelledError` original se preserva (no lo reemplaza el cleanup)."""
+    stuck = _StuckContextRepository()
+    captured: list[LudexPlayer] = []
+    created = threading.Event()
+    collector, stderr_lines, stderr_event = _stderr_collector()
+    monkeypatch.setattr(sys, "stderr", collector)
+
+    _patch_benchmark_infra(
+        monkeypatch, _hanging_agent_factory(captured, created), stuck
+    )
+
+    bench_task = asyncio.create_task(_benchmark_command(
+        n=1, opponent="random", concurrency=1, persist=False,
+        provider_name="fake", model="fake-model",
+        fmt="gen6randombattle", battle_timeout_seconds=1.5,
+        diagnostic_snapshot_interval=0.02,
+    ))
+    try:
+        assert await asyncio.to_thread(created.wait, 5), (
+            "el benchmark nunca creo el agente"
+        )
+        agent = captured[0]
+        decision_future = await _start_hanging_decision(
+            agent, stuck, tag="battle-diag-cancel-1"
+        )
+        assert await asyncio.to_thread(stderr_event.wait, 5), (
+            "el monitor no llego a emitir antes de la cancelacion"
+        )
+        bench_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(bench_task, timeout=15)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wrap_future(decision_future)
+    finally:
+        if not bench_task.done():
+            bench_task.cancel()
+            await asyncio.gather(bench_task, return_exceptions=True)
+    _assert_no_monitor_leak()

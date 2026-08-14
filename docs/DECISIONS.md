@@ -3158,12 +3158,19 @@ opt-in. Decisiones de esta ronda (commit `c143e0b` + ronda 2):
    prompts, credenciales, respuestas de provider, filas, payloads de
    batalla ni secretos. El monitor emite `LUDEX_SNAPSHOT <json>` por tick.
 
-4. **Flag e intervalo.** `benchmark --diagnostic-snapshot-interval N`
-   (opt-in; default ausente → el benchmark no crea monitor y su salida,
-   paths y semántica no cambian). Con `N > 0`, `_benchmark_command` agenda
-   desde el caller loop un monitor que cada `N` segundos emite
-   `agent.decision_snapshot()`; `snapshot_emit` es inyectable para tests.
-   Un intervalo no positivo es `typer.BadParameter`.
+4. **Flag, intervalo y canal de salida efectivo (R3).**
+   `benchmark --diagnostic-snapshot-interval N` (opt-in; default ausente →
+   el benchmark no crea monitor y su salida, paths y semántica no cambian).
+   Con `N > 0`, `_benchmark_command` agenda desde el caller loop un monitor
+   que cada `N` segundos emite `agent.decision_snapshot()`; `snapshot_emit`
+   es inyectable para tests y un intervalo no positivo es
+   `typer.BadParameter`. El emisor por defecto es `typer.echo(..., err=True)`
+   con una línea exacta `LUDEX_SNAPSHOT <json>` por tick en STDERR
+   (`grep LUDEX_SNAPSHOT 2>&1`). NO usa `logger.info`: root y
+   `ludex_agent.cli` tienen nivel efectivo WARNING y un canal de log
+   silencioso haría el diagnóstico invisible (blocker confirmado de la
+   ronda 3). El canal solo existe cuando el flag opt-in crea el monitor; la
+   ejecución normal no escribe nada nuevo.
 
 5. **Cleanup y lifecycle del monitor.** El monitor se cancela y se espera
    (`cancel()` + `gather(return_exceptions=True)`) en un `finally` interno
@@ -3175,8 +3182,8 @@ opt-in. Decisiones de esta ronda (commit `c143e0b` + ronda 2):
    altera la semántica del benchmark — canario con `emit` que lanza en la
    primera llamada: mismo `failure_type` (`BenchmarkDeadlineExceeded`).
 
-6. **DIAG-A no es un fix.** Ni la ronda 1 ni la 2 tocan el comportamiento de
-   decisión: no agregan timeouts, no cancelan nada. El cuelgue de R1C
+6. **DIAG-A no es un fix.** Ni la ronda 1, la 2 ni la 3 tocan el
+   comportamiento de decisión: no agregan timeouts, no cancelan nada. El cuelgue de R1C
    (ausencia de progreso ~6 min antes del timeout de batalla de 1800 s)
    sigue pendiente de localización con el monitor en vivo; los únicos awaits
    sin deadline del camino de decisión son los SQL (model_repository vía

@@ -746,10 +746,17 @@ async def _diagnostic_snapshot_monitor(
 
 
 def _default_snapshot_emit(snapshot: list[dict[str, Any]]) -> None:
-    """Emision por defecto del monitor: una linea JSON por tick, consumible
-    por grep. Solo campos sanitizados (task_id, stage, module/function/line);
-    nunca prompts, credenciales, respuestas, filas, payloads ni `f_locals`."""
-    logger.info("LUDEX_SNAPSHOT %s", json.dumps(snapshot, ensure_ascii=False))
+    """Emision por defecto del monitor: una linea exacta
+    `LUDEX_SNAPSHOT <json>` por tick, en STDERR (R3: `logger.info` quedaba
+    en silencio porque root y `ludex_agent.cli` tienen nivel efectivo
+    WARNING). Consumible por `grep LUDEX_SNAPSHOT 2>&1`. Solo campos
+    sanitizados (task_id, stage, module/function/line); nunca prompts,
+    credenciales, respuestas, filas, payloads ni `f_locals`. Solo existe
+    cuando el flag diagnostico opt-in crea el monitor."""
+    typer.echo(
+        f"LUDEX_SNAPSHOT {json.dumps(snapshot, ensure_ascii=False)}",
+        err=True,
+    )
 
 
 async def _benchmark_command(
