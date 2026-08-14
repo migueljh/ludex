@@ -761,9 +761,6 @@ async def _benchmark_command(
         pinned = PinnedResolver(
             selected, provider_name, model, enforce_pin=True,
         )
-        graph = build_decision_graph(
-            calculator, pinned, metrics, context_repository
-        )
         suffix = str(time.time_ns())[-8:]
         common = {
             "server_configuration": server,
@@ -771,12 +768,25 @@ async def _benchmark_command(
             "log_level": 40,
             "max_concurrent_battles": concurrency,
         }
+        # MON-20 DIAG-A: el agente se crea ANTES del grafo para poder
+        # cablearle `on_stage` (los nodos del grafo publican su etapa a
+        # `decision_snapshot`, que corre en ps_client.loop). Construccion
+        # pura: ninguna batalla arranco todavia, y el grafo se asigna antes
+        # del primer `choose_move`.
         agent = LudexPlayer(
             account_configuration=AccountConfiguration(f"Bench{suffix}", None),
-            decision_graph=graph,
+            decision_graph=None,
             decision_budget_seconds=settings.decision_budget_seconds,
             **common,
         )
+        graph = build_decision_graph(
+            calculator, pinned, metrics, context_repository,
+            # `getattr`: los fakes de los tests de `_benchmark_command` no
+            # exponen la superficie diagnostica; el cable solo existe cuando
+            # el agente real la tiene.
+            on_stage=getattr(agent, "record_decision_stage", None),
+        )
+        agent.decision_graph = graph
         rival = opponent_types[opponent](
             account_configuration=AccountConfiguration(f"Opp{suffix}", None),
             **common,
