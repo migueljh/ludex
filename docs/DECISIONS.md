@@ -3266,9 +3266,10 @@ y `RUN_SHOWDOWN_INTEGRATION=1`:
  > la frase anterior describía el estado de los commits fuente MON-25
  > (6d40018, 84a2f13) antes de la integración. En el HEAD combinado de
  > MON-20, D50 quedó aplicada dentro de la rama mediante `a83e6eb` (sobre
- > `b9bc21b`, con la corrección documental `665b42c`); `integration/phase-2
- > -accepted` sigue sin recibir este trabajo, como se indicó. Ninguna
- > conclusión, límite ni clasificación cambia por esta aclaración.
+ > `b9bc21b`, con la corrección documental `665b42c`);
+ > `integration/phase-2-accepted` sigue sin recibir este trabajo, como se
+ > indicó. Ninguna conclusión, límite ni clasificación cambia por esta
+ > aclaración.
 
 ## D51 — MON-20 DIAG-A R2/R3 (review Tasos/Latwan): monitor diagnóstico opt-in del benchmark (`--diagnostic-snapshot-interval`)
 
