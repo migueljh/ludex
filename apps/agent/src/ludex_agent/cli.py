@@ -715,10 +715,49 @@ def _cleanup_failure_result(
     )
 
 
+async def _diagnostic_snapshot_monitor(
+    agent: Any,
+    interval: float,
+    emit: Callable[[list[dict[str, Any]]], None],
+) -> None:
+    """Monitor diagnostico opt-in de decisiones en vuelo.
+
+    Corre en el CALLER loop (el que orquesta `run_benchmark`) y cada
+    `interval` segundos captura `agent.decision_snapshot()` — que agenda su
+    propia captura en `ps_client.loop` (POKE_LOOP) — y emite la evidencia
+    sanitizada ({task_id, stage, frames[{module,function,line}]}).
+
+    Un fallo de observabilidad (captura o emision) se registra y NO altera
+    la semantica del benchmark: el monitor no toca el flujo de decision, no
+    cancela nada y su unica accion es leer y emitir. El `CancelledError`
+    del shutdown propaga (el caller hace `gather(return_exceptions=True)`).
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            snapshot = await agent.decision_snapshot()
+            if snapshot:
+                emit(snapshot)
+        except Exception as exc:
+            logger.warning(
+                "monitor diagnostico de snapshots fallo: %s",
+                type(exc).__name__,
+            )
+
+
+def _default_snapshot_emit(snapshot: list[dict[str, Any]]) -> None:
+    """Emision por defecto del monitor: una linea JSON por tick, consumible
+    por grep. Solo campos sanitizados (task_id, stage, module/function/line);
+    nunca prompts, credenciales, respuestas, filas, payloads ni `f_locals`."""
+    logger.info("LUDEX_SNAPSHOT %s", json.dumps(snapshot, ensure_ascii=False))
+
+
 async def _benchmark_command(
     *, n: int, opponent: str, concurrency: int, persist: bool,
     provider_name: str, model: str, fmt: str,
     battle_timeout_seconds: float,
+    diagnostic_snapshot_interval: float | None = None,
+    snapshot_emit: Callable[[list[dict[str, Any]]], None] | None = None,
     on_progress: Callable[
         [BenchmarkResult, Mapping[str, int | None]], Awaitable[None] | None
     ] | None = None,
@@ -805,37 +844,63 @@ async def _benchmark_command(
                 if pending is not None:
                     await pending
 
+        # MON-20 DIAG-A R2: monitor diagnostico OPT-IN mientras
+        # `run_benchmark` esta en vuelo. Con intervalo ausente (default), la
+        # ejecucion normal no crea el monitor ni cambia su salida, paths ni
+        # semantica. El try/finally interno garantiza el lifecycle: el
+        # monitor se cancela y se espera en exito, fallo (incluida la
+        # excepcion primaria no clasificada) y cancelacion externa, ANTES
+        # del cleanup estructurado (drain → players → calc → contexto →
+        # engine), sin ocultar ni reemplazar la primaria.
+        monitor_task: asyncio.Task[Any] | None = None
+        if (
+            diagnostic_snapshot_interval is not None
+            and diagnostic_snapshot_interval > 0
+        ):
+            monitor_task = asyncio.create_task(
+                _diagnostic_snapshot_monitor(
+                    agent,
+                    diagnostic_snapshot_interval,
+                    snapshot_emit or _default_snapshot_emit,
+                ),
+                name="ludex-snapshot-monitor",
+            )
         try:
-            result = await run_benchmark(
-                agent, rival, n=n, persist=persist,
-                persist_battle=persist_tag if persist else None,
-                provider=provider_name, model=model,
-                on_progress=report_progress,
-                timeout=battle_timeout_seconds,
-            )
-        except (ProviderError, BenchmarkDeadlineExceeded) as exc:
-            completed = (
-                agent.n_won_battles + agent.n_lost_battles
-                + agent.n_tied_battles
-            )
-            # R3 (MON-15): evidencia durable y sanitizada del fallo. El
-            # error clasificado (`TransientProviderError`, etc.) conserva
-            # su `__cause__` original (p.ej. `APITimeoutError`) porque
-            # `KeyRotatingProvider` lo re-lanza con `raise error from raw`.
-            # Persistimos SOLO los nombres de clase, nunca el mensaje crudo.
-            failure_type, failure_cause_type = failure_classification(exc)
-            # L-03 (R1A): http_status y provider_error_code (solo campo
-            # estructurado permitido) cuando existen; jamas texto libre.
-            result = BenchmarkResult(
-                requested=n, completed=completed,
-                wins=agent.n_won_battles, losses=agent.n_lost_battles,
-                ties=agent.n_tied_battles, provider=provider_name,
-                model=model, failure=f"{type(exc).__name__}: {exc}",
-                failure_type=failure_type,
-                failure_cause_type=failure_cause_type,
-                http_status=_http_status_chain(exc),
-                provider_error_code=_structured_provider_error_code(exc),
-            )
+            try:
+                result = await run_benchmark(
+                    agent, rival, n=n, persist=persist,
+                    persist_battle=persist_tag if persist else None,
+                    provider=provider_name, model=model,
+                    on_progress=report_progress,
+                    timeout=battle_timeout_seconds,
+                )
+            except (ProviderError, BenchmarkDeadlineExceeded) as exc:
+                completed = (
+                    agent.n_won_battles + agent.n_lost_battles
+                    + agent.n_tied_battles
+                )
+                # R3 (MON-15): evidencia durable y sanitizada del fallo. El
+                # error clasificado (`TransientProviderError`, etc.) conserva
+                # su `__cause__` original (p.ej. `APITimeoutError`) porque
+                # `KeyRotatingProvider` lo re-lanza con `raise error from raw`.
+                # Persistimos SOLO los nombres de clase, nunca el mensaje crudo.
+                failure_type, failure_cause_type = failure_classification(exc)
+                # L-03 (R1A): http_status y provider_error_code (solo campo
+                # estructurado permitido) cuando existen; jamas texto libre.
+                result = BenchmarkResult(
+                    requested=n, completed=completed,
+                    wins=agent.n_won_battles, losses=agent.n_lost_battles,
+                    ties=agent.n_tied_battles, provider=provider_name,
+                    model=model, failure=f"{type(exc).__name__}: {exc}",
+                    failure_type=failure_type,
+                    failure_cause_type=failure_cause_type,
+                    http_status=_http_status_chain(exc),
+                    provider_error_code=_structured_provider_error_code(exc),
+                )
+        finally:
+            if monitor_task is not None:
+                monitor_task.cancel()
+                await asyncio.gather(monitor_task, return_exceptions=True)
     except BaseException as exc:
         primary = exc
     # L-01 (correccion LATWAN): frontera estructurada del cleanup. Se
@@ -886,10 +951,24 @@ def benchmark_command(
         help="Deadline por batalla en segundos (default: LUDEX_BATTLE_TIMEOUT_SECONDS o 180). "
         "La matriz usa 1800. Positivo; independiente del deadline de cada decision.",
     ),
+    diagnostic_snapshot_interval: float | None = typer.Option(
+        None, "--diagnostic-snapshot-interval",
+        help="DIAGNOSTICO OPT-IN (MON-20 DIAG-A): emite cada N segundos un "
+        "snapshot sanitizado de las decisiones en vuelo (stage + frames "
+        "module/function/line) mientras el benchmark corre. Sin el flag, el "
+        "benchmark no crea monitor y su salida no cambia. Positivo.",
+    ),
 ) -> None:
     settings = load_settings()
     if battle_timeout is not None and battle_timeout <= 0:
         raise typer.BadParameter("--battle-timeout debe ser un numero positivo")
+    if (
+        diagnostic_snapshot_interval is not None
+        and diagnostic_snapshot_interval <= 0
+    ):
+        raise typer.BadParameter(
+            "--diagnostic-snapshot-interval debe ser un numero positivo"
+        )
     effective_battle_timeout = (
         battle_timeout or settings.battle_timeout_seconds
     )
@@ -940,6 +1019,7 @@ def benchmark_command(
             provider_name=provider_name, model=model_name,
             fmt=fmt or settings.showdown_battle_format,
             battle_timeout_seconds=effective_battle_timeout,
+            diagnostic_snapshot_interval=diagnostic_snapshot_interval,
             on_progress=report_progress,
         ))
     except ProviderSelectionError as exc:
