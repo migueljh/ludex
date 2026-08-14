@@ -94,6 +94,27 @@ En esta máquina conviven contenedores de **otros proyectos del usuario**. Los d
   nada fuera de configuración.
 - Registrá toda decisión no trivial en `docs/DECISIONS.md`.
 
+## Higiene de contexto y consumo de Codex
+
+La cuota de Codex también es un recurso operativo. Ahorrarla no autoriza a
+reducir alcance, omitir evidencia ni relajar verificaciones: hay que reducir el
+ruido que entra al contexto.
+
+- Para procesos largos o ruidosos, redirigí `stdout`/`stderr` a un archivo
+  nombrado bajo `/tmp` y leé sólo deltas o resúmenes con `rg`/`jq` (y `tail`
+  acotado cuando haga falta). No vuelques al chat trazas, logs, JSON o salidas
+  de suites completas salvo que la evidencia exacta lo exija.
+- Acotá siempre la salida de herramientas. Buscá y seleccioná primero; no
+  vuelvas a leer archivos grandes sin cambios ni repitas contexto ya verificado.
+- En monitoreos, espaciá las consultas según el timeout real y reportá sólo
+  cambios de estado, clasificaciones o bloqueos. No hagas polling ruidoso.
+- Antes de una compactación, handoff o fin de sesión, registrá en Linear el
+  comando activo, límites, último estado durable, artefactos y próxima acción.
+  Si forma parte del entregable, versioná también la evidencia saneada.
+- Al iniciar o retomar una sesión, releé este archivo, la gobernanza, el issue
+  activo, el `/goal`, el último handoff/comentario y el HEAD del worktree antes
+  de ejecutar. No reconstruyas el trabajo cargando logs históricos completos.
+
 ## Sobre los tests
 
 El entregable del agente no es que juegue bien, es que **grabe bien**: el
