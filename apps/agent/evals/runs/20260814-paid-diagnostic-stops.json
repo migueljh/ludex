@@ -1,0 +1,218 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-08-14T21:42:34Z",
+  "purpose": "Evidencia saneada de intentos pagos interrumpidos antes de que matrix-run escribiera el artefacto atomico",
+  "policy": {
+    "classification": "internal-defect",
+    "classification_scope": "observabilidad/artefacto de la corrida; no afirma incompatibilidad del modelo",
+    "compatibility_result": "indeterminate-current-run",
+    "comparable": false,
+    "reason": "matrix-run no propagaba el monitor D51; no existe snapshot retroactivo y el silencio del log no autoriza inventar una causa del modelo",
+    "retry": "prohibido sin nueva autoridad de gasto; gpt-5.6-luna no se reintenta nunca por instruccion del usuario"
+  },
+  "rows": [
+    {
+      "provider": "open_code_zen",
+      "model": "deepseek-v4-flash",
+      "tier": "paid",
+      "protocol": "chat_completions",
+      "round": "r4-zen-paid",
+      "attempt_count": 1,
+      "provider_pin": [
+        "open_code_zen",
+        "deepseek-v4-flash"
+      ],
+      "cross_model_fallback": false,
+      "concurrency": 1,
+      "persist": false,
+      "smoke_result": "passed-by-control-flow",
+      "battles_requested": 2,
+      "battles_completed": null,
+      "effective_provider": null,
+      "effective_model": null,
+      "failure_stage": "battle",
+      "decision_stage": null,
+      "failure_type": "CancelledError",
+      "failure_cause_type": null,
+      "http_status": null,
+      "final_classification": "internal-defect",
+      "compatibility_result": "indeterminate-current-run",
+      "comparable": false,
+      "win_rate": null,
+      "diagnostic_stop_after_seconds": 265,
+      "snapshot_available": false,
+      "atomic_artifact": null,
+      "sanitized_observations": [
+        "APIConnectionError and APITimeoutError occurred before benchmark entry",
+        "benchmark logger became active, which is reachable only after a valid smoke response",
+        "operator SIGINT produced CancelledError intercepted"
+      ],
+      "log_evidence": {
+        "original_path": "/tmp/ludex-coordination/r4-zen-paid.log",
+        "sha256": "fc98d19cdae129256352a8ab42cdeade28609c29b7039d2491ed45e1808ba6f4",
+        "bytes": 598,
+        "sanitized_events": [
+          "line 4: APIConnectionError",
+          "line 5: APITimeoutError",
+          "line 6: benchmark active; CancelledError intercepted"
+        ]
+      },
+      "historical_supplement": {
+        "artifact": "20260728-deepseek-v4-flash-15.json",
+        "status": "complete",
+        "battles_requested": 15,
+        "battles_completed": 15,
+        "provider_switches": 0,
+        "note": "respaldo historico de compatibilidad; no reemplaza el artefacto atomico faltante de esta ronda"
+      }
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.6-luna",
+      "tier": "paid",
+      "protocol": "responses",
+      "round": "r4b-zen-paid-rest",
+      "attempt_count": 1,
+      "provider_pin": [
+        "open_code_zen",
+        "gpt-5.6-luna"
+      ],
+      "cross_model_fallback": false,
+      "concurrency": 1,
+      "persist": false,
+      "smoke_result": "passed-by-control-flow",
+      "battles_requested": 2,
+      "battles_completed": null,
+      "effective_provider": null,
+      "effective_model": null,
+      "failure_stage": "battle",
+      "decision_stage": null,
+      "failure_type": "CancelledError",
+      "failure_cause_type": null,
+      "http_status": null,
+      "final_classification": "internal-defect",
+      "compatibility_result": "indeterminate-current-run",
+      "comparable": false,
+      "win_rate": null,
+      "diagnostic_stop_after_seconds": 317,
+      "snapshot_available": false,
+      "atomic_artifact": null,
+      "future_execution": "operator-prohibited-never-retry",
+      "sanitized_observations": [
+        "benchmark logger became active, which is reachable only after a valid smoke response",
+        "operator SIGINT produced CancelledError intercepted"
+      ],
+      "log_evidence": {
+        "original_path": "/tmp/ludex-coordination/r4b-zen-paid-rest.log",
+        "sha256": "ea7a593df19496561a7d41eeb1dd111201f9b0f1e99581db31b91f89da5ae8f9",
+        "bytes": 82,
+        "sanitized_events": [
+          "line 1: benchmark active; CancelledError intercepted"
+        ]
+      }
+    },
+    {
+      "provider": "open_code_zen",
+      "model": "minimax-m2.5",
+      "tier": "paid",
+      "protocol": "chat_completions",
+      "round": "r4f-zen-paid-minimax-m2.5",
+      "attempt_count": 1,
+      "provider_pin": [
+        "open_code_zen",
+        "minimax-m2.5"
+      ],
+      "cross_model_fallback": false,
+      "concurrency": 1,
+      "persist": false,
+      "smoke_result": "passed-by-control-flow",
+      "battles_requested": 2,
+      "battles_completed": null,
+      "effective_provider": null,
+      "effective_model": null,
+      "failure_stage": "battle",
+      "decision_stage": null,
+      "failure_type": "CancelledError",
+      "failure_cause_type": null,
+      "http_status": null,
+      "final_classification": "internal-defect",
+      "compatibility_result": "indeterminate-current-run",
+      "comparable": false,
+      "win_rate": null,
+      "diagnostic_stop_after_seconds": 295,
+      "snapshot_available": false,
+      "atomic_artifact": null,
+      "sanitized_observations": [
+        "APIConnectionError occurred before benchmark entry",
+        "benchmark logger became active, which is reachable only after a valid smoke response",
+        "operator SIGINT produced CancelledError intercepted"
+      ],
+      "log_evidence": {
+        "original_path": "/tmp/ludex-coordination/r4f-zen-paid-minimax-m2.5.log",
+        "sha256": "b547edbb06a8d7e345a712f04b5f1b88bad582ee98b09a9ad8db3a7dde7c93fb",
+        "bytes": 183,
+        "sanitized_events": [
+          "line 1: APIConnectionError",
+          "line 2: benchmark active; CancelledError intercepted"
+        ]
+      }
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k2.6",
+      "tier": "paid",
+      "protocol": "chat_completions",
+      "round": "r5-kimi-paid",
+      "attempt_count": 1,
+      "provider_pin": [
+        "kimi",
+        "kimi-k2.6"
+      ],
+      "cross_model_fallback": false,
+      "concurrency": 1,
+      "persist": false,
+      "smoke_result": "passed-by-control-flow",
+      "battles_requested": 2,
+      "battles_completed": null,
+      "effective_provider": null,
+      "effective_model": null,
+      "failure_stage": "battle",
+      "decision_stage": null,
+      "failure_type": "CancelledError",
+      "failure_cause_type": null,
+      "http_status": null,
+      "final_classification": "internal-defect",
+      "compatibility_result": "indeterminate-current-run",
+      "comparable": false,
+      "win_rate": null,
+      "diagnostic_stop_after_seconds": 259,
+      "snapshot_available": false,
+      "atomic_artifact": null,
+      "sanitized_observations": [
+        "APIConnectionError and HTTP 429 rate limits occurred before benchmark entry",
+        "benchmark logger became active, which is reachable only after a valid smoke response",
+        "operator SIGINT produced CancelledError intercepted"
+      ],
+      "log_evidence": {
+        "original_path": "/tmp/ludex-coordination/r5-kimi-paid.log",
+        "sha256": "671ca2c2095a9d1623a0f03818fe0e10cfb39f0630963c8f64d1ce6d82c3174f",
+        "bytes": 22958,
+        "sanitized_events": [
+          "line 211: APIConnectionError",
+          "lines 212-213: RateLimitError",
+          "line 214: benchmark active; CancelledError intercepted"
+        ]
+      },
+      "historical_supplement": {
+        "artifacts": [
+          "20260728-kimi-k26-10.json",
+          "20260728-kimi-k26-10-retry1.json",
+          "20260808-kimi-k26-battle-1.json"
+        ],
+        "status": "aborted",
+        "failure_type": "TransientProviderError",
+        "note": "tres antecedentes consistentes de limite externo; no sustituyen el artefacto atomico faltante de esta ronda"
+      }
+    }
+  ]
+}

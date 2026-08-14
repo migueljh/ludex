@@ -3444,3 +3444,42 @@ reconocía el flag; el de intervalo cero falló porque la corrida terminaba con
 exit 0. Tras el cambio mínimo ambos pasan. Suite focal
 `tests/test_cli.py tests/test_diagnostic_monitor.py`: 62 passed; sin red, DB ni
 llamadas de proveedor.
+
+## D54 — MON-20: cobertura final separa estado runtime, clasificación y fuerza de evidencia (2026-08-14)
+
+**Contexto.** El catálogo vivo final contiene 112 filas, pero sólo 22 quedaron
+`ready` dentro del tier/presupuesto autorizado. Dieciocho produjeron artefacto
+atómico; cuatro fueron interrumpidas antes de `on_result` por el hueco D53. El
+status runtime incluye `aborted`, mientras el contrato público de MON-20 pide
+una clasificación de compatibilidad. Mezclar ambos perdería la clase original
+o convertiría un defecto de evidencia en un falso veredicto sobre el modelo.
+
+**Decisión.** `20260814-provider-matrix-coverage.json` conserva por separado:
+
+1. `manifest_status` y su razón original;
+2. `runtime_status`, clase, causa, stage y métricas verbatim del artefacto;
+3. `final_classification` normalizada: `aborted` → `externally-limited`,
+   `pending-budget` → `externally-limited`, exclusión explícita de una
+   capacidad no-chat → `unsupported-protocol`; las demás clases conservan su
+   valor;
+4. `evidence_kind`: `atomic-runtime-artifact`,
+   `sanitized-diagnostic-stop` o `manifest-classification`.
+
+Los cuatro stops quedan `internal-defect` de observabilidad con
+`compatibility_result=indeterminate-current-run`, stage `battle` y terminal
+`CancelledError`; nunca `externally-limited` del modelo porque no existe
+snapshot retroactivo. Sus hashes y eventos saneados viven en
+`20260814-paid-diagnostic-stops.json`; los logs crudos de `/tmp` no se
+versionan. DeepSeek y Kimi incluyen evidencia histórica sólo como suplemento.
+
+**Alcance operativo posterior.** Por instrucción del usuario,
+`gpt-5.6-luna` queda `operator-prohibited-never-retry`; toda futura ejecución
+live se limita a modelos chinos y Gemini free tier. Los resultados históricos
+no habilitan nuevas corridas y cualquier repetición paga china requiere un
+nuevo tope explícito.
+
+**Invariantes.** 112 pares provider/model únicos = 38 Google + 12 Kimi + 62
+Zen; 22/22 filas ready tienen evidencia (18 atómicas + 4 stops); 75 quedan
+pending-budget, 15 excluidas por capacidad; cero filas comparables, cero
+persistencia y cero secretos. La matriz demuestra compatibilidad funcional,
+nunca calidad ni winrate.
