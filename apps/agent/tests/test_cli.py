@@ -2233,12 +2233,17 @@ def test_benchmark_sin_credenciales_valida_antes_de_tocar_showdown_y_emite_not_r
     assert record["failure_type"] == "ProviderSelectionError"
 
 
-def test_matrix_plan_registra_procedencia_de_la_tabla_efectiva(tmp_path):
+def test_matrix_plan_registra_procedencia_de_la_tabla_efectiva(tmp_path, monkeypatch):
     """DIAG-B: matrix-plan --no-refresh registra en el artefacto la tabla
     efectiva que produjo el manifiesto: `table_id`, `currency` y la ruta
     efectiva seleccionada (default o `LUDEX_PRICING_TABLE`). La ruta
     explicita se conserva verbatim; el default se registra tal cual lo
-    resuelve el CLI, sin secretos y sin depender de otras fuentes."""
+    resuelve el CLI, sin secretos y sin depender de otras fuentes.
+
+    R2 (T-01): `CliRunner env=` fusiona el entorno real, asi que un
+    `LUDEX_PRICING_TABLE` heredado invalidaba el caso default; se elimina
+    explicitamente antes de esa invocacion (monkeypatch) y el caso
+    explicito sigue fijando su propio override."""
     import json as _json
 
     from ludex_agent.eval_cost import DEFAULT_PRICING_PATH, PricingTable
@@ -2253,6 +2258,7 @@ def test_matrix_plan_registra_procedencia_de_la_tabla_efectiva(tmp_path):
     base_env = {
         "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
     }
+    monkeypatch.delenv("LUDEX_PRICING_TABLE", raising=False)
 
     out_default = tmp_path / "manifest-default.json"
     result = CliRunner().invoke(
