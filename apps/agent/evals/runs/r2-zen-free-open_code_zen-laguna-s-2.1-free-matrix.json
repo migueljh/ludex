@@ -1,0 +1,45 @@
+{
+  "provider": "open_code_zen",
+  "model": "laguna-s-2.1-free",
+  "tier": "free",
+  "protocol": "chat_completions",
+  "status": "aborted",
+  "smoke_ok": true,
+  "battles_requested": 2,
+  "battles_completed": 1,
+  "effective_provider": "open_code_zen",
+  "effective_model": "laguna-s-2.1-free",
+  "win_rate": null,
+  "completion_latency_ms": {
+    "count": 37,
+    "total": 1100180,
+    "p50": 20622,
+    "p95": 73141,
+    "max": 94940
+  },
+  "decision_latency_ms": {
+    "count": 29,
+    "total": 1088360,
+    "p50": 30915,
+    "p95": 79892,
+    "max": 120780
+  },
+  "tokens": {
+    "input_tokens": 1388448,
+    "output_tokens": 22390,
+    "cached_input_tokens": 135840,
+    "reasoning_tokens": 19634
+  },
+  "retries": 30,
+  "rotations": 0,
+  "quarantined": 0,
+  "failure_type": "TransientProviderError",
+  "failure_cause_type": "InternalServerError",
+  "battles_wins": 0,
+  "battles_losses": 1,
+  "battles_ties": 0,
+  "note": "batallas parciales o abortadas: sin winrate comparable",
+  "failure_stage": "battle",
+  "http_status": 503,
+  "provider_error_code": null
+}

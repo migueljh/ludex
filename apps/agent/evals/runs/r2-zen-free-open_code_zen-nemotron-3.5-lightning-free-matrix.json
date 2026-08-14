@@ -1,0 +1,45 @@
+{
+  "provider": "open_code_zen",
+  "model": "nemotron-3.5-lightning-free",
+  "tier": "free",
+  "protocol": "chat_completions",
+  "status": "aborted",
+  "smoke_ok": true,
+  "battles_requested": 2,
+  "battles_completed": 0,
+  "effective_provider": "open_code_zen",
+  "effective_model": "nemotron-3.5-lightning-free",
+  "win_rate": null,
+  "completion_latency_ms": {
+    "count": 7,
+    "total": 189789,
+    "p50": 22723,
+    "p95": 44300,
+    "max": 45908
+  },
+  "decision_latency_ms": {
+    "count": 7,
+    "total": 189799,
+    "p50": 22725,
+    "p95": 44301,
+    "max": 45910
+  },
+  "tokens": {
+    "input_tokens": 298091,
+    "output_tokens": 14087,
+    "cached_input_tokens": 54400,
+    "reasoning_tokens": 14204
+  },
+  "retries": 3,
+  "rotations": 0,
+  "quarantined": 0,
+  "failure_type": "TransientProviderError",
+  "failure_cause_type": "APITimeoutError",
+  "battles_wins": 0,
+  "battles_losses": 0,
+  "battles_ties": 0,
+  "note": "batallas parciales o abortadas: sin winrate comparable",
+  "failure_stage": "battle",
+  "http_status": null,
+  "provider_error_code": null
+}

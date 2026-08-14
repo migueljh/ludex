@@ -1,0 +1,45 @@
+{
+  "provider": "open_code_zen",
+  "model": "hy3-free",
+  "tier": "free",
+  "protocol": "chat_completions",
+  "status": "compatible",
+  "smoke_ok": true,
+  "battles_requested": 2,
+  "battles_completed": 2,
+  "effective_provider": "open_code_zen",
+  "effective_model": "hy3-free",
+  "win_rate": "1.0000",
+  "completion_latency_ms": {
+    "count": 47,
+    "total": 1723815,
+    "p50": 24763,
+    "p95": 110436,
+    "max": 172433
+  },
+  "decision_latency_ms": {
+    "count": 47,
+    "total": 1723937,
+    "p50": 24764,
+    "p95": 110438,
+    "max": 172434
+  },
+  "tokens": {
+    "input_tokens": 1623047,
+    "output_tokens": 103042,
+    "cached_input_tokens": 239504,
+    "reasoning_tokens": 98079
+  },
+  "retries": 8,
+  "rotations": 0,
+  "quarantined": 0,
+  "failure_type": null,
+  "failure_cause_type": null,
+  "battles_wins": 2,
+  "battles_losses": 0,
+  "battles_ties": 0,
+  "note": null,
+  "failure_stage": null,
+  "http_status": null,
+  "provider_error_code": null
+}
