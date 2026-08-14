@@ -3340,8 +3340,79 @@ opt-in. Decisiones de esta ronda (commit `c143e0b` + ronda 2):
    persistencia post-batalla.
 
 7. **Stop condition de R1C.** Durante el diagnóstico en vivo: si una
-   decisión permanece en la MISMA etapa más de `decision_budget_seconds`
-   (240 s) o la batalla muestra cero decisiones completadas tras
-   2×`decision_budget_seconds`+60 s, detener la corrida SIN reintentar el
-   modelo ni rotar claves, clasificar con el snapshot como evidencia y pedir
-   veredicto a Latwan. R1C sigue NO AUTORIZADA hasta nuevo veredicto.
+    decisión permanece en la MISMA etapa más de `decision_budget_seconds`
+    (240 s) o la batalla muestra cero decisiones completadas tras
+    2×`decision_budget_seconds`+60 s, detener la corrida SIN reintentar el
+    modelo ni rotar claves, clasificar con el snapshot como evidencia y pedir
+    veredicto a Latwan. R1C sigue NO AUTORIZADA hasta nuevo veredicto.
+
+## D52 — MON-20 DIAG-B: precedencia tier/precio en `build_manifest`, tabla de precios vigente explícita y cinco modelos nuevos declarativos (2026-08-14)
+
+**Contexto.** El ROOT-CAUSE CHECKPOINT DIAG-B (Linear, 2026-08-14) detectó
+que `build_manifest` degradaba la información del inventario al enriquecer
+el catálogo fresco: en la rama sin hit de tabla de precios el tier salía de
+`prev_row["tier"]` (no de `tier_override`) y en la rama sin tabla ni precios
+se forzaba `unknown`, perdiendo overrides explícitos y convirtiendo en
+"unknown" modelos que ya estaban verificados como free/paid. Además
+`plan_budget` trataba `unknown` como ejecutable en una fase, con riesgo de
+gastar cuota sobre un tier no probado. La tabla vigente además no cubría los
+cinco modelos publicados por Zen docs entre el 08-08 y el 08-14
+(`gemini-3.7-flash`, `grok-4.6`, `muse-spark-1.2`, `hy3-free`,
+`nemotron-3.5-lightning-free`).
+
+**Decisiones:**
+
+1. **Precedencia de tier/precio en `build_manifest` (fail-closed, nunca
+   inventar precios).** La tabla de precios manda para precios y fuente;
+   `tier_override` del inventario manda SOLO sobre el tier, incluso cuando
+   vale `unknown` sobre un hit paid de tabla (el override explícito expresa
+   "no pruebo este tier", y `plan_budget` lo deja pending-budget). Sin hit
+   de tabla, los precios del inventario derivan el tier: free SOLO con
+   input y output exactamente 0; cualquier precio no cero infiere paid. Sin
+   tabla ni precios se conserva el `tier_override` explícito (free
+   verificado sin precio sigue free, costo 0) y solo queda `unknown` cuando
+   no hay override ni dato alguno — jamas al reves.
+
+2. **`unknown` en `plan_budget` es pending-budget, no ejecutable.** Un tier
+   desconocido no puede probar costo cero ni correr en una fase (free|paid):
+   queda `pending-budget` conservando protocolo/ruta/costo estimado (extiende
+   D43: "sin prueba de costo cero → pending-budget", que antes solo cubría
+   filas sin precio). Un `unknown` jamás se convierte en free por tener
+   precios 0/0 sin fuente verificada.
+
+3. **Tabla de precios vigente explícita y trazable.** `DEFAULT_PRICING_PATH`
+   apunta a `pricing-2026-08-14.json` (`2026-08-14-zen-moonshot-modelsdev`,
+   USD, 97 filas, fuentes `opencode.ai/docs/zen/` y docs de Moonshot). El
+   manifiesto de `matrix-plan` registra la procedencia efectiva:
+   `pricing.table_id`, `currency` y `path` (default resuelto por el CLI o el
+   valor verbatim de `LUDEX_PRICING_TABLE`, sin secretos). Las tablas
+   anteriores quedan como histórico versionado, no se borran.
+
+4. **Cinco modelos nuevos, declarativos.** Rutas en `model-routes.json`:
+   `gemini-3.7-flash` (google/json_schema), `grok-4.6` y `muse-spark-1.2`
+   (responses/text_json), `hy3-free` y `nemotron-3.5-lightning-free`
+   (chat_completions/text_json, conservador; el smoke posterior valida
+   compatibilidad). Precios en la tabla 08-14 desde Zen docs (checked_at
+   2026-08-14): gemini-3.7-flash 1.50/7.50 (cached 0.15), grok-4.6 2.00/6.00
+   (cached 0.50), muse-spark-1.2 1.25/4.25 (cached 0.15), hy3-free y
+   nemotron-3.5-lightning-free 0/0. Cero condicionales runtime por nombre de
+   modelo: todo sale de las rutas y la tabla, y el catálogo sigue
+   refrescándose en runtime desde /models (D43).
+
+**Límite documentado (Grok).** La fila oficial de Zen para `grok-4.6` es la
+de <=200K tokens (input 2.00/output 6.00); el runner usa una completion por
+decisión y la ancla existente es 40K por smoke/por llamada, pero el schema
+actual no expresa pricing escalonado, así que se presupuesta con la fila
+<=200K y el resto del rango no se estima. Impacto: el costo estimado puede
+subestimar llamadas con contexto muy largo; dentro de los usos actuales
+(smoke 40K, batallas con ancla 1.5M/60K por batalla) es la cota oficial
+menor disponible y se valida en vivo con el uso real antes de cerrar R1C.
+
+**Verificación.** 6 tests DIAG-B nuevos en `test_matrix.py` (A1-A5 + C),
+procedencia en `test_cli.py`, tabla en `test_eval_cost.py`/`test_eval_report.py`.
+Mutaciones RED confirmadas, una por corrección: perder `tier_override` en la
+rama sin tabla (A4), ignorar override/derivación de tier en la rama de
+precios (A1/A3), quitar el branch `unknown` de `plan_budget` (A2), quitar la
+ruta de `grok-4.6` (C → missing-route), quitar la procedencia del manifiesto
+(CLI), y revertir la tabla default a 07-28 (table_id). GREEN restaurado:
+125 passed en la suite focal. Sin red, sin Docker, sin DB.

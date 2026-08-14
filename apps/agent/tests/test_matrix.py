@@ -19,6 +19,7 @@ from ludex_agent.matrix import (
     build_manifest,
     delta_catalog,
     plan_budget,
+    tier_prices_from_pricing_table,
 )
 
 
@@ -1580,3 +1581,194 @@ def test_manifiesto_unitario_r1c_dentro_del_cap_y_sin_cumulative_stale():
     assert row["cumulative_cost_usd"] == "0.45976"
     total = Decimal(row["estimated_smoke_usd"]) + Decimal(row["estimated_cost_usd"])
     assert total <= Decimal("0.60")
+
+
+# --- MON-20 DIAG-B: precedencia de tier/precio en build_manifest -----------
+
+
+def test_diagb_tier_override_free_con_precios_cero_sin_tabla_es_free_costo_cero():
+    """DIAG-B A1: sin hit en la tabla de precios, `tier_override: free` del
+    inventario con precios 0/0 produce tier free y costo 0 — nunca convierte
+    un free verificado en unknown."""
+    rows = build_manifest(
+        {"open_code_zen": ["mimo-v2.5-free"]},
+        previous_inventory={
+            "models": {"open_code_zen": [
+                {"id": "mimo-v2.5-free", "in_scope": True,
+                 "tier_override": "free",
+                 "prices": {
+                     "input_per_million": "0", "output_per_million": "0",
+                     "source_url": "https://models.dev/",
+                 }},
+            ]},
+        },
+        tier_prices={},
+        routes=_routes(),
+    )
+    row = rows[0]
+    assert row.status == "ready"
+    assert row.tier == "free"
+    assert row.estimated_cost_usd == Decimal("0")
+    assert row.estimated_smoke_usd == Decimal("0")
+    assert "models.dev" in (row.classification_note or "")
+
+
+def test_diagb_tier_override_unknown_con_precios_cero_sigue_unknown_y_pending():
+    """DIAG-B A2: `tier_override: unknown` + precios 0/0 sin tabla PERMANECE
+    unknown (nunca se convierte a free) y plan_budget lo deja pending-budget
+    incluso con presupuesto disponible (no se puede probar costo cero)."""
+    rows = build_manifest(
+        {"google": ["gemini-2.5-flash"]},
+        previous_inventory={
+            "models": {"google": [
+                {"id": "gemini-2.5-flash", "in_scope": True,
+                 "tier_override": "unknown",
+                 "prices": {
+                     "input_per_million": "0", "output_per_million": "0",
+                     "source_url": "https://models.dev/",
+                 }},
+            ]},
+        },
+        tier_prices={},
+        routes=_routes(),
+    )
+    row = rows[0]
+    assert row.tier == "unknown"
+    assert row.estimated_cost_usd == Decimal("0")
+    planned = plan_budget(rows, {
+        "google": BudgetSpec(
+            balance_usd=Decimal("1"), cap_usd=Decimal("1"),
+            leave_usd=Decimal("0"),
+        ),
+    })
+    assert planned[0].status == "pending-budget"
+    assert planned[0].tier == "unknown"
+
+
+def test_diagb_precios_no_cero_sin_override_infieren_paid():
+    """DIAG-B A3: precios no cero del inventario sin hit de tabla y sin
+    override infieren paid (no unknown)."""
+    rows = build_manifest(
+        {"open_code_zen": ["gpt-5.5"]},
+        previous_inventory={
+            "models": {"open_code_zen": [
+                {"id": "gpt-5.5", "in_scope": True,
+                 "prices": {
+                     "input_per_million": "5", "output_per_million": "30",
+                     "source_url": "https://opencode.ai/docs/zen/",
+                 }},
+            ]},
+        },
+        tier_prices={},
+        routes=_routes(),
+    )
+    row = rows[0]
+    assert row.tier == "paid"
+    assert row.estimated_cost_usd == Decimal("18.6")
+    assert "opencode.ai/docs/zen" in (row.classification_note or "")
+
+
+def test_diagb_sin_tabla_ni_precios_conserva_el_tier_override():
+    """DIAG-B A4: sin hit ni precios, un `tier_override` explicito se
+    conserva (free verificado sin precio sigue free/costo 0) y un modelo sin
+    override ni datos queda unknown — jamas al reves."""
+    rows = build_manifest(
+        {"open_code_zen": ["gpt-5.5", "deepseek-v4-flash"]},
+        previous_inventory={
+            "models": {"open_code_zen": [
+                {"id": "gpt-5.5", "in_scope": True,
+                 "tier_override": "free"},
+                {"id": "deepseek-v4-flash", "in_scope": True},
+            ]},
+        },
+        tier_prices={},
+        routes=_routes(),
+    )
+    by_model = {(r.provider, r.model): r for r in rows}
+    assert by_model[("open_code_zen", "gpt-5.5")].tier == "free"
+    assert by_model[("open_code_zen", "gpt-5.5")].estimated_cost_usd == Decimal("0")
+    assert by_model[("open_code_zen", "deepseek-v4-flash")].tier == "unknown"
+
+
+def test_diagb_hit_de_tabla_manda_en_precios_y_override_solo_sobre_tier():
+    """DIAG-B A5: con hit de tabla, precios y fuente de la tabla mandan; el
+    `tier_override` explicito manda SOLO sobre el tier, incluso si vale
+    `unknown`."""
+    rows = build_manifest(
+        {"open_code_zen": ["deepseek-v4-flash"]},
+        previous_inventory={
+            "models": {"open_code_zen": [
+                {"id": "deepseek-v4-flash", "in_scope": True,
+                 "tier_override": "unknown"},
+            ]},
+        },
+        tier_prices={
+            ("open_code_zen", "deepseek-v4-flash"): (
+                "paid", "0.14", "0.28", "zen-docs",
+            ),
+        },
+        routes=_routes(),
+    )
+    row = rows[0]
+    assert row.tier == "unknown"
+    assert row.estimated_cost_usd == Decimal("0.4536")
+    assert "zen-docs" in (row.classification_note or "")
+
+
+def test_diagb_cinco_rutas_oficiales_construyen_manifiesto_esperado():
+    """DIAG-B C: los cinco modelos verificados en zen docs (2026-08-14)
+    construyen el manifiesto con `load_model_routes()` + la tabla real
+    (default 08-14): ninguno queda `missing-route`, los protocolos son los
+    literales aprobados y tiers/costos derivados a mano."""
+    from ludex_agent.eval_cost import PricingTable
+    from ludex_agent.graph.provider import load_model_routes
+
+    routes = load_model_routes()
+    pricing = PricingTable.load()
+    assert pricing.table_id == "2026-08-14-zen-moonshot-modelsdev"
+    five = [
+        "gemini-3.7-flash", "grok-4.6", "muse-spark-1.2",
+        "hy3-free", "nemotron-3.5-lightning-free",
+    ]
+    rows = build_manifest(
+        {"open_code_zen": five},
+        previous_inventory={
+            "models": {"open_code_zen": [
+                {"id": model, "in_scope": True} for model in five
+            ]},
+        },
+        tier_prices=tier_prices_from_pricing_table(pricing),
+        routes=routes,
+    )
+    by_model = {r.model: r for r in rows}
+    assert len(rows) == 5
+    for model in five:
+        assert by_model[model].status == "ready", model
+
+    assert by_model["gemini-3.7-flash"].protocol == "google"
+    assert by_model["gemini-3.7-flash"].structured_output == "json_schema"
+    assert by_model["gemini-3.7-flash"].tier == "paid"
+    assert by_model["gemini-3.7-flash"].estimated_cost_usd == Decimal("5.40")
+    assert by_model["gemini-3.7-flash"].estimated_smoke_usd == Decimal("0.075")
+
+    assert by_model["grok-4.6"].protocol == "responses"
+    assert by_model["grok-4.6"].structured_output == "text_json"
+    assert by_model["grok-4.6"].tier == "paid"
+    assert by_model["grok-4.6"].estimated_cost_usd == Decimal("6.72")
+    assert by_model["grok-4.6"].estimated_smoke_usd == Decimal("0.092")
+
+    assert by_model["muse-spark-1.2"].protocol == "responses"
+    assert by_model["muse-spark-1.2"].structured_output == "text_json"
+    assert by_model["muse-spark-1.2"].tier == "paid"
+    assert by_model["muse-spark-1.2"].estimated_cost_usd == Decimal("4.26")
+    assert by_model["muse-spark-1.2"].estimated_smoke_usd == Decimal("0.0585")
+
+    assert by_model["hy3-free"].protocol == "chat_completions"
+    assert by_model["hy3-free"].structured_output == "text_json"
+    assert by_model["hy3-free"].tier == "free"
+    assert by_model["hy3-free"].estimated_cost_usd == Decimal("0")
+
+    assert by_model["nemotron-3.5-lightning-free"].protocol == "chat_completions"
+    assert by_model["nemotron-3.5-lightning-free"].structured_output == "text_json"
+    assert by_model["nemotron-3.5-lightning-free"].tier == "free"
+    assert by_model["nemotron-3.5-lightning-free"].estimated_cost_usd == Decimal("0")

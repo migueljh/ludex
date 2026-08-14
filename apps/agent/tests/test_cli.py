@@ -2231,3 +2231,57 @@ def test_benchmark_sin_credenciales_valida_antes_de_tocar_showdown_y_emite_not_r
     record = json.loads(artifact.read_text())
     assert record["status"] == "not-run"
     assert record["failure_type"] == "ProviderSelectionError"
+
+
+def test_matrix_plan_registra_procedencia_de_la_tabla_efectiva(tmp_path):
+    """DIAG-B: matrix-plan --no-refresh registra en el artefacto la tabla
+    efectiva que produjo el manifiesto: `table_id`, `currency` y la ruta
+    efectiva seleccionada (default o `LUDEX_PRICING_TABLE`). La ruta
+    explicita se conserva verbatim; el default se registra tal cual lo
+    resuelve el CLI, sin secretos y sin depender de otras fuentes."""
+    import json as _json
+
+    from ludex_agent.eval_cost import DEFAULT_PRICING_PATH, PricingTable
+
+    inventory = tmp_path / "inventory.json"
+    inventory.write_text(_json.dumps({
+        "models": {
+            "google": [{"id": "gemini-2.5-flash", "in_scope": True}],
+            "open_code_zen": [{"id": "grok-4.6", "in_scope": True}],
+        },
+    }))
+    base_env = {
+        "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+    }
+
+    out_default = tmp_path / "manifest-default.json"
+    result = CliRunner().invoke(
+        app,
+        ["matrix-plan", "--inventory", str(inventory),
+         "--manifest", str(out_default), "--no-refresh"],
+        env=base_env,
+    )
+    assert result.exit_code == 0, result.stdout
+    document = _json.loads(out_default.read_text())
+    provenance = document["pricing"]
+    default_table = PricingTable.load()
+    assert provenance["table_id"] == default_table.table_id
+    assert provenance["currency"] == default_table.currency == "USD"
+    assert provenance["path"] == str(DEFAULT_PRICING_PATH)
+
+    out_explicit = tmp_path / "manifest-explicit.json"
+    env_explicit = dict(base_env)
+    env_explicit["LUDEX_PRICING_TABLE"] = "evals/pricing-2026-08-08.json"
+    result = CliRunner().invoke(
+        app,
+        ["matrix-plan", "--inventory", str(inventory),
+         "--manifest", str(out_explicit), "--no-refresh"],
+        env=env_explicit,
+    )
+    assert result.exit_code == 0, result.stdout
+    document = _json.loads(out_explicit.read_text())
+    assert document["pricing"] == {
+        "table_id": "2026-08-08-zen-moonshot-modelsdev",
+        "currency": "USD",
+        "path": "evals/pricing-2026-08-08.json",
+    }

@@ -1188,11 +1188,9 @@ def matrix_plan_command(
     from .eval_cost import PricingTable
 
     settings = load_settings()
-    pricing_table = PricingTable.load(
-        Path(os.environ.get(
-            "LUDEX_PRICING_TABLE", DEFAULT_PRICING_PATH
-        ))
-    )
+    pricing_env = os.environ.get("LUDEX_PRICING_TABLE")
+    pricing_path = Path(pricing_env) if pricing_env else DEFAULT_PRICING_PATH
+    pricing_table = PricingTable.load(pricing_path)
     tier_prices = tier_prices_from_pricing_table(pricing_table)
     import asyncio as _asyncio
 
@@ -1292,6 +1290,14 @@ def matrix_plan_command(
         document = manifest_to_dict(rows)
         document["delta"] = delta
         document["baseline_inventory"] = str(inventory_path)
+        # DIAG-B: procedencia reproducible de la tabla que produjo el
+        # manifiesto. `path` es la ruta efectiva usada (default o el valor
+        # verbatim de LUDEX_PRICING_TABLE); nunca expone secretos.
+        document["pricing"] = {
+            "table_id": pricing_table.table_id,
+            "currency": pricing_table.currency,
+            "path": str(pricing_path),
+        }
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_suffix(target.suffix + ".tmp")
         temporary.write_text(

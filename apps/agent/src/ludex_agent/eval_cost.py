@@ -12,7 +12,7 @@ from typing import Mapping
 DEFAULT_PRICING_PATH = (
     Path(__file__).resolve().parents[2]
     / "evals"
-    / "pricing-2026-07-28.json"
+    / "pricing-2026-08-14.json"
 )
 MILLION = Decimal(1_000_000)
 

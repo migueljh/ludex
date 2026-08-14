@@ -231,9 +231,9 @@ def build_manifest(
                 # Proveedor nativo sin capa de rutas (google): el protocolo
                 # es el del kind, no se declara por modelo.
                 route = ModelRoute(protocol="google")
-            # Tier/precio: la tabla de precios manda; el inventario puede
-            # sobreescribir el tier (p.ej. "unknown" aunque el precio sea 0)
-            # o aportar precio cuando la tabla no lo cubre.
+            # Tier/precio (DIAG-B): la tabla de precios manda; el inventario
+            # puede sobreescribir SOLO el tier (p.ej. "unknown" aunque el
+            # precio sea 0) o aportar precio cuando la tabla no lo cubre.
             table_hit = tier_prices.get((provider, model))
             inv_tier = prev_row.get("tier_override") if prev_row else None
             if table_hit is not None:
@@ -241,15 +241,28 @@ def build_manifest(
                 if inv_tier is not None:
                     tier = inv_tier
             elif prev_row is not None and prev_row.get("prices"):
-                tier = prev_row.get("tier", "unknown")
                 prices = prev_row["prices"]
                 price_in = prices.get("input_per_million")
                 price_out = prices.get("output_per_million")
                 source = prices.get("source_url")
+                if inv_tier is not None:
+                    tier = inv_tier
+                else:
+                    # Sin override: free SOLO cuando input y output son
+                    # exactamente 0; con precios no cero se infiere paid.
+                    zero = (
+                        price_in is not None
+                        and price_out is not None
+                        and Decimal(str(price_in)) == 0
+                        and Decimal(str(price_out)) == 0
+                    )
+                    tier = "free" if zero else "paid"
             else:
-                tier, price_in, price_out, source = (
-                    "unknown", None, None, None
-                )
+                # Sin tabla ni precios se conserva el override explicito
+                # (free verificado sin precio sigue free) o queda unknown;
+                # jamas se convierte un tier_override: unknown en gratis.
+                tier = inv_tier if inv_tier is not None else "unknown"
+                price_in, price_out, source = None, None, None
             price_in_d = Decimal(price_in) if price_in is not None else None
             price_out_d = Decimal(price_out) if price_out is not None else None
             cost = _estimate_cost(route, tier, price_in_d, price_out_d)
@@ -329,6 +342,16 @@ def plan_budget(
         spec = budgets.get(row.provider)
         if row.tier == "free":
             result.append(row)
+            continue
+        if row.tier == "unknown":
+            # DIAG-B: un tier desconocido no puede probar costo cero ni
+            # ejecutarse en una fase (free|paid): pending-budget, sin perder
+            # protocolo/ruta/costo estimado.
+            result.append(_as_status(
+                row, "pending-budget",
+                "tier desconocido: no se puede probar costo cero ni "
+                "ejecutar en una fase",
+            ))
             continue
         if spec is None or row.estimated_cost_usd is None:
             result.append(_as_status(

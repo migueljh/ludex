@@ -132,7 +132,7 @@ def test_json_y_ledger_rechazan_sobrescritura_y_conservan_fuente(tmp_path):
 
     rendered = artifact.read_text()
     markdown = ledger.read_text()
-    assert '"pricing_table_id": "2026-07-28-official"' in rendered
+    assert '"pricing_table_id": "2026-08-14-zen-moonshot-modelsdev"' in rendered
     assert "test-minimax" in markdown
     assert "test-minimax.json" in markdown
     with pytest.raises(FileExistsError):
@@ -330,7 +330,7 @@ def test_corrida_abortada_con_progreso_no_publica_latencia_comparable_ni_winrate
     assert "0/0/0" not in markdown
     # El ledger no publica latencia de runs incompletos: las dos celdas de
     # latencia quedan vacias (tres separadores consecutivos).
-    assert "|  |  | 2026-07-28-official" in markdown
+    assert "|  |  | 2026-08-14-zen-moonshot-modelsdev" in markdown
     assert "300/310/320" not in markdown
 
 
