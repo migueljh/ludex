@@ -35,7 +35,6 @@ class BenchmarkDeadlineExceeded(Exception):
 
 
 class ShowdownUnavailableError(RuntimeError):
-class ShowdownUnavailableError(RuntimeError):
     """L-03 (post-R1B) + D49 (MON-25): el preflight local de Showdown fallo
     (indisponibilidad de INFRAESTRUCTURA, no del modelo). Se levanta `from`
     el OSError/timeout/error de handshake real del probe de protocolo, que
