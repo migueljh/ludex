@@ -3198,11 +3198,19 @@ wait_closed()`, con el porqué documentado inline.
   mudo.
 
 **No se tocó.** `seasons` no se modificó, desactivó ni reconfiguró (no es
-causal de R1C, D-ROOT-CAUSE CHECKPOINT §2/§4). `exports.routes` en
-`docker/showdown/config.js` no se tocó (el ruido histórico de `CRASH` no
-fue causal; higiene de logs queda fuera de este issue). `ping_interval`/
-`ping_timeout` de poke-env no se tocaron. La rama/worktree de MON-20 no se
-modificó -- todo lo que se necesitó de ella se leyó vía `git show`.
+ causal de R1C, D-ROOT-CAUSE CHECKPOINT §2/§4). `exports.routes` en
+ `docker/showdown/config.js` no se tocó (el ruido histórico de `CRASH` no
+ fue causal; higiene de logs queda fuera de este issue). `ping_interval`/
+ `ping_timeout` de poke-env no se tocaron. La rama/worktree de MON-20 no se
+ modificó -- todo lo que se necesitó de ella se leyó vía `git show`.
+
+ > Alcance histórico (aclaración post-reconciliación): las frases
+ > anteriores eran ciertas para el commit fuente MON-25 (6d40018) antes de
+ > la integración. En el HEAD combinado de MON-20, D49 quedó aplicada
+ > dentro de la rama mediante el cherry-pick `b9bc21b` (más los commits de
+ > reconciliación `a83e6eb` y `665b42c`), que es donde vive hoy el preflight
+ > endurecido. Ninguna conclusión, límite ni clasificación cambia por esta
+ > aclaración.
 
 **Limitación conocida.** El counterweight de integración depende de que el
 Showdown local real esté arriba (`docker compose --profile local up -d
@@ -3250,9 +3258,17 @@ y `RUN_SHOWDOWN_INTEGRATION=1`:
 - Suite completa `tests/test_cli.py` + el counterweight: 33 passed.
 
 **No se tocó.** El endurecimiento de D49 (`_probe_showdown_protocol`,
-`_check_showdown_reachable`) no cambió. `SHOWDOWN_WS_URL` sigue con el mismo
-default y el mismo rol de configurar la URL, no de gatear el skip. MON-20 y
-la rama de integración no se tocaron.
+ `_check_showdown_reachable`) no cambió. `SHOWDOWN_WS_URL` sigue con el mismo
+ default y el mismo rol de configurar la URL, no de gatear el skip. MON-20 y
+ la rama de integración no se tocaron.
+
+ > Alcance histórico (aclaración post-reconciliación): igual que en D49,
+ > la frase anterior describía el estado de los commits fuente MON-25
+ > (6d40018, 84a2f13) antes de la integración. En el HEAD combinado de
+ > MON-20, D50 quedó aplicada dentro de la rama mediante `a83e6eb` (sobre
+ > `b9bc21b`, con la corrección documental `665b42c`); `integration/phase-2
+ > -accepted` sigue sin recibir este trabajo, como se indicó. Ninguna
+ > conclusión, límite ni clasificación cambia por esta aclaración.
 
 ## D51 — MON-20 DIAG-A R2/R3 (review Tasos/Latwan): monitor diagnóstico opt-in del benchmark (`--diagnostic-snapshot-interval`)
 
