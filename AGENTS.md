@@ -94,6 +94,21 @@ En esta máquina conviven contenedores de **otros proyectos del usuario**. Los d
   nada fuera de configuración.
 - Registrá toda decisión no trivial en `docs/DECISIONS.md`.
 
+## Restricción operativa de modelos para juego
+
+- **Nunca uses `gpt-5.6-luna` para provider-smoke, completions de decisión ni
+  batallas.** No lo reintentes aunque exista una ruta, saldo o artefacto
+  incompleto.
+- Las futuras ejecuciones live de juego se limitan a **modelos chinos** y a
+  **Gemini dentro del free tier**. Discovery puramente metadata (`/models`) no
+  cuenta como juego, pero no habilita smokes ni completions fuera de este
+  alcance.
+- Conservá los artefactos históricos de otros modelos como evidencia; no los
+  uses como autorización para repetirlos.
+- Un modelo chino pago tampoco se repite ni amplía presupuesto sin un nuevo
+  tope explícito del usuario. Nunca compres créditos, habilites auto-reload ni
+  aumentes cuota por inferencia.
+
 ## Higiene de contexto y consumo de Codex
 
 La cuota de Codex también es un recurso operativo. Ahorrarla no autoriza a
