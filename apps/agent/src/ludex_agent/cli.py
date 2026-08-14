@@ -1325,6 +1325,10 @@ def matrix_run_command(
         None, "--smoke-timeout",
         help="Deadline del smoke en segundos (default: request timeout + margen)",
     ),
+    diagnostic_snapshot_interval: float | None = typer.Option(
+        None, "--diagnostic-snapshot-interval",
+        help="Intervalo opt-in para snapshots D51 durante cada benchmark",
+    ),
     resume: bool = typer.Option(False, "--resume"),
     zen_auto_reload_confirmed: bool = typer.Option(
         False, "--zen-auto-reload-confirmed",
@@ -1349,6 +1353,13 @@ def matrix_run_command(
     settings = load_settings()
     if battle_timeout <= 0:
         raise typer.BadParameter("--battle-timeout debe ser positivo")
+    if (
+        diagnostic_snapshot_interval is not None
+        and diagnostic_snapshot_interval <= 0
+    ):
+        raise typer.BadParameter(
+            "--diagnostic-snapshot-interval debe ser un numero positivo"
+        )
     if tier not in {"free", "paid"}:
         raise typer.BadParameter("--tier debe ser free o paid")
 
@@ -1417,6 +1428,7 @@ def matrix_run_command(
             n=n, opponent=opponent, concurrency=1, persist=False,
             provider_name=provider_name, model=model_name,
             fmt=fmt, battle_timeout_seconds=battle_timeout_seconds,
+            diagnostic_snapshot_interval=diagnostic_snapshot_interval,
         )
 
     def build_provider(provider_name: str, model_name: str):

@@ -3416,3 +3416,31 @@ precios (A1/A3), quitar el branch `unknown` de `plan_budget` (A2), quitar la
 ruta de `grok-4.6` (C → missing-route), quitar la procedencia del manifiesto
 (CLI), y revertir la tabla default a 07-28 (table_id). GREEN restaurado:
 125 passed en la suite focal. Sin red, sin Docker, sin DB.
+
+## D53 — MON-20: el monitor D51 también es opt-in desde `matrix-run` (2026-08-14)
+
+**Contexto.** D51 cableó `--diagnostic-snapshot-interval` solamente en el
+comando `benchmark`. `matrix-run` construía un callback `run_battles` que
+invocaba `_benchmark_command()` sin ese argumento. Por eso cuatro filas
+pagas que entraron en benchmark y superaron el umbral diagnóstico fueron
+interrumpidas sin `LUDEX_SNAPSHOT` y antes de que `on_result` pudiera escribir
+el artefacto atómico. El silencio del log no permite reconstruir la etapa de
+decisión ni autoriza inventar una clase de fallo.
+
+**Decisión.** `matrix-run` expone el mismo flag opt-in y lo propaga sin
+transformación a cada `_benchmark_command`. Ausente conserva exactamente el
+default `None`; presente debe ser mayor que cero o el CLI falla antes de
+refrescar catálogos o ejecutar modelos. No se agregan timeouts, cancelaciones,
+reintentos ni cambios de clasificación: la semántica y los campos seguros del
+snapshot siguen siendo exclusivamente los de D51.
+
+**Límite.** Este wiring evita repetir el defecto, pero no recupera snapshots
+retroactivamente. DeepSeek V4 Flash, GPT-5.6 Luna, MiniMax M2.5 y Kimi K2.6
+conservan como evidencia sus intentos únicos y logs sanitizados; cualquier
+nueva llamada requiere autoridad de gasto y veredicto de Latwan.
+
+**Verificación TDD.** El canario de propagación falló primero porque el CLI no
+reconocía el flag; el de intervalo cero falló porque la corrida terminaba con
+exit 0. Tras el cambio mínimo ambos pasan. Suite focal
+`tests/test_cli.py tests/test_diagnostic_monitor.py`: 62 passed; sin red, DB ni
+llamadas de proveedor.

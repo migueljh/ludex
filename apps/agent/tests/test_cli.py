@@ -1423,6 +1423,83 @@ def test_matrix_run_rechaza_battle_timeout_no_positivo(tmp_path):
     assert "positivo" in result.stdout
 
 
+def test_matrix_run_rechaza_interval_diagnostico_no_positivo(
+    tmp_path, monkeypatch
+):
+    """D51 exige un intervalo positivo; cero no puede desactivar en silencio
+    un monitor que el operador pidio explicitamente."""
+    manifest = _manifest_document(tmp_path, rows=[])
+
+    async def fake_run_matrix_round(**kwargs):
+        return []
+
+    monkeypatch.setattr(
+        "ludex_agent.matrix.run_matrix_round", fake_run_matrix_round
+    )
+    result = CliRunner().invoke(
+        app,
+        ["matrix-run", "--manifest", str(manifest), "--tier", "free",
+         "--diagnostic-snapshot-interval", "0"],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+        },
+    )
+    assert result.exit_code != 0
+    assert "numero positivo" in result.stdout
+
+
+def test_matrix_run_propaga_monitor_d51_al_benchmark(tmp_path, monkeypatch):
+    """Canario D51: una matriz debe poder observar la decision colgada.
+
+    Romper la propagacion del intervalo desde el CLI hasta
+    `_benchmark_command` deja nuevamente una corrida paga sin snapshots ni
+    artefacto clasificable, que es el defecto observado en R4/R5.
+    """
+    manifest = _manifest_document(tmp_path, rows=[{
+        "provider": "fake", "model": "fake-model",
+        "protocol": "chat_completions", "endpoint": None,
+        "structured_output": "json_schema", "tier": "free",
+        "status": "ready", "battles": 2, "concurrency": 1,
+        "persist": False, "pin": ["fake", "fake-model"],
+        "estimated_cost_usd": "0", "estimated_smoke_usd": "0",
+        "classification_note": "fixture offline",
+    }])
+    captured: dict[str, object] = {}
+
+    async def fake_benchmark_command(**kwargs):
+        captured.update(kwargs)
+        return BenchmarkResult(
+            requested=2, completed=2, wins=1, losses=1, ties=0,
+            provider="fake", model="fake-model",
+        ), {}
+
+    async def fake_run_matrix_round(**kwargs):
+        await kwargs["run_battles"](
+            "fake", "fake-model", n=2,
+            battle_timeout_seconds=1800.0,
+            fmt="gen6randombattle", opponent="simple_heuristics",
+        )
+        return []
+
+    monkeypatch.setattr(
+        "ludex_agent.matrix.run_matrix_round", fake_run_matrix_round
+    )
+    monkeypatch.setattr(
+        cli_module, "_benchmark_command", fake_benchmark_command
+    )
+
+    result = CliRunner().invoke(app, [
+        "matrix-run", "--manifest", str(manifest), "--tier", "free",
+        "--round", "diag-matrix",
+        "--diagnostic-snapshot-interval", "0.25",
+    ], env={
+        "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+    })
+
+    assert result.exit_code == 0, result.stdout
+    assert captured.get("diagnostic_snapshot_interval") == 0.25
+
+
 def test_escritura_parcial_no_reemplaza_el_ultimo_artefacto_valido(tmp_path):
     """Canario: una escritura fallida a mitad de camino (JSON no
     serializable) no debe tocar el artefacto valido previo."""
