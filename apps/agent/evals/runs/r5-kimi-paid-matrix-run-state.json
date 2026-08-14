@@ -1,0 +1,92 @@
+{
+  "kimi/moonshot-v1-8k": {
+    "provider": "kimi",
+    "model": "moonshot-v1-8k",
+    "tier": "paid",
+    "protocol": "chat_completions",
+    "status": "aborted",
+    "smoke_ok": true,
+    "battles_requested": 2,
+    "battles_completed": 0,
+    "effective_provider": "kimi",
+    "effective_model": "moonshot-v1-8k",
+    "win_rate": null,
+    "completion_latency_ms": {
+      "count": 0,
+      "total": null,
+      "p50": null,
+      "p95": null,
+      "max": null
+    },
+    "decision_latency_ms": {
+      "count": 0,
+      "total": null,
+      "p50": null,
+      "p95": null,
+      "max": null
+    },
+    "tokens": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cached_input_tokens": 0,
+      "reasoning_tokens": 0
+    },
+    "retries": 1,
+    "rotations": 0,
+    "quarantined": 0,
+    "failure_type": "FatalProviderError",
+    "failure_cause_type": "BadRequestError",
+    "battles_wins": 0,
+    "battles_losses": 0,
+    "battles_ties": 0,
+    "note": "batallas parciales o abortadas: sin winrate comparable",
+    "failure_stage": "battle",
+    "http_status": 400,
+    "provider_error_code": null
+  },
+  "kimi/moonshot-v1-8k-vision-preview": {
+    "provider": "kimi",
+    "model": "moonshot-v1-8k-vision-preview",
+    "tier": "paid",
+    "protocol": "chat_completions",
+    "status": "aborted",
+    "smoke_ok": true,
+    "battles_requested": 2,
+    "battles_completed": 0,
+    "effective_provider": "kimi",
+    "effective_model": "moonshot-v1-8k-vision-preview",
+    "win_rate": null,
+    "completion_latency_ms": {
+      "count": 0,
+      "total": null,
+      "p50": null,
+      "p95": null,
+      "max": null
+    },
+    "decision_latency_ms": {
+      "count": 0,
+      "total": null,
+      "p50": null,
+      "p95": null,
+      "max": null
+    },
+    "tokens": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cached_input_tokens": 0,
+      "reasoning_tokens": 0
+    },
+    "retries": 1,
+    "rotations": 1,
+    "quarantined": 0,
+    "failure_type": "FatalProviderError",
+    "failure_cause_type": "BadRequestError",
+    "battles_wins": 0,
+    "battles_losses": 0,
+    "battles_ties": 0,
+    "note": "batallas parciales o abortadas: sin winrate comparable",
+    "failure_stage": "battle",
+    "http_status": 400,
+    "provider_error_code": null
+  }
+}
