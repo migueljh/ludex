@@ -3577,3 +3577,75 @@ imports M1, rutas M2. Suite hermética completa (todo fuera de tests/db y
 tests/integration, `--noconftest`, env sanitizado): 626 passed, 37 skipped
 (module de integración con DB), exit 0. Sin red, sin providers, sin .env,
 sin DB, sin Docker.
+
+## D56 — MON-20 R3: cierre de los findings de la revisión independiente de Tasos (T-01..T-07) (2026-08-15)
+
+**Contexto.** La revisión independiente (Tasos, Opus) sobre el R2 confirmó
+los nueve requisitos (C1/C2/I1..I5/M1/M2) y emitió CHANGES_REQUESTED por un
+único ítem bloqueante (T-01) más seis menores (T-02..T-07). El veredicto de
+Latwan adjudicó los siete como correcciones de esta ronda, todo offline y
+hermético (sin providers, sin red, sin .env, sin DB, sin Docker).
+
+**Decisiones.**
+
+1. **T-01 — el artefacto de stop conserva su marca en la cobertura
+   (IMPORTANT).** `_atomic_row` ahora propaga `compatibility_result`,
+   `sample_size`, `round`, `manifest`, `manifest_sha256`, `generated_at` y
+   `battle_timeout_seconds` del artefacto, y cuando
+   `compatibility_result == "indeterminate-current-run"` publica la fila
+   como `evidence_kind: sanitized-diagnostic-stop` — NUNCA como un
+   `internal-defect` medido cualquiera — conservando la indeterminación que
+   I2 existe para producir. Canario end-to-end: artefacto de stop sintético
+   en un `runs/` temporal pasa por `scan_executed_artifacts` +
+   `build_coverage` y la fila conserva la marca y el contexto. Las 22 filas
+   commiteadas no cambian de clasificación (los 18 artefactos atómicos
+   históricos no traen `compatibility_result`).
+
+2. **T-02 — `already-finalized` conserva la marca del stop (MINOR).** La
+   rama de resume copia `compatibility_result` y `note` de la fila previa:
+   un stop indeterminado no pierde su marca en el state file al reanudar.
+   El marcador "ya finalizado en una corrida anterior" queda como fallback
+   cuando no hay nota previa.
+
+3. **T-03 — `FatalProviderError` aborted: sólo HTTP 400 es
+   `unsupported-protocol` (MINOR).** La normalización del generador
+   restringe el rechazo de protocolo a `http_status == 400` estructurado;
+   401/403 siguen siendo `credential/model unavailable` y 404/500/None
+   caen a `internal-defect` (fail-closed: sin la señal exacta del contrato
+   no se afirma un rechazo de protocolo sobre el modelo). Se alinean
+   docstring y D54 R1 con la regla efectiva; las 22 filas medidas no
+   cambian (las únicas aborted FatalProviderError reales son HTTP 400).
+
+4. **T-04 — `comparable`/`win_rate`/`sample_size` salen del artefacto
+   (MINOR).** `_atomic_row` y `_stop_row` leen los tres campos de la fuente
+   (artefacto o ledger), no de literales: la invariante `comparable_rows ==
+   0` deja de ser tautológica y mide datos reales. `win_rate` sólo se
+   publica si la fuente declara `comparable=true` (la matriz nunca lo hace
+   por I5). El coverage commiteado se regeneró con los campos nuevos
+   (`sample_size`, contexto I4) en null para los artefactos históricos;
+   `generator --check` sigue byte a byte.
+
+5. **T-05 — variable muerta borrada (MINOR).** `win_rate = None` local en
+   `_run_one` no se usaba (el return pasa `None` literal); se eliminó para
+   no invitar a reintroducir el cálculo.
+
+6. **T-06 — aserción de Luna sobre el campo exacto (MINOR).** El canario
+   del ledger ahora fija `future_execution == "operator-prohibited-never-retry"`
+   en lugar de una disyunción de texto sobre toda la fila.
+
+7. **T-07 — artefacto reciente por `generated_at`, no por nombre (MINOR).**
+   `scan_executed_artifacts` ordena por el `generated_at` que I4 persiste
+   dentro del artefacto (ISO, orden lexicográfico válido), con el nombre
+   como desempate; los históricos sin fecha caen al fallback lexicográfico
+   documentado (prefijos de ronda cronológicos de este repo). Ronda `r9`
+   ya no puede ganarle a `r10` por el nombre.
+
+**Verificación.** 4 tests nuevos y 1 reforzado (132 focales totales) con 6
+mutaciones deliberadas RED verificadas una por una (T-01 propagación+stop,
+T-02 resume, T-03 404/500/None, T-04 lectura desde artefacto, T-06 campo
+exacto del ledger, T-07 orden por generated_at) y restauradas. Suite
+hermética completa (todo fuera de tests/db y tests/integration,
+`--noconftest`, env sanitizado): 630 passed, 37 skipped (module de
+integración con DB), exit 0. `generator --check` byte a byte, JSONs parsean,
+secret scan 0 infractores, `typing.get_type_hints(run_matrix_round)` OK.
+Sin red, sin providers, sin .env, sin DB, sin Docker.
