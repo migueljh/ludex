@@ -658,12 +658,19 @@ async def run_matrix_round(
                 rotations=prior.rotations, quarantined=prior.quarantined,
                 failure_type=prior.failure_type,
                 failure_cause_type=prior.failure_cause_type,
-                note="ya finalizado en una corrida anterior: no se repite",
+                # T-02 (MON-20 R3): la rama already-finalized conserva la
+                # note del resultado previo (p.ej. la del stop por
+                # interrupcion); el marcador de no-repeticion solo aplica
+                # cuando no habia nota que preservar.
+                note=prior.note or "ya finalizado en una corrida anterior: no se repite",
                 failure_stage=prior.failure_stage,
                 http_status=prior.http_status,
                 provider_error_code=prior.provider_error_code,
                 comparable=prior.comparable,
                 sample_size=prior.sample_size,
+                # T-02 (MON-20 R3): la rama already-finalized conserva la
+                # marca de indeterminacion del stop al reanudar
+                compatibility_result=prior.compatibility_result,
             ))
             continue
         if refresh_catalog is not None and (
@@ -912,7 +919,6 @@ async def _run_one(
         status = "compatible"
     else:
         status = "externally-limited"
-    win_rate = None
     wins = getattr(result, "wins", 0)
     losses = getattr(result, "losses", 0)
     ties = getattr(result, "ties", 0)

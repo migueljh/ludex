@@ -677,6 +677,53 @@ def test_resume_no_repite_modelo_finalizado_ni_salta_sin_clasificar():
     assert built == ["deepseek-v4-flash-free"]
 
 
+def test_resume_conserva_marca_de_stop_y_note_en_ya_finalizado():
+    """T-02 (MON-20 R3): la rama `already-finalized` del resume conserva
+    `compatibility_result` y `note` de la fila previa: un stop
+    indeterminado no pierde su marca al reanudar."""
+    import asyncio
+    from ludex_agent.matrix import MatrixModelResult, run_matrix_round
+
+    rows = [_ready_row("open_code_zen", "mimo-v2.5-free", "free")]
+    prior_stop = MatrixModelResult(
+        provider="open_code_zen", model="mimo-v2.5-free", tier="free",
+        protocol="chat_completions", status="internal-defect", smoke_ok=True,
+        battles_requested=2, battles_completed=0,
+        effective_provider=None, effective_model=None,
+        win_rate=None, completion_latency_ms=None,
+        decision_latency_ms=None, tokens=None, retries=0, rotations=0,
+        quarantined=0, failure_type="CancelledError",
+        failure_cause_type=None, failure_stage="battle",
+        comparable=False, sample_size=None,
+        compatibility_result="indeterminate-current-run",
+        note="fila interrumpida por CancelledError durante battle: "
+             "artefacto de stop sanitizado",
+    )
+    built: list[str] = []
+
+    def build_provider(provider, model):
+        built.append(model)
+        return _FakeSmokeProvider()
+
+    async def run_battles(provider, model, **kwargs):
+        raise AssertionError("el stop ya finalizado no se reejecuta")
+
+    results = asyncio.run(run_matrix_round(
+        rows=rows, tier="free", battle_timeout_seconds=1800,
+        fmt="gen6randombattle", opponent="simple_heuristics",
+        smoke_deadline_seconds=120,
+        build_provider=build_provider, run_battles=run_battles,
+        refresh_catalog=None,
+        previous={"open_code_zen/mimo-v2.5-free": prior_stop},
+    ))
+    assert built == []
+    final = results[0]
+    assert final.status == "already-finalized"
+    assert final.compatibility_result == "indeterminate-current-run"
+    assert final.note == prior_stop.note
+    assert final.failure_type == "CancelledError"
+
+
 def test_modelo_fuera_del_catalogo_fresco_se_clasifica_no_se_ejecuta():
     import asyncio
 
