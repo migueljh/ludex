@@ -3679,7 +3679,11 @@ sostiene y que contradice el principio de D56 §3.
    unsupported-protocol 4, internal-defect 5 (4 stops + la 404 histórica),
    total medido 22; el resto de invariantes idéntico (externally-limited 10,
    compatible 1, credential/model unavailable 1, invalid-semantic-response 1,
-   comparable 0, persist 0, fatal_400_aborted 2).
+   comparable 0, persist 0, fatal_400_aborted 2). **T-12 (MON-20 R5):** la
+   composición exacta de los 4 `unsupported-protocol` es DOS smoke HTTP 400
+   (`gpt-5-nano`, `gpt-5.1-codex-mini`, runtime unsupported-protocol) + DOS
+   aborted HTTP 400 (`moonshot-v1-8k`, `moonshot-v1-8k-vision-preview`,
+   runtime aborted), todos con `http_status: 400`.
 
 3. **Canario cruzado runner+coverage.** `test_taxonomia_runner_y_coverage_son_la_misma_tabla`
    verifica para 400/401/403/404/500/None que el smoke del runner y la
@@ -3701,8 +3705,60 @@ esperable.
 deliberadas RED verificadas y restauradas: runner que vuelve a mapear
 cualquier FatalProviderError no-401/403 a unsupported-protocol (3 canarios
 rojos), y cobertura que vuelve a tratar unsupported-protocol como clase fiel
-(2 canarios rojos). Suite hermética completa (fuera de tests/db e
-integration, `--noconftest`, env sanitizado): 634 passed, 37 skipped, exit 0.
-`generator --check` byte a byte, JSONs parsean, secret scan 0 infractores,
-sin rutas absolutas, `typing.get_type_hints(run_matrix_round)` OK. Sin red,
-sin providers, sin .env, sin DB, sin Docker.
+(3 canarios rojos: normalización, fila histórica 404 y conteos; la tabla de
+R4 decía 2, corregido en T-12 de R5). Suite hermética completa (fuera de
+tests/db e integration, `--noconftest`, env sanitizado): 634 passed, 37
+skipped, exit 0. `generator --check` byte a byte, JSONs parsean, secret scan
+0 infractores, sin rutas absolutas, `typing.get_type_hints(run_matrix_round)`
+OK. Sin red, sin providers, sin .env, sin DB, sin Docker.
+
+## D58 — MON-20 R5: cierre de la taxonomía estructurada única (T-11, T-12) (2026-08-15)
+
+**Contexto.** La revisión formal del R4 dejó abierto T-11 (IMPORTANT): la
+ruta de excepción DIRECTA durante batalla en `run_matrix_round` seguía
+mapeando todo `ProviderError` salvo `ProviderMixError` a
+`externally-limited`, con la taxonomía del smoke aplicada sólo por nombre de
+clase. El mismo fallo del proveedor recibía veredictos distintos según la
+etapa, y la tabla quedaba duplicada en el generador de cobertura.
+
+**Decisión.**
+
+1. **T-11 — una única fuente de taxonomía en las tres rutas.**
+   `provider_failure_class(failure_type, http_status)` en `matrix.py` es la
+   tabla única structured-only (FatalProviderError 400 →
+   unsupported-protocol; 401/403 → credential/model unavailable; 404/500/None
+   u otro status → internal-defect; ProviderMixError/InternalCleanupError →
+   internal-defect; transitorio/deadline/pool → externally-limited; sin
+   clase → internal-defect fail-closed). La usan: el smoke
+   (`_fatal_status`), la excepción directa de batalla (antes el colapso
+   `ProviderMixError else externally-limited`), las clases terminales del
+   resultado parcial tipado (`_TERMINAL_BATTLE_CLASSES` → la misma función,
+   con `aborted` preservado para el resto) y la normalización histórica de
+   la cobertura (`build_matrix_coverage.normalize_final_classification`
+   importa `provider_failure_class` y eliminó sus `_TRANSIENT`/
+   `_INTERNAL_DEFECT` locales). Nunca se infiere de texto libre: sólo clase
+   y cadena de status.
+
+2. **T-12 — composición de counts y sub-conteo de mutaciones.** La
+   composición de los 4 `unsupported-protocol` queda declarada en D57 §2
+   (dos smoke HTTP 400 + dos aborted HTTP 400) y fijada por
+   `test_counts_t08_unsupported_4_internal_defect_5` (smoke_400 = {gpt-5-nano,
+   gpt-5.1-codex-mini}, aborted_400 = {moonshot-v1-8k,
+   moonshot-v1-8k-vision-preview}, todos http 400). El sub-conteo de
+   mutaciones de D57 se corrige a 3 canarios rojos por la re-verificación
+   de R4.
+
+**Verificación.** Canario absoluto de tres rutas ampliado:
+`test_taxonomia_runner_y_coverage_son_la_misma_tabla` (smoke + excepción
+directa de batalla + normalización aborted/unsupported-protocol para
+400/401/403/404/500/None) y `test_excepcion_directa_de_batalla_usa_la_misma_taxonomia`
+(tabla completa con ProviderMixError y transitorio). Mutaciones deliberadas
+RED y restauradas: colapso del camino de batalla a `ProviderMixError else
+externally-limited` (2 canarios rojos) y colapso de la normalización de
+cobertura a `externally-limited` (4 canarios rojos, incluido el byte a byte).
+Focales 137 passed; suite hermética completa (fuera de tests/db e
+integration, `--noconftest`, env sanitizado): 637 passed, 37 skipped, exit 0.
+`generator --check` byte a byte (sin cambios en el coverage commiteado),
+JSONs parsean, secret scan 0 infractores, sin rutas absolutas,
+`typing.get_type_hints(run_matrix_round)` OK. Sin red, sin providers, sin
+.env, sin DB, sin Docker.
