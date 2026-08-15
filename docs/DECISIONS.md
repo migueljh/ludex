@@ -3705,9 +3705,12 @@ esperable.
 deliberadas RED verificadas y restauradas: runner que vuelve a mapear
 cualquier FatalProviderError no-401/403 a unsupported-protocol (3 canarios
 rojos), y cobertura que vuelve a tratar unsupported-protocol como clase fiel
-(4 canarios rojos: normalización, fila histórica 404, conteos y el canario
-byte a byte; la tabla de R4 decía 2, corregido en T-12 de R5 y el conteo
-exacto en T-16 de R6). Suite hermética completa (fuera de tests/db e
+(5 canarios rojos: normalización, fila histórica 404, conteos, el canario
+byte a byte y test_taxonomia_runner_y_coverage_son_la_misma_tabla; la tabla
+de R4 decía 2, corregido en T-12 de R5; el conteo exacto se midió en el
+árbol de R4 — git archive 2f8d075, baseline 136 passed, mutación
+`_FAITHFUL += "unsupported-protocol"` → 5 failed — y se inscribió en F4 de
+R7). Suite hermética completa (fuera de tests/db e
 integration, `--noconftest`, env sanitizado): 635 passed, 37 skipped, exit 0.
 `generator --check` byte a byte, JSONs parsean, secret scan 0 infractores,
 sin rutas absolutas, `typing.get_type_hints(run_matrix_round)` OK. Sin red,
@@ -3837,3 +3840,111 @@ interpretes, JSONs parsean, secret scan 0 infractores, sin rutas absolutas,
 `typing.get_type_hints(run_matrix_round)` OK, invariantes recomputadas (112
 únicos, 22 ready con 18+4, comparable 0, persist 0, 0 no intentadas en
 bucket medido). Sin red, sin providers, sin .env, sin DB, sin Docker.
+
+## D60 — MON-20 R7: cierre de la clase por INVARIANTE EJECUTABLE (F1..F8) (2026-08-15)
+
+**Contexto.** Quinta aparición de la misma familia (T-03 → T-08 → T-11 →
+T-13 → F1). R6 resolvió "la tabla está en varios lugares" pero no cerró la
+clase: F1, introducida por el propio arreglo de R6, demostró que la causa
+raíz de fondo es que NO existía ningún invariante enforced que ligara lo que
+el runner decide con lo que el artefacto persiste. R7 ataca eso.
+
+**Los tres invariantes (nuevos, enforced).**
+
+1. **Round-trip runner → serialización → normalize.**
+   `test_round_trip_runner_serializacion_normalize`: para cada clase de la
+   tabla, clasifica la excepción con el runner REAL, serializa el
+   `MatrixModelResult` tal como se persiste y re-deriva desde ese JSON con
+   `normalize_final_classification`, exigiendo igualdad en las rutas
+   alcanzables (smoke y batalla directa; QuotaExceeded por la tabla). Con
+   el código pre-R7 este test estaba ROJO: demostraba F1.
+2. **Introspección de subclases.**
+   `test_introspeccion_subclases_provider_error_entran_en_tabla`: enumera
+   por introspección las 9 clases de la jerarquía de `ProviderError` y
+   exige que TODAS estén en `EXPLICIT_CLASSES` (fuente única). El
+   fail-closed queda como red de seguridad, no como absorbedor silencioso
+   de clases olvidadas.
+3. **Literales vivos.**
+   `test_literales_taxonomia_solo_en_sitios_allowlist`: enumera los
+   literales de la taxonomía que aparecen en `matrix.py` FUERA de la
+   fuente única y falla si aparece uno nuevo fuera de la allowlist
+   justificada (sitios: `except Exception` del runner, `_terminal_stop_result`,
+   conteo parcial sin failure y `_battle_infrastructure_status`).
+
+**Decisiones.**
+
+1. **F1 — la decisión se limita a la causa DIRECTA.** El tech lead decidió:
+   alinear el runner con lo que se persiste, no agrandar el artefacto.
+   `_structured_cause_type` mira únicamente `exc.__cause__`; el principio
+   inscripto: *la evidencia persistida debe alcanzar para reproducir su
+   propia decisión*. Agrandar lo persistido para justificar una decisión
+   más profunda invierte esa relación y agranda la superficie del artefacto
+   sin necesidad. (Se implementó sin encontrar razón técnica que
+   contradijera la decisión.)
+2. **F3 — canario de RUTEO del sitio 1.** `test_ruteo_sitio1_build_provider_por_la_fuente_unica`
+   usa `TransientProviderError` (veredicto `externally-limited`, distinto
+   del literal viejo `credential/model unavailable`): un bypass del sitio 1
+   al literal fijo lo pone ROJO (verificado).
+3. **F5 — `QuotaExceeded` entra a la tabla como `externally-limited`.** Es
+   el caso arquetípico de límite externo y el fail-closed lo estaba
+   absorbiendo como internal-defect. Hoy es inalcanzable como excepción en
+   la matriz (`KeyRotatingProvider` la captura), pero D60 no quiere otra
+   ronda por omisión: entrada explícita en la tabla y en `EXPLICIT_CLASSES`.
+4. **F6 — la fila publicada SÍ se corrige; el coverage commiteado CAMBIA.**
+   `credential/model unavailable` sale de `_FAITHFUL` y se re-deriva
+   exactamente como T-08 hizo con `unsupported-protocol`. La fila
+   `open_code_zen/mimo-v2.5-free` afirmaba credential con `quarantined=0`,
+   `failure_cause_type=null`, 2 rotaciones y 1 reintento: su propia
+   evidencia dice cooldown/cuota → `externally-limited` bajo D54 R1.
+   Counts nuevos: credential/model unavailable **0**, externally-limited
+   **11**, total medido **22**; ninguna otra fila, count o invariante
+   cambió (verificado sobre el diff exacto del JSON regenerado con el
+   generador versionado).
+5. **F2 — residuo completo, enumerado y justificado POR SITIO.**
+   Los literales de la taxonomía que quedan fuera de la fuente única:
+   (a) `matrix.py` `except Exception` del runner → `internal-defect`
+   (defecto del runner, no fallo de provider); (b) `_terminal_stop_result`
+   → `internal-defect` (I2, stop por interrupción, compatibilidad
+   indeterminada); (c) conteo parcial sin `failure` y
+   `completed != requested` → `externally-limited` (conteo de benchmark,
+   no veredicto de provider: se conserva con razón explícita, la
+   alternativa fail-closed acusaría a la casa un parcial reportado sin
+   error de proveedor); (d) `_battle_infrastructure_status` (L-03) →
+   `externally-limited`/`internal-defect`, **declarado deliberadamente
+   FUERA de la fuente única**: clasifica infraestructura LOCAL de Showdown
+   (`ConnectionClosedError`/`ShowdownUnavailableError`), no fallos del
+   proveedor — comentario inscripto en el propio sitio; (e) `_stop_row`
+   del generador → passthrough de la fuente versionada (ledger de stops),
+   nunca una derivación paralela.
+6. **F4 — el número de D57 es 5.** Medido en el árbol de R4
+   (`git archive 2f8d075`, baseline 136 passed, mutación
+   `_FAITHFUL += "unsupported-protocol"` → `5 failed, 131 passed`): los
+   cuatro nombrados más `test_taxonomia_runner_y_coverage_son_la_misma_tabla`.
+   D57 corregido con el valor que imprimió el comando.
+7. **F7 — sin cambio de código, declarado.** El passthrough de `_stop_row`
+   copia `final_classification` del ledger versionado (no es una
+   derivación paralela); queda enumerado en el residuo.
+8. **F8 — follow-up explícito, preexistente, FUERA de R7.** La
+   sanitización del `note` no tiene canario propio (el código es correcto
+   y el control de fuga pasa, pero nada protege la propiedad). Queda como
+   issue de seguimiento.
+
+**Cierre de la quinta recurrencia.** El invariante 1a es el que cierra la
+familia: cualquier divergencia futura entre decisión y evidencia persistida
+es falsada por el round-trip sin importar la forma nueva que tome.
+
+**Verificación.** 146 tests focales (142 + 4 nuevos), suite hermética
+completa (fuera de tests/db e integration, `--noconftest`, env sanitizado):
+644 passed, 37 skipped, exit 0. `generator --check` byte a byte con .venv y
+con `/usr/bin/python3` bajo env mínimo. Mutaciones deliberadas POR SITIO,
+todas ROJAS en el canario correcto y restauradas: reintroducir el chain-walk
+(F1) → round-trip rojo; bypass del sitio 1 al literal (F3) → ruteo rojo;
+sacar QuotaExceeded (F5) → introspección + round-trip rojos; volver a
+tratar credential como fiel (F6) → conteos + byte a byte rojos; literal
+nuevo fuera de la allowlist (1c) → guard rojo. `git diff --check` limpio;
+JSONs parsean; secret scan 0 infractores; sin rutas absolutas;
+`typing.get_type_hints(run_matrix_round)` OK. Invariantes: 112 únicos,
+cobertura == manifiesto, 22 medidas con 18+4, 0 comparables, 0 persistidas,
+90 no intentadas, 0 no intentadas en bucket medido, counts nuevos F6
+(credential 0, externally-limited 11). Sin red, sin providers, sin .env,
+sin DB, sin Docker.
