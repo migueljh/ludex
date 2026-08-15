@@ -3705,12 +3705,13 @@ esperable.
 deliberadas RED verificadas y restauradas: runner que vuelve a mapear
 cualquier FatalProviderError no-401/403 a unsupported-protocol (3 canarios
 rojos), y cobertura que vuelve a tratar unsupported-protocol como clase fiel
-(3 canarios rojos: normalización, fila histórica 404 y conteos; la tabla de
-R4 decía 2, corregido en T-12 de R5). Suite hermética completa (fuera de
-tests/db e integration, `--noconftest`, env sanitizado): 634 passed, 37
-skipped, exit 0. `generator --check` byte a byte, JSONs parsean, secret scan
-0 infractores, sin rutas absolutas, `typing.get_type_hints(run_matrix_round)`
-OK. Sin red, sin providers, sin .env, sin DB, sin Docker.
+(4 canarios rojos: normalización, fila histórica 404, conteos y el canario
+byte a byte; la tabla de R4 decía 2, corregido en T-12 de R5 y el conteo
+exacto en T-16 de R6). Suite hermética completa (fuera de tests/db e
+integration, `--noconftest`, env sanitizado): 635 passed, 37 skipped, exit 0.
+`generator --check` byte a byte, JSONs parsean, secret scan 0 infractores,
+sin rutas absolutas, `typing.get_type_hints(run_matrix_round)` OK. Sin red,
+sin providers, sin .env, sin DB, sin Docker.
 
 ## D58 — MON-20 R5: cierre de la taxonomía estructurada única (T-11, T-12) (2026-08-15)
 
@@ -3757,8 +3758,82 @@ RED y restauradas: colapso del camino de batalla a `ProviderMixError else
 externally-limited` (2 canarios rojos) y colapso de la normalización de
 cobertura a `externally-limited` (4 canarios rojos, incluido el byte a byte).
 Focales 137 passed; suite hermética completa (fuera de tests/db e
-integration, `--noconftest`, env sanitizado): 637 passed, 37 skipped, exit 0.
+integration, `--noconftest`, env sanitizado): 635 passed, 37 skipped, exit 0.
 `generator --check` byte a byte (sin cambios en el coverage commiteado),
 JSONs parsean, secret scan 0 infractores, sin rutas absolutas,
 `typing.get_type_hints(run_matrix_round)` OK. Sin red, sin providers, sin
 .env, sin DB, sin Docker.
+
+## D59 — MON-20 R6: cierre de diseño de la taxonomía completa (T-13..T-16) (2026-08-15)
+
+**Contexto.** Cuarta recurrencia consecutiva sobre la misma causa raíz (la
+taxonomía de fallos aplicada en sitios separados): T-03 (R2→R3), T-08
+(R3→R4), T-11 (R4→R5) y T-13 (R5→R6). `code_review_best_practices.md` §7
+exige volver a diseño cuando tres rondas revelan la misma causa bajo formas
+nuevas. Latwan adjudicó este cierre de diseño en R6 con reconciliación
+explícita de D43.2 ↔ D54 R1.
+
+**Decisión.**
+
+1. **T-13 — reconciliación estructurada D43.2 ↔ D54 R1.** La tabla única
+   queda definida por señales estructuradas, nunca por texto libre:
+   - `FatalProviderError` + 400 → `unsupported-protocol`; 401/403 →
+     `credential/model unavailable`; 404/500/None u otro status →
+     `internal-defect`;
+   - `CredentialRejected` → `credential/model unavailable` (D43.2);
+   - `ProviderPoolExhausted` CON `failure_cause_type == "CredentialRejected"`
+     (pool totalmente en cuarentena por 401/403 credential-specific) →
+     `credential/model unavailable` (D43.2); SIN esa causa (cooldown/cuota/
+     pool transitorio) → `externally-limited` (D54 R1);
+   - `ProviderMixError`/`InternalCleanupError` → `internal-defect`;
+   - `TransientProviderError`, `BenchmarkDeadlineExceeded`,
+     `DecisionDeadlineExceeded` y `ProviderError` genérico →
+     `externally-limited`;
+   - `ProviderSelectionError` en construcción → `credential/model unavailable`;
+   - clase desconocida o `None` → `internal-defect` fail-closed.
+2. **Fuente única stdlib-only.** La tabla vive en
+   `apps/agent/src/ludex_agent/provider_taxonomy.py` (sin imports de
+   SDK/DB/httpx) con firma `provider_failure_class(failure_type,
+   http_status, failure_cause_type=None)`. Runner y generador la importan.
+3. **Los SIETE sitios del inventario pasan por la fuente única.**
+   `matrix.py` rutea `build_provider` (sitio 1), smoke (sitios 2-4 con un
+   solo `except ProviderError`), excepción directa de batalla (sitio 5) y
+   clases terminales del resultado parcial (sitio 6) por
+   `_fatal_status`/`provider_failure_class`; la cobertura (sitio 7) la
+   importa y pasa `failure_cause_type`. Los únicos literales que quedan son
+   `aborted` (preservación para re-derivación por la misma fuente) y
+   `compatible`/`invalid-semantic-response`/`missing-route` (clases no
+   provider). `runtime_status`, `failure_type`, `failure_cause_type`,
+   `failure_stage` y `http_status` se preservan verbatim.
+4. **Canario clase × status × ruta no vacuo.** `test_canario_clase_x_status_x_ruta_no_vacuo`
+   cruza 13 clases (Fatal 400/401/403/404/500/None, ProviderMixError,
+   CredentialRejected, ProviderPoolExhausted con/sin causa, Transient,
+   DecisionDeadlineExceeded, ProviderError genérico) × 4 rutas (smoke,
+   batalla directa, coverage aborted y unsupported-protocol);
+   `test_pool_agotado_por_credencial_no_es_limite_externo` y
+   `test_pool_transitorio_sin_causa_credencial_es_limite_externo` fijan los
+   dos lados de la reconciliación; `test_build_provider_provider_selection_error_es_credential`
+   fija el sitio 1. Mutaciones por bypass de los 7 sitios: todas RED y
+   restauradas.
+5. **T-14 — generador standalone.** `build_matrix_coverage.py` bootstrapa
+   `sys.path` con `apps/agent/src` y importa la taxonomía desde
+   `ludex_agent.provider_taxonomy` (stdlib-only): su comando documentado
+   corre con `/usr/bin/python3` bajo env mínimo, sin instalar `ludex_agent`
+   ni SDKs y sin DB/red/.env. Canario subprocess
+   (`test_generador_corre_con_python3_del_sistema_env_minimo`). R5 lo había
+   roto al importar transitivamente `ludex_agent.matrix`.
+6. **T-15/T-16 — correcciones documentales.** D58: 637 → 635 (el valor real
+   de la suite hermética R5). D57: sub-conteo de mutaciones de la cobertura
+   3 → 4, incluyendo el canario byte a byte.
+
+**Impacto sobre evidencia.** Cero: la reconciliación sólo afecta rutas
+futuras; el coverage commiteado y sus counts permanecen byte a byte
+(verificado con `--check` bajo el venv y bajo `/usr/bin/python3`).
+
+**Verificación.** 142 tests focales (137 + 5 nuevos), suite hermética
+completa (fuera de tests/db e integration, `--noconftest`, env sanitizado):
+640 passed, 37 skipped, exit 0. `generator --check` byte a byte con ambas
+interpretes, JSONs parsean, secret scan 0 infractores, sin rutas absolutas,
+`typing.get_type_hints(run_matrix_round)` OK, invariantes recomputadas (112
+únicos, 22 ready con 18+4, comparable 0, persist 0, 0 no intentadas en
+bucket medido). Sin red, sin providers, sin .env, sin DB, sin Docker.
