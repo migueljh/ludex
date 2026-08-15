@@ -136,11 +136,15 @@ def test_aborted_con_400_fatal_no_es_limite_externo():
 
 
 def test_normalizacion_aborted_usa_la_tabla_del_runner():
-    """C2/T-08: la tabla de normalizacion es la del runner y aplica a
+    """C2/T-08/T-13: la tabla de normalizacion es la del runner y aplica a
     AMBOS runtime_status historicos que afirman una clase que hay que
     re-derivar: `aborted` y `unsupported-protocol`. FatalProviderError 400
     -> unsupported-protocol; 401/403 -> credential/model unavailable;
-    404/500/None -> internal-defect (fail-closed, nunca texto libre)."""
+    404/500/None -> internal-defect (fail-closed, nunca texto libre).
+    T-13 (MON-20 R6): CredentialRejected y ProviderPoolExhausted con causa
+    CredentialRejected -> credential; pool transitorio -> externally-limited;
+    ProviderSelectionError -> credential; ProviderMixError/InternalCleanupError
+    -> internal-defect."""
     n = bmc.normalize_final_classification
     # passthrough de clases ya fieles
     assert n("compatible", None, None) == "compatible"
@@ -156,16 +160,60 @@ def test_normalizacion_aborted_usa_la_tabla_del_runner():
         assert n(runtime, "FatalProviderError", 404) == "internal-defect"
         assert n(runtime, "FatalProviderError", 500) == "internal-defect"
         assert n(runtime, "FatalProviderError", None) == "internal-defect"
-    # transitorio / deadline / pool -> limite externo
-    assert n("aborted", "TransientProviderError", None) == "externally-limited"
-    assert n("aborted", "ProviderPoolExhausted", None) == "externally-limited"
-    assert n("aborted", "BenchmarkDeadlineExceeded", None) == "externally-limited"
-    # defecto interno -> internal-defect
-    assert n("aborted", "ProviderMixError", None) == "internal-defect"
-    assert n("aborted", "InternalCleanupError", None) == "internal-defect"
+        # T-13: CredentialRejected y pool-por-credencial -> credential
+        assert n(runtime, "CredentialRejected", None) == \
+            "credential/model unavailable"
+        assert n(runtime, "ProviderPoolExhausted", None,
+                  "CredentialRejected") == "credential/model unavailable"
+        # pool transitorio / transitorio / deadline -> limite externo
+        assert n(runtime, "ProviderPoolExhausted", None, None) == \
+            "externally-limited"
+        assert n(runtime, "TransientProviderError", None) == "externally-limited"
+        assert n(runtime, "BenchmarkDeadlineExceeded", None) == "externally-limited"
+        # defecto interno -> internal-defect
+        assert n(runtime, "ProviderMixError", None) == "internal-defect"
+        assert n(runtime, "InternalCleanupError", None) == "internal-defect"
+        # ProviderSelectionError en construccion -> credential
+        assert n(runtime, "ProviderSelectionError", None) == \
+            "credential/model unavailable"
     # sin evidencia estructurada atribuible al proveedor: nunca limite externo
     assert n("aborted", None, None) == "internal-defect"
     assert n("unsupported-protocol", None, None) == "internal-defect"
+
+
+def test_generador_corre_con_python3_del_sistema_env_minimo():
+    """T-14 (MON-20 R6): el generador es standalone: su comando documentado
+    corre con el python3 del SISTEMA bajo env minimo (sin instalar
+    ludex_agent, sin SDKs, sin DB/red/.env) y reproduce el coverage
+    commiteado byte a byte. R5 lo habia roto (import transitivo de SDKs via
+    ludex_agent.matrix)."""
+    import subprocess
+    import sys as _sys
+
+    python3_sistema = "/usr/bin/python3"
+    if not Path(python3_sistema).exists():
+        _sys.exit("no hay /usr/bin/python3 en esta maquina")
+
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    proc = subprocess.run(
+        [
+            python3_sistema,
+            str(EVALS_DIR / "build_matrix_coverage.py"),
+            "--manifest", str(MANIFEST_PATH),
+            "--runs-dir", str(RUNS),
+            "--ledger", str(LEDGER_PATH),
+            "--out", str(COVERAGE_PATH),
+            "--check",
+        ],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+    assert proc.returncode == 0, (
+        f"exit {proc.returncode}\nstdout: {proc.stdout}\nstderr: {proc.stderr}"
+    )
+    assert "es reproducible desde fuentes versionadas" in proc.stdout
 
 
 def test_fila_historica_404_deriva_internal_defect_preservando_runtime():

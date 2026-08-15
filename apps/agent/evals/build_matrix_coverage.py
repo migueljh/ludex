@@ -5,10 +5,15 @@ fuentes versionadas: el manifiesto de la ronda, los artefactos atomicos por
 modelo de `runs/` y el ledger de stops diagnosticos. Nada se inventa: una
 fila que nunca se contacto queda explicitamente `not-attempted` (C1) y una
 fila `aborted` se normaliza SOLO con evidencia estructurada y la taxonomia
-del runner (C2).
+del runner (C2/T-13).
+
+Standalone (T-14): corre con el python3 del SISTEMA bajo env minimo, sin
+instalar `ludex_agent` ni SDKs. La taxonomia unica vive en
+`apps/agent/src/ludex_agent/provider_taxonomy.py` (stdlib-only) y se
+importa via bootstrap de `sys.path`; no arrastra SDK/DB/httpx.
 
 Uso:
-    python build_matrix_coverage.py \\
+    python3 build_matrix_coverage.py \\
         --manifest runs/20260814t183716z-matrix-manifest.json \\
         --runs-dir runs --ledger runs/20260814-paid-diagnostic-stops.json \\
         --out runs/20260814-provider-matrix-coverage.json [--check]
@@ -26,6 +31,15 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Mapping
+
+# T-14 (MON-20 R6): bootstrap standalone. El modulo de taxonomia es
+# stdlib-only; agregar `apps/agent/src` a sys.path permite importarlo con el
+# python3 del sistema sin instalar ludex_agent ni arrastrar SDKs.
+_SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from ludex_agent.provider_taxonomy import provider_failure_class  # noqa: E402
 
 RUNS_GLOB = "*-matrix.json"
 
@@ -63,24 +77,25 @@ def normalize_final_classification(
     runtime_status: str,
     failure_type: str | None,
     http_status: int | None,
+    failure_cause_type: str | None = None,
 ) -> str:
-    """C2/T-08/T-11: normaliza con evidencia ESTRUCTURADA y la MISMA
-    taxonomia unica del runner (`ludex_agent.matrix.provider_failure_class`),
+    """C2/T-08/T-13: normaliza con evidencia ESTRUCTURADA y la MISMA
+    taxonomia unica del runner (`ludex_agent.provider_taxonomy`),
     jamas desde texto libre. Aplica a los DOS runtime_status que afirman una
     clase re-derivable: `aborted` y `unsupported-protocol` (historico viejo
-    del runner pre-T-08).
+    del runner pre-T-08). `failure_cause_type` participa SOLO para
+    ProviderPoolExhausted (causa CredentialRejected -> credential, D43.2).
 
-    La tabla vive en UN solo lugar (matrix.py) y este modulo la importa:
-    smoke, excepcion directa de batalla y normalizacion historica no pueden
-    divergir (canarios cruzados en test_matrix.py).
+    La tabla vive en UN solo lugar (provider_taxonomy.py) y este modulo la
+    importa: smoke, excepcion directa de batalla y normalizacion historica
+    no pueden divergir (canarios cruzados en test_matrix.py).
 
     Las demas clases terminales se conservan verbatim."""
     if runtime_status in _FAITHFUL:
         return runtime_status
     if runtime_status not in {"aborted", "unsupported-protocol"}:
         return runtime_status
-    from ludex_agent.matrix import provider_failure_class
-    return provider_failure_class(failure_type, http_status)
+    return provider_failure_class(failure_type, http_status, failure_cause_type)
 
 
 def load_manifest(path: str | Path) -> dict:
@@ -253,6 +268,7 @@ def _atomic_row(
             artifact.get("status"),
             artifact.get("failure_type"),
             artifact.get("http_status"),
+            artifact.get("failure_cause_type"),
         ),
         "disposition": "measured",
         "not_attempted_reason": None,

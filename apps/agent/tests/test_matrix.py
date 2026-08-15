@@ -1669,6 +1669,163 @@ def test_taxonomia_runner_y_coverage_son_la_misma_tabla():
             ) == verdict, (runtime, status)
 
 
+def test_canario_clase_x_status_x_ruta_no_vacuo():
+    """T-13 (MON-20 R6): la taxonomia reconciliada (D43.2 ↔ D54 R1) es
+    una tabla UNICA clase × status × causa, y TODAS las rutas alcanzables
+    producen el mismo veredicto. Cubre clase (Fatal, ProviderMixError,
+    CredentialRejected, ProviderPoolExhausted con/sin causa CredentialRejected,
+    TransientProviderError, DecisionDeadlineExceeded, ProviderError generico)
+    × rutas (smoke, batalla directa, normalizacion aborted y
+    unsupported-protocol). Bypassear cualquiera de las rutas vuelve rojo."""
+    import asyncio
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    from ludex_agent.graph.provider import (
+        CredentialRejected,
+        DecisionDeadlineExceeded,
+        FatalProviderError,
+        ProviderError,
+        ProviderMixError,
+        ProviderPoolExhausted,
+        TransientProviderError,
+    )
+
+    evals_dir = _Path(__file__).resolve().parents[1] / "evals"
+    if str(evals_dir) not in _sys.path:
+        _sys.path.insert(0, str(evals_dir))
+    import build_matrix_coverage as bmc  # noqa: E402
+
+    def pool_from_credential_rejected() -> ProviderPoolExhausted:
+        cause = CredentialRejected("pool quarantined por credencial")
+        pool = ProviderPoolExhausted("pool exhausted por credencial")
+        pool.__cause__ = cause
+        return pool
+
+    # (clase, http_status, failure_cause_type, veredicto esperado)
+    cases = [
+        ("FatalProviderError", 400, None, "unsupported-protocol"),
+        ("FatalProviderError", 401, None, "credential/model unavailable"),
+        ("FatalProviderError", 403, None, "credential/model unavailable"),
+        ("FatalProviderError", 404, None, "internal-defect"),
+        ("FatalProviderError", 500, None, "internal-defect"),
+        ("FatalProviderError", None, None, "internal-defect"),
+        ("ProviderMixError", None, None, "internal-defect"),
+        ("CredentialRejected", None, None, "credential/model unavailable"),
+        # T-13: pool agotado POR credencial (D43.2) no es limite externo
+        ("ProviderPoolExhausted", None, "CredentialRejected",
+         "credential/model unavailable"),
+        # pool transitorio (cooldown/cuota) si es limite externo (D54 R1)
+        ("ProviderPoolExhausted", None, None, "externally-limited"),
+        ("TransientProviderError", None, None, "externally-limited"),
+        ("DecisionDeadlineExceeded", None, None, "externally-limited"),
+        ("ProviderError", None, None, "externally-limited"),
+    ]
+    rows = [_ready_row("open_code_zen", "big-pickle", "free")]
+
+    def build_error(failure_type, http_status, failure_cause_type):
+        if failure_type == "FatalProviderError":
+            return (
+                FatalProviderError("boom") if http_status is None
+                else _fatal_with_http(http_status)
+            )
+        if failure_type == "ProviderMixError":
+            return ProviderMixError("mezcla efectiva")
+        if failure_type == "CredentialRejected":
+            return CredentialRejected("credencial rechazada")
+        if failure_type == "ProviderPoolExhausted":
+            if failure_cause_type == "CredentialRejected":
+                return pool_from_credential_rejected()
+            return ProviderPoolExhausted("pool transitorio")
+        if failure_type == "TransientProviderError":
+            return TransientProviderError("transitorio")
+        if failure_type == "DecisionDeadlineExceeded":
+            return DecisionDeadlineExceeded("deadline")
+        return ProviderError("generico")
+
+    for failure_type, http_status, failure_cause_type, verdict in cases:
+        error = build_error(failure_type, http_status, failure_cause_type)
+        # ruta smoke
+        results, _, _ = asyncio.run(_run(rows, smoke_error=error))
+        assert results[0].status == verdict, (
+            "smoke", failure_type, http_status, results[0].status,
+        )
+        # ruta batalla directa
+        results, _, _ = asyncio.run(_run(rows, battle_raise=error))
+        assert results[0].status == verdict, (
+            "battle", failure_type, http_status, results[0].status,
+        )
+        # ruta normalizacion historica (aborted y unsupported-protocol)
+        for runtime in ("aborted", "unsupported-protocol"):
+            assert bmc.normalize_final_classification(
+                runtime, failure_type, http_status, failure_cause_type
+            ) == verdict, (
+                runtime, failure_type, http_status, failure_cause_type,
+            )
+
+
+def test_pool_agotado_por_credencial_no_es_limite_externo():
+    """T-13 (MON-20 R6): reconciliacion D43.2 ↔ D54 R1. Un
+    ProviderPoolExhausted encadenado desde CredentialRejected (pool
+    totalmente en cuarentena por 401/403 credential-specific) se clasifica
+    `credential/model unavailable`, NO `externally-limited`. La causa se
+    lee SOLO de la cadena estructurada (nunca del mensaje)."""
+    import asyncio
+
+    from ludex_agent.graph.provider import (
+        CredentialRejected, ProviderPoolExhausted,
+    )
+
+    try:
+        raise CredentialRejected("pool quarantined por credencial")
+    except CredentialRejected as cause:
+        pool = ProviderPoolExhausted("pool exhausted")
+        pool.__cause__ = cause
+
+    rows = [_ready_row("open_code_zen", "big-pickle", "free")]
+    results, _, _ = asyncio.run(_run(rows, smoke_error=pool))
+    assert results[0].status == "credential/model unavailable"
+    assert results[0].failure_type == "ProviderPoolExhausted"
+    assert results[0].failure_cause_type == "CredentialRejected"
+    results, _, _ = asyncio.run(_run(rows, battle_raise=pool))
+    assert results[0].status == "credential/model unavailable"
+
+
+def test_pool_transitorio_sin_causa_credencial_es_limite_externo():
+    """T-13 (MON-20 R6): un ProviderPoolExhausted SIN causa
+    CredentialRejected (cooldown/cuota/pool transitorio) se clasifica
+    `externally-limited` (D54 R1), incluso en el smoke que antes lo
+    mapeaba siempre a credential."""
+    import asyncio
+
+    from ludex_agent.graph.provider import ProviderPoolExhausted
+
+    rows = [_ready_row("open_code_zen", "big-pickle", "free")]
+    results, _, _ = asyncio.run(_run(
+        rows, smoke_error=ProviderPoolExhausted("pool transitorio"),
+    ))
+    assert results[0].status == "externally-limited"
+    assert results[0].failure_cause_type is None
+
+
+def test_build_provider_provider_selection_error_es_credential():
+    """T-13 (MON-20 R6): sitio 1 del inventario (build_provider falla). Un
+    ProviderSelectionError en la CONSTRUCCION del provider se clasifica
+    `credential/model unavailable` (nunca limite externo ni defecto)."""
+    import asyncio
+
+    from ludex_agent.graph.provider import ProviderSelectionError
+
+    def build_provider(provider_name, model_name):
+        raise ProviderSelectionError("sin seleccion activa")
+
+    rows = [_ready_row("open_code_zen", "big-pickle", "free")]
+    results, _, _ = asyncio.run(_run(rows, build_provider=build_provider))
+    assert results[0].status == "credential/model unavailable"
+    assert results[0].failure_type == "ProviderSelectionError"
+    assert results[0].failure_stage == "smoke"
+
+
 def test_excepcion_directa_de_batalla_usa_la_misma_taxonomia():
     """T-11 (MON-20 R5): la excepcion ProviderError que llega DIRECTA del
     run_battles (no via BenchmarkResult tipado) se clasifica con la misma

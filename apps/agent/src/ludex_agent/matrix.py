@@ -33,6 +33,7 @@ from .graph.provider import (
     _http_status_chain,
     _structured_provider_error_code,
 )
+from .provider_taxonomy import provider_failure_class
 
 logger = logging.getLogger(__name__)
 
@@ -742,56 +743,37 @@ class _RowProgress:
         self.stage = "smoke"
 
 
-def provider_failure_class(
-    failure_type: str | None,
-    http_status: int | None,
-) -> str:
-    """T-08/T-11 (MON-20 R4/R5): taxonomia estructurada UNICA de
-    ProviderError, aplicada por las TRES rutas de clasificacion — smoke,
-    excepcion directa durante batalla y normalizacion historica de la
-    cobertura (build_matrix_coverage.normalize_final_classification para
-    runtime_status aborted/unsupported-protocol). Evita una cuarta
-    divergencia: si una ruta colapsa o inventa su propia tabla, los canarios
-    cruzados se ponen rojos.
+def _structured_cause_type(exc: BaseException) -> str | None:
+    """T-13 (MON-20 R6): clase de la causa estructurada de la excepcion.
 
-    - `FatalProviderError` + HTTP 400 -> `unsupported-protocol` (rechazo de
-      protocolo/structured output, el unico caso que la categoria mide);
-    - `FatalProviderError` + 401/403 -> `credential/model unavailable`;
-    - `FatalProviderError` + 404/500/None u otro status -> `internal-defect`
-      (fail-closed: sin la senal exacta del contrato no se afirma un rechazo
-      de protocolo sobre el modelo);
-    - `ProviderMixError`/`InternalCleanupError` -> `internal-defect`;
-    - transitorio/deadline/pool (`TransientProviderError`,
-      `ProviderPoolExhausted`, `BenchmarkDeadlineExceeded`,
-      `DecisionDeadlineExceeded`, `CredentialRejected`, `ProviderError`) ->
-      `externally-limited`;
-    - cualquier otra clase o None -> `internal-defect` (fail-closed).
-
-    Nunca se infiere de texto libre: solo de la clase y la cadena de
-    status."""
-    if failure_type == "FatalProviderError":
-        if http_status in (401, 403):
-            return "credential/model unavailable"
-        if http_status == 400:
-            return "unsupported-protocol"
-        return "internal-defect"
-    if failure_type in {"ProviderMixError", "InternalCleanupError"}:
-        return "internal-defect"
-    if failure_type in {
-        "TransientProviderError", "ProviderPoolExhausted",
-        "BenchmarkDeadlineExceeded", "DecisionDeadlineExceeded",
-        "CredentialRejected", "ProviderError",
-    }:
-        return "externally-limited"
-    return "internal-defect"
+    Camina la cadena `__cause__` y devuelve "CredentialRejected" si alguna
+    causa es de esa clase (pool totalmente en cuarentena por 401/403
+    credential-specific, ver D43.2); si no, la clase de la causa directa;
+    si no hay causa, None. Solo nombres de clase, jamas texto libre."""
+    seen: set[int] = set()
+    cause = exc.__cause__
+    first_cause_name: str | None = None
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if first_cause_name is None:
+            first_cause_name = type(cause).__name__
+        if type(cause).__name__ == "CredentialRejected":
+            return "CredentialRejected"
+        cause = cause.__cause__
+    return first_cause_name
 
 
 def _fatal_status(exc: BaseException) -> str:
-    """T-08 (MON-20 R4): wraper de la taxonomia unica para una excepcion
-    real: la clase se extrae de `type(exc).__name__` y el status de la
-    cadena de causas. Un solo punto de entrada para las rutas con
-    excepciones (smoke y batalla directa)."""
-    return provider_failure_class(type(exc).__name__, _http_status_chain(exc))
+    """T-08 (MON-20 R4) + T-13 (MON-20 R6): wraper de la taxonomia unica
+    para una excepcion real: la clase se extrae de `type(exc).__name__`, el
+    status de la cadena de causas y la causa estructurada de `__cause__`
+    (para ProviderPoolExhausted -> CredentialRejected). Un solo punto de
+    entrada para las rutas con excepciones (smoke y batalla directa)."""
+    return provider_failure_class(
+        type(exc).__name__,
+        _http_status_chain(exc),
+        _structured_cause_type(exc),
+    )
 
 
 # T-11 (MON-20 R5): clases que el resultado parcial tipado (BenchmarkResult)
@@ -859,22 +841,17 @@ async def _run_one(
     progress: _RowProgress | None = None,
 ) -> MatrixModelResult:
     from .graph.decision import DecisionResponse
-    from .graph.provider import (
-        CredentialRejected,
-        DecisionDeadlineExceeded,
-        FatalProviderError,
-        ProviderError,
-        ProviderPoolExhausted,
-        TransientProviderError,
-    )
+    from .graph.provider import ProviderError
 
     # --- smoke: una completion estructurada, sin Showdown ---------------
     try:
         provider = build_provider(row.provider, row.model)
     except ProviderError as exc:
-        return _smoke_failed(
-            row, "credential/model unavailable", exc
-        )
+        # T-13 (MON-20 R6), sitio 1 del inventario: falla en la
+        # CONSTRUCCION del provider. ProviderSelectionError -> credential
+        # (la taxonomia unica lo mapea); ninguna otra clase de ProviderError
+        # recibe un veredicto fijo aca.
+        return _smoke_failed(row, _fatal_status(exc), exc)
     except ValueError as exc:
         return _smoke_failed(
             row, "missing-route", exc
@@ -897,27 +874,20 @@ async def _run_one(
             deadline=time.monotonic() + smoke_deadline_seconds,
             turn_id=f"matrix-smoke:{row.provider}:{row.model}",
         )
-    except ProviderPoolExhausted as exc:
-        return _fail("credential/model unavailable", exc)
-    except CredentialRejected as exc:
-        return _fail("credential/model unavailable", exc)
     except ProviderError as exc:
-        # L-04 (post-R1B) + T-08 (MON-20 R4): la taxonomia del smoke es
-        # structured-only y fail-closed. `unsupported-protocol` queda
-        # reservada EXCLUSIVAMENTE al rechazo de protocolo/structured
-        # output con HTTP 400 estructurado; 401/403 upstream/model-wide
-        # (sin senal key-specific; el provider ya no rota ni cuarentena) es
-        # `credential/model unavailable`; y un FatalProviderError con
-        # 404/500 o sin status NO autoriza a afirmar un rechazo de
-        # protocolo sobre el modelo -> `internal-defect`. Esta misma tabla
-        # es la que la cobertura aplica a los historicos
-        # (normalize_final_classification), asi runner y evidencia nunca
-        # divergen por etapa. Transitorio o deadline: limite externo.
-        if isinstance(exc, FatalProviderError):
-            status = _fatal_status(exc)
-        else:
-            status = "externally-limited"
-        return _fail(status, exc)
+        # L-04 (post-R1B) + T-08 (MON-20 R4) + T-13 (MON-20 R6): TODA la
+        # taxonomia del smoke sale de la fuente unica
+        # (`provider_failure_class` via `_fatal_status`, con la causa
+        # estructurada): FatalProviderError 400 -> unsupported-protocol;
+        # 401/403 -> credential/model unavailable; 404/500/None ->
+        # internal-defect; ProviderPoolExhausted con causa CredentialRejected
+        # -> credential/model unavailable (D43.2) y sin causa ->
+        # externally-limited (D54 R1); CredentialRejected ->
+        # credential/model unavailable; ProviderMixError -> internal-defect;
+        # transitorio/deadline/pool -> externally-limited. Sin
+        # condicionales por clase en este sitio: la tabla es una sola y la
+        # cobertura la importa igual.
+        return _fail(_fatal_status(exc), exc)
     try:
         DecisionResponse.model_validate(envelope.payload)
     except (ValueError, TypeError) as exc:
@@ -977,7 +947,8 @@ async def _run_one(
     # desde failure_type/http_status (nunca se colapsa a un veredicto).
     if failure_type in _TERMINAL_BATTLE_CLASSES:
         status = provider_failure_class(
-            failure_type, getattr(result, "http_status", None)
+            failure_type, getattr(result, "http_status", None),
+            getattr(result, "failure_cause_type", None),
         )
     elif failure is not None:
         status = "aborted"
