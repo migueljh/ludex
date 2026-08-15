@@ -3637,8 +3637,11 @@ hermético (sin providers, sin red, sin .env, sin DB, sin Docker).
    `scan_executed_artifacts` ordena por el `generated_at` que I4 persiste
    dentro del artefacto (ISO, orden lexicográfico válido), con el nombre
    como desempate; los históricos sin fecha caen al fallback lexicográfico
-   documentado (prefijos de ronda cronológicos de este repo). Ronda `r9`
-   ya no puede ganarle a `r10` por el nombre.
+   documentado (prefijos de ronda cronológicos de este repo). **T-10
+   (MON-20 R4):** la garantía "la ronda `r9` ya no puede ganarle a `r10`"
+   vale SOLO cuando los artefactos traen `generated_at` (I4); los históricos
+   sin fecha siguen resolviéndose por nombre, y hoy ninguno de los 36
+   artefactos versionados lo trae, así que el orden efectivo es el fallback.
 
 **Verificación.** 4 tests nuevos y 1 reforzado (132 focales totales) con 6
 mutaciones deliberadas RED verificadas una por una (T-01 propagación+stop,
@@ -3649,3 +3652,57 @@ hermética completa (todo fuera de tests/db y tests/integration,
 integración con DB), exit 0. `generator --check` byte a byte, JSONs parsean,
 secret scan 0 infractores, `typing.get_type_hints(run_matrix_round)` OK.
 Sin red, sin providers, sin .env, sin DB, sin Docker.
+
+## D57 — MON-20 R4: la taxonomía de FatalProviderError es una sola, en runner y cobertura (T-08, T-10) (2026-08-15)
+
+**Contexto.** La revisión independiente de Tasos sobre el R3 (T-08, IMPORTANT)
+encontró que T-03 se había corregido sólo en el generador: el runner de smoke
+seguía clasificando cualquier `FatalProviderError` no-401/403 como
+`unsupported-protocol`, y como esa clase pasaba verbatim por `_FAITHFUL`, la
+fila histórica `google/gemini-2.5-flash-lite` (HTTP 404) quedaba publicada
+como `unsupported-protocol` — una afirmación que su propia evidencia no
+sostiene y que contradice el principio de D56 §3.
+
+**Decisión.**
+
+1. **T-08 — el runner y la cobertura comparten UNA tabla structured-only.**
+   `matrix.py` introduce `_fatal_status(exc)` para el smoke:
+   `FatalProviderError` + HTTP 400 → `unsupported-protocol`; 401/403 →
+   `credential/model unavailable`; 404/500/None → `internal-defect`
+   (fail-closed). `normalize_final_classification` deja de tratar
+   `unsupported-protocol` como clase fiel: tanto `aborted` como
+   `unsupported-protocol` (histórico viejo del runner) se re-derivan con la
+   misma tabla. La cobertura conserva el `runtime_status` histórico verbatim
+   pero la `final_classification` sale de failure_type/http_status.
+
+2. **Conteos regenerados.** `by_final_classification` pasa a
+   unsupported-protocol 4, internal-defect 5 (4 stops + la 404 histórica),
+   total medido 22; el resto de invariantes idéntico (externally-limited 10,
+   compatible 1, credential/model unavailable 1, invalid-semantic-response 1,
+   comparable 0, persist 0, fatal_400_aborted 2).
+
+3. **Canario cruzado runner+coverage.** `test_taxonomia_runner_y_coverage_son_la_misma_tabla`
+   verifica para 400/401/403/404/500/None que el smoke del runner y la
+   normalización histórica (aborted y unsupported-protocol) producen el mismo
+   veredicto; `test_fila_historica_404_deriva_internal_defect_preservando_runtime`
+   fija la fila histórica 404 y sus pares 400.
+
+4. **T-10 — acotar la garantía de T-07 en D56 §7** (ver §7 de D56, corregido).
+
+**T-09 (MINOR, descubierto por Tasos, NO implementado).** Los artefactos
+ejecutados cuyo par (provider, model) no figura en el manifiesto final
+(`ling-3.0-tiny-free`, `longcat-2.0-free`, `north-mini-code-free`) se ignoran
+en silencio por `build_coverage` y ninguna invariante los registra. Queda
+como follow-up de MON-16 (contrato de consumo de la cobertura): agregar una
+invariante `execution_artifacts_without_manifest_row` con nota de por qué es
+esperable.
+
+**Verificación.** 5 tests nuevos/actualizados (132 → 136 focales), mutaciones
+deliberadas RED verificadas y restauradas: runner que vuelve a mapear
+cualquier FatalProviderError no-401/403 a unsupported-protocol (3 canarios
+rojos), y cobertura que vuelve a tratar unsupported-protocol como clase fiel
+(2 canarios rojos). Suite hermética completa (fuera de tests/db e
+integration, `--noconftest`, env sanitizado): 634 passed, 37 skipped, exit 0.
+`generator --check` byte a byte, JSONs parsean, secret scan 0 infractores,
+sin rutas absolutas, `typing.get_type_hints(run_matrix_round)` OK. Sin red,
+sin providers, sin .env, sin DB, sin Docker.
