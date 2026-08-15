@@ -106,7 +106,7 @@ def test_ninguna_fila_no_ejecutada_esta_en_un_bucket_medido():
     by_class = doc["counts"]["by_final_classification"]
     assert sum(by_class.values()) == 22
     assert "externally-limited" in by_class
-    assert by_class["externally-limited"] == 10  # solo aborted transitorios
+    assert by_class["externally-limited"] == 11  # 10 transitorios + 1 pool sin causa (F6)
 
 
 def test_aborted_con_400_fatal_no_es_limite_externo():
@@ -149,7 +149,9 @@ def test_normalizacion_aborted_usa_la_tabla_del_runner():
     # passthrough de clases ya fieles
     assert n("compatible", None, None) == "compatible"
     assert n("invalid-semantic-response", None, None) == "invalid-semantic-response"
-    assert n("credential/model unavailable", None, None) == "credential/model unavailable"
+    # F6: credential/model unavailable sale de _FAITHFUL y se re-deriva;
+    # sin evidencia estructurada -> fail-closed internal-defect
+    assert n("credential/model unavailable", None, None) == "internal-defect"
     assert n("internal-defect", None, None) == "internal-defect"
     # FatalProviderError: 400 -> protocolo; 401/403 -> credencial
     for runtime in ("aborted", "unsupported-protocol"):
@@ -254,9 +256,9 @@ def test_counts_t08_unsupported_4_internal_defect_5():
     assert sum(by_class.values()) == 22
     assert by_class["unsupported-protocol"] == 4, by_class
     assert by_class["internal-defect"] == 5, by_class
-    assert by_class["externally-limited"] == 10
+    assert by_class["externally-limited"] == 11
     assert by_class["compatible"] == 1
-    assert by_class["credential/model unavailable"] == 1
+    assert by_class.get("credential/model unavailable", 0) == 0
     assert by_class["invalid-semantic-response"] == 1
     # T-12: composicion exacta de los 4 unsupported-protocol
     unsupported = [

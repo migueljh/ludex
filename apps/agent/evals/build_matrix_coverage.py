@@ -39,7 +39,10 @@ _SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from ludex_agent.provider_taxonomy import provider_failure_class  # noqa: E402
+from ludex_agent.provider_taxonomy import (  # noqa: E402
+    EXPLICIT_CLASSES,
+    provider_failure_class,
+)
 
 RUNS_GLOB = "*-matrix.json"
 
@@ -63,13 +66,13 @@ PURPOSE = (
 )
 
 # Clasificaciones terminales que no dependen del status HTTP y pasan tal
-# cual. `unsupported-protocol` NO esta aca (T-08): un runtime_status viejo
-# con ese valor se re-deriva de failure_type/http_status como cualquier
-# `aborted`, para que la evidencia historica nunca afirme una clase que su
-# propia senal no sostiene.
+# cual. `unsupported-protocol` NO esta aca (T-08) ni
+# `credential/model unavailable` (F6): un runtime_status viejo con esos
+# valores se re-deriva de failure_type/http_status/failure_cause_type como
+# cualquier `aborted`, para que la evidencia historica nunca afirme una
+# clase que su propia senal no sostiene.
 _FAITHFUL = frozenset({
-    "compatible", "invalid-semantic-response",
-    "credential/model unavailable", "internal-defect",
+    "compatible", "invalid-semantic-response", "internal-defect",
 })
 
 
@@ -93,7 +96,9 @@ def normalize_final_classification(
     Las demas clases terminales se conservan verbatim."""
     if runtime_status in _FAITHFUL:
         return runtime_status
-    if runtime_status not in {"aborted", "unsupported-protocol"}:
+    if runtime_status not in {
+        "aborted", "unsupported-protocol", "credential/model unavailable",
+    }:
         return runtime_status
     return provider_failure_class(failure_type, http_status, failure_cause_type)
 
@@ -322,6 +327,10 @@ def _stop_row(
         "failure_cause_type": stop.get("failure_cause_type"),
         "http_status": stop.get("http_status"),
         "provider_error_code": None,
+        # D60 (R7): passthrough de la FUENTE VERSIONADA (ledger de stops),
+        # no una derivacion paralela: el ledger clasifico esas filas con su
+        # propia politica (internal-defect/indeterminada) y aca se copia
+        # verbatim, nunca se re-deriva. Residuo declarado del inventario.
         "final_classification": stop.get("final_classification"),
         "compatibility_result": stop.get("compatibility_result"),
         "future_execution": stop.get("future_execution"),

@@ -14,6 +14,17 @@ texto libre, mensajes, notes ni URLs.
 
 from __future__ import annotations
 
+# INVARIANTE 1b (MON-20 R7): nombres de clase con entrada EXPLICITA en la
+# tabla. El fail-closed es red de seguridad, no absorbedor silencioso: una
+# subclase de ProviderError que no este aca es una clase olvidada y el
+# test de introspeccion la denuncia.
+EXPLICIT_CLASSES = frozenset({
+    "FatalProviderError", "CredentialRejected", "ProviderSelectionError",
+    "ProviderPoolExhausted", "ProviderMixError", "InternalCleanupError",
+    "TransientProviderError", "BenchmarkDeadlineExceeded",
+    "DecisionDeadlineExceeded", "ProviderError", "QuotaExceeded",
+})
+
 
 def provider_failure_class(
     failure_type: str | None,
@@ -36,8 +47,9 @@ def provider_failure_class(
       pool transitorio) -> `externally-limited` (D54 R1);
     - `ProviderMixError`/`InternalCleanupError` -> `internal-defect`;
     - `TransientProviderError`, `BenchmarkDeadlineExceeded`,
-      `DecisionDeadlineExceeded` y `ProviderError` generico ->
-      `externally-limited`;
+      `DecisionDeadlineExceeded`, `ProviderError` generico y `QuotaExceeded`
+      -> `externally-limited` (F5: cuota agotada es limite externo por
+      definicion);
     - `ProviderSelectionError` (construccion del provider) ->
       `credential/model unavailable`;
     - clase desconocida o None -> `internal-defect` fail-closed.
@@ -60,7 +72,7 @@ def provider_failure_class(
         return "internal-defect"
     if failure_type in {
         "TransientProviderError", "BenchmarkDeadlineExceeded",
-        "DecisionDeadlineExceeded", "ProviderError",
+        "DecisionDeadlineExceeded", "ProviderError", "QuotaExceeded",
     }:
         return "externally-limited"
     return "internal-defect"

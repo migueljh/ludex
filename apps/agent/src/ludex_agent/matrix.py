@@ -709,6 +709,10 @@ async def run_matrix_round(
             emit(_terminal_stop_result(row, exc, stage=progress.stage))
             raise
         except Exception as exc:  # noqa: BLE001 - fallo interno del runner
+            # D60 (R7): literal fuera de la fuente unica, residuo declarado.
+            # Este except no clasifica un fallo de provider: es un defecto
+            # del runner de la matriz (no hay excepcion de proveedor en
+            # vuelo). `internal-defect` es el unico veredicto honesto.
             emit(MatrixModelResult(
                 provider=row.provider, model=row.model, tier=row.tier,
                 protocol=row.protocol, status="internal-defect",
@@ -744,23 +748,18 @@ class _RowProgress:
 
 
 def _structured_cause_type(exc: BaseException) -> str | None:
-    """T-13 (MON-20 R6): clase de la causa estructurada de la excepcion.
+    """T-13 (MON-20 R6) + F1 (MON-20 R7): clase de la causa ESTRUCTURADA
+    de la excepcion, limitada a la causa DIRECTA.
 
-    Camina la cadena `__cause__` y devuelve "CredentialRejected" si alguna
-    causa es de esa clase (pool totalmente en cuarentena por 401/403
-    credential-specific, ver D43.2); si no, la clase de la causa directa;
-    si no hay causa, None. Solo nombres de clase, jamas texto libre."""
-    seen: set[int] = set()
+    Principio F1: la evidencia persistida debe alcanzar para reproducir su
+    propia decision. `_smoke_failed`/`_battle_failed` persisten SOLO
+    `type(exc.__cause__).__name__`; si esta funcion caminara la cadena
+    completa, el runner decidiria con mas evidencia de la que el artefacto
+    guarda y la cobertura re-derivaria otro veredicto (divergencia medida
+    a profundidad 2/3/5/20). Por eso aca se mira UNICAMENTE la causa
+    directa. Solo nombres de clase, jamas texto libre."""
     cause = exc.__cause__
-    first_cause_name: str | None = None
-    while cause is not None and id(cause) not in seen:
-        seen.add(id(cause))
-        if first_cause_name is None:
-            first_cause_name = type(cause).__name__
-        if type(cause).__name__ == "CredentialRejected":
-            return "CredentialRejected"
-        cause = cause.__cause__
-    return first_cause_name
+    return type(cause).__name__ if cause is not None else None
 
 
 def _fatal_status(exc: BaseException) -> str:
@@ -955,6 +954,14 @@ async def _run_one(
     elif completed == requested:
         status = "compatible"
     else:
+        # D60 (R7): literal fuera de la fuente unica, residuo declarado.
+        # Sin `failure` y con completed != requested no hay excepcion de
+        # provider que clasificar: es un conteo incompleto del benchmark
+        # (condicion de entorno de la corrida), no un veredicto de
+        # compatibilidad. Se conserva externally-limited por razon
+        # explicita: la alternativa (internal-defect fail-closed)
+        # acusaria a la casa un resultado que el benchmark reporto como
+        # parcial sin error de proveedor.
         status = "externally-limited"
     wins = getattr(result, "wins", 0)
     losses = getattr(result, "losses", 0)
@@ -1078,8 +1085,13 @@ def _smoke_failed(
 
 
 def _battle_infrastructure_status(exc: BaseException) -> str:
-    """L-03 (post-R1B): infraestructura LOCAL no es incompatibilidad del
-    modelo:
+    """L-03 (post-R1B) — DECLARADO FUERA de la fuente unica (D60, R7):
+    esta taxonomia clasifica infraestructura LOCAL de Showdown
+    (ConnectionClosedError / ShowdownUnavailableError), NO fallos del
+    proveedor. No debe entrar a provider_taxonomy: los veredictos de aca
+    son sobre el entorno de batalla, no sobre el modelo. Los literales
+    estan en la allowlist del invariante 1c (test_literales_taxonomia).
+    Infraestructura LOCAL no es incompatibilidad del modelo:
     - `ConnectionClosedError` de Showdown durante batalla -> externally-limited;
     - `ShowdownUnavailableError` (RuntimeError from OSError del preflight
       local) -> externally-limited;

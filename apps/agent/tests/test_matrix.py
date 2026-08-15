@@ -2424,3 +2424,233 @@ def test_system_exit_emite_stop_y_relanza_la_misma_excepcion():
         ))
     assert excinfo.value.code == 3
     assert on_result_rows[0]["failure_type"] == "SystemExit"
+
+
+# --- MON-20 R7: los TRES INVARIANTES ENFORCED (punto 1 del brief) -----------
+
+
+def _taxonomy_cases():
+    """Tabla completa clase -> (http_status, failure_cause_type, veredicto)
+    con la que el runner y la cobertura DEBEN coincidir. Incluye la cadena
+    profunda que demuestra F1: la decision se limita a la causa DIRECTA (lo
+    unico que el artefacto persiste)."""
+    from ludex_agent.graph.provider import (
+        CredentialRejected, DecisionDeadlineExceeded, FatalProviderError,
+        ProviderError, ProviderMixError, ProviderPoolExhausted,
+        TransientProviderError,
+    )
+
+    def _pool_deep_chain() -> ProviderPoolExhausted:
+        # F1: CredentialRejected a profundidad 2 (causa directa = transitoria)
+        cred = CredentialRejected("credencial profunda")
+        trans = TransientProviderError("transitoria intermedia")
+        trans.__cause__ = cred
+        pool = ProviderPoolExhausted("pool profundo")
+        pool.__cause__ = trans
+        return pool
+
+    def _pool_direct_credential() -> ProviderPoolExhausted:
+        cause = CredentialRejected("pool quarantined")
+        pool = ProviderPoolExhausted("pool exhausted")
+        pool.__cause__ = cause
+        return pool
+
+    def _fatal(status):
+        return (
+            FatalProviderError("boom") if status is None
+            else _fatal_with_http(status)
+        )
+
+    from ludex_agent.graph.provider import QuotaExceeded as _QuotaExceeded
+
+    return [
+        # (nombre, excepcion, veredicto esperado)
+        ("Fatal 400", _fatal(400), "unsupported-protocol"),
+        ("Fatal 401", _fatal(401), "credential/model unavailable"),
+        ("Fatal 403", _fatal(403), "credential/model unavailable"),
+        ("Fatal 404", _fatal(404), "internal-defect"),
+        ("Fatal 500", _fatal(500), "internal-defect"),
+        ("Fatal None", _fatal(None), "internal-defect"),
+        ("ProviderMixError", ProviderMixError("mix"), "internal-defect"),
+        ("CredentialRejected", CredentialRejected("cred"), "credential/model unavailable"),
+        ("Pool causa directa Credential", _pool_direct_credential(),
+         "credential/model unavailable"),
+        ("Pool sin causa", ProviderPoolExhausted("pool"),
+         "externally-limited"),
+        ("Pool cadena profunda Credential", _pool_deep_chain(),
+         "externally-limited"),
+        ("TransientProviderError", TransientProviderError("trans"),
+         "externally-limited"),
+        ("DecisionDeadlineExceeded", DecisionDeadlineExceeded("deadline"),
+         "externally-limited"),
+        ("ProviderError generico", ProviderError("gen"),
+         "externally-limited"),
+        ("QuotaExceeded", _QuotaExceeded("quota agotada"), "externally-limited"),
+    ]
+
+
+def test_round_trip_runner_serializacion_normalize():
+    """INVARIANTE 1a (MON-20 R7): para CADA clase de la tabla, el veredicto
+    que el runner decide se reproduce EXACTAMENTE desde el artefacto
+    serializado: clasificar con el runner real, serializar el
+    MatrixModelResult tal como se persiste, re-derivar desde ese JSON con
+    normalize_final_classification y exigir igualdad, por TODAS las rutas
+    alcanzables (smoke y batalla directa; build_provider para selection).
+    Con F1 este test esta ROJO: el runner camina la cadena de causas y
+    decide credential, pero el artefacto persiste solo la causa directa y
+    la cobertura re-deriva externally-limited."""
+    import asyncio
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    evals_dir = _Path(__file__).resolve().parents[1] / "evals"
+    if str(evals_dir) not in _sys.path:
+        _sys.path.insert(0, str(evals_dir))
+    import build_matrix_coverage as bmc  # noqa: E402
+
+    rows = [_ready_row("open_code_zen", "big-pickle", "free")]
+    for name, error, expected in _taxonomy_cases():
+        if name == "QuotaExceeded":
+            # KeyRotatingProvider captura QuotaExceeded y no la propaga,
+            # pero la clasificacion por la tabla SI es alcanzable en la
+            # normalizacion historica y en la fuente unica.
+            assert bmc.normalize_final_classification(
+                "aborted", "QuotaExceeded", None, None
+            ) == expected, name
+            assert bmc.provider_failure_class("QuotaExceeded", None, None) \
+                == expected
+            continue
+        # ruta smoke
+        smoke_results, _, _ = asyncio.run(_run(rows, smoke_error=error))
+        smoke = smoke_results[0]
+        assert smoke.status == expected, (name, "smoke", smoke.status)
+        _assert_round_trip(smoke, expected, name, "smoke", bmc)
+        # ruta batalla directa
+        battle_results, _, _ = asyncio.run(_run(rows, battle_raise=error))
+        battle = battle_results[0]
+        assert battle.status == expected, (name, "battle", battle.status)
+        _assert_round_trip(battle, expected, name, "battle", bmc)
+
+
+def _assert_round_trip(result, expected, name, route, bmc):
+    """El JSON serializado (lo que se persiste) re-deriva el MISMO veredicto
+    que el runner decidio. Con F1 esto falla para la cadena profunda."""
+    serialized = result.to_dict()
+    rederived = bmc.normalize_final_classification(
+        serialized["status"],
+        serialized["failure_type"],
+        serialized["http_status"],
+        serialized["failure_cause_type"],
+    )
+    assert rederived == result.status, (
+        name, route, "runner:", result.status,
+        "failure_cause_type persistido:", serialized["failure_cause_type"],
+        "rederivado:", rederived,
+    )
+    assert result.status == expected
+
+
+def test_introspeccion_subclases_provider_error_entran_en_tabla():
+    """INVARIANTE 1b (MON-20 R7): TODAS las subclases de ProviderError de
+    graph/provider.py tienen entrada EXPLICITA en la tabla. El fail-closed
+    es red de seguridad, no absorbedor silencioso de clases olvidadas.
+    ROJO hoy: QuotaExceeded no esta en la tabla."""
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    from ludex_agent.graph.provider import ProviderError
+
+    evals_dir = _Path(__file__).resolve().parents[1] / "evals"
+    if str(evals_dir) not in _sys.path:
+        _sys.path.insert(0, str(evals_dir))
+    import build_matrix_coverage as bmc  # noqa: E402
+
+    seen: set[str] = set()
+    frontier = [ProviderError]
+    while frontier:
+        current = frontier.pop()
+        if current.__name__ in seen:
+            continue
+        seen.add(current.__name__)
+        frontier.extend(current.__subclasses__())
+    assert "ProviderError" in seen
+    assert len(seen) == 9, seen  # base + 8 subclases
+    # INVARIANTE 1b: toda subclase (y la base) tiene entrada EXPLICITA
+    assert seen <= set(bmc.EXPLICIT_CLASSES), (
+        f"subclases sin entrada explicita: {seen - set(bmc.EXPLICIT_CLASSES)}"
+    )
+    # QuotaExceeded es externo por definicion (limite de cuota)
+    assert bmc.provider_failure_class("QuotaExceeded", None, None) == \
+        "externally-limited"
+
+
+def test_literales_taxonomia_solo_en_sitios_allowlist():
+    """INVARIANTE 1c (MON-20 R7): los literales de la taxonomia que aparecen
+    en matrix.py FUERA de la fuente unica estan declarados en una allowlist
+    con justificacion escrita. Un literal nuevo fuera de la allowlist falla.
+    Sitios legitimos: except Exception del runner (internal-defect),
+    _terminal_stop_result (internal-defect, I2), batallas parciales sin
+    failure (:958, externally-limited, conteo no provider), y
+    _battle_infrastructure_status (L-03, infraestructura LOCAL)."""
+    import re
+    from pathlib import Path as _Path
+
+    source = _Path(__file__).resolve().parents[1] / "src" / "ludex_agent" / "matrix.py"
+    text = source.read_text(encoding="utf-8")
+
+    def _function_at(lineno: int) -> str:
+        current = "<module>"
+        for i, line in enumerate(text.splitlines(), start=1):
+            m = re.match(r"^(?:async )?def (\w+)", line)
+            if m and i <= lineno:
+                current = m.group(1)
+        return current
+
+    literals = (
+        "internal-defect", "externally-limited", "unsupported-protocol",
+        "credential/model unavailable",
+    )
+    sites = set()
+    for i, line in enumerate(text.splitlines(), start=1):
+        for literal in literals:
+            # solo sitios que PRODUCEN el literal (asignacion/return), no
+            # comparaciones ni docstrings
+            if re.search(
+                rf'(?:status\s*=\s*|return\s+|_fail\("|_smoke_failed\(\w+,\s*")'
+                rf'"{re.escape(literal)}"', line
+            ):
+                sites.add((_function_at(i), literal, i))
+    allowlist = {
+        ("run_matrix_round", "internal-defect"),
+        ("_terminal_stop_result", "internal-defect"),
+        ("_run_one", "externally-limited"),
+        ("_battle_infrastructure_status", "externally-limited"),
+        ("_battle_infrastructure_status", "internal-defect"),
+    }
+    offenders = {
+        (func, literal) for func, literal, _ in sites
+        if (func, literal) not in allowlist
+    }
+    assert not offenders, (
+        f"literales de taxonomia fuera de la allowlist: {offenders}"
+    )
+
+
+def test_ruteo_sitio1_build_provider_por_la_fuente_unica():
+    """F3 (MON-20 R7): canario de RUTEO del sitio 1 (build_provider). Usa una
+    clase cuyo veredicto DIFIERE del literal viejo
+    (credential/model unavailable): TransientProviderError -> externally-
+    limited. Si el sitio vuelve al literal fijo, este test se pone rojo.
+    """
+    import asyncio
+
+    from ludex_agent.graph.provider import TransientProviderError
+
+    def build_provider(provider_name, model_name):
+        raise TransientProviderError("transitorio en construccion")
+
+    rows = [_ready_row("open_code_zen", "big-pickle", "free")]
+    results, _, _ = asyncio.run(_run(rows, build_provider=build_provider))
+    assert results[0].status == "externally-limited"
+    assert results[0].failure_type == "TransientProviderError"
+    assert results[0].failure_stage == "smoke"
