@@ -591,7 +591,7 @@ def test_smoke_semantic_invalido_produce_0_batallas():
     assert battle_calls == []
 
 
-def test_smoke_verde_produce_exactamente_2_batallas_y_winrate():
+def test_smoke_verde_produce_exactamente_2_batallas_sin_winrate():
     import asyncio
 
     rows = [_ready_row("google", "gemma-4-26b-a4b-it", "free")]
@@ -600,7 +600,10 @@ def test_smoke_verde_produce_exactamente_2_batallas_y_winrate():
     assert results[0].battles_requested == 2
     assert results[0].battles_completed == 2
     assert battle_calls == [2]
-    assert results[0].win_rate == "0.5000"
+    # I5 (MON-20 R2): N=2 no publica win_rate como evidencia de calidad
+    assert results[0].win_rate is None
+    assert results[0].comparable is False
+    assert results[0].sample_size == 2
     assert results[0].rotations == 1
     assert results[0].completion_latency_ms["p50"] == 10
 
@@ -1772,3 +1775,328 @@ def test_diagb_cinco_rutas_oficiales_construyen_manifiesto_esperado():
     assert by_model["nemotron-3.5-lightning-free"].structured_output == "text_json"
     assert by_model["nemotron-3.5-lightning-free"].tier == "free"
     assert by_model["nemotron-3.5-lightning-free"].estimated_cost_usd == Decimal("0")
+
+
+# --- MON-20 R2 (Changes Requested): M1, I3, I4, I5, I2 -------------------
+
+
+def test_get_type_hints_de_run_matrix_round_funciona():
+    """M1: `matrix.py` importa Callable/Awaitable; sin ellos,
+    `typing.get_type_hints(run_matrix_round)` reventaba con NameError y
+    cualquier introspeccion futura (pydantic, typer, TypeAdapter) se rompe."""
+    import typing
+
+    from ludex_agent.matrix import run_matrix_round
+
+    hints = typing.get_type_hints(run_matrix_round)
+    assert "build_provider" in hints
+    assert "run_battles" in hints
+    assert "on_result" in hints
+
+
+def test_artefactos_incluyen_contexto_de_corrida_auditable():
+    """I4: el artefacto atomico es auditable sin contexto externo: persiste
+    `battle_timeout_seconds`, identidad de ronda, `generated_at` y
+    referencia+hash del manifiesto en TODAS las filas (compatible, fallida,
+    stop y ya-finalizada)."""
+    import asyncio
+    import hashlib
+
+    from ludex_agent.matrix import MatrixModelResult, run_matrix_round
+
+    rows = [
+        _ready_row("open_code_zen", "mimo-v2.5-free", "free"),
+        _ready_row("google", "gemma-4-26b-a4b-it", "free"),
+    ]
+    done = MatrixModelResult(
+        provider="google", model="gemma-4-26b-a4b-it", tier="free",
+        protocol="google", status="compatible", smoke_ok=True,
+        battles_requested=2, battles_completed=2,
+        effective_provider="google", effective_model="gemma-4-26b-a4b-it",
+        win_rate=None, completion_latency_ms=None,
+        decision_latency_ms=None, tokens=None, retries=0, rotations=0,
+        quarantined=0, failure_type=None, failure_cause_type=None,
+        comparable=False, sample_size=2,
+    )
+    built: list[str] = []
+
+    def build_provider(provider, model):
+        built.append(model)
+        return _FakeSmokeProvider()
+
+    async def run_battles(provider, model, **kwargs):
+        return _ok_battles()
+
+    manifest_hash = hashlib.sha256(b"manifest-json").hexdigest()
+    results = asyncio.run(run_matrix_round(
+        rows=rows, tier="free", battle_timeout_seconds=1234.0,
+        fmt="gen6randombattle", opponent="simple_heuristics",
+        smoke_deadline_seconds=120,
+        build_provider=build_provider, run_battles=run_battles,
+        refresh_catalog=None,
+        previous={"google/gemma-4-26b-a4b-it": done},
+        round_name="r2-ctx", manifest_ref="20260814t183716z-matrix-manifest.json",
+        manifest_sha256=manifest_hash,
+    ))
+    for result in results:
+        assert result.battle_timeout_seconds == 1234.0, result.model
+        assert result.round == "r2-ctx", result.model
+        assert result.generated_at, result.model
+        assert result.manifest == "20260814t183716z-matrix-manifest.json"
+        assert result.manifest_sha256 == manifest_hash
+    # la fila ya-finalizada tambien lleva el contexto de la corrida nueva
+    final = next(r for r in results if r.status == "already-finalized")
+    assert final.round == "r2-ctx"
+    assert final.manifest_sha256 == manifest_hash
+
+
+def test_compatible_no_publica_winrate_ni_n2_como_calidad():
+    """I5: una corrida de 2 batallas (N=2) prueba compatibilidad funcional,
+    nunca calidad: `win_rate` queda null y se conservan W/L/T +
+    `comparable=false` + `sample_size`."""
+    import asyncio
+
+    rows = [_ready_row("google", "gemma-4-26b-a4b-it", "free")]
+    results, _, _ = asyncio.run(_run(rows))
+    result = results[0]
+    assert result.status == "compatible"
+    assert result.battles_completed == 2
+    assert result.win_rate is None
+    assert result.comparable is False
+    assert result.sample_size == 2
+    # W/L/T conservados como datos, no como winrate
+    assert result.battles_wins == 1
+    assert result.battles_losses == 1
+    assert result.battles_ties == 0
+
+
+def test_operador_prohibido_construye_fila_no_ejecutable_en_manifiesto():
+    """I3: la politica declarativa versionada marca gpt-5.6-luna como
+    `operator-prohibited` en manifiestos NUEVOS: battles=0, sin costo
+    estimado, con la accion en la nota. No es un condicional por nombre en
+    src: sale del archivo de politica."""
+    rows = build_manifest(
+        {"open_code_zen": ["gpt-5.6-luna", "mimo-v2.5-free"]},
+        previous_inventory={
+            "models": {"open_code_zen": [
+                {"id": "gpt-5.6-luna", "in_scope": True},
+                {"id": "mimo-v2.5-free", "in_scope": True},
+            ]},
+        },
+    )
+    by_model = {r.model: r for r in rows}
+    luna = by_model["gpt-5.6-luna"]
+    assert luna.status == "operator-prohibited"
+    assert luna.battles == 0
+    assert "operator-prohibited-never-retry" in (luna.classification_note or "")
+    # el resto de las filas no se contamina
+    assert by_model["mimo-v2.5-free"].status == "ready"
+
+
+def test_matrix_run_rechaza_fila_prohibida_con_cero_llamadas():
+    """I3: aunque un manifiesto (p.ej. el versionado) traiga gpt-5.6-luna
+    como `ready`, matrix-run la rechaza ANTES del primer request: cero
+    providers construidos, cero batallas, cero refrescos de catalogo."""
+    import asyncio
+    import pytest
+
+    from ludex_agent.matrix import run_matrix_round
+
+    rows = [
+        _ready_row("open_code_zen", "gpt-5.6-luna", "paid"),
+        _ready_row("open_code_zen", "mimo-v2.5-free", "free"),
+    ]
+    built: list[str] = []
+    refreshes: list[str] = []
+
+    def build_provider(provider, model):
+        built.append(model)
+        return _FakeSmokeProvider()
+
+    async def run_battles(provider, model, **kwargs):
+        raise AssertionError("no deberia llamarse")
+
+    async def refresh():
+        refreshes.append("refresh")
+        return {}
+
+    with pytest.raises(ValueError, match="operator-prohibited"):
+        asyncio.run(run_matrix_round(
+            rows=rows, tier="paid", battle_timeout_seconds=1800,
+            fmt="gen6randombattle", opponent="simple_heuristics",
+            smoke_deadline_seconds=120,
+            build_provider=build_provider, run_battles=run_battles,
+            refresh_catalog=refresh,
+        ))
+    assert built == []
+    assert refreshes == []
+
+
+def test_cancelacion_en_vuelo_durante_batalla_emite_stop_y_relanza():
+    """I2: interrumpir una fila en vuelo (batalla) emite SINCRONICAMENTE por
+    on_result un artefacto de stop sanitizado y RE-LANZA la misma excepcion
+    (nunca se traga): la fila ya no se pierde entera."""
+    import asyncio
+    import json
+
+    from ludex_agent.matrix import run_matrix_round
+
+    rows = [_ready_row("open_code_zen", "mimo-v2.5-free", "free")]
+    on_result_rows: list[dict] = []
+    artifacts: list[str] = []
+
+    def build_provider(provider, model):
+        return _FakeSmokeProvider()
+
+    async def run_battles(provider, model, **kwargs):
+        await asyncio.Event().wait()  # cuelga hasta la cancelacion
+
+    def on_result(result):
+        on_result_rows.append(result.to_dict())
+        artifacts.append(json.dumps(result.to_dict()))
+
+    async def _scenario():
+        task = asyncio.create_task(run_matrix_round(
+            rows=rows, tier="free", battle_timeout_seconds=1800,
+            fmt="gen6randombattle", opponent="simple_heuristics",
+            smoke_deadline_seconds=120,
+            build_provider=build_provider, run_battles=run_battles,
+            refresh_catalog=None, on_result=on_result,
+            round_name="r-cancel", manifest_ref="m.json",
+            manifest_sha256="abc",
+        ))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return task.cancelled()
+
+    assert asyncio.run(_scenario())
+    # la excepcion no se trago: on_result corrio UNA vez, sincronicamente,
+    # ANTES del re-lanzamiento, y dejo artefacto durable
+    assert len(on_result_rows) == 1
+    stop = on_result_rows[0]
+    assert stop["provider"] == "open_code_zen"
+    assert stop["model"] == "mimo-v2.5-free"
+    assert stop["status"] == "internal-defect"
+    assert stop["failure_type"] == "CancelledError"
+    assert stop["failure_stage"] == "battle"
+    assert stop["smoke_ok"] is True
+    assert stop["compatibility_result"] == "indeterminate-current-run"
+    assert stop["comparable"] is False
+    assert stop["win_rate"] is None
+    assert stop["battles_requested"] == 2
+    assert stop["round"] == "r-cancel"
+    assert len(artifacts) == 1
+
+
+def test_cancelacion_durante_smoke_emite_stop_con_stage_smoke():
+    """I2: la interrupcion durante el smoke (antes de la batalla) deja un
+    stop con la etapa REAL (smoke), smoke_ok=false y 0 batallas pedidas."""
+    import asyncio
+
+    from ludex_agent.matrix import run_matrix_round
+
+    rows = [_ready_row("open_code_zen", "mimo-v2.5-free", "free")]
+    on_result_rows: list[dict] = []
+
+    class _HangingProvider:
+        def metrics_snapshot(self):
+            return None
+
+        async def complete(self, prompt, *, deadline, turn_id):
+            await asyncio.Event().wait()
+
+    def build_provider(provider, model):
+        return _HangingProvider()
+
+    async def run_battles(provider, model, **kwargs):
+        raise AssertionError("no deberia llamarse")
+
+    def on_result(result):
+        on_result_rows.append(result.to_dict())
+
+    async def _scenario():
+        task = asyncio.create_task(run_matrix_round(
+            rows=rows, tier="free", battle_timeout_seconds=1800,
+            fmt="gen6randombattle", opponent="simple_heuristics",
+            smoke_deadline_seconds=120,
+            build_provider=build_provider, run_battles=run_battles,
+            refresh_catalog=None, on_result=on_result,
+        ))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_scenario())
+    stop = on_result_rows[0]
+    assert stop["status"] == "internal-defect"
+    assert stop["failure_stage"] == "smoke"
+    assert stop["smoke_ok"] is False
+    assert stop["battles_requested"] == 0
+    assert stop["failure_type"] == "CancelledError"
+
+
+def test_keyboard_interrupt_emite_stop_y_relanza_la_misma_excepcion():
+    """I2: KeyboardInterrupt a mitad de batalla emite el stop y se relanza
+    tal cual (no se convierte en fallo ordinario)."""
+    import asyncio
+
+    from ludex_agent.matrix import run_matrix_round
+
+    rows = [_ready_row("open_code_zen", "mimo-v2.5-free", "free")]
+    on_result_rows: list[dict] = []
+
+    def build_provider(provider, model):
+        return _FakeSmokeProvider()
+
+    async def run_battles(provider, model, **kwargs):
+        raise KeyboardInterrupt()
+
+    def on_result(result):
+        on_result_rows.append(result.to_dict())
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(run_matrix_round(
+            rows=rows, tier="free", battle_timeout_seconds=1800,
+            fmt="gen6randombattle", opponent="simple_heuristics",
+            smoke_deadline_seconds=120,
+            build_provider=build_provider, run_battles=run_battles,
+            refresh_catalog=None, on_result=on_result,
+        ))
+    stop = on_result_rows[0]
+    assert stop["status"] == "internal-defect"
+    assert stop["failure_type"] == "KeyboardInterrupt"
+    assert stop["failure_stage"] == "battle"
+    assert stop["compatibility_result"] == "indeterminate-current-run"
+
+
+def test_system_exit_emite_stop_y_relanza_la_misma_excepcion():
+    """I2: SystemExit a mitad de fila emite el stop y se relanza tal cual."""
+    import asyncio
+
+    from ludex_agent.matrix import run_matrix_round
+
+    rows = [_ready_row("open_code_zen", "mimo-v2.5-free", "free")]
+    on_result_rows: list[dict] = []
+
+    def build_provider(provider, model):
+        return _FakeSmokeProvider()
+
+    async def run_battles(provider, model, **kwargs):
+        raise SystemExit(3)
+
+    def on_result(result):
+        on_result_rows.append(result.to_dict())
+
+    with pytest.raises(SystemExit) as excinfo:
+        asyncio.run(run_matrix_round(
+            rows=rows, tier="free", battle_timeout_seconds=1800,
+            fmt="gen6randombattle", opponent="simple_heuristics",
+            smoke_deadline_seconds=120,
+            build_provider=build_provider, run_battles=run_battles,
+            refresh_catalog=None, on_result=on_result,
+        ))
+    assert excinfo.value.code == 3
+    assert on_result_rows[0]["failure_type"] == "SystemExit"

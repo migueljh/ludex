@@ -15,13 +15,14 @@ sin publicar winrate.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 import httpx
 
@@ -37,6 +38,30 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 INVENTORY_DIR = REPO_ROOT / "apps" / "agent" / "evals" / "runs"
+DEFAULT_OPERATOR_POLICY_PATH = (
+    REPO_ROOT / "apps" / "agent" / "evals" / "operator-policy.json"
+)
+
+
+def load_operator_policy(
+    path: str | Path | None = None,
+) -> dict[tuple[str, str], str]:
+    """Politica declarativa de prohibicion de modelos (I3/MON-20 R2).
+
+    Versionada en `apps/agent/evals/operator-policy.json`: un mapa
+    (provider, model) -> accion, SIN condicionales por nombre en src. La
+    prohibicion de `open_code_zen/gpt-5.6-luna` es permanente por
+    instruccion del usuario; `build_manifest` la marca en manifiestos
+    nuevos y `run_matrix_round` la rechaza antes del primer request aunque
+    un manifiesto versionado la traiga como `ready`. Archivo ausente =
+    error explicito (fail-closed): sin politica no se certifica nada."""
+    if path is None:
+        path = DEFAULT_OPERATOR_POLICY_PATH
+    document = json.loads(Path(path).read_text(encoding="utf-8"))
+    policy: dict[tuple[str, str], str] = {}
+    for entry in document.get("entries", []):
+        policy[(entry["provider"], entry["model"])] = entry["action"]
+    return policy
 
 # Anclas de tokens por batalla medida (BENCHMARKS.md 2026-07-28/2026-08-08):
 # deepseek-v4-flash: ~89k input / 60k output por batalla; gemini-2.5-flash:
@@ -188,9 +213,29 @@ def build_manifest(
     if tier_prices is None:
         tier_prices = {}
     previous_models = previous_inventory.get("models", {})
+    policy = load_operator_policy()
     rows: list[ManifestRow] = []
     for provider in sorted(fresh_models):
         for model in sorted(fresh_models[provider]):
+            # I3 (MON-20 R2): politica declarativa versionada ANTES que
+            # cualquier otra clasificacion: una prohibicion de operador
+            # (p.ej. gpt-5.6-luna, permanente) no se negocia con rutas,
+            # precios ni inventario.
+            action = policy.get((provider, model))
+            if action is not None:
+                rows.append(ManifestRow(
+                    provider=provider, model=model,
+                    protocol=None, endpoint=None, structured_output=None,
+                    tier="unknown", status="operator-prohibited",
+                    battles=0, concurrency=1, persist=False,
+                    pin=(provider, model),
+                    estimated_cost_usd=None, estimated_smoke_usd=None,
+                    classification_note=(
+                        f"operator-prohibited ({action}): prohibido por "
+                        "politica declarativa versionada; no se ejecuta"
+                    ),
+                ))
+                continue
             prev_row = None
             for entry in previous_models.get(provider, []):
                 if entry.get("id") == model:
@@ -462,6 +507,23 @@ class MatrixModelResult:
     failure_stage: str | None = None
     http_status: int | None = None
     provider_error_code: str | None = None
+    # I4 (MON-20 R2): el artefacto atomico es auditable SIN contexto
+    # externo: deadline de batalla, identidad de ronda, `generated_at` y
+    # referencia + hash del manifiesto que produjo la corrida.
+    battle_timeout_seconds: float | None = None
+    round: str | None = None
+    generated_at: str | None = None
+    manifest: str | None = None
+    manifest_sha256: str | None = None
+    # I5 (MON-20 R2): N=2 nunca es evidencia de calidad: `win_rate` queda
+    # null siempre y se publican W/L/T + `comparable=false` +
+    # `sample_size` (batallas completadas).
+    comparable: bool = False
+    sample_size: int | None = None
+    # I2 (MON-20 R2): solo los artefactos de stop por interrupcion llevan
+    # `compatibility_result=indeterminate-current-run`; las demas filas lo
+    # tienen null.
+    compatibility_result: str | None = None
 
     @property
     def final(self) -> bool:
@@ -496,10 +558,16 @@ async def run_matrix_round(
     refresh_catalog: Callable[[], Awaitable[dict[str, list[str]]]] | None,
     previous: Mapping[str, MatrixModelResult] | None = None,
     on_result: Callable[[MatrixModelResult], None] | None = None,
+    round_name: str | None = None,
+    manifest_ref: str | None = None,
+    manifest_sha256: str | None = None,
 ) -> list[MatrixModelResult]:
     """Ejecuta una fase de la matriz con fail-closed.
 
     - selecciona SOLO filas `ready` del tier pedido (nunca mezcla);
+    - rechaza ANTES del primer request cualquier fila prohibida por la
+      politica declarativa de operador (I3: gpt-5.6-luna permanente), aunque
+      el manifiesto la traiga como `ready`;
     - refresca el catalogo antes de la ronda: un modelo que ya no esta en
       /models se clasifica `removed-from-catalog`, no se ejecuta;
     - por modelo: 1 smoke -> si pasa, EXACTAMENTE 2 batallas pinneadas
@@ -508,10 +576,19 @@ async def run_matrix_round(
     - `previous` permite reanudar: filas con clasificacion final no se
       repiten (`already-finalized`) y las sin clasificacion se reejecutan
       (nunca se salta una sin clasificar);
-    - un resultado parcial/abortado nunca publica winrate comparable.
+    - un resultado parcial/abortado nunca publica winrate comparable;
+    - I2: si una fila es interrumpida por CancelledError/KeyboardInterrupt/
+      SystemExit durante smoke o batalla, emite SINCRONICAMENTE por
+      `on_result` un artefacto de stop sanitizado (internal-defect,
+      compatibility indeterminate) y RE-LANZA la misma excepcion: la fila
+      nunca se pierde entera;
+    - I4: cada artefacto lleva contexto de corrida (`battle_timeout_seconds`,
+      `round`, `generated_at`, `manifest` + hash) para ser auditable sin
+      contexto externo.
     """
     results: list[MatrixModelResult] = []
     previous = previous or {}
+    generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     selected = select_rows_for_tier(rows, tier)
     offenders = [row for row in selected if row.tier != tier]
@@ -524,15 +601,46 @@ async def run_matrix_round(
             + ", ".join(f"{r.provider}/{r.model}" for r in offenders)
         )
 
+    # I3 (MON-20 R2): fail-closed de politica de operador ANTES del refresh
+    # de catalogo (que tambien es un request): cero llamadas al proveedor,
+    # cero refrescos, cero batallas.
+    policy = load_operator_policy()
+    policy_offenders = [
+        row for row in selected
+        if (row.provider, row.model) in policy
+    ]
+    if policy_offenders:
+        action = policy[(policy_offenders[0].provider, policy_offenders[0].model)]
+        raise ValueError(
+            f"fila(s) {action} por politica de operador (prohibidas): "
+            + ", ".join(
+                f"{r.provider}/{r.model}" for r in policy_offenders
+            )
+        )
+
     fresh: dict[str, list[str]] = {}
     if refresh_catalog is not None:
         fresh = await refresh_catalog() or {}
+
+    def emit(result: MatrixModelResult) -> MatrixModelResult:
+        stamped = replace(
+            result,
+            battle_timeout_seconds=battle_timeout_seconds,
+            round=round_name,
+            generated_at=generated_at,
+            manifest=manifest_ref,
+            manifest_sha256=manifest_sha256,
+        )
+        results.append(stamped)
+        if on_result is not None:
+            on_result(stamped)
+        return stamped
 
     for row in selected:
         key = f"{row.provider}/{row.model}"
         prior = previous.get(key)
         if prior is not None and prior.final:
-            results.append(MatrixModelResult(
+            emit(MatrixModelResult(
                 provider=row.provider, model=row.model, tier=row.tier,
                 protocol=row.protocol, status="already-finalized",
                 smoke_ok=prior.smoke_ok,
@@ -543,7 +651,7 @@ async def run_matrix_round(
                 battles_ties=prior.battles_ties,
                 effective_provider=prior.effective_provider,
                 effective_model=prior.effective_model,
-                win_rate=prior.win_rate,
+                win_rate=None,
                 completion_latency_ms=prior.completion_latency_ms,
                 decision_latency_ms=prior.decision_latency_ms,
                 tokens=prior.tokens, retries=prior.retries,
@@ -554,14 +662,14 @@ async def run_matrix_round(
                 failure_stage=prior.failure_stage,
                 http_status=prior.http_status,
                 provider_error_code=prior.provider_error_code,
+                comparable=prior.comparable,
+                sample_size=prior.sample_size,
             ))
-            if on_result is not None:
-                on_result(results[-1])
             continue
         if refresh_catalog is not None and (
             row.model not in fresh.get(row.provider, [])
         ):
-            result = MatrixModelResult(
+            emit(MatrixModelResult(
                 provider=row.provider, model=row.model, tier=row.tier,
                 protocol=row.protocol, status="removed-from-catalog",
                 smoke_ok=False, battles_requested=0, battles_completed=0,
@@ -572,20 +680,28 @@ async def run_matrix_round(
                 retries=0, rotations=0, quarantined=0,
                 failure_type=None, failure_cause_type=None,
                 note="ya no esta en /models fresco: no se ejecuta",
-            )
-            results.append(result)
-            if on_result is not None:
-                on_result(result)
+            ))
             continue
+        # I2: el progreso mutable de la fila dice en que etapa REAL fue
+        # interrumpida (smoke o battle) para el artefacto de stop.
+        progress = _RowProgress()
         try:
             result = await _run_one(
                 row=row, battle_timeout_seconds=battle_timeout_seconds,
                 fmt=fmt, opponent=opponent,
                 smoke_deadline_seconds=smoke_deadline_seconds,
                 build_provider=build_provider, run_battles=run_battles,
+                progress=progress,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+            # I2 (MON-20 R2): artefacto de stop sincronico via on_result y
+            # re-lanzamiento EXACTO de la excepcion original (nunca se
+            # traga ni se convierte en fallo ordinario). La fila deja
+            # evidencia durable clasificada.
+            emit(_terminal_stop_result(row, exc, stage=progress.stage))
+            raise
         except Exception as exc:  # noqa: BLE001 - fallo interno del runner
-            result = MatrixModelResult(
+            emit(MatrixModelResult(
                 provider=row.provider, model=row.model, tier=row.tier,
                 protocol=row.protocol, status="internal-defect",
                 smoke_ok=False, battles_requested=0, battles_completed=0,
@@ -604,11 +720,61 @@ async def run_matrix_round(
                 http_status=_http_status_chain(exc),
                 provider_error_code=_structured_provider_error_code(exc),
                 note="fallo del runner de la matriz, no del modelo",
-            )
-        results.append(result)
-        if on_result is not None:
-            on_result(result)
+            ))
+        else:
+            emit(result)
     return results
+
+
+class _RowProgress:
+    """I2: etapa REAL de la fila en vuelo, para clasificar el stop si la
+    fila es interrumpida durante smoke o batalla. Mutable a proposito:
+    `_run_one` la actualiza en cuanto el smoke pasa."""
+
+    def __init__(self) -> None:
+        self.stage = "smoke"
+
+
+def _terminal_stop_result(
+    row: ManifestRow,
+    exc: BaseException,
+    *,
+    stage: str,
+) -> MatrixModelResult:
+    """I2 (MON-20 R2): artefacto de stop por interrupcion.
+
+    Clasificacion conservadora y sanitizada: `internal-defect` de la
+    corrida (NUNCA un veredicto sobre el modelo), `compatibility_result`
+    indeterminado, etapa real (`smoke` o `battle`), terminal original
+    (`failure_type` = clase de la excepcion) y progreso disponible
+    (`battles_requested` = 2 si el smoke ya paso, 0 si no; sin batallas
+    completadas durables porque la interrupcion no transporta partial)."""
+    return MatrixModelResult(
+        provider=row.provider, model=row.model, tier=row.tier,
+        protocol=row.protocol, status="internal-defect",
+        smoke_ok=(stage == "battle"),
+        battles_requested=BATTLES_PER_MODEL if stage == "battle" else 0,
+        battles_completed=0,
+        battles_wins=0, battles_losses=0, battles_ties=0,
+        effective_provider=None, effective_model=None,
+        win_rate=None, completion_latency_ms=None,
+        decision_latency_ms=None, tokens=None,
+        retries=0, rotations=0, quarantined=0,
+        failure_type=type(exc).__name__,
+        failure_cause_type=(
+            type(exc.__cause__).__name__ if exc.__cause__ else None
+        ),
+        failure_stage=stage,
+        http_status=_http_status_chain(exc),
+        provider_error_code=_structured_provider_error_code(exc),
+        comparable=False, sample_size=None,
+        compatibility_result="indeterminate-current-run",
+        note=(
+            f"fila interrumpida por {type(exc).__name__} durante {stage}: "
+            "artefacto de stop sanitizado; compatibilidad indeterminada, "
+            "no es veredicto sobre el modelo"
+        ),
+    )
 
 
 async def _run_one(
@@ -622,6 +788,7 @@ async def _run_one(
     run_battles: Callable[..., Awaitable[
         tuple[Any, Mapping[str, int | None]]
     ]],
+    progress: _RowProgress | None = None,
 ) -> MatrixModelResult:
     from .graph.decision import DecisionResponse
     from .graph.provider import (
@@ -691,6 +858,8 @@ async def _run_one(
         )
 
     # --- smoke verde: exactamente 2 batallas pinneadas -------------------
+    if progress is not None:
+        progress.stage = "battle"
     try:
         result, metrics = await run_battles(
             row.provider, row.model,
@@ -747,8 +916,9 @@ async def _run_one(
     wins = getattr(result, "wins", 0)
     losses = getattr(result, "losses", 0)
     ties = getattr(result, "ties", 0)
-    if status == "compatible" and completed:
-        win_rate = f"{wins / completed:.4f}"
+    # I5 (MON-20 R2): win_rate queda null SIEMPRE. N=2 (2 batallas) prueba
+    # compatibilidad funcional, nunca calidad: se publican W/L/T +
+    # comparable=false + sample_size.
     return MatrixModelResult(
         provider=row.provider, model=row.model, tier=row.tier,
         protocol=row.protocol, status=status, smoke_ok=True,
@@ -756,7 +926,7 @@ async def _run_one(
         battles_wins=wins, battles_losses=losses, battles_ties=ties,
         effective_provider=getattr(result, "provider", None),
         effective_model=getattr(result, "model", None),
-        win_rate=win_rate,
+        win_rate=None,
         completion_latency_ms=_latency_slice(metrics, "completion_latency_ms"),
         decision_latency_ms=_latency_slice(metrics, "decision_latency_ms"),
         tokens={
@@ -777,6 +947,8 @@ async def _run_one(
         failure_stage="battle" if failure is not None else None,
         http_status=getattr(result, "http_status", None),
         provider_error_code=getattr(result, "provider_error_code", None),
+        comparable=False,
+        sample_size=completed if completed > 0 else None,
         note=None if status == "compatible" else (
             "batallas parciales o abortadas: sin winrate comparable"
         ),
@@ -857,6 +1029,7 @@ def _smoke_failed(
         failure_stage="battle" if smoke_ok else "smoke",
         http_status=_http_status_chain(exc),
         provider_error_code=_structured_provider_error_code(exc),
+        comparable=False,
         note=note or f"smoke fallido ({type(exc).__name__})",
     )
 
@@ -978,6 +1151,8 @@ def _battle_failed(
         failure_stage="battle",
         http_status=http_status,
         provider_error_code=provider_error_code,
+        comparable=False,
+        sample_size=battles_completed if battles_completed > 0 else None,
         note="fallo en fase de batalla tras smoke verde: sin winrate comparable",
     )
 

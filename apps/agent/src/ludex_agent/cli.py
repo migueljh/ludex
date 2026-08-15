@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -1446,6 +1447,10 @@ def matrix_run_command(
         max(settings.llm_request_timeout_seconds, 60.0) + 30.0
     )
 
+    # I4 (MON-20 R2): cada artefacto de la corrida es auditable sin contexto
+    # externo: identidad de ronda + referencia y SHA-256 del manifiesto.
+    manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
+
     _asyncio.run(run_matrix_round(
         rows=rows,
         tier=tier,
@@ -1458,6 +1463,9 @@ def matrix_run_command(
         refresh_catalog=refresh_catalog,
         previous=previous,
         on_result=on_result,
+        round_name=round_name,
+        manifest_ref=manifest.name,
+        manifest_sha256=manifest_sha256,
     ))
     summary = _matrix_run_summary(previous)
     typer.echo(f"matrix-run: {round_name} terminado: {summary}")

@@ -1228,6 +1228,11 @@ async def test_battle_timeout_llega_a_run_benchmark(monkeypatch):
     """La propagacion NO puede volver a una constante fija: el timeout que
     recibe run_benchmark tiene que ser exactamente el configurado (1800),
     no el default productivo (180)."""
+    # hermetico: load_settings() exige el STRING de la URL; todos los
+    # repos/engine estan fakeados, nunca se conecta
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+asyncpg://x:x@localhost:15432/x"
+    )
     captured: dict[str, object] = {}
 
     async def fake_run_benchmark(agent, rival, *, timeout, **kwargs):
@@ -2368,3 +2373,174 @@ def test_matrix_plan_registra_procedencia_de_la_tabla_efectiva(tmp_path, monkeyp
         "currency": "USD",
         "path": "evals/pricing-2026-08-08.json",
     }
+
+
+# --- MON-20 R2 (Changes Requested): I2 CLI, I4 wiring, I3 fail-closed ----
+
+
+def test_matrix_run_cancela_en_vuelo_y_el_artefacto_es_durable(
+    tmp_path, monkeypatch
+):
+    """I2 a nivel matrix-run: si una fila se interrumpe en vuelo, el CLI
+    escribe SIEMPRE el artefacto/state de stop (on_result sincronico) y la
+    excepcion se relanza (exit != 0), en vez de perder la fila entera.
+
+    El runner real corre con el on_result REAL del CLI; la cancelacion
+    llega desde `_benchmark_command` (monkeypatcheado) a mitad de batalla.
+    """
+    import asyncio as _asyncio
+    import json as _json
+
+    manifest = _manifest_document(tmp_path)
+    monkeypatch.setattr(
+        cli_module, "DEFAULT_RUNS_PATH", tmp_path / "runs"
+    )
+    run_dir = tmp_path / "runs"
+    run_dir.mkdir(parents=True)
+
+    class _FakeProvider:
+        def metrics_snapshot(self):
+            return None
+
+        async def complete(self, prompt, *, deadline, turn_id):
+            from ludex_agent.graph.decision import DecisionResponse
+            from ludex_agent.graph.provider import (
+                CompletionEnvelope, CompletionUsage,
+            )
+            payload = {
+                "action": {"kind": "move", "id": "tackle"},
+                "target": None,
+                "rationale": "smoke",
+                "confidence": 0.9,
+                "alternatives": [],
+            }
+            DecisionResponse.model_validate(payload)
+            return CompletionEnvelope(
+                payload=payload, provider="open_code_zen",
+                model="mimo-v2.5-free",
+                usage=CompletionUsage(input_tokens=1, output_tokens=1),
+                latency_ms=1.0,
+            )
+
+    def fake_build_provider(provider_name, model_name, timeout, metrics):
+        return _FakeProvider()
+
+    async def fake_benchmark_command(**kwargs):
+        raise _asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        cli_module, "_benchmark_provider", fake_build_provider
+    )
+    monkeypatch.setattr(
+        cli_module, "_benchmark_command", fake_benchmark_command
+    )
+
+    async def fake_refresh_models(provider, *, base_url, api_key, environ,
+                                  client=None):
+        # el catalogo fresco conserva la fila del manifiesto: el smoke y la
+        # batalla pueden correr (y la batalla ser cancelada en vuelo)
+        return ["mimo-v2.5-free"]
+
+    monkeypatch.setattr("ludex_agent.matrix.refresh_models", fake_refresh_models)
+    # Hermetico: el refresh usa la clave fake de zen y no toca otros proveedores
+    monkeypatch.setenv("OPEN_CODE_ZEN_API_KEY", "fake-key")
+    for secret_env in ("GEMINI_API_KEY", "GEMINI_API_KEYS", "GOOGLE_API_KEY",
+                       "GOOGLE_API_KEYS", "KIMI_API_KEY", "KIMI_BASE_URL"):
+        monkeypatch.delenv(secret_env, raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://x:x@localhost:15432/x")
+
+    # la excepcion NO se traga: CancelledError (BaseException) escapa del
+    # CLI tal cual, como una interrupcion real de Ctrl+C
+    with pytest.raises(_asyncio.CancelledError):
+        CliRunner().invoke(
+            app,
+            ["matrix-run", "--manifest", str(manifest), "--tier", "free",
+             "--round", "r2-cancel-cli", "--zen-auto-reload-confirmed"],
+        )
+    # el artefacto de stop es durable
+    state_path = run_dir / "r2-cancel-cli-matrix-run-state.json"
+    assert state_path.exists(), "falta el state file de la fila interrumpida"
+    state = _json.loads(state_path.read_text())
+    stop = state["open_code_zen/mimo-v2.5-free"]
+    assert stop["status"] == "internal-defect"
+    assert stop["failure_type"] == "CancelledError"
+    assert stop["failure_stage"] == "battle"
+    assert stop["compatibility_result"] == "indeterminate-current-run"
+    # artefacto atomico por modelo escrito por on_result antes del re-lanzamiento
+    artifact = run_dir / (
+        "r2-cancel-cli-open_code_zen-mimo-v2.5-free-matrix.json"
+    )
+    assert artifact.exists(), "falta el artefacto atomico del stop"
+    assert _json.loads(artifact.read_text())["status"] == "internal-defect"
+    # el contexto de corrida llega al artefacto
+    assert _json.loads(artifact.read_text())["round"] == "r2-cancel-cli"
+
+
+def test_matrix_run_pasa_contexto_y_hash_del_manifiesto_al_runner(
+    tmp_path, monkeypatch
+):
+    """I4: el CLI computa la referencia y el sha256 del manifiesto y los
+    propaga al runner junto con la identidad de ronda, para que cada
+    artefacto sea auditable sin contexto externo."""
+    import hashlib as _hashlib
+    import json as _json
+
+    manifest = _manifest_document(tmp_path)
+    captured: dict[str, object] = {}
+
+    async def fake_run_matrix_round(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(
+        "ludex_agent.matrix.run_matrix_round", fake_run_matrix_round
+    )
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://x:x@localhost:15432/x")
+    for secret_env in ("GEMINI_API_KEY", "KIMI_API_KEY", "OPEN_CODE_ZEN_API_KEY"):
+        monkeypatch.delenv(secret_env, raising=False)
+
+    result = CliRunner().invoke(
+        app,
+        ["matrix-run", "--manifest", str(manifest), "--tier", "free",
+         "--round", "r2-ctx-cli", "--zen-auto-reload-confirmed"],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert captured["round_name"] == "r2-ctx-cli"
+    assert captured["manifest_ref"] == manifest.name
+    expected_hash = _hashlib.sha256(
+        manifest.read_bytes()
+    ).hexdigest()
+    assert captured["manifest_sha256"] == expected_hash
+
+
+def test_matrix_run_rechaza_manifiesto_con_fila_operador_prohibida(
+    tmp_path, monkeypatch
+):
+    """I3: un manifiesto que trae gpt-5.6-luna como ready (p.ej. el
+    versionado) es rechazado por matrix-run antes de tocar cualquier
+    request: exit != 0 y el mensaje nombra la politica."""
+    manifest = _manifest_document(tmp_path, rows=[
+        {
+            "provider": "open_code_zen", "model": "gpt-5.6-luna",
+            "protocol": "responses", "endpoint": None,
+            "structured_output": "text_json", "tier": "paid",
+            "status": "ready", "battles": 2, "concurrency": 1,
+            "persist": False, "pin": ["open_code_zen", "gpt-5.6-luna"],
+            "estimated_cost_usd": "0.744", "estimated_smoke_usd": "0.0104",
+            "classification_note": "paid (zen-docs)",
+        },
+    ])
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://x:x@localhost:15432/x")
+    for secret_env in ("GEMINI_API_KEY", "KIMI_API_KEY", "OPEN_CODE_ZEN_API_KEY"):
+        monkeypatch.delenv(secret_env, raising=False)
+
+    # hermetico: los artefactos de la corrida van a tmp, nunca al repo
+    monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path / "runs")
+    (tmp_path / "runs").mkdir(parents=True)
+
+    result = CliRunner().invoke(
+        app,
+        ["matrix-run", "--manifest", str(manifest), "--tier", "paid"],
+    )
+    assert result.exit_code != 0, result.stdout
+    assert "operator-prohibited" in str(result.exception)

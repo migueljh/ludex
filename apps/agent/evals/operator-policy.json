@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-08-15",
+  "scope": {
+    "effective_from": "2026-08-14",
+    "live_game_execution": "Chinese models and Gemini free tier only",
+    "paid_chinese_retry": "requires a new explicit provider cap",
+    "historical_non_chinese_results": "evidence-only; never authority to rerun",
+    "source_of_truth": "AGENTS.md seccion 'Restriccion operativa de modelos para juego' y D54"
+  },
+  "entries": [
+    {
+      "provider": "open_code_zen",
+      "model": "gpt-5.6-luna",
+      "action": "operator-prohibited-never-retry",
+      "reason": "prohibicion permanente por instruccion del usuario: nunca se reintenta, aunque exista ruta, saldo o artefacto incompleto",
+      "effective_since": "2026-08-14"
+    }
+  ]
+}
