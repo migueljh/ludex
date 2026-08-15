@@ -48,14 +48,15 @@
         "operator SIGINT produced CancelledError intercepted"
       ],
       "log_evidence": {
-        "original_path": "/tmp/ludex-coordination/r4-zen-paid.log",
         "sha256": "fc98d19cdae129256352a8ab42cdeade28609c29b7039d2491ed45e1808ba6f4",
         "bytes": 598,
         "sanitized_events": [
           "line 4: APIConnectionError",
           "line 5: APITimeoutError",
           "line 6: benchmark active; CancelledError intercepted"
-        ]
+        ],
+        "log_reference": "r4-zen-paid.log",
+        "location_note": "log crudo del operador, no versionado (referencia por nombre)"
       },
       "historical_supplement": {
         "artifact": "20260728-deepseek-v4-flash-15.json",
@@ -103,12 +104,13 @@
         "operator SIGINT produced CancelledError intercepted"
       ],
       "log_evidence": {
-        "original_path": "/tmp/ludex-coordination/r4b-zen-paid-rest.log",
         "sha256": "ea7a593df19496561a7d41eeb1dd111201f9b0f1e99581db31b91f89da5ae8f9",
         "bytes": 82,
         "sanitized_events": [
           "line 1: benchmark active; CancelledError intercepted"
-        ]
+        ],
+        "log_reference": "r4b-zen-paid-rest.log",
+        "location_note": "log crudo del operador, no versionado (referencia por nombre)"
       }
     },
     {
@@ -148,13 +150,14 @@
         "operator SIGINT produced CancelledError intercepted"
       ],
       "log_evidence": {
-        "original_path": "/tmp/ludex-coordination/r4f-zen-paid-minimax-m2.5.log",
         "sha256": "b547edbb06a8d7e345a712f04b5f1b88bad582ee98b09a9ad8db3a7dde7c93fb",
         "bytes": 183,
         "sanitized_events": [
           "line 1: APIConnectionError",
           "line 2: benchmark active; CancelledError intercepted"
-        ]
+        ],
+        "log_reference": "r4f-zen-paid-minimax-m2.5.log",
+        "location_note": "log crudo del operador, no versionado (referencia por nombre)"
       }
     },
     {
@@ -194,14 +197,15 @@
         "operator SIGINT produced CancelledError intercepted"
       ],
       "log_evidence": {
-        "original_path": "/tmp/ludex-coordination/r5-kimi-paid.log",
         "sha256": "671ca2c2095a9d1623a0f03818fe0e10cfb39f0630963c8f64d1ce6d82c3174f",
         "bytes": 22958,
         "sanitized_events": [
           "line 211: APIConnectionError",
           "lines 212-213: RateLimitError",
           "line 214: benchmark active; CancelledError intercepted"
-        ]
+        ],
+        "log_reference": "r5-kimi-paid.log",
+        "location_note": "log crudo del operador, no versionado (referencia por nombre)"
       },
       "historical_supplement": {
         "artifacts": [
