@@ -136,21 +136,26 @@ def test_aborted_con_400_fatal_no_es_limite_externo():
 
 
 def test_normalizacion_aborted_usa_la_tabla_del_runner():
-    """C2: la tabla de normalizacion de `aborted` es exactamente la del
-    runner (smoke y batalla): FatalProviderError 400 -> unsupported-protocol;
-    401/403 -> credential/model unavailable; transitorio/deadline/pool ->
-    externally-limited; defecto interno -> internal-defect."""
+    """C2/T-08: la tabla de normalizacion es la del runner y aplica a
+    AMBOS runtime_status historicos que afirman una clase que hay que
+    re-derivar: `aborted` y `unsupported-protocol`. FatalProviderError 400
+    -> unsupported-protocol; 401/403 -> credential/model unavailable;
+    404/500/None -> internal-defect (fail-closed, nunca texto libre)."""
     n = bmc.normalize_final_classification
     # passthrough de clases ya fieles
     assert n("compatible", None, None) == "compatible"
-    assert n("unsupported-protocol", None, None) == "unsupported-protocol"
     assert n("invalid-semantic-response", None, None) == "invalid-semantic-response"
     assert n("credential/model unavailable", None, None) == "credential/model unavailable"
     assert n("internal-defect", None, None) == "internal-defect"
     # FatalProviderError: 400 -> protocolo; 401/403 -> credencial
-    assert n("aborted", "FatalProviderError", 400) == "unsupported-protocol"
-    assert n("aborted", "FatalProviderError", 401) == "credential/model unavailable"
-    assert n("aborted", "FatalProviderError", 403) == "credential/model unavailable"
+    for runtime in ("aborted", "unsupported-protocol"):
+        assert n(runtime, "FatalProviderError", 400) == "unsupported-protocol", runtime
+        assert n(runtime, "FatalProviderError", 401) == "credential/model unavailable"
+        assert n(runtime, "FatalProviderError", 403) == "credential/model unavailable"
+        # T-08: 404/500/None no autorizan a afirmar unsupported-protocol
+        assert n(runtime, "FatalProviderError", 404) == "internal-defect"
+        assert n(runtime, "FatalProviderError", 500) == "internal-defect"
+        assert n(runtime, "FatalProviderError", None) == "internal-defect"
     # transitorio / deadline / pool -> limite externo
     assert n("aborted", "TransientProviderError", None) == "externally-limited"
     assert n("aborted", "ProviderPoolExhausted", None) == "externally-limited"
@@ -160,12 +165,55 @@ def test_normalizacion_aborted_usa_la_tabla_del_runner():
     assert n("aborted", "InternalCleanupError", None) == "internal-defect"
     # sin evidencia estructurada atribuible al proveedor: nunca limite externo
     assert n("aborted", None, None) == "internal-defect"
-    # T-03 (MON-20 R3): FatalProviderError SOLO con HTTP 400 estructurado es
-    # rechazo de protocolo; 404/500/None no autorizan a afirmar
-    # unsupported-protocol sobre un modelo
-    assert n("aborted", "FatalProviderError", 404) == "internal-defect"
-    assert n("aborted", "FatalProviderError", 500) == "internal-defect"
-    assert n("aborted", "FatalProviderError", None) == "internal-defect"
+    assert n("unsupported-protocol", None, None) == "internal-defect"
+
+
+def test_fila_historica_404_deriva_internal_defect_preservando_runtime():
+    """T-08 (MON-20 R4): la fila historica google/gemini-2.5-flash-lite
+    (runtime_status viejo `unsupported-protocol`, FatalProviderError + HTTP
+    404) se publica con final_classification `internal-defect` — el
+    runtime_status historico se conserva verbatim, pero la clase derivada
+    sale de la evidencia estructurada, no del status viejo."""
+    doc = _rebuilt()
+    row = next(
+        r for r in doc["rows"]
+        if r["provider"] == "google"
+        and r["model"] == "gemini-2.5-flash-lite"
+    )
+    assert row["runtime_status"] == "unsupported-protocol"  # historico, verbatim
+    assert row["failure_type"] == "FatalProviderError"
+    assert row["http_status"] == 404
+    assert row["failure_stage"] == "smoke"
+    assert row["final_classification"] == "internal-defect", row
+    assert row["evidence_kind"] == "atomic-runtime-artifact"
+    # las 400 reales siguen siendo unsupported-protocol (medido)
+    for model in ("gpt-5-nano", "gpt-5.1-codex-mini"):
+        r400 = next(
+            r for r in doc["rows"]
+            if r["provider"] == "open_code_zen" and r["model"] == model
+        )
+        assert r400["final_classification"] == "unsupported-protocol", model
+
+
+def test_counts_t08_unsupported_4_internal_defect_5():
+    """T-08 (MON-20 R4): conteos regenerados: unsupported-protocol 4 (las
+    tres 400 medidas + la Kimi), internal-defect 5 (4 stops + la 404
+    historica), total medido 22; el resto de invariantes identico."""
+    doc = _rebuilt()
+    by_class = doc["counts"]["by_final_classification"]
+    assert sum(by_class.values()) == 22
+    assert by_class["unsupported-protocol"] == 4, by_class
+    assert by_class["internal-defect"] == 5, by_class
+    assert by_class["externally-limited"] == 10
+    assert by_class["compatible"] == 1
+    assert by_class["credential/model unavailable"] == 1
+    assert by_class["invalid-semantic-response"] == 1
+    # invariantes sin cambio
+    assert doc["invariants"]["comparable_rows"] == 0
+    assert doc["invariants"]["persisted_rows"] == 0
+    assert doc["invariants"]["not_attempted_rows_in_measured_bucket"] == 0
+    assert doc["invariants"]["fatal_400_aborted_classified_unsupported"] == 2
+    assert doc["counts"]["measured_rows"] == 22
 
 
 def test_stop_semantico_desde_artefacto_conserva_marca_y_campos(tmp_path):

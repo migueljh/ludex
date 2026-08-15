@@ -572,7 +572,10 @@ def test_smoke_fallido_produce_0_batallas():
     results, built, battle_calls = asyncio.run(_run(
         rows, smoke_error=FatalProviderError("provider permission or model unavailable"),
     ))
-    assert results[0].status == "unsupported-protocol"
+    # T-08 (MON-20 R4): un FatalProviderError SIN status estructurado no
+    # autoriza a afirmar un rechazo de protocolo: fail-closed a
+    # internal-defect (antes era unsupported-protocol por default).
+    assert results[0].status == "internal-defect"
     assert results[0].smoke_ok is False
     assert results[0].battles_completed == 0
     assert battle_calls == []
@@ -1580,6 +1583,74 @@ def test_fatal_400_structured_output_sigue_siendo_unsupported_protocol():
     results, _, _ = asyncio.run(_run(rows, smoke_error=_fatal_with_http(400)))
     assert results[0].status == "unsupported-protocol"
     assert results[0].http_status == 400
+
+
+def test_fatal_404_y_500_y_sin_status_de_smoke_son_internal_defect():
+    """T-08 (MON-20 R4): la taxonomia del runner queda structured-only y
+    fail-closed: FatalProviderError con HTTP 404, 500 o sin status en el
+    smoke NO autoriza a afirmar `unsupported-protocol` (que queda reservado
+    a HTTP 400). 404/500/None -> internal-defect."""
+    import asyncio
+
+    rows = [_ready_row("open_code_zen", "big-pickle", "free")]
+    for status in (404, 500):
+        results, _, _ = asyncio.run(_run(
+            rows, smoke_error=_fatal_with_http(status),
+        ))
+        assert results[0].status == "internal-defect", status
+        assert results[0].http_status == status, status
+    # sin status estructurado: fail-closed a internal-defect
+    from ludex_agent.graph.provider import FatalProviderError
+
+    results, _, _ = asyncio.run(_run(
+        rows, smoke_error=FatalProviderError("boom sin status"),
+    ))
+    assert results[0].status == "internal-defect"
+    assert results[0].http_status is None
+
+
+def test_taxonomia_runner_y_coverage_son_la_misma_tabla():
+    """T-08 (MON-20 R4): canario CRUZADO runner+coverage. La tabla
+    structured-only de FatalProviderError es UNA: el smoke del runner y la
+    normalizacion historica del generador (para runtime_status aborted y
+    unsupported-protocol) producen exactamente el mismo veredicto para
+    400/401/403/404/500/None. Si uno de los dos lados se desalinea, este
+    test se pone rojo."""
+    import asyncio
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    from ludex_agent.graph.provider import FatalProviderError
+
+    evals_dir = _Path(__file__).resolve().parents[1] / "evals"
+    if str(evals_dir) not in _sys.path:
+        _sys.path.insert(0, str(evals_dir))
+    import build_matrix_coverage as bmc  # noqa: E402
+
+    expected = {
+        400: "unsupported-protocol",
+        401: "credential/model unavailable",
+        403: "credential/model unavailable",
+        404: "internal-defect",
+        500: "internal-defect",
+        None: "internal-defect",
+    }
+    rows = [_ready_row("open_code_zen", "big-pickle", "free")]
+    for status, verdict in expected.items():
+        # lado runner: el smoke clasifica con la misma tabla
+        smoke_error = (
+            FatalProviderError("boom") if status is None
+            else _fatal_with_http(status)
+        )
+        results, _, _ = asyncio.run(_run(
+            rows, smoke_error=smoke_error,
+        ))
+        assert results[0].status == verdict, (status, results[0].status)
+        # lado coverage: ambas rutas historicas derivan el mismo veredicto
+        for runtime in ("aborted", "unsupported-protocol"):
+            assert bmc.normalize_final_classification(
+                runtime, "FatalProviderError", status
+            ) == verdict, (runtime, status)
 
 
 def test_manifiesto_unitario_r1c_dentro_del_cap_y_sin_cumulative_stale():

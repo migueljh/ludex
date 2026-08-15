@@ -742,6 +742,25 @@ class _RowProgress:
         self.stage = "smoke"
 
 
+def _fatal_status(exc: BaseException) -> str:
+    """T-08 (MON-20 R4): taxonomia structured-only de FatalProviderError,
+    compartida con la normalizacion historica de la cobertura:
+
+    - HTTP 400 -> `unsupported-protocol` (rechazo de protocolo/structured
+      output, el unico caso que la categoria mide);
+    - HTTP 401/403 -> `credential/model unavailable`;
+    - HTTP 404/500 o sin status -> `internal-defect` (fail-closed: sin la
+      senal exacta del contrato no se afirma un rechazo de protocolo).
+
+    Nunca se infiere de texto libre: solo de la cadena de status."""
+    http = _http_status_chain(exc)
+    if http in (401, 403):
+        return "credential/model unavailable"
+    if http == 400:
+        return "unsupported-protocol"
+    return "internal-defect"
+
+
 def _terminal_stop_result(
     row: ManifestRow,
     exc: BaseException,
@@ -841,20 +860,21 @@ async def _run_one(
     except CredentialRejected as exc:
         return _fail("credential/model unavailable", exc)
     except ProviderError as exc:
-        # L-04 (post-R1B): `FatalProviderError` con HTTP 401/403 upstream/
-        # model-wide (sin senal key-specific; el provider ya no rota ni
-        # cuarentena) es `credential/model unavailable`; la categoria
-        # `unsupported-protocol` queda reservada para rechazo de
-        # protocolo/structured output (p.ej. HTTP 400 de response_format).
-        # Transitorio o deadline: limite externo.
-        if isinstance(exc, FatalProviderError) and _http_status_chain(exc) in (401, 403):
-            status = "credential/model unavailable"
+        # L-04 (post-R1B) + T-08 (MON-20 R4): la taxonomia del smoke es
+        # structured-only y fail-closed. `unsupported-protocol` queda
+        # reservada EXCLUSIVAMENTE al rechazo de protocolo/structured
+        # output con HTTP 400 estructurado; 401/403 upstream/model-wide
+        # (sin senal key-specific; el provider ya no rota ni cuarentena) es
+        # `credential/model unavailable`; y un FatalProviderError con
+        # 404/500 o sin status NO autoriza a afirmar un rechazo de
+        # protocolo sobre el modelo -> `internal-defect`. Esta misma tabla
+        # es la que la cobertura aplica a los historicos
+        # (normalize_final_classification), asi runner y evidencia nunca
+        # divergen por etapa. Transitorio o deadline: limite externo.
+        if isinstance(exc, FatalProviderError):
+            status = _fatal_status(exc)
         else:
-            status = (
-                "unsupported-protocol"
-                if isinstance(exc, FatalProviderError)
-                else "externally-limited"
-            )
+            status = "externally-limited"
         return _fail(status, exc)
     try:
         DecisionResponse.model_validate(envelope.payload)

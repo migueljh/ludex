@@ -48,9 +48,13 @@ PURPOSE = (
     "calidad ni winrate"
 )
 
-# Clasificaciones terminales fieles que el runner ya emitio: pasan tal cual.
+# Clasificaciones terminales que no dependen del status HTTP y pasan tal
+# cual. `unsupported-protocol` NO esta aca (T-08): un runtime_status viejo
+# con ese valor se re-deriva de failure_type/http_status como cualquier
+# `aborted`, para que la evidencia historica nunca afirme una clase que su
+# propia senal no sostiene.
 _FAITHFUL = frozenset({
-    "compatible", "unsupported-protocol", "invalid-semantic-response",
+    "compatible", "invalid-semantic-response",
     "credential/model unavailable", "internal-defect",
 })
 
@@ -69,14 +73,16 @@ def normalize_final_classification(
     failure_type: str | None,
     http_status: int | None,
 ) -> str:
-    """C2: normaliza `aborted` con evidencia ESTRUCTURADA y la misma
-    taxonomia del runner, jamas desde texto libre:
+    """C2/T-08: normaliza con evidencia ESTRUCTURADA y la misma taxonomia
+    del runner, jamas desde texto libre. Aplica a los DOS runtime_status
+    que afirman una clase re-derivable: `aborted` y `unsupported-protocol`
+    (historico viejo del runner pre-T-08):
 
     - FatalProviderError + HTTP 400 -> `unsupported-protocol` (rechazo de
       protocolo/structured output);
     - FatalProviderError + HTTP 401/403 -> `credential/model unavailable`;
     - FatalProviderError sin HTTP 400 estructurado (404/500/None) ->
-      `internal-defect` (T-03: sin la senal exacta del contrato no se
+      `internal-defect` (T-03/T-08: sin la senal exacta del contrato no se
       afirma un rechazo de protocolo sobre el modelo);
     - transitorio/deadline/pool -> `externally-limited`;
     - defecto interno (ProviderMixError/InternalCleanupError) ->
@@ -87,7 +93,7 @@ def normalize_final_classification(
     Las demas clases terminales se conservan verbatim."""
     if runtime_status in _FAITHFUL:
         return runtime_status
-    if runtime_status != "aborted":
+    if runtime_status not in {"aborted", "unsupported-protocol"}:
         return runtime_status
     if failure_type == "FatalProviderError":
         if http_status in (401, 403):
