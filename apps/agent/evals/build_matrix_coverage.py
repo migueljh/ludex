@@ -58,54 +58,29 @@ _FAITHFUL = frozenset({
     "credential/model unavailable", "internal-defect",
 })
 
-# Taxonomia del runner (matrix.py:_run_one, misma para smoke y batalla).
-_TRANSIENT = frozenset({
-    "TransientProviderError", "ProviderPoolExhausted",
-    "BenchmarkDeadlineExceeded", "CredentialRejected", "ProviderError",
-})
-_INTERNAL_DEFECT = frozenset({
-    "ProviderMixError", "InternalCleanupError",
-})
-
 
 def normalize_final_classification(
     runtime_status: str,
     failure_type: str | None,
     http_status: int | None,
 ) -> str:
-    """C2/T-08: normaliza con evidencia ESTRUCTURADA y la misma taxonomia
-    del runner, jamas desde texto libre. Aplica a los DOS runtime_status
-    que afirman una clase re-derivable: `aborted` y `unsupported-protocol`
-    (historico viejo del runner pre-T-08):
+    """C2/T-08/T-11: normaliza con evidencia ESTRUCTURADA y la MISMA
+    taxonomia unica del runner (`ludex_agent.matrix.provider_failure_class`),
+    jamas desde texto libre. Aplica a los DOS runtime_status que afirman una
+    clase re-derivable: `aborted` y `unsupported-protocol` (historico viejo
+    del runner pre-T-08).
 
-    - FatalProviderError + HTTP 400 -> `unsupported-protocol` (rechazo de
-      protocolo/structured output);
-    - FatalProviderError + HTTP 401/403 -> `credential/model unavailable`;
-    - FatalProviderError sin HTTP 400 estructurado (404/500/None) ->
-      `internal-defect` (T-03/T-08: sin la senal exacta del contrato no se
-      afirma un rechazo de protocolo sobre el modelo);
-    - transitorio/deadline/pool -> `externally-limited`;
-    - defecto interno (ProviderMixError/InternalCleanupError) ->
-      `internal-defect`;
-    - sin evidencia estructurada atribuible al proveedor -> internal-defect
-      (fail-closed: nunca se afirma un limite externo sin senal).
+    La tabla vive en UN solo lugar (matrix.py) y este modulo la importa:
+    smoke, excepcion directa de batalla y normalizacion historica no pueden
+    divergir (canarios cruzados en test_matrix.py).
 
     Las demas clases terminales se conservan verbatim."""
     if runtime_status in _FAITHFUL:
         return runtime_status
     if runtime_status not in {"aborted", "unsupported-protocol"}:
         return runtime_status
-    if failure_type == "FatalProviderError":
-        if http_status in (401, 403):
-            return "credential/model unavailable"
-        if http_status == 400:
-            return "unsupported-protocol"
-        return "internal-defect"
-    if failure_type in _TRANSIENT:
-        return "externally-limited"
-    if failure_type in _INTERNAL_DEFECT:
-        return "internal-defect"
-    return "internal-defect"
+    from ludex_agent.matrix import provider_failure_class
+    return provider_failure_class(failure_type, http_status)
 
 
 def load_manifest(path: str | Path) -> dict:

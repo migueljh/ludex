@@ -1610,12 +1610,14 @@ def test_fatal_404_y_500_y_sin_status_de_smoke_son_internal_defect():
 
 
 def test_taxonomia_runner_y_coverage_son_la_misma_tabla():
-    """T-08 (MON-20 R4): canario CRUZADO runner+coverage. La tabla
-    structured-only de FatalProviderError es UNA: el smoke del runner y la
-    normalizacion historica del generador (para runtime_status aborted y
-    unsupported-protocol) producen exactamente el mismo veredicto para
-    400/401/403/404/500/None. Si uno de los dos lados se desalinea, este
-    test se pone rojo."""
+    """T-08 (MON-20 R4) + T-11 (MON-20 R5): canario ABSOLUTO de las TRES
+    rutas de clasificacion. La tabla structured-only de FatalProviderError
+    es UNA y produce exactamente el mismo veredicto para
+    400/401/403/404/500/None en: (1) el smoke del runner, (2) la excepcion
+    DIRECTA durante batalla (run_battles levanta el ProviderError), y
+    (3) la normalizacion historica del generador (runtime_status aborted y
+    unsupported-protocol). Si cualquiera de las tres rutas vuelve a
+    colapsar su clasificacion, este test se pone rojo."""
     import asyncio
     import sys as _sys
     from pathlib import Path as _Path
@@ -1637,7 +1639,7 @@ def test_taxonomia_runner_y_coverage_son_la_misma_tabla():
     }
     rows = [_ready_row("open_code_zen", "big-pickle", "free")]
     for status, verdict in expected.items():
-        # lado runner: el smoke clasifica con la misma tabla
+        # ruta 1: smoke del runner
         smoke_error = (
             FatalProviderError("boom") if status is None
             else _fatal_with_http(status)
@@ -1645,12 +1647,59 @@ def test_taxonomia_runner_y_coverage_son_la_misma_tabla():
         results, _, _ = asyncio.run(_run(
             rows, smoke_error=smoke_error,
         ))
-        assert results[0].status == verdict, (status, results[0].status)
-        # lado coverage: ambas rutas historicas derivan el mismo veredicto
+        assert results[0].status == verdict, ("smoke", status, results[0].status)
+        # ruta 2: excepcion DIRECTA durante batalla (smoke verde y la
+        # batalla levanta el mismo ProviderError)
+        battle_error = (
+            FatalProviderError("boom") if status is None
+            else _fatal_with_http(status)
+        )
+        results, _, _ = asyncio.run(_run(
+            rows, battle_raise=battle_error,
+        ))
+        assert results[0].status == verdict, ("battle", status, results[0].status)
+        assert results[0].failure_stage == "battle", status
+        assert results[0].smoke_ok is True, status
+        assert results[0].http_status == status, status
+        # ruta 3: normalizacion historica del generador (aborted y
+        # unsupported-protocol viejo)
         for runtime in ("aborted", "unsupported-protocol"):
             assert bmc.normalize_final_classification(
                 runtime, "FatalProviderError", status
             ) == verdict, (runtime, status)
+
+
+def test_excepcion_directa_de_batalla_usa_la_misma_taxonomia():
+    """T-11 (MON-20 R5): la excepcion ProviderError que llega DIRECTA del
+    run_battles (no via BenchmarkResult tipado) se clasifica con la misma
+    taxonomia: FatalProviderError 400 -> unsupported-protocol; 401/403 ->
+    credential; 404/500/None -> internal-defect; ProviderMixError ->
+    internal-defect; transitorio -> externally-limited. Antes del arreglo
+    TODO ProviderError salvo ProviderMixError caia a externally-limited."""
+    import asyncio
+
+    from ludex_agent.graph.provider import (
+        FatalProviderError, ProviderMixError, TransientProviderError,
+    )
+
+    rows = [_ready_row("open_code_zen", "big-pickle", "free")]
+    cases = [
+        (_fatal_with_http(400), "unsupported-protocol"),
+        (_fatal_with_http(401), "credential/model unavailable"),
+        (_fatal_with_http(403), "credential/model unavailable"),
+        (_fatal_with_http(404), "internal-defect"),
+        (_fatal_with_http(500), "internal-defect"),
+        (FatalProviderError("boom sin status"), "internal-defect"),
+        (ProviderMixError("mezcla efectiva"), "internal-defect"),
+        (TransientProviderError("transitorio"), "externally-limited"),
+    ]
+    for error, verdict in cases:
+        results, _, _ = asyncio.run(_run(rows, battle_raise=error))
+        result = results[0]
+        assert result.status == verdict, (type(error).__name__, result.status)
+        assert result.failure_stage == "battle"
+        assert result.smoke_ok is True
+        assert result.failure_type == type(error).__name__
 
 
 def test_manifiesto_unitario_r1c_dentro_del_cap_y_sin_cumulative_stale():

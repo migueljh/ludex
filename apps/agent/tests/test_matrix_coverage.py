@@ -196,9 +196,11 @@ def test_fila_historica_404_deriva_internal_defect_preservando_runtime():
 
 
 def test_counts_t08_unsupported_4_internal_defect_5():
-    """T-08 (MON-20 R4): conteos regenerados: unsupported-protocol 4 (las
-    tres 400 medidas + la Kimi), internal-defect 5 (4 stops + la 404
-    historica), total medido 22; el resto de invariantes identico."""
+    """T-08/T-12 (MON-20 R4/R5): conteos regenerados. `unsupported-protocol`
+    = 4, compuesto por DOS smoke HTTP 400 (gpt-5-nano, gpt-5.1-codex-mini) +
+    DOS aborted HTTP 400 (moonshot-v1-8k, moonshot-v1-8k-vision-preview);
+    `internal-defect` = 5 (4 stops + la 404 historica); total medido 22; el
+    resto de invariantes identico."""
     doc = _rebuilt()
     by_class = doc["counts"]["by_final_classification"]
     assert sum(by_class.values()) == 22
@@ -208,6 +210,17 @@ def test_counts_t08_unsupported_4_internal_defect_5():
     assert by_class["compatible"] == 1
     assert by_class["credential/model unavailable"] == 1
     assert by_class["invalid-semantic-response"] == 1
+    # T-12: composicion exacta de los 4 unsupported-protocol
+    unsupported = [
+        r for r in doc["rows"]
+        if r["final_classification"] == "unsupported-protocol"
+    ]
+    assert len(unsupported) == 4
+    smoke_400 = {r["model"] for r in unsupported if r["runtime_status"] == "unsupported-protocol"}
+    aborted_400 = {r["model"] for r in unsupported if r["runtime_status"] == "aborted"}
+    assert smoke_400 == {"gpt-5-nano", "gpt-5.1-codex-mini"}
+    assert aborted_400 == {"moonshot-v1-8k", "moonshot-v1-8k-vision-preview"}
+    assert all(r["http_status"] == 400 for r in unsupported)
     # invariantes sin cambio
     assert doc["invariants"]["comparable_rows"] == 0
     assert doc["invariants"]["persisted_rows"] == 0

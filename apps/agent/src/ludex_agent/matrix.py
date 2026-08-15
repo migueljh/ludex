@@ -742,23 +742,65 @@ class _RowProgress:
         self.stage = "smoke"
 
 
-def _fatal_status(exc: BaseException) -> str:
-    """T-08 (MON-20 R4): taxonomia structured-only de FatalProviderError,
-    compartida con la normalizacion historica de la cobertura:
+def provider_failure_class(
+    failure_type: str | None,
+    http_status: int | None,
+) -> str:
+    """T-08/T-11 (MON-20 R4/R5): taxonomia estructurada UNICA de
+    ProviderError, aplicada por las TRES rutas de clasificacion — smoke,
+    excepcion directa durante batalla y normalizacion historica de la
+    cobertura (build_matrix_coverage.normalize_final_classification para
+    runtime_status aborted/unsupported-protocol). Evita una cuarta
+    divergencia: si una ruta colapsa o inventa su propia tabla, los canarios
+    cruzados se ponen rojos.
 
-    - HTTP 400 -> `unsupported-protocol` (rechazo de protocolo/structured
-      output, el unico caso que la categoria mide);
-    - HTTP 401/403 -> `credential/model unavailable`;
-    - HTTP 404/500 o sin status -> `internal-defect` (fail-closed: sin la
-      senal exacta del contrato no se afirma un rechazo de protocolo).
+    - `FatalProviderError` + HTTP 400 -> `unsupported-protocol` (rechazo de
+      protocolo/structured output, el unico caso que la categoria mide);
+    - `FatalProviderError` + 401/403 -> `credential/model unavailable`;
+    - `FatalProviderError` + 404/500/None u otro status -> `internal-defect`
+      (fail-closed: sin la senal exacta del contrato no se afirma un rechazo
+      de protocolo sobre el modelo);
+    - `ProviderMixError`/`InternalCleanupError` -> `internal-defect`;
+    - transitorio/deadline/pool (`TransientProviderError`,
+      `ProviderPoolExhausted`, `BenchmarkDeadlineExceeded`,
+      `DecisionDeadlineExceeded`, `CredentialRejected`, `ProviderError`) ->
+      `externally-limited`;
+    - cualquier otra clase o None -> `internal-defect` (fail-closed).
 
-    Nunca se infiere de texto libre: solo de la cadena de status."""
-    http = _http_status_chain(exc)
-    if http in (401, 403):
-        return "credential/model unavailable"
-    if http == 400:
-        return "unsupported-protocol"
+    Nunca se infiere de texto libre: solo de la clase y la cadena de
+    status."""
+    if failure_type == "FatalProviderError":
+        if http_status in (401, 403):
+            return "credential/model unavailable"
+        if http_status == 400:
+            return "unsupported-protocol"
+        return "internal-defect"
+    if failure_type in {"ProviderMixError", "InternalCleanupError"}:
+        return "internal-defect"
+    if failure_type in {
+        "TransientProviderError", "ProviderPoolExhausted",
+        "BenchmarkDeadlineExceeded", "DecisionDeadlineExceeded",
+        "CredentialRejected", "ProviderError",
+    }:
+        return "externally-limited"
     return "internal-defect"
+
+
+def _fatal_status(exc: BaseException) -> str:
+    """T-08 (MON-20 R4): wraper de la taxonomia unica para una excepcion
+    real: la clase se extrae de `type(exc).__name__` y el status de la
+    cadena de causas. Un solo punto de entrada para las rutas con
+    excepciones (smoke y batalla directa)."""
+    return provider_failure_class(type(exc).__name__, _http_status_chain(exc))
+
+
+# T-11 (MON-20 R5): clases que el resultado parcial tipado (BenchmarkResult)
+# clasifica como terminales en la fase de batalla, resueltas con la misma
+# taxonomia unica. Todo lo demas con `failure` se preserva como `aborted`
+# para que la cobertura lo re-derive desde failure_type/http_status.
+_TERMINAL_BATTLE_CLASSES = frozenset({
+    "ProviderMixError", "InternalCleanupError", "BenchmarkDeadlineExceeded",
+})
 
 
 def _terminal_stop_result(
@@ -894,11 +936,17 @@ async def _run_one(
             fmt=fmt, opponent=opponent,
         )
     except ProviderError as exc:
-        # ProviderMixError (mezcla efectiva) aborta la corrida del modelo.
-        status = "internal-defect" if type(exc).__name__ == "ProviderMixError" \
-            else "externally-limited"
+        # T-11 (MON-20 R5): la excepcion ProviderError DIRECTA del
+        # run_battles se clasifica con la MISMA taxonomia estructurada del
+        # smoke y de la normalizacion historica (provider_failure_class):
+        # FatalProviderError 400 -> unsupported-protocol; 401/403 ->
+        # credential/model unavailable; 404/500/None -> internal-defect;
+        # ProviderMixError -> internal-defect; transitorio/deadline/pool ->
+        # externally-limited. Antes, todo ProviderError salvo
+        # ProviderMixError colapsaba a externally-limited y el mismo fallo
+        # recibia dos veredictos segun la etapa.
         return _battle_failed(
-            row, exc, status=status,
+            row, exc, status=_fatal_status(exc),
             metrics=_metrics_delta(
                 before, _provider_metrics_snapshot(provider)
             ),
@@ -923,16 +971,14 @@ async def _run_one(
     requested = getattr(result, "requested", 0)
     failure = getattr(result, "failure", None)
     failure_type = getattr(result, "failure_type", None)
-    if failure_type == "ProviderMixError":
-        status = "internal-defect"
-    elif failure_type == "BenchmarkDeadlineExceeded":
-        status = "externally-limited"
-    elif failure_type == "InternalCleanupError":
-        # L-01 (correccion LATWAN): sin excepcion primaria, un fallo del
-        # cierre de recursos del benchmark (drain/players/calc/contexto/
-        # engine) jamas puede quedar `compatible`: internal-defect
-        # sanitizado, con el progreso real preservado.
-        status = "internal-defect"
+    # T-11 (MON-20 R5): las clases terminales que el resultado parcial ya
+    # clasifica se resuelven con la MISMA taxonomia unica; el resto con
+    # fallo se preserva como `aborted` para que la cobertura lo re-derive
+    # desde failure_type/http_status (nunca se colapsa a un veredicto).
+    if failure_type in _TERMINAL_BATTLE_CLASSES:
+        status = provider_failure_class(
+            failure_type, getattr(result, "http_status", None)
+        )
     elif failure is not None:
         status = "aborted"
     elif completed == requested:
