@@ -3483,3 +3483,97 @@ Zen; 22/22 filas ready tienen evidencia (18 atómicas + 4 stops); 75 quedan
 pending-budget, 15 excluidas por capacidad; cero filas comparables, cero
 persistencia y cero secretos. La matriz demuestra compatibilidad funcional,
 nunca calidad ni winrate.
+
+**D54 R1 — reconciliación con D43 tras revisión independiente (MON-20 R2,
+2026-08-15).** La regla 3 de la decisión original normalizaba
+`pending-budget → externally-limited` y `aborted → externally-limited`, lo
+que contradecía a D43 punto 5, al docstring de `matrix.py` y a un canario
+enforced (`test_plan_budget_pending_nunca_es_unsupported`). La revisión
+independiente (Neoblex) lo señaló como C1/C2. Corrección efectiva:
+
+1. Una fila NUNCA contactada (evidence_kind `manifest-classification`: 75
+   pending-budget + 15 excluidas por capacidad) queda
+   `final_classification: null` con `disposition: not-attempted` y
+   `not_attempted_reason` explícito: fuera de los buckets medidos, jamás
+   unsupported/incompatible/externally-limited. La exclusión por capacidad
+   conserva su razón en `manifest_status`/`not_attempted_reason` (no se
+   convierte en un `unsupported-protocol` medido).
+2. `aborted` se normaliza SÓLO con evidencia estructurada y la misma
+   taxonomía del runner (smoke/batalla): `FatalProviderError` + HTTP 400 →
+   `unsupported-protocol`; `FatalProviderError` + 401/403 →
+   `credential/model unavailable`; transitorio/deadline/pool →
+   `externally-limited`; defecto interno (ProviderMixError,
+   InternalCleanupError) → `internal-defect`; sin evidencia estructurada →
+   `internal-defect` (nunca se infiere un límite externo de texto libre).
+   `runtime_status`, `failure_type`, `failure_cause_type`, `failure_stage`
+   y `http_status` originales se preservan verbatim. Efecto medido sobre
+   las 22 filas ready: `externally-limited` baja de 12 a 10 (las dos Kimi
+   con 400 fatal pasan a `unsupported-protocol`); `unsupported-protocol`
+   pasa de 3 a 5 (medido en smoke 404/400 + batalla 400).
+3. `counts` y `invariants` se regeneran: 112 pares únicos, cobertura exacta
+   del manifiesto, 22 ready con evidencia 18+4, 0 comparables, 0
+   persistidos, 0 filas no ejecutadas en bucket medido, 2 aborted 400
+   clasificados unsupported-protocol.
+4. El generador ya no vive en `/tmp`: `apps/agent/evals/build_matrix_coverage.py`
+   reconstruye el coverage byte a byte desde fuentes versionadas
+   (manifiesto + artefactos + ledger) con `--check`; los tests
+   (`test_matrix_coverage.py`) recomputan las invariantes commiteadas y se
+   ponen rojos si se reintroducen los mapeos C1/C2.
+
+## D55 — MON-20 R2: política declarativa de operador, stop durable ante interrupción y artefactos autosuficientes (2026-08-15)
+
+**Contexto.** La revisión independiente (Neoblex) dejó cinco requerimientos
+fuera de la normalización: la prohibición de `gpt-5.6-luna` era sólo prosa
+(I3), una interrupción seguía perdiendo la fila entera (I2), los artefactos
+no eran auditable sin contexto externo ni el N=2 marcado como no comparable
+(I4/I5), y faltaban dos correcciones menores (M1/M2). Todos se implementan
+offline, sin providers, sin red, sin DB.
+
+**Decisiones.**
+
+1. **Política declarativa de operador (I3).** `apps/agent/evals/operator-policy.json`
+   versiona la prohibición: `open_code_zen/gpt-5.6-luna` →
+   `operator-prohibited-never-retry`, sin condicionales por nombre en `src/`.
+   `build_manifest` marca la fila `operator-prohibited` (battles=0, sin
+   costo, razón en la nota) en manifiestos NUEVOS; el manifiesto final
+   versionado `20260814t183716z-matrix-manifest.json` marca la fila con
+   `operator_prohibited` conservando su historial (status ready + evidencia
+   de stop, para no romper la invariante 22/18+4); `run_matrix_round`
+   rechaza cualquier fila prohibida con `ValueError` ANTES del primer
+   request (canarios de cero llamadas a proveedor y cero refrescos de
+   catálogo).
+
+2. **Stop durable ante interrupción (I2).** Si una fila es interrumpida por
+   `CancelledError`/`KeyboardInterrupt`/`SystemExit` durante smoke o
+   batalla, `run_matrix_round` emite SINCRONICAMENTE por `on_result` un
+   artefacto de stop sanitizado — `internal-defect`,
+   `compatibility_result=indeterminate-current-run`, etapa REAL
+   (`failure_stage` smoke|battle), `failure_type` = terminal original,
+   progreso disponible (`battles_requested` 2 si el smoke pasó, 0 si no) —
+   y RE-LANZA exactamente la misma excepción (nunca se traga ni se
+   convierte en fallo ordinario). La fila deja evidencia durable y el
+   `--resume` no la vuelve a ejecutar. Canarios a nivel runner y a nivel
+   CLI (artefacto en disco + excepción que escapa).
+
+3. **Artefactos autosuficientes (I4/I5).** `MatrixModelResult` persiste
+   `battle_timeout_seconds`, identidad de ronda (`round`), `generated_at` y
+   referencia + SHA-256 del manifiesto (`manifest`, `manifest_sha256`).
+   `win_rate` queda `null` SIEMPRE: N=2 prueba compatibilidad funcional,
+   nunca calidad; se publican W/L/T + `comparable=false` + `sample_size`
+   (batallas completadas). `already-finalized` también anula win_rate.
+
+4. **Correcciones menores (M1/M2).** `matrix.py` importa `Awaitable`/
+   `Callable` (verificado con `typing.get_type_hints(run_matrix_round)`).
+   La evidencia versionada elimina rutas absolutas del operador: el
+   manifiesto y el coverage registran `pricing.path` relativo a la raíz del
+   repo, y el ledger usa `log_reference` (basename) + `location_note` en
+   lugar de `/tmp/ludex-coordination/...`.
+
+**Verificación.** 128 tests focales nuevos/actualizados (test_matrix.py,
+test_cli.py, test_matrix_coverage.py) con 9 mutaciones deliberadas RED
+verificadas una por una: mapeo C1, mapeo C2, handler de stop I2, política
+I3 en runner, política I3 en build_manifest, win_rate I5, contexto I4,
+imports M1, rutas M2. Suite hermética completa (todo fuera de tests/db y
+tests/integration, `--noconftest`, env sanitizado): 626 passed, 37 skipped
+(module de integración con DB), exit 0. Sin red, sin providers, sin .env,
+sin DB, sin Docker.
