@@ -75,6 +75,9 @@ def normalize_final_classification(
     - FatalProviderError + HTTP 400 -> `unsupported-protocol` (rechazo de
       protocolo/structured output);
     - FatalProviderError + HTTP 401/403 -> `credential/model unavailable`;
+    - FatalProviderError sin HTTP 400 estructurado (404/500/None) ->
+      `internal-defect` (T-03: sin la senal exacta del contrato no se
+      afirma un rechazo de protocolo sobre el modelo);
     - transitorio/deadline/pool -> `externally-limited`;
     - defecto interno (ProviderMixError/InternalCleanupError) ->
       `internal-defect`;
@@ -89,7 +92,9 @@ def normalize_final_classification(
     if failure_type == "FatalProviderError":
         if http_status in (401, 403):
             return "credential/model unavailable"
-        return "unsupported-protocol"
+        if http_status == 400:
+            return "unsupported-protocol"
+        return "internal-defect"
     if failure_type in _TRANSIENT:
         return "externally-limited"
     if failure_type in _INTERNAL_DEFECT:
@@ -105,14 +110,28 @@ def load_ledger(path: str | Path) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _artifact_order_key(filename: str, document: Mapping[str, Any]) -> tuple:
+    """T-07 (MON-20 R3): orden determinista de artefactos por (provider,
+    model).
+
+    El criterio primario es el `generated_at` que I4 persiste DENTRO del
+    artefacto (fecha ISO, orden lexicografico valido). Los historicos sin
+    fecha caen al fallback documentado: el nombre de archivo
+    lexicograficamente mayor (los prefijos de ronda de este repo son
+    cronologicos), con el propio nombre como desempate final. Nunca se
+    elige por el orden de barrido del filesystem."""
+    return (document.get("generated_at") or "", filename)
+
+
 def scan_executed_artifacts(
     runs_dir: str | Path,
 ) -> dict[tuple[str, str], tuple[str, dict]]:
-    """I1: barre `runs/` y devuelve, por (provider, model), el artefacto de
-    la ronda mas reciente (nombre lexicograficamente mayor; los prefijos de
-    ronda son cronologicos en este repo). Solo archivos `*-matrix.json`
-    cuyo contenido trae provider+model: manifiestos, state files, coverage y
-    ledger no matchean el glob ni el shape."""
+    """I1/T-07: barre `runs/` y devuelve, por (provider, model), el
+    artefacto mas reciente segun `_artifact_order_key`: `generated_at` del
+    artefacto primero (I4), fallback lexicografico documentado para
+    historicos sin fecha. Solo archivos `*-matrix.json` cuyo contenido trae
+    provider+model: manifiestos, state files, coverage y ledger no
+    matchean el glob ni el shape."""
     result: dict[tuple[str, str], tuple[str, dict]] = {}
     for path in sorted(Path(runs_dir).glob(RUNS_GLOB)):
         try:
@@ -127,7 +146,9 @@ def scan_executed_artifacts(
             continue
         key = (provider, model)
         current = result.get(key)
-        if current is None or path.name > current[0]:
+        if current is None or _artifact_order_key(
+            path.name, document
+        ) > _artifact_order_key(current[0], current[1]):
             result[key] = (path.name, document)
     return result
 
@@ -207,10 +228,28 @@ def _atomic_row(
     source_artifact: str,
 ) -> dict:
     """Fila con artefacto atomico: runtime verbatim del artefacto y
-    clasificacion final normalizada con la tabla C2."""
+    clasificacion final normalizada con la tabla C2.
+
+    T-01 (MON-20 R3): un artefacto de STOP que I2 escribio por on_result
+    (status `internal-defect` + `compatibility_result` igual a
+    `indeterminate-current-run`) se publica como `sanitized-diagnostic-stop`
+    — NUNCA como un internal-defect medido cualquiera — conservando su marca
+    de indeterminacion y el contexto I4 (`compatibility_result`,
+    `sample_size`, `round`, `manifest`, `manifest_sha256`, `generated_at`,
+    `battle_timeout_seconds`).
+
+    T-04 (MON-20 R3): `comparable`, `win_rate` y `sample_size` se leen del
+    artefacto (no son literales): la invariante `comparable_rows == 0` mide
+    datos reales y deja de ser tautologica. `win_rate` solo se publica si el
+    artefacto declara `comparable=true` (la matriz nunca lo hace por I5)."""
+    is_stop = artifact.get("compatibility_result") == "indeterminate-current-run"
+    comparable = bool(artifact.get("comparable", False))
     row = _base_row(plan, source_artifact)
     row.update({
-        "evidence_kind": "atomic-runtime-artifact",
+        "evidence_kind": (
+            "sanitized-diagnostic-stop" if is_stop
+            else "atomic-runtime-artifact"
+        ),
         "source_artifact": source_artifact,
         "runtime_status": artifact.get("status"),
         "smoke_result": "passed" if artifact.get("smoke_ok") else "failed",
@@ -237,8 +276,17 @@ def _atomic_row(
         "disposition": "measured",
         "not_attempted_reason": None,
         "adaptation_applied": _adaptation_applied(plan),
-        "comparable": False,
-        "win_rate": None,
+        # T-04: los campos salen del artefacto, no de literales
+        "comparable": comparable,
+        "win_rate": artifact.get("win_rate") if comparable else None,
+        "sample_size": artifact.get("sample_size"),
+        # T-01: contexto I4 y marca de stop conservados en la fila
+        "compatibility_result": artifact.get("compatibility_result"),
+        "round": artifact.get("round"),
+        "manifest": artifact.get("manifest"),
+        "manifest_sha256": artifact.get("manifest_sha256"),
+        "generated_at": artifact.get("generated_at"),
+        "battle_timeout_seconds": artifact.get("battle_timeout_seconds"),
         "note": artifact.get("note"),
     })
     return row
@@ -250,7 +298,11 @@ def _stop_row(
     ledger_name: str,
 ) -> dict:
     """Fila interrumpida: clasificacion del ledger (internal-defect /
-    indeterminada) y evidencia saneada, nunca un veredicto del modelo."""
+    indeterminada) y evidencia saneada, nunca un veredicto del modelo.
+
+    T-04 (MON-20 R3): `comparable`/`win_rate`/`sample_size` se leen del
+    ledger (fuente versionada), no de literales."""
+    comparable = bool(stop.get("comparable", False))
     row = _base_row(plan, ledger_name)
     row.update({
         "evidence_kind": "sanitized-diagnostic-stop",
@@ -279,8 +331,9 @@ def _stop_row(
         "disposition": "measured",
         "not_attempted_reason": None,
         "adaptation_applied": _adaptation_applied(plan),
-        "comparable": False,
-        "win_rate": None,
+        "comparable": comparable,
+        "win_rate": stop.get("win_rate") if comparable else None,
+        "sample_size": stop.get("sample_size"),
         "note": (
             "clasificacion de la evidencia de corrida; no afirma "
             "incompatibilidad del modelo"

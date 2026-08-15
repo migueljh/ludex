@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-15T15:24:07Z",
+  "generated_at": "2026-08-15T16:00:00Z",
   "purpose": "Matriz final de compatibilidad funcional MON-20; nunca ranking de calidad ni winrate",
   "generator": "apps/agent/evals/build_matrix_coverage.py",
   "source_manifest": "20260814t183716z-matrix-manifest.json",
@@ -1237,6 +1237,13 @@
       "adaptation_applied": null,
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "batallas parciales o abortadas: sin winrate comparable"
     },
     {
@@ -1302,6 +1309,13 @@
       "adaptation_applied": null,
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "smoke fallido (FatalProviderError)"
     },
     {
@@ -1367,6 +1381,13 @@
       "adaptation_applied": null,
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "batallas parciales o abortadas: sin winrate comparable"
     },
     {
@@ -1432,6 +1453,13 @@
       "adaptation_applied": null,
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "batallas parciales o abortadas: sin winrate comparable"
     },
     {
@@ -1497,6 +1525,13 @@
       "adaptation_applied": null,
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "batallas parciales o abortadas: sin winrate comparable"
     },
     {
@@ -1562,6 +1597,13 @@
       "adaptation_applied": "chat_completions/text_json",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "batallas parciales o abortadas: sin winrate comparable"
     },
     {
@@ -1627,6 +1669,13 @@
       "adaptation_applied": "chat_completions/text_json",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "batallas parciales o abortadas: sin winrate comparable"
     },
     {
@@ -1692,6 +1741,13 @@
       "adaptation_applied": "chat_completions/text_json",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": null
     },
     {
@@ -1757,6 +1813,13 @@
       "adaptation_applied": "chat_completions/text_json",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "batallas parciales o abortadas: sin winrate comparable"
     },
     {
@@ -1822,6 +1885,13 @@
       "adaptation_applied": "chat_completions/json_schema",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "smoke fallido (ProviderPoolExhausted)"
     },
     {
@@ -1887,6 +1957,13 @@
       "adaptation_applied": "chat_completions/json_schema",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "batallas parciales o abortadas: sin winrate comparable"
     },
     {
@@ -1952,6 +2029,13 @@
       "adaptation_applied": "chat_completions/text_json",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "batallas parciales o abortadas: sin winrate comparable"
     },
     {
@@ -2017,6 +2101,13 @@
       "adaptation_applied": "responses/text_json",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "smoke fallido (FatalProviderError)"
     },
     {
@@ -2068,6 +2159,7 @@
       "adaptation_applied": "chat_completions/json_schema",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
       "note": "clasificacion de la evidencia de corrida; no afirma incompatibilidad del modelo"
     },
     {
@@ -2167,6 +2259,7 @@
       "adaptation_applied": "responses/text_json",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
       "note": "clasificacion de la evidencia de corrida; no afirma incompatibilidad del modelo",
       "operator_prohibited": "operator-prohibited-never-retry"
     },
@@ -2233,6 +2326,13 @@
       "adaptation_applied": "messages/text_json",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "batallas parciales o abortadas: sin winrate comparable"
     },
     {
@@ -2298,6 +2398,13 @@
       "adaptation_applied": "responses/text_json",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "la respuesta del modelo no valida el contrato DecisionResponse"
     },
     {
@@ -2363,6 +2470,13 @@
       "adaptation_applied": "chat_completions/json_schema",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "batallas parciales o abortadas: sin winrate comparable"
     },
     {
@@ -2428,6 +2542,13 @@
       "adaptation_applied": "chat_completions/json_schema",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "batallas parciales o abortadas: sin winrate comparable"
     },
     {
@@ -2541,6 +2662,13 @@
       "adaptation_applied": "responses/text_json",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
+      "compatibility_result": null,
+      "round": null,
+      "manifest": null,
+      "manifest_sha256": null,
+      "generated_at": null,
+      "battle_timeout_seconds": null,
       "note": "smoke fallido (FatalProviderError)"
     },
     {
@@ -2592,6 +2720,7 @@
       "adaptation_applied": "chat_completions/json_schema",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
       "note": "clasificacion de la evidencia de corrida; no afirma incompatibilidad del modelo"
     },
     {
@@ -3123,6 +3252,7 @@
       "adaptation_applied": "chat_completions/json_schema",
       "comparable": false,
       "win_rate": null,
+      "sample_size": null,
       "note": "clasificacion de la evidencia de corrida; no afirma incompatibilidad del modelo"
     },
     {
