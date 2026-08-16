@@ -23,6 +23,42 @@ exacto pineado.
 El ejercicio de romper además encontró un segundo bug distinto del que se buscaba.
 Eso pasa seguido: el intento de romper te obliga a leer la función de verdad.
 
+## Mutaciones: el install editable puede darte falso verde (MON-20 R8)
+
+**Si mutás una copia exportada del repo y no pineás `PYTHONPATH`, el test puede
+correr contra el árbol SIN mutar y salir verde en silencio.**
+
+El venv de `apps/agent` es un install editable: `.venv/lib/python*/site-packages/
+_editable_impl_ludex_agent.pth` contiene la ruta ABSOLUTA del src del worktree
+real. `import ludex_agent` resuelve ahí aunque corras pytest desde la copia
+mutada. Medido en R8: la misma mutación (subclase nueva sin rama en la tabla)
+dio `1 passed` sin pin y `FAILED` con pin — el falso verde es indistinguible de
+un canario vacuo, y por eso un canario vacuo puede sobrevivir varias rondas.
+
+**Método correcto para mutaciones sobre copias (`git archive` a scratch):**
+
+```bash
+cd /tmp/<scratch>/apps/agent && \
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=$PWD/src \
+    /Users/<usuario>/Documents/ludex-mon-20/apps/agent/.venv/bin/python \
+    -m pytest --noconftest -q tests/...
+```
+
+Verificá el pin antes de creer cualquier verde o rojo:
+
+```bash
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin PYTHONPATH=$PWD/src \
+    /Users/<usuario>/Documents/ludex-mon-20/apps/agent/.venv/bin/python \
+    -c "import ludex_agent.provider_taxonomy; print(ludex_agent.provider_taxonomy.__file__)"
+# tiene que imprimir la ruta del SCRATCH, no la del worktree
+```
+
+Alternativa equivalente: mutar in-place sobre el worktree y restaurar cada
+mutación verificando `sha256` contra el archivo original. `evals/` y `tests/`
+se cargan por path relativo al archivo de test y no están afectados por el
+`.pth`; el riesgo está en `src/ludex_agent/*`.
+
 ## Números esperados: inspeccionar, nunca recordar
 
 **Nunca escribas un valor esperado de memoria.** Ni un conteo, ni un learnset, ni el

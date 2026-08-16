@@ -3864,12 +3864,28 @@ el runner decide con lo que el artefacto persiste. R7 ataca eso.
    exige que TODAS estén en `EXPLICIT_CLASSES` (fuente única). El
    fail-closed queda como red de seguridad, no como absorbedor silencioso
    de clases olvidadas.
+
+   **Corrección R8 (F-A):** `EXPLICIT_CLASSES` nunca fue la fuente única:
+   era un frozenset escrito a mano desacoplado de las ramas de la tabla, y
+   1b lo validaba contra sí mismo (introspección ⊆ frozenset; el frozenset
+   contra nada). Medido por la revisión de R7 (MUT-E3): subclase nueva en
+   el frozenset sin rama en la tabla se publica como `internal-defect` con
+   146 passed y cero rojos — el fail-closed siguió siendo absorbedor
+   silencioso con un invariante en verde dándole cobertura. R8 borró el
+   frozenset y 1b deriva la membresía DE la tabla (ver D61).
 3. **Literales vivos.**
    `test_literales_taxonomia_solo_en_sitios_allowlist`: enumera los
    literales de la taxonomía que aparecen en `matrix.py` FUERA de la
    fuente única y falla si aparece uno nuevo fuera de la allowlist
    justificada (sitios: `except Exception` del runner, `_terminal_stop_result`,
    conteo parcial sin failure y `_battle_infrastructure_status`).
+
+   **Corrección R8:** "falla si aparece uno nuevo fuera de la allowlist"
+   era falso en tres formas medidas por la revisión de R7: no escaneaba
+   `build_matrix_coverage.py`, no veía literales construidos dinámicamente
+   ni multilínea, y la enumeración del residuo cubría 5 de los 9 sitios
+   reales de `matrix.py`. R8 extendió el scan a ambos archivos y D61
+   declara el alcance real y las limitaciones por escrito.
 
 **Decisiones.**
 
@@ -3879,8 +3895,12 @@ el runner decide con lo que el artefacto persiste. R7 ataca eso.
    inscripto: *la evidencia persistida debe alcanzar para reproducir su
    propia decisión*. Agrandar lo persistido para justificar una decisión
    más profunda invierte esa relación y agranda la superficie del artefacto
-   sin necesidad. (Se implementó sin encontrar razón técnica que
-   contradijera la decisión.)
+   sin necesidad. (Corrección R8: la razón técnica que contradice la
+   presentación original SÍ existe y se aceptó deliberadamente — se pierde
+   precisión diagnóstica en cadenas anidadas: `ProviderPoolExhausted` con
+   credencial a profundidad ≥ 2 queda `externally-limited` donde antes la
+   evidencia decía `credential/model unavailable`. Es un costo aceptado,
+   no un costo inexistente.)
 2. **F3 — canario de RUTEO del sitio 1.** `test_ruteo_sitio1_build_provider_por_la_fuente_unica`
    usa `TransientProviderError` (veredicto `externally-limited`, distinto
    del literal viejo `credential/model unavailable`): un bypass del sitio 1
@@ -3889,7 +3909,9 @@ el runner decide con lo que el artefacto persiste. R7 ataca eso.
    el caso arquetípico de límite externo y el fail-closed lo estaba
    absorbiendo como internal-defect. Hoy es inalcanzable como excepción en
    la matriz (`KeyRotatingProvider` la captura), pero D60 no quiere otra
-   ronda por omisión: entrada explícita en la tabla y en `EXPLICIT_CLASSES`.
+   ronda por omisión: entrada explícita en la tabla y en `EXPLICIT_CLASSES`
+   (R8: `EXPLICIT_CLASSES` ya no existe; la membresía se deriva de la
+   tabla — ver D61).
 4. **F6 — la fila publicada SÍ se corrige; el coverage commiteado CAMBIA.**
    `credential/model unavailable` sale de `_FAITHFUL` y se re-deriva
    exactamente como T-08 hizo con `unsupported-protocol`. La fila
@@ -3905,17 +3927,34 @@ el runner decide con lo que el artefacto persiste. R7 ataca eso.
    (a) `matrix.py` `except Exception` del runner → `internal-defect`
    (defecto del runner, no fallo de provider); (b) `_terminal_stop_result`
    → `internal-defect` (I2, stop por interrupción, compatibilidad
-   indeterminada); (c) conteo parcial sin `failure` y
+   indeterminada);    (c) conteo parcial sin `failure` y
    `completed != requested` → `externally-limited` (conteo de benchmark,
    no veredicto de provider: se conserva con razón explícita, la
    alternativa fail-closed acusaría a la casa un parcial reportado sin
    error de proveedor); (d) `_battle_infrastructure_status` (L-03) →
    `externally-limited`/`internal-defect`, **declarado deliberadamente
    FUERA de la fuente única**: clasifica infraestructura LOCAL de Showdown
-   (`ConnectionClosedError`/`ShowdownUnavailableError`), no fallos del
-   proveedor — comentario inscripto en el propio sitio; (e) `_stop_row`
+   (`ConnectionClosedError`/`ShowdownUnavailableError`). Corrección R8
+   (F-C): la afirmación original "no fallos del proveedor" era
+   descriptivamente falsa — el `else` de ese sitio clasifica como
+   internal-defect cualquier excepción que llegue post-smoke, incluidas
+   las de proveedor (medido: `CredentialRejected` → internal-defect donde
+   la tabla diría credential/model unavailable); hoy ninguna llega por el
+   ORDEN de los `except` de `_run_one`, no por diseño del sitio. El
+   comentario inscripto en el propio sitio se corrigió en R8;
+   (e) `_stop_row`
    del generador → passthrough de la fuente versionada (ledger de stops),
    nunca una derivación paralela.
+   R8 completó la enumeración, que en R7 cubría 5 de los 9 sitios reales
+   de `matrix.py` y ninguno de `build_matrix_coverage.py`:
+   (f) `FINAL_STATUSES` (módulo de `matrix.py`) → los cuatro literales,
+   vocabulario de validación del artefacto persistido, no una derivación
+   de veredicto; (g) `build_matrix_coverage.py`: `_FAITHFUL` →
+   `internal-defect` (passthrough de clases terminales no re-derivables),
+   el set de re-derivación de `normalize_final_classification` →
+   `unsupported-protocol`/`credential/model unavailable`, y la comparación
+   T-12 en `build_invariants` → `unsupported-protocol` (comparación, no
+   producción).
 6. **F4 — el número de D57 es 5.** Medido en el árbol de R4
    (`git archive 2f8d075`, baseline 136 passed, mutación
    `_FAITHFUL += "unsupported-protocol"` → `5 failed, 131 passed`): los
@@ -3929,9 +3968,20 @@ el runner decide con lo que el artefacto persiste. R7 ataca eso.
    y el control de fuga pasa, pero nada protege la propiedad). Queda como
    issue de seguimiento.
 
-**Cierre de la quinta recurrencia.** El invariante 1a es el que cierra la
-familia: cualquier divergencia futura entre decisión y evidencia persistida
-es falsada por el round-trip sin importar la forma nueva que tome.
+**Cierre de la quinta recurrencia — corregido en R8.** La afirmación
+original ("1a falsa cualquier divergencia futura sin importar la forma
+nueva que tome") no resiste medición: `normalize_final_classification`
+sólo re-deriva `aborted`, `unsupported-protocol` y
+`credential/model unavailable`; todo lo demás es passthrough, así que la
+aserción de round-trip es un no-op en 10 de los 15 casos (medido caso por
+caso por la revisión de R7), incluido "Pool cadena profunda Credential".
+Alcance real de 1a: es load-bearing para las clases re-derivables; para
+`externally-limited` e `internal-defect` la protección efectiva es la
+tabla de valores esperados (columna `expected`), no el round-trip. Y 1a
+sólo muerde en la cadena profunda porque F6 sacó
+`credential/model unavailable` de `_FAITHFUL` en esta misma ronda; bajo el
+`_FAITHFUL` de R6 la misma aserción habría sido passthrough ciego. Ver
+D61.
 
 **Verificación.** 146 tests focales (142 + 4 nuevos), suite hermética
 completa (fuera de tests/db e integration, `--noconftest`, env sanitizado):
@@ -3948,3 +3998,131 @@ cobertura == manifiesto, 22 medidas con 18+4, 0 comparables, 0 persistidas,
 90 no intentadas, 0 no intentadas en bucket medido, counts nuevos F6
 (credential 0, externally-limited 11). Sin red, sin providers, sin .env,
 sin DB, sin Docker.
+
+## D61 — MON-20 R8: la membresía de la tabla se DERIVA, no se declara; alcance real de cada invariante con mutaciones medidas (2026-08-15)
+
+**Contexto.** La revisión de R7 demostró que los tres invariantes de D60
+no protegían lo que decían proteger: 1b validaba `EXPLICIT_CLASSES` contra
+sí mismo (introspección ⊆ frozenset; el frozenset contra nada) y abría la
+sexta instancia de la causa raíz; 1a era un test de tabla disfrazado de
+round-trip, vacuo en 10 de 15 casos; 1c no escaneaba el generador. El
+tech lead asumió el diagnóstico: el defecto estaba en su diseño de los
+invariantes, no en la ejecución de R7.
+
+**REGLA DE PROCESO (de D61 en adelante).** Ninguna afirmación de que un
+test protege una propiedad puede escribirse sin la mutación MEDIDA que la
+respalde, y las limitaciones del test van escritas al lado. No se escribe
+"el invariante X cierra la familia": se escribe "X detecta las mutaciones
+M1..Mn, verificadas y listadas; X NO detecta la clase C por la razón R".
+Si una afirmación no se puede medir, no se escribe. Esta regla se aplica
+a todo lo que sigue en esta decisión.
+
+**F-A — borrar `EXPLICIT_CLASSES` y derivar la membresía DE la tabla.**
+`provider_taxonomy.py` ahora tiene la tabla en `explicit_failure_class
+(...) -> str | None`: cada rama explícita devuelve su categoría; la
+ausencia de rama devuelve `None` (fail-closed). `provider_failure_class`
+es un wrapper de dos líneas sin ninguna rama: mapea `None` a
+`internal-defect` y nada más. La corrección QUITA la fuente de verdad
+duplicada y no agrega ningún objeto que haya que mantener en sincronía
+con otro: las ramas existen una sola vez y el sentinel `None` es la forma
+en que la tabla reporta su propia decisión. La firma pública y la
+semántica de `provider_failure_class` no cambian para ninguno de los 5
+callers (medido por la suite completa).
+
+1b reescrito deriva la membresía de la tabla: introspecciona la jerarquía
+de `ProviderError` (9 clases) y le exige a `explicit_failure_class` una
+rama explícita para cada una (`explicit_failure_class(nombre, None, None)
+is not None`), más las dos clases de `benchmark.py` que la tabla
+clasifica y NO heredan de `ProviderError` (`InternalCleanupError`,
+`BenchmarkDeadlineExceeded`), importadas como objetos de clase, nunca
+como strings a mano.
+
+Mutaciones medidas (copias `git archive` en scratch, `PYTHONPATH`
+pineado, baseline 146 passed; cada una restaurada y verificada por
+sha256 contra el worktree):
+
+| mutación | canario(s) rojo(s) | resultado |
+|---|---|---|
+| subclase nueva `ProviderThrottled` SIN rama en la tabla (reproducción de MUT-E3 del reviewer) | 1b | 1 failed, 145 passed |
+| sacar `InternalCleanupError` de la rama (reproducción de MUT-E2) | 1b | 1 failed, 145 passed |
+| sacar `BenchmarkDeadlineExceeded` de la rama (reproducción de MUT-E1) | 1b + `test_normalizacion_aborted_usa_la_tabla_del_runner` | 2 failed, 144 passed |
+
+Las tres mutaciones eran VERDES en el árbol de R7 (146 passed, medido por
+el reviewer); ahora las tres ponen 1b en rojo. Límite escrito de 1b: una
+clase nueva agregada FUERA de la jerarquía de `ProviderError` y fuera de
+las dos clases de `benchmark.py` importadas no entra al universo de
+probes y el fail-closed la absorbe; no se intentó cubrir ese caso, queda
+escrito en el docstring del test.
+
+**F-B — alcance real de 1a (documental; el test no cambia).** 1a es
+load-bearing para las clases re-derivables (`aborted`,
+`unsupported-protocol`, `credential/model unavailable`); para
+`externally-limited` e `internal-defect` la protección efectiva es la
+tabla de valores esperados (columna `expected`), porque
+`normalize_final_classification` devuelve esos status verbatim. 1a sólo
+muerde en la cadena profunda porque F6 sacó `credential/model
+unavailable` de `_FAITHFUL` en la misma ronda; bajo el `_FAITHFUL` de R6
+la aserción habría sido passthrough ciego. Medido sobre el árbol de R8
+(mismas mutaciones que la revisión de R7, reproducción propia):
+MUT-F: aserciones de valor esperado neutralizadas (queda SÓLO el
+round-trip) + chain-walk de F1 reintroducido → 1a ROJO (1 failed);
+MUT-G: misma neutralización + flip del expected de un caso passthrough
+("Pool sin causa" → internal-defect) → 1 passed, VERDE: el round-trip no
+ve divergencias que aterricen en `externally-limited`. D60 corregido con
+este alcance.
+
+**1c — extendido a `build_matrix_coverage.py`.** El scan corre sobre los
+DOS archivos con allowlists por (archivo, función, literal) y
+justificación escrita en el test: matrix.py (5 sitios R7 + los 4
+literales de `FINAL_STATUSES`, vocabulario de validación) y
+build_matrix_coverage.py (`_FAITHFUL` → internal-defect passthrough;
+set de re-derivación de `normalize_final_classification`). Mutaciones
+medidas: MUT-D literal nuevo producido en
+`build_matrix_coverage.py` (frozenset con `externally-limited`) → 1c ROJO
+exclusivo (1 failed, 145 passed); MUT-E literal nuevo producido en
+`matrix.py` (sitio no allowlisted) → 1c ROJO exclusivo (1 failed, 145
+passed). Limitaciones escritas en el docstring del test: NO detecta
+literales construidos dinámicamente, NO detecta literales partidos en
+varias líneas, sólo mira contextos de producción en una línea
+(asignación `status =`, `return `, `_fail("`, `_smoke_failed(x, "`,
+miembros de set/frozenset precedidos por `{`/`,` o solos en su línea) y
+sólo escanea los dos archivos listados. No se intentó cubrir los casos
+fuera de ese alcance.
+
+**F-C — comentario de L-03 corregido, sin tocar el código.** La
+afirmación de R7 ("NO fallos del proveedor") era descriptivamente falsa
+para la ruta `BenchmarkFailure`: el `else` de
+`_battle_infrastructure_status` clasifica como internal-defect cualquier
+excepción que llegue post-smoke, incluidas las de proveedor (medido por
+la revisión: `CredentialRejected` → internal-defect donde la tabla diría
+credential/model unavailable). Hoy es inalcanzable por el ORDEN de los
+`except` de `_run_one` (el `except ProviderError` captura antes), no por
+diseño del sitio. El comentario ahora dice esa verdad verificable; la
+taxonomía de infraestructura local sigue deliberadamente fuera de la
+fuente única.
+
+**Trampa del PYTHONPATH (método, no código).** El install editable del
+venv resuelve `ludex_agent` al src del worktree real; una copia
+`git archive` mutada sin `PYTHONPATH` pineado testea el árbol SIN mutar y
+da falso verde en silencio. Medido en esta ronda con la misma mutación y
+el mismo comando: MUT-A sin pin → 1 passed (falso verde); MUT-A con
+`PYTHONPATH=$PWD/src` → FAILED. Tres de las cinco mutaciones de R7
+habrían dado falso verde sin el pin (medido por la revisión de R7 §2.1).
+El método canónico quedó escrito en `.claude/verification/SKILL.md`.
+
+**Verificación.** 146 focales (`test_matrix.py` + `test_cli.py` +
+`test_matrix_coverage.py`, `--noconftest`, env sanitizado); suite
+hermética completa (todos los paths de `tests/` salvo `tests/db` y
+`tests/integration`, por paths explícitos): 644 passed, 37 skipped, exit
+0. `generator --check` byte a byte con `.venv/bin/python` y con
+`/usr/bin/python3` bajo env mínimo: el coverage commiteado NO cambió.
+`git diff --check` limpio; JSONs parsean; secret scan 0 infractores
+nuevos (el único hit es el fixture falso `sk-fake…` preexistente en
+`test_matrix.py`); sin rutas absolutas en el diff;
+`typing.get_type_hints` OK en ambas funciones nuevas. TDD: 1b nuevo ROJO
+contra la taxonomía vieja (ImportError de `explicit_failure_class`),
+VERDE con el cambio, restaurado y verificado por sha256.
+
+**Modelo efectivo:** deepseek-v4-pro (opencode-go/deepseek-v4-pro),
+agente Nebula. Recomendación: In Review (el tech lead interino es la
+única autoridad de veredicto e integración).
