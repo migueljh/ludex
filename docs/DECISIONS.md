@@ -4126,3 +4126,108 @@ VERDE con el cambio, restaurado y verificado por sha256.
 **Modelo efectivo:** deepseek-v4-pro (opencode-go/deepseek-v4-pro),
 agente Nebula. Recomendación: In Review (el tech lead interino es la
 única autoridad de veredicto e integración).
+
+## D62 — MON-26: la narración que un request `wait:true` interpone no queda huérfana; `-enditem` resuelve por identidad (2026-08-16)
+
+**Contexto.** El gate MON-16 detectó 21 violaciones de
+`hidden_information/item` en `battle-gen6randombattle-67` (schema v2): el
+item de Probopass (`airballoon`, revelado en el turno 0) sobrevivió al
+`-enditem` del turno 2 y quedó persistido hasta el turno 15. La hipótesis
+del tech lead decía que el handler `-enditem` (protocol.py) perdía la
+mutación porque `active()` devolvía `None` tras el `-damage|0 fnt`
+precedente. **Refutada con replay empírico** contra el proyector real y
+los estados persistidos como ground truth: ni el handler `-damage` ni el
+de `faint` ni `Pokemon.faint()` (poke-env 0.15.0, pokemon.py:422-429)
+tocan `active`, y la secuencia exacta proyectada A NIVEL DE PROYECTOR
+produce `item=None` correcto.
+
+**Causa raíz medida.** Los frames reales (límites por `>` en
+`protocol_lines`; `|turn|N` cierra el frame que narra N-1) muestran que
+la narración del turno 2 —la que contiene `-enditem`— llegó ENTRE un
+request `wait:true` (rqid 6, publicado cuando la elección se mandó
+temprano y el servidor espera al rival) y el request activo (rqid 8). La
+espera de cada decisión sólo miraba hacia adelante de su propio request,
+así que esa narración no la proyectó NINGUNA decisión: la del turno 2
+tomó la narración del turno 1 y la del turno 3 tomó el frame del switch
+del reemplazo. Mientras tanto poke-env SÍ procesó `-enditem`
+(`end_item()` → item None) y el snapshot fresco lo traía correcto, pero
+el bucle de reaplicación D40 (memoria de item contra la corrupción de
+Trick) pisa el snapshot con `entry["item"]="airballoon"` al inicio de
+CADA proyección, y la línea que actualizaría esa memoria nunca llegó:
+por eso fainted llegaba bien (snapshot) y el item no (memoria stale
+reafirmada). Verificación: replay de las decisiones D0-D3 sobre los
+frames reales reproduce EXACTAMENTE los cuatro estados persistidos,
+incluida la fila defectuosa D2.
+
+**A — la espera devuelve una VENTANA, no un frame suelto.**
+`RawFrameInbox.wait_for_resolution` recibe ahora dos seq: `after_seq`
+(watermark: último frame entregado a la proyección anterior de ESTE tag)
+y `until_seq` (seq del request propio). Devuelve, en orden, todos los
+frames de resolución con `after_seq < seq <= closing`, donde `closing`
+es el primer frame de resolución posterior al request —el mismo frame
+único que la API anterior devolvía—. Sin request interpuesto la ventana
+es exactamente la de antes; con un `wait:true` interpuesto, la narración
+huérfana entra en la ventana de la decisión siguiente. El watermark vive
+en `client._projected_until`, dict POR TAG (nunca global: con
+concurrencia > 1 un cursor compartido haría que dos batallas se salteen
+frames en silencio). Avanza al ENTREGAR la ventana, antes de proyectar:
+si la proyección falla cerrado (`-swapboost`), los frames ya consumidos
+no envenenan la decisión siguiente. El reintento no consume frames y no
+toca el watermark. El chequeo de desalojo ahora protege todo el rango
+`(watermark, closing]`, no sólo el cierre.
+
+**B — `-enditem` resuelve por identidad, no por activo actual.** La
+línea nombra al mon (`p2a: Probopass`). En una ventana con gap la
+narración puede traer `-enditem` seguido de `switch` en el MISMO frame y
+el snapshot —post-narración— ya tiene al nombrado fuera de cancha;
+`active()` resolvería al REEMPLAZO: corrompería su item y dejaría la
+memoria del nombrado stale. `enditem_target` resuelve por `find`
+(`base_species`) sobre el equipo, con fallback a `active()` sólo si el
+nombre no está en el equipo (comportamiento previo). Bajo Illusion el
+disfraz ES la entrada del equipo: `find` y `active()` devuelven el mismo
+objeto, cero cambio para D40 T-02.
+
+**Mutaciones medidas** (in-place sobre el worktree, `PYTHONPATH` pineado
+al árbol mutado, restauradas con `git checkout` y verificadas por
+sha256):
+
+| mutación | tests rojos | otros tests nuevos |
+|---|---|---|
+| A revertida (`return [closing]`) | `test_la_ventana_incluye_la_narracion_anterior_al_request_wait` (inbox) y `test_el_watermark_de_proyeccion_es_por_batalla` (client) | el de no-regresión del flujo normal y el de la pieza B quedan verdes |
+| B revertida (`mon = active()`) | `test_enditem_limpia_al_nombrado_aunque_ya_no_este_activo`, SOLO ese | secuencia batalla-67 y berry (`-enditem` con mon activo) quedan verdes |
+
+La afirmación de no-regresión del flujo normal tiene mutación medida
+(condición del tech lead): `test_sin_request_wait_la_ventana_es_el_frame_
+unico_de_siempre` fija que, sin `wait:true`, la ventana entrega
+exactamente el mismo frame único de la API anterior; al revertir A ese
+test sigue verde porque el contrato se preserva, y los DOS tests de la
+ventana son los que muerden. El aislamiento por tag tiene doble
+evidencia: estructural (`_projected_until` es dict por tag; el test
+aserta los valores por separado) y comportamental (un frame de A
+publicado mientras B decide sobrevive para la decisión siguiente de A —
+la mutación A lo pierde).
+
+**Limitaciones conocidas.** (1) `active()` devolviendo `None` en tags de
+evidencia observada (`-item`, boosts, `-ability`) sigue siendo
+SILENCIOSO; MON-26 no lo cambió (item 6 del alcance, aceptado por el
+tech lead): B elimina el caso agudo de `-enditem` y el silencio global
+queda como candidato a issue aparte. (2) `-item` que caiga completo en
+un gap (sin su `-enditem` posterior) deja la memoria sin sembrar; el
+defecto de MON-26 era el par revelación→consumo y la pieza A lo cierra
+para toda la clase, pero ese caso puntual no tiene test propio —si el
+mon nunca se reveló, `enditem_target` cae al fallback `active()`
+documentado. (3) Las violaciones ya persistidas de la batalla 67 (y las
+v1 de D44) no se re-persisten: fuera de alcance por el issue. (4) El
+watermark se inicializa en 0 y avanza por entrega; una decisión que
+falla cerrado por timeout no avanza el watermark (no consumió frames),
+que es lo correcto.
+
+**Verificación.** TDD rojo antes (11 tests rojos: firma nueva + defecto
+B), verde después. Suite Python completa con base descartable
+(`TEST_DATABASE_URL` DSN PLANO — la variante `postgresql+asyncpg` la
+rechaza el fixture; medido): worktree 795 passed / 1 skipped / 0 failed;
+base limpia 093296c (archive completo, mismo env, `PYTHONPATH` pineado)
+789 passed / 1 skipped / 0 failed; delta = los 6 tests nuevos. Suite
+TypeScript: no aplica (ningún archivo TS tocado; el auditor no cambia).
+`git diff --check` limpio; sin rutas absolutas; sin secretos; commit en
+inglés con rutas explícitas.
