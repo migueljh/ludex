@@ -10,35 +10,36 @@ reconciliacion de D43.2 (pool rechazado por credencial) con D54 R1
 Firma minima: `provider_failure_class(failure_type, http_status,
 failure_cause_type)`. Solo se usan strings de clase y status HTTP; jamas
 texto libre, mensajes, notes ni URLs.
+
+R8 (F-A): la membresia de la tabla se DERIVA de la tabla, no se declara.
+`explicit_failure_class` es la tabla: cada rama explicita devuelve su
+categoria y la ausencia de rama devuelve `None` (fail-closed). Solo
+`provider_failure_class` mapea `None` a `internal-defect`. El invariante
+1b introspecciona las subclases y le exige a la tabla una rama explicita
+para cada una; ya no existe ningun frozenset de membresia que mantener a
+mano.
 """
 
 from __future__ import annotations
 
-# INVARIANTE 1b (MON-20 R7): nombres de clase con entrada EXPLICITA en la
-# tabla. El fail-closed es red de seguridad, no absorbedor silencioso: una
-# subclase de ProviderError que no este aca es una clase olvidada y el
-# test de introspeccion la denuncia.
-EXPLICIT_CLASSES = frozenset({
-    "FatalProviderError", "CredentialRejected", "ProviderSelectionError",
-    "ProviderPoolExhausted", "ProviderMixError", "InternalCleanupError",
-    "TransientProviderError", "BenchmarkDeadlineExceeded",
-    "DecisionDeadlineExceeded", "ProviderError", "QuotaExceeded",
-})
 
-
-def provider_failure_class(
+def explicit_failure_class(
     failure_type: str | None,
     http_status: int | None,
     failure_cause_type: str | None = None,
-) -> str:
-    """Taxonomia unica de ProviderError (T-08/T-11/T-13).
+) -> str | None:
+    """Taxonomia unica de ProviderError (T-08/T-11/T-13) — LA TABLA.
+
+    Fuente unica de clasificacion Y de membresia (R8, F-A): una clase
+    tiene rama explicita aca o cae al fail-closed devolviendo `None`.
+    Ningun otro objeto declara que clases existen.
 
     - `FatalProviderError` + HTTP 400 -> `unsupported-protocol` (rechazo de
       protocolo/structured output, el unico caso que la categoria mide);
     - `FatalProviderError` + 401/403 -> `credential/model unavailable`;
     - `FatalProviderError` + 404/500/None u otro status -> `internal-defect`
-      (fail-closed: sin la senal exacta del contrato no se afirma un rechazo
-      de protocolo sobre el modelo);
+      (veredicto conservador: sin la senal exacta del contrato no se
+      afirma un rechazo de protocolo sobre el modelo);
     - `CredentialRejected` -> `credential/model unavailable` (D43.2);
     - `ProviderPoolExhausted` CON `failure_cause_type == "CredentialRejected"`
       (pool totalmente en cuarentena por 401/403 credential-specific) ->
@@ -52,7 +53,8 @@ def provider_failure_class(
       definicion);
     - `ProviderSelectionError` (construccion del provider) ->
       `credential/model unavailable`;
-    - clase desconocida o None -> `internal-defect` fail-closed.
+    - clase desconocida o None -> `None` (fail-closed; solo el wrapper
+      publico lo mapea a `internal-defect`).
 
     Nunca se infiere de texto libre: solo de la clase, la cadena de status
     y la causa estructurada."""
@@ -75,4 +77,20 @@ def provider_failure_class(
         "DecisionDeadlineExceeded", "ProviderError", "QuotaExceeded",
     }:
         return "externally-limited"
-    return "internal-defect"
+    return None
+
+
+def provider_failure_class(
+    failure_type: str | None,
+    http_status: int | None,
+    failure_cause_type: str | None = None,
+) -> str:
+    """Wrapper publico de `explicit_failure_class` (R8, F-A).
+
+    Ninguna rama vive aca: la tabla es una sola. Unica responsabilidad de
+    este wrapper: mapear el fail-closed (`None`) a `internal-defect`, el
+    veredicto conservador que el runner y el generador persisten."""
+    category = explicit_failure_class(
+        failure_type, http_status, failure_cause_type
+    )
+    return "internal-defect" if category is None else category

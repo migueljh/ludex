@@ -40,7 +40,6 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 from ludex_agent.provider_taxonomy import (  # noqa: E402
-    EXPLICIT_CLASSES,
     provider_failure_class,
 )
 

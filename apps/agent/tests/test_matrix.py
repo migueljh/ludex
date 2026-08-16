@@ -2551,19 +2551,31 @@ def _assert_round_trip(result, expected, name, route, bmc):
 
 
 def test_introspeccion_subclases_provider_error_entran_en_tabla():
-    """INVARIANTE 1b (MON-20 R7): TODAS las subclases de ProviderError de
-    graph/provider.py tienen entrada EXPLICITA en la tabla. El fail-closed
-    es red de seguridad, no absorbedor silencioso de clases olvidadas.
-    ROJO hoy: QuotaExceeded no esta en la tabla."""
-    import sys as _sys
-    from pathlib import Path as _Path
-
+    """INVARIANTE 1b (MON-20 R8, F-A): la membresia de la tabla se DERIVA
+    de la tabla misma, no se declara. R8 borro EXPLICIT_CLASSES (frozenset
+    a mano desacoplado de las ramas): el invariante le exige a
+    `explicit_failure_class` una rama EXPLICITA para cada clase del
+    universo, via el sentinel del fail-closed: el probe
+    `explicit_failure_class(nombre, None, None)` no debe devolver None.
+    Universo: la jerarquia de ProviderError por introspeccion (9 clases) +
+    las dos clases de benchmark.py que la tabla clasifica y que NO heredan
+    de ProviderError (InternalCleanupError, BenchmarkDeadlineExceeded),
+    importadas como objetos de clase, nunca como strings a mano.
+    LIMITACION (escrita): una clase nueva agregada FUERA de la jerarquia
+    de ProviderError y fuera de esas dos clases de benchmark.py no entra
+    al universo de probes de este invariante y el fail-closed la absorbe.
+    Mutaciones medidas que DETECTA (R8): subclase nueva sin rama;
+    sacar InternalCleanupError de la rama; sacar BenchmarkDeadlineExceeded
+    de la rama (las tres dejan 1b ROJO)."""
+    from ludex_agent.benchmark import (
+        BenchmarkDeadlineExceeded,
+        InternalCleanupError,
+    )
     from ludex_agent.graph.provider import ProviderError
-
-    evals_dir = _Path(__file__).resolve().parents[1] / "evals"
-    if str(evals_dir) not in _sys.path:
-        _sys.path.insert(0, str(evals_dir))
-    import build_matrix_coverage as bmc  # noqa: E402
+    from ludex_agent.provider_taxonomy import (
+        explicit_failure_class,
+        provider_failure_class,
+    )
 
     seen: set[str] = set()
     frontier = [ProviderError]
@@ -2575,62 +2587,132 @@ def test_introspeccion_subclases_provider_error_entran_en_tabla():
         frontier.extend(current.__subclasses__())
     assert "ProviderError" in seen
     assert len(seen) == 9, seen  # base + 8 subclases
-    # INVARIANTE 1b: toda subclase (y la base) tiene entrada EXPLICITA
-    assert seen <= set(bmc.EXPLICIT_CLASSES), (
-        f"subclases sin entrada explicita: {seen - set(bmc.EXPLICIT_CLASSES)}"
+    universe = sorted(
+        seen
+        | {InternalCleanupError.__name__, BenchmarkDeadlineExceeded.__name__}
+    )
+    # INVARIANTE 1b: ninguna clase del universo cae al fail-closed de la
+    # tabla (None = sin rama explicita = clase olvidada).
+    missing = [
+        name for name in universe
+        if explicit_failure_class(name, None, None) is None
+    ]
+    assert not missing, (
+        f"clases sin rama explicita en la tabla (fail-closed): {missing}"
     )
     # QuotaExceeded es externo por definicion (limite de cuota)
-    assert bmc.provider_failure_class("QuotaExceeded", None, None) == \
+    assert provider_failure_class("QuotaExceeded", None, None) == \
         "externally-limited"
 
 
 def test_literales_taxonomia_solo_en_sitios_allowlist():
-    """INVARIANTE 1c (MON-20 R7): los literales de la taxonomia que aparecen
-    en matrix.py FUERA de la fuente unica estan declarados en una allowlist
-    con justificacion escrita. Un literal nuevo fuera de la allowlist falla.
-    Sitios legitimos: except Exception del runner (internal-defect),
-    _terminal_stop_result (internal-defect, I2), batallas parciales sin
-    failure (:958, externally-limited, conteo no provider), y
-    _battle_infrastructure_status (L-03, infraestructura LOCAL)."""
+    """INVARIANTE 1c (MON-20 R7/R8): los literales de la taxonomia que se
+    PRODUCEN fuera de la fuente unica (provider_taxonomy.py) estan
+    declarados en una allowlist por (archivo, funcion, literal) con
+    justificacion escrita. R8 extendio el scan de matrix.py a
+    build_matrix_coverage.py (sitios: _FAITHFUL y el set de re-derivacion
+    de normalize_final_classification).
+    LIMITACIONES (escritas, no cubiertas a proposito):
+    - NO detecta literales construidos dinamicamente (concatenacion,
+      f-strings, constantes armadas en runtime);
+    - NO detecta literales partidos en varias lineas (continuaciones de
+      string, `"exter" "nally-limited"`); solo mira una linea a la vez;
+    - solo detecta contextos de PRODUCCION en una linea: asignacion
+      `status =`, `return `, `_fail("`, `_smoke_failed(x, "` y miembros
+      de set/frozenset (precedidos por `{` o `,` en la misma linea, o
+      solos en su linea); comparaciones, comentarios y docstrings no
+      matchean;
+    - solo escanea los dos archivos listados aca; un archivo nuevo con un
+      sitio nuevo no se escanea hasta agregarlo explicitamente.
+    Mutaciones medidas que DETECTA (R8): literal nuevo producido en
+    matrix.py en sitio no allowlisted; literal nuevo producido en
+    build_matrix_coverage.py (ambas dejan 1c ROJO)."""
     import re
     from pathlib import Path as _Path
 
-    source = _Path(__file__).resolve().parents[1] / "src" / "ludex_agent" / "matrix.py"
-    text = source.read_text(encoding="utf-8")
+    _root = _Path(__file__).resolve().parents[1]
 
-    def _function_at(lineno: int) -> str:
+    def _function_at(text: str, lineno: int) -> str:
         current = "<module>"
         for i, line in enumerate(text.splitlines(), start=1):
+            if i > lineno:
+                break
             m = re.match(r"^(?:async )?def (\w+)", line)
-            if m and i <= lineno:
+            if m:
                 current = m.group(1)
+            elif line[:1] not in ("", " ", "\t", ")", "]", "}", ",") \
+                    and line.strip():
+                # codigo de nivel modulo (constantes, docstrings, imports):
+                # el alcance de funcion termino. Las continuaciones de
+                # firma en col 0 (`)`/`]`/`}`/`,`) no cortan el alcance.
+                current = "<module>"
         return current
 
-    literals = (
-        "internal-defect", "externally-limited", "unsupported-protocol",
-        "credential/model unavailable",
-    )
-    sites = set()
-    for i, line in enumerate(text.splitlines(), start=1):
-        for literal in literals:
-            # solo sitios que PRODUCEN el literal (asignacion/return), no
-            # comparaciones ni docstrings
-            if re.search(
-                rf'(?:status\s*=\s*|return\s+|_fail\("|_smoke_failed\(\w+,\s*")'
-                rf'"{re.escape(literal)}"', line
-            ):
-                sites.add((_function_at(i), literal, i))
-    allowlist = {
-        ("run_matrix_round", "internal-defect"),
-        ("_terminal_stop_result", "internal-defect"),
-        ("_run_one", "externally-limited"),
-        ("_battle_infrastructure_status", "externally-limited"),
-        ("_battle_infrastructure_status", "internal-defect"),
+    def _sites(text: str) -> set[tuple[str, str, int]]:
+        literals = (
+            "internal-defect", "externally-limited", "unsupported-protocol",
+            "credential/model unavailable",
+        )
+        sites = set()
+        for i, line in enumerate(text.splitlines(), start=1):
+            for literal in literals:
+                # solo sitios que PRODUCEN el literal (asignacion/return/
+                # _fail/_smoke_failed o miembro de set/frozenset), no
+                # comparaciones ni docstrings. Un miembro solitario en su
+                # linea (primer miembro de un set multilinea) tambien
+                # cuenta: una linea cuyo unico contenido es el literal.
+                if re.search(
+                    rf'(?:status\s*=\s*|return\s+|_fail\("|'
+                    rf'_smoke_failed\(\w+,\s*"|[,{{]\s*)'
+                    rf'"{re.escape(literal)}"', line
+                ) or re.search(
+                    rf'^\s*"{re.escape(literal)}",?\s*$', line
+                ):
+                    sites.add((_function_at(text, i), literal, i))
+        return sites
+
+    files = {
+        "matrix.py": _root / "src" / "ludex_agent" / "matrix.py",
+        "build_matrix_coverage.py": _root / "evals" / "build_matrix_coverage.py",
     }
-    offenders = {
-        (func, literal) for func, literal, _ in sites
-        if (func, literal) not in allowlist
+    allowlists = {
+        "matrix.py": {
+            # except Exception del runner: fail-closed del runner, no
+            # fallo de provider.
+            ("run_matrix_round", "internal-defect"),
+            # I2: stop por interrupcion, compatibilidad indeterminada.
+            ("_terminal_stop_result", "internal-defect"),
+            # conteo parcial de benchmark sin failure: no es veredicto de
+            # provider (la alternativa fail-closed acusaria a la casa un
+            # parcial reportado sin error de proveedor).
+            ("_run_one", "externally-limited"),
+            # L-03: taxonomia de infraestructura LOCAL de Showdown,
+            # deliberadamente fuera de la fuente unica (D60/R8 F-C).
+            ("_battle_infrastructure_status", "externally-limited"),
+            ("_battle_infrastructure_status", "internal-defect"),
+            # FINAL_STATUSES (modulo): vocabulario de validacion del
+            # artefacto persistido, no una derivacion de veredicto.
+            ("<module>", "internal-defect"),
+            ("<module>", "externally-limited"),
+            ("<module>", "unsupported-protocol"),
+            ("<module>", "credential/model unavailable"),
+        },
+        "build_matrix_coverage.py": {
+            # _FAITHFUL (modulo): passthrough de clases terminales no
+            # re-derivables.
+            ("<module>", "internal-defect"),
+            # normalize_final_classification: set de clases re-derivables
+            # (T-08/F6), no una derivacion paralela.
+            ("normalize_final_classification", "unsupported-protocol"),
+            ("normalize_final_classification", "credential/model unavailable"),
+        },
     }
+    offenders: set[tuple[str, str, str, int]] = set()
+    for name, path in files.items():
+        text = path.read_text(encoding="utf-8")
+        for func, literal, lineno in _sites(text):
+            if (func, literal) not in allowlists[name]:
+                offenders.add((name, func, literal, lineno))
     assert not offenders, (
         f"literales de taxonomia fuera de la allowlist: {offenders}"
     )

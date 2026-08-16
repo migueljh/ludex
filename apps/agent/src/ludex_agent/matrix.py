@@ -1085,13 +1085,20 @@ def _smoke_failed(
 
 
 def _battle_infrastructure_status(exc: BaseException) -> str:
-    """L-03 (post-R1B) — DECLARADO FUERA de la fuente unica (D60, R7):
-    esta taxonomia clasifica infraestructura LOCAL de Showdown
-    (ConnectionClosedError / ShowdownUnavailableError), NO fallos del
-    proveedor. No debe entrar a provider_taxonomy: los veredictos de aca
-    son sobre el entorno de batalla, no sobre el modelo. Los literales
-    estan en la allowlist del invariante 1c (test_literales_taxonomia).
-    Infraestructura LOCAL no es incompatibilidad del modelo:
+    """L-03 (post-R1B) — DECLARADO FUERA de la fuente unica (D60, R7;
+    alcance corregido en R8 F-C): esta taxonomia clasifica infraestructura
+    LOCAL de Showdown (ConnectionClosedError / ShowdownUnavailableError).
+    No debe entrar a provider_taxonomy: los veredictos de aca son sobre el
+    entorno de batalla, no sobre el modelo. Los literales estan en la
+    allowlist del invariante 1c (test_literales_taxonomia).
+    ALCANCE REAL (F-C, medido): el `else` de aca clasifica como
+    internal-defect CUALQUIER excepcion que llegue post-smoke, incluidas
+    las de proveedor (medido: CredentialRejected -> internal-defect aca,
+    donde la tabla diria credential/model unavailable). Hoy ninguna
+    excepcion de proveedor llega por el ORDEN de los except de `_run_one`
+    (el `except ProviderError` la captura antes), NO por diseno de este
+    sitio. Si ese orden cambiara, la fila publicaria internal-defect junto
+    a un failure_type de proveedor.
     - `ConnectionClosedError` de Showdown durante batalla -> externally-limited;
     - `ShowdownUnavailableError` (RuntimeError from OSError del preflight
       local) -> externally-limited;
