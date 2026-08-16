@@ -36,6 +36,14 @@ juzga.
 - Entrega evidencia reproducible y verifica que el test detecte la regresión.
 - Puede mover una tarea a `In Review`; nunca puede autoaprobarla.
 
+### Code reviewer independiente (Tasos)
+
+- Revisa en modo read-only el rango exacto `Base SHA..Head SHA`.
+- Contrasta código, tests y evidencia contra el plan y las decisiones del repo.
+- Publica findings reproducibles con severidad calibrada y una recomendación.
+- No modifica código, no mueve tareas y no emite el veredicto final.
+- Sigue el contrato completo de `code_review_best_practices.md`.
+
 ### Usuario
 
 - Conserva la autoridad de producto y resuelve cambios de alcance.
@@ -56,7 +64,21 @@ juzga.
 | Plan de implementación | `docs/superpowers/plans/` |
 | Métricas de modelos | `docs/BENCHMARKS.md` |
 | Evidencia ejecutable | Código, tests y migraciones |
+| Protocolo del reviewer independiente | `code_review_best_practices.md` |
 | Veredicto técnico | Revisión del tech lead, reflejada después en Linear |
+
+## Selección de modelos para workers
+
+- La capacidad máxima de razonamiento no es el valor por defecto: se elige por
+  riesgo y complejidad, considerando también latencia y consumo.
+- Neoblex y Andromeda usan por defecto el modelo suficiente más económico y
+  escalan sólo ante los riesgos definidos en `code_review_best_practices.md`.
+- **Galileo** no recibe trabajo ordinario: se reserva para problemas
+  extremadamente difíciles y sólo por autorización explícita del tech lead.
+- Tasos usa `Terra High` como reviewer habitual y `Sol High` para protocolo,
+  dataset, migraciones, seguridad o concurrencia; `xhigh` no es el default.
+- Una vez resuelto el checkpoint difícil, la implementación puede bajar de
+  esfuerzo si el contrato ya quedó cerrado.
 
 No duplicar documentos completos entre Linear y el repo. Linear enlaza los
 artefactos permanentes del repo y el repo menciona el identificador de Linear
@@ -92,10 +114,15 @@ Una revisión fallida normal termina en `Changes Requested`, no en `Rejected`.
 7. Verifica el arreglo, rompe deliberadamente la función corregida y demuestra
    que el test de regresión falla.
 8. Publica el `REVIEW PACKET` y mueve la tarea a `In Review`.
-9. El tech lead inspecciona código, decisiones, tests, datos y resultados de
-   forma independiente.
-10. El tech lead emite un `LINEAR_VERDICT`.
-11. El chat operador aplica el estado indicado y publica el veredicto completo
+9. Tasos revisa todo cambio de código, datos, migraciones o protocolo y publica
+   su `TASOS REVIEW PACKET`. Documentación y cambios mecánicos pueden omitirlo
+   sólo si el tech lead registra el motivo.
+10. El implementador corrige los findings que el tech lead valide y Tasos
+    verifica la nueva revisión.
+11. El tech lead inspecciona código, decisiones, tests, datos y resultados de
+    forma independiente.
+12. El tech lead emite un `LINEAR_VERDICT`.
+13. El chat operador aplica el estado indicado y publica el veredicto completo
     en la tarea.
 
 ## REVIEW PACKET obligatorio
