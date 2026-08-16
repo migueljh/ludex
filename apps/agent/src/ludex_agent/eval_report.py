@@ -59,6 +59,11 @@ class BenchmarkRecord:
     decision_latency_ms_p50: int | None
     decision_latency_ms_p95: int | None
     decision_latency_ms_max: int | None
+    # F2-10B (MON-20): deadline por batalla usado por la corrida. El
+    # deadline compartido de cada DECISION es independiente y vive en el
+    # provider; este campo documenta el reloj de batalla configurado y
+    # persiste en TODOS los artefactos (complete, aborted, not-run).
+    battle_timeout_seconds: float
     pricing_table_id: str
     pricing_currency: str
     pricing_source_url: str | None
@@ -95,6 +100,7 @@ def build_benchmark_record(
     route: ModelRoute,
     pricing: PricingTable,
     status: str | None = None,
+    battle_timeout_seconds: float | None = None,
 ) -> BenchmarkRecord:
     if RUN_ID_PATTERN.fullmatch(run_id) is None:
         raise ValueError("run_id must match [a-z0-9-]+")
@@ -169,6 +175,7 @@ def build_benchmark_record(
         decision_latency_ms_p50=metrics.get("decision_latency_ms_p50"),
         decision_latency_ms_p95=metrics.get("decision_latency_ms_p95"),
         decision_latency_ms_max=metrics.get("decision_latency_ms_max"),
+        battle_timeout_seconds=battle_timeout_seconds or 180.0,
         pricing_table_id=pricing.table_id,
         pricing_currency=pricing.currency,
         pricing_source_url=price.source_url if price is not None else None,

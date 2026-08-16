@@ -866,6 +866,19 @@ class LudexPlayer(RandomPlayer):
         # `_drain_on_poke_loop`, agendada ahi vía `run_coroutine_threadsafe`)
         # -- nunca hay dos escritores concurrentes de threads distintos.
         self._decisions_closed = False
+        # MON-20 DIAG-A: ETAPA actual de cada decision en vuelo, por task.
+        # Las decisiones corren como tasks fire-and-forget en
+        # `ps_client.loop` (POKE_LOOP en produccion), hermanas de
+        # `battle_against`: `asyncio.all_tasks()` desde el loop del caller
+        # no las ve y `PendingChoice.phase` solo habla de la correlacion de
+        # choices, no del grafo. Sin este registro, una decision atascada en
+        # un await SQL sin deadline (context_repository) o en el proveedor
+        # es INVISIBLE hasta el timeout de la batalla. Escritura SOLO desde
+        # codigo que corre en `ps_client.loop` (los nodos del grafo, dentro
+        # de la task de la decision); lectura desde
+        # `decision_snapshot()`, que tambien agenda su captura ahi. Nunca
+        # serializa prompts, credenciales, respuestas, filas ni payloads.
+        self._decision_stages: dict[asyncio.Task[Any], str] = {}
         # Idempotencia cross-loop de `drain_inflight_decisions`, mismo patron
         # que `_background_failure`: un `concurrent.futures.Future` no esta
         # atado a ningun loop, así que un segundo llamador (de cualquier
@@ -904,6 +917,99 @@ class LudexPlayer(RandomPlayer):
 
     def _release_decision(self, task: asyncio.Task[Any]) -> None:
         self._decision_tasks.discard(task)
+        self._decision_stages.pop(task, None)
+        # Los nodos del grafo corren en tasks propias (executor de
+        # LangGraph) y pueden haber dejado un stage registrado: se barren
+        # las terminadas. `_release_decision` corre en `ps_client.loop`
+        # despues de que `ainvoke` retorno, asi que para entonces estan
+        # todas done.
+        for done in [t for t in self._decision_stages if t.done()]:
+            self._decision_stages.pop(done, None)
+
+    def _set_decision_stage(self, task: asyncio.Task[Any], stage: str) -> None:
+        """Registra la etapa actual de la decision `task`.
+
+        SOLO desde codigo que corre en `ps_client.loop` (dentro de la task
+        de la decision): es el mismo regimen de hilos que `_decision_tasks`.
+        """
+        self._decision_stages[task] = stage
+
+    def record_decision_stage(self, stage: str) -> None:
+        """Callback para los nodos del grafo (`build_decision_graph`).
+
+        LangGraph ejecuta cada nodo en una task PROPIA (el executor crea
+        una por paso), asi que `asyncio.current_task()` aca es la task del
+        nodo — la que tiene el chain de awaits profundo con la linea exacta
+        que la decision espera. Se registra bajo ESA task: es lo que
+        `decision_snapshot()` busca. Un nodo que no corra dentro de una
+        task (tests, invocacion directa del grafo) se ignora.
+        """
+        task = asyncio.current_task()
+        if task is not None:
+            self._decision_stages[task] = stage
+
+    async def _capture_decision_snapshot(self) -> list[dict[str, Any]]:
+        """Cuerpo del snapshot. Corre ENTERO en `ps_client.loop`.
+
+        Captura tasks + etapas + stacks desde el MISMO loop que los escribe
+        (regimen de hilos identico al del drain). Los frames se reducen a
+        (module, function, line): NUNCA se serializan `f_locals` — una
+        variable local de un frame del proveedor puede contener una clave
+        API, y los frames de contexto traen filas y payloads.
+
+        `Task.get_stack()` solo expone el frame del coroutine raiz de la
+        task; el chain real de awaits (run_graph -> ainvoke -> nodo ->
+        repositorio) se camina con `cr_await` sobre `task.get_coro()`, que
+        es lo que identifica la LINEA EXACTA que la decision espera.
+        """
+        entries: list[dict[str, Any]] = []
+        for task in list(self._decision_tasks) + [
+            t for t in self._decision_stages if t not in self._decision_tasks
+        ]:
+            if task.done():
+                continue
+            frames: list[dict[str, str | int]] = []
+            current = task.get_coro()
+            while current is not None:
+                # Los chains de await mezclan coroutines (`cr_frame`/
+                # `cr_await`) con async generators (`ag_frame`/`ag_await`,
+                # p.ej. el `astream` de LangGraph).
+                frame = getattr(current, "cr_frame", None) or getattr(
+                    current, "ag_frame", None
+                )
+                if frame is not None:
+                    frames.append({
+                        "module": frame.f_globals.get("__name__", ""),
+                        "function": frame.f_code.co_name,
+                        "line": frame.f_lineno,
+                    })
+                current = getattr(current, "cr_await", None) or getattr(
+                    current, "ag_await", None
+                )
+            entries.append({
+                "task_id": id(task),
+                "stage": self._decision_stages.get(task),
+                "frames": frames,
+            })
+        return entries
+
+    async def decision_snapshot(self) -> list[dict[str, Any]]:
+        """Estado observado de las decisiones en vuelo, para diagnosticos.
+
+        Devuelve una entrada por decision registrada: `task_id`, `stage`
+        (la etapa del grafo en la que esta, o `None` si todavia no marco
+        ninguna) y `frames` sanitizados (module/function/line) que
+        identifican la LINEA EXACTA que la decision esta esperando — el
+        stack de `ps_client.loop`, no el del caller.
+
+        Diagnostico puro: no cancela, no espera, no cambia el flujo. El
+        proximo diagnostico en vivo (MON-20 DIAG-A) la usa en checkpoints
+        fijos para localizar un cuelgue antes del timeout de la batalla.
+        """
+        future = asyncio.run_coroutine_threadsafe(
+            self._capture_decision_snapshot(), self.ps_client.loop
+        )
+        return await asyncio.wrap_future(future)
 
     async def _drain_on_poke_loop(self) -> None:
         """Cuerpo real del drenaje. Corre ENTERO en `ps_client.loop`.
@@ -1394,6 +1500,7 @@ class LudexPlayer(RandomPlayer):
             async def run_random() -> Any:
                 task = self._admit_decision()
                 try:
+                    self._set_decision_stage(task, "resolve_state")
                     step["state"] = await self._resolve_state(
                         tag, snapshot, step=step, cursor=cursor, retry=retry,
                         opponent_side=opponent_side, vocabulary=vocabulary,
@@ -1466,6 +1573,7 @@ class LudexPlayer(RandomPlayer):
             # proyeccion/grafo/calc. Ver `_admit_decision`.
             task = self._admit_decision()
             try:
+                self._set_decision_stage(task, "resolve_state")
                 projected = await self._resolve_state(
                     tag, snapshot, step=step, cursor=cursor, retry=retry,
                     opponent_side=opponent_side, vocabulary=vocabulary,
@@ -1479,7 +1587,14 @@ class LudexPlayer(RandomPlayer):
                     "turn_id": f"{tag}:{index}",
                     "deadline": deadline,
                 }
+                # Los nodos del grafo publican sus propias etapas via
+                # `on_stage` (record_decision_stage) cuando el grafo se
+                # construyo con ese cable; el marker grueso de aca queda
+                # para grafos sin cable (tests) y para el tramo dentro de
+                # `ainvoke` que no es de ningun nodo.
+                self._set_decision_stage(task, "graph")
                 result = await self.decision_graph.ainvoke(graph_input)
+                self._set_decision_stage(task, "execute")
                 action = result["action"]
                 # F2-09 (D39): adapter explícito del resultado del grafo a la
                 # ejecución de poke-env. NO es un nodo LangGraph: el mapa

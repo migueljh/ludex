@@ -1,0 +1,22 @@
+{
+  "provider": "open_code_zen",
+  "model": "north-mini-code-free",
+  "tier": "free",
+  "protocol": "chat_completions",
+  "status": "credential/model unavailable",
+  "smoke_ok": false,
+  "battles_requested": 0,
+  "battles_completed": 0,
+  "effective_provider": null,
+  "effective_model": null,
+  "win_rate": null,
+  "completion_latency_ms": null,
+  "decision_latency_ms": null,
+  "tokens": null,
+  "retries": 0,
+  "rotations": 0,
+  "quarantined": 0,
+  "failure_type": "ProviderPoolExhausted",
+  "failure_cause_type": null,
+  "note": "smoke fallido (ProviderPoolExhausted)"
+}

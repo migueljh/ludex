@@ -1,0 +1,45 @@
+{
+  "provider": "open_code_zen",
+  "model": "qwen3.5-plus",
+  "tier": "paid",
+  "protocol": "messages",
+  "status": "aborted",
+  "smoke_ok": true,
+  "battles_requested": 2,
+  "battles_completed": 0,
+  "effective_provider": "open_code_zen",
+  "effective_model": "qwen3.5-plus",
+  "win_rate": null,
+  "completion_latency_ms": {
+    "count": 2,
+    "total": 237274,
+    "p50": 118637,
+    "p95": 170027,
+    "max": 175737
+  },
+  "decision_latency_ms": {
+    "count": 2,
+    "total": 237277,
+    "p50": 118639,
+    "p95": 170029,
+    "max": 175739
+  },
+  "tokens": {
+    "input_tokens": 76546,
+    "output_tokens": 5511,
+    "cached_input_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  "retries": 5,
+  "rotations": 0,
+  "quarantined": 0,
+  "failure_type": "TransientProviderError",
+  "failure_cause_type": "APITimeoutError",
+  "battles_wins": 0,
+  "battles_losses": 0,
+  "battles_ties": 0,
+  "note": "batallas parciales o abortadas: sin winrate comparable",
+  "failure_stage": "battle",
+  "http_status": null,
+  "provider_error_code": null
+}

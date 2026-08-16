@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -9,9 +10,12 @@ from anthropic import APITimeoutError as AnthropicAPITimeoutError
 from openai import APITimeoutError as OpenAIAPITimeoutError
 from pydantic import BaseModel, Field, ValidationError
 
+from ludex_agent.graph.decision import DecisionResponse
+
 from ludex_agent.graph.provider import (
     CompletionEnvelope,
     CompletionUsage,
+    CredentialRejected,
     DecisionDeadlineExceeded,
     DecisionMetrics,
     FatalProviderError,
@@ -26,7 +30,9 @@ from ludex_agent.graph.provider import (
     TransientProviderError,
     _LangChainBackend,
     _classified,
+    _http_status_chain,
     _redacted,
+    _structured_provider_error_code,
     anthropic_sdk_base_url,
     load_model_routes,
     message_text_content,
@@ -165,30 +171,67 @@ def test_rutas_de_modelo_eligen_el_protocolo_real():
 
     assert model_route(
         routes, "open_code_zen", "minimax-m2.7"
-    ) == ModelRoute(protocol="chat_completions")
+    ) == ModelRoute(
+        protocol="chat_completions", structured_output="json_schema",
+        timeout_seconds=60,
+    )
     assert model_route(
         routes, "open_code_zen", "deepseek-v4-pro"
-    ) == ModelRoute(protocol="chat_completions")
+    ) == ModelRoute(
+        protocol="chat_completions", structured_output="json_schema",
+        timeout_seconds=60,
+    )
     assert model_route(
         routes, "open_code_zen", "deepseek-v4-flash"
-    ) == ModelRoute(protocol="chat_completions")
+    ) == ModelRoute(
+        protocol="chat_completions", structured_output="json_schema",
+        timeout_seconds=60,
+    )
+    assert model_route(
+        routes, "open_code_zen", "gpt-5.5"
+    ) == ModelRoute(
+        protocol="responses", structured_output="text_json",
+        timeout_seconds=120,
+    )
+    assert model_route(
+        routes, "open_code_zen", "grok-4.5"
+    ) == ModelRoute(
+        protocol="responses", structured_output="text_json",
+        timeout_seconds=120,
+    )
+    assert model_route(
+        routes, "open_code_zen", "claude-haiku-4-5"
+    ) == ModelRoute(
+        protocol="messages", structured_output="text_json",
+        timeout_seconds=60,
+    )
+    assert model_route(
+        routes, "open_code_zen", "gemini-3.6-flash"
+    ) == ModelRoute(
+        protocol="google", structured_output="json_schema",
+        timeout_seconds=60,
+    )
     assert model_route(
         routes, "open_code_zen", "qwen3.5-plus"
     ) == ModelRoute(
-        protocol="messages",
+        protocol="messages", structured_output="text_json",
         max_tokens=1024,
         timeout_seconds=60,
     )
     assert model_route(
         routes, "open_code_zen", "qwen3.6-plus"
-    ) == ModelRoute(protocol="messages")
+    ) == ModelRoute(
+        protocol="messages", structured_output="text_json",
+        timeout_seconds=60,
+    )
     assert model_route(
         routes, "kimi", "kimi-k2.6"
     ) == ModelRoute(
-        protocol="chat_completions",
+        protocol="chat_completions", structured_output="json_schema",
         temperature=1.0,
         thinking="enabled",
         max_tokens=16_000,
+        timeout_seconds=120,
     )
 
 
@@ -1060,3 +1103,807 @@ async def test_pinned_auditor_permite_respuesta_que_coincide_con_el_pin():
         "p", deadline=time.monotonic() + 1, turn_id="t"
     )
     assert envelope.model == "gemini-2.5-flash"
+
+
+# --- F2-10B (MON-20): cuarentena de credenciales, pool de 11 claves y
+# protocolos declarativos ------------------------------------------------
+
+
+def _http_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://provider.example/v1/x")
+    return httpx.HTTPStatusError(
+        "request failed",
+        request=request,
+        response=httpx.Response(status, request=request),
+    )
+
+
+def _openai_401(code: str) -> httpx.HTTPStatusError:
+    return _http_error_with_body(401, {
+        "error": {"message": "unauthorized", "type": "authentication_error",
+                  "code": code},
+    })
+
+
+@pytest.mark.asyncio
+async def test_401_con_senal_estructurada_cuarentena_solo_esa_clave_y_sigue():
+    """L-02 (R1A): un 401 SOLO cuarentena cuando una senal ESTRUCTURADA
+    allowlisted demuestra rechazo de NUESTRA credencial (p.ej.
+    `error.code=invalid_api_key` de openai). Esa clave se descarta y la
+    siguiente del pool se intenta. Nunca se decide por texto libre."""
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([_openai_401("invalid_api_key"), {"ok": True}])
+    provider = KeyRotatingProvider(
+        "open_code_zen", ("key-bad", "key-ok"), backend, metrics=metrics
+    )
+
+    result = await provider.complete(
+        "p", deadline=time.monotonic() + 1, turn_id="t1"
+    )
+
+    assert result.payload == {"ok": True}
+    assert backend.calls == [("p", "key-bad"), ("p", "key-ok")]
+    assert metrics.snapshot()["keys_quarantined"] == 1
+    assert metrics.snapshot()["key_rotations"] == 0
+    # La clave en cuarentena NO se vuelve a probar en el turno siguiente.
+    backend.responses.append({"ok2": True})
+    await provider.complete("p", deadline=time.monotonic() + 1, turn_id="t2")
+    assert backend.calls == [
+        ("p", "key-bad"), ("p", "key-ok"), ("p", "key-ok"),
+    ]
+
+
+def _http_error_with_body(status: int, body: dict) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://provider.example/v1/x")
+    return httpx.HTTPStatusError(
+        "request failed",
+        request=request,
+        response=httpx.Response(status, request=request, json=body),
+    )
+
+
+def _google_403(reason: str) -> httpx.HTTPStatusError:
+    return _http_error_with_body(403, {
+        "error": {
+            "code": 403,
+            "status": "PERMISSION_DENIED",
+            "details": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": reason,
+                "domain": "googleapis.com",
+            }],
+        },
+    })
+
+
+def _openai_403(code: str) -> httpx.HTTPStatusError:
+    return _http_error_with_body(403, {
+        "error": {"message": "forbidden", "type": "permission_error", "code": code},
+    })
+
+
+@pytest.mark.asyncio
+async def test_403_sin_senal_estructurada_es_model_wide_y_detiene():
+    """Un 403 sin senal estructurada (o model-wide: ACCESS_DENIED,
+    PERMISSION_DENIED, model_not_accessible...) es un error de
+    modelo/proyecto/region: se detiene en la PRIMERA clave y no quema el
+    pool de 11 (canario del blocker R3 de MON-20)."""
+    for error in (_http_error(403), _google_403("ACCESS_DENIED"),
+                  _openai_403("model_not_accessible")):
+        keys = tuple(f"k{i}" for i in range(11))
+        backend = ScriptedBackend([error])
+        provider = KeyRotatingProvider(
+            "google", keys, backend, metrics=DecisionMetrics()
+        )
+        with pytest.raises(FatalProviderError):
+            await provider.complete(
+                "p", deadline=time.monotonic() + 5, turn_id="t"
+            )
+        assert len(backend.calls) == 1, f"pool quemado para {error}"
+        assert backend.calls[0][1] == keys[0]
+        assert provider._metrics.snapshot()["keys_quarantined"] == 0
+
+
+@pytest.mark.asyncio
+async def test_403_credential_specific_google_rota_solo_esa_clave():
+    """reason=API_KEY_INVALID (senal estructurada de Google) demuestra
+    rechazo de credencial: cuarentena de esa clave y sigue con la
+    siguiente."""
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([_google_403("API_KEY_INVALID"), {"ok": True}])
+    provider = KeyRotatingProvider(
+        "google", ("key-bad", "key-ok"), backend, metrics=metrics
+    )
+    result = await provider.complete(
+        "p", deadline=time.monotonic() + 1, turn_id="t"
+    )
+    assert result.payload == {"ok": True}
+    assert metrics.snapshot()["keys_quarantined"] == 1
+    assert metrics.snapshot()["turns_quota_affected"] == 0
+
+
+@pytest.mark.asyncio
+async def test_403_credential_specific_openai_rota_solo_esa_clave():
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([_openai_403("invalid_api_key"), {"ok": True}])
+    provider = KeyRotatingProvider(
+        "open_code_zen", ("key-bad", "key-ok"), backend, metrics=metrics
+    )
+    result = await provider.complete(
+        "p", deadline=time.monotonic() + 1, turn_id="t"
+    )
+    assert result.payload == {"ok": True}
+    assert metrics.snapshot()["keys_quarantined"] == 1
+    assert metrics.snapshot()["turns_quota_affected"] == 0
+
+
+@pytest.mark.asyncio
+async def test_403_credential_specific_google_a_traves_del_wrapper_langchain():
+    """langchain_google_genai envuelve el APIError de Google en
+    ChatGoogleGenerativeAIError: la senal estructurada (reason) vive en la
+    cadena de causas. La clasificacion debe caminarla."""
+    from google.genai.errors import APIError as GoogleAPIError
+
+    api_error = GoogleAPIError(
+        code=403,
+        response_json={
+            "error": {
+                "code": 403,
+                "status": "PERMISSION_DENIED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "API_KEY_EXPIRED",
+                    "domain": "googleapis.com",
+                }],
+            },
+        },
+    )
+    try:
+        raise RuntimeError(
+            f"Error calling model 'gemini-2.5-flash' "
+            f"(PERMISSION_DENIED): {api_error}"
+        ) from api_error
+    except RuntimeError as exc:
+        wrapper = exc
+    metrics = DecisionMetrics()
+    backend = ScriptedBackend([wrapper, {"ok": True}])
+    provider = KeyRotatingProvider(
+        "google", ("key-bad", "key-ok"), backend, metrics=metrics
+    )
+    result = await provider.complete(
+        "p", deadline=time.monotonic() + 1, turn_id="t"
+    )
+    assert result.payload == {"ok": True}
+    assert metrics.snapshot()["keys_quarantined"] == 1
+    assert metrics.snapshot()["key_rotations"] == 0
+
+
+@pytest.mark.asyncio
+async def test_401_sin_senal_estructurada_es_fatal_y_no_quema_el_pool():
+    """L-02 (R1A): reemplaza al test que esperaba ProviderPoolExhausted
+    para un 401 sin senal. Un 401 SIN senal estructurada allowlisted (o
+    identificado como upstream/model-wide) es un error del provider/modelo,
+    NO de nuestra credencial: FatalProviderError en la PRIMERA clave, sin
+    rotacion ni cuarentena. R1A demostro que Zen puede devolver 401
+    originado en el provider upstream de un modelo mientras la misma
+    credencial funciona en modelos vecinos."""
+    for error in (
+        _http_error(401),
+        _http_error_with_body(401, {"error": {"message": "bad key"}}),
+        _openai_401("model_not_accessible"),
+    ):
+        keys = tuple(f"k{i}" for i in range(11))
+        backend = ScriptedBackend([error])
+        provider = KeyRotatingProvider(
+            "open_code_zen", keys, backend, metrics=DecisionMetrics()
+        )
+        with pytest.raises(FatalProviderError):
+            await provider.complete(
+                "p", deadline=time.monotonic() + 5, turn_id="t"
+            )
+        assert len(backend.calls) == 1, f"pool quemado para {error}"
+        assert backend.calls[0][1] == keys[0]
+        snapshot = provider._metrics.snapshot()
+        assert snapshot["keys_quarantined"] == 0
+        assert snapshot["key_rotations"] == 0
+
+
+def test_401_se_clasifica_por_senal_estructurada_nunca_por_texto():
+    """L-02 (R1A): counterweights de clasificacion. `invalid_api_key`
+    estructurado -> CredentialRejected (cuarentena); un 401 sin senal o con
+    code de modelo/upstream -> FatalProviderError (sin cuarentena). El
+    mensaje de texto libre jamas decide, ni siquiera cuando parece hablar
+    de la clave."""
+    assert isinstance(
+        _classified(_openai_401("invalid_api_key")), CredentialRejected
+    )
+    assert isinstance(
+        _classified(_openai_401("api_key_expired")), CredentialRejected
+    )
+    assert isinstance(
+        _classified(_http_error_with_body(
+            401, {"error": {"message": "upstream model unavailable"}}
+        )), FatalProviderError
+    )
+    assert isinstance(
+        _classified(_openai_401("model_not_accessible")), FatalProviderError
+    )
+    assert isinstance(
+        _classified(_http_error_with_body(
+            401, {"error": {"message": "la clave es incorrecta, revise su "
+                              "API key (upstream)"}}
+        )), FatalProviderError
+    )
+
+
+@pytest.mark.asyncio
+async def test_error_model_wide_no_quema_el_pool_de_11_claves():
+    """Canario MON-20: un error model-wide (404 de modelo, fatal) detiene
+    la corrida en la PRIMERA clave. Si el codigo rotara sobre las 11, el
+    pool se quemaria en vano y este test fallaria."""
+    keys = tuple(f"k{i}" for i in range(11))
+    backend = ScriptedBackend([_http_error(404)])
+    provider = KeyRotatingProvider(
+        "google", keys, backend, metrics=DecisionMetrics()
+    )
+    with pytest.raises(FatalProviderError):
+        await provider.complete(
+            "p", deadline=time.monotonic() + 5, turn_id="t"
+        )
+    assert len(backend.calls) == 1
+    assert backend.calls[0][1] == keys[0]
+
+
+@pytest.mark.asyncio
+async def test_pool_de_11_claves_rota_429_hasta_encontrar_una_disponible():
+    metrics = DecisionMetrics()
+    responses: list = [QuotaExceeded("quota") for _ in range(10)]
+    responses.append({"ok": True})
+    backend = ScriptedBackend(responses)
+    provider = KeyRotatingProvider(
+        "google", tuple(f"k{i}" for i in range(11)), backend, metrics=metrics
+    )
+    result = await provider.complete(
+        "p", deadline=time.monotonic() + 5, turn_id="t"
+    )
+    assert result.payload == {"ok": True}
+    assert len(backend.calls) == 11
+    assert backend.calls[-1][1] == "k10"
+    assert metrics.snapshot()["key_rotations"] == 10
+    assert metrics.snapshot()["turns_quota_affected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rotacion_comparte_un_mismo_deadline():
+    """Todos los intentos (rotacion incluida) comparten el deadline de la
+    decision: una rotacion no resetea el reloj ni lo extiende."""
+    clock_values = iter([0.0, 1.0, 2.0, 3.0, 99.0, 99.0])
+    metrics = DecisionMetrics()
+
+    class ScriptedClock:
+        def __call__(self) -> float:
+            return next(clock_values)
+
+    backend = ScriptedBackend([QuotaExceeded("q")] * 11)
+    provider = KeyRotatingProvider(
+        "google", tuple(f"k{i}" for i in range(11)), backend,
+        metrics=metrics, clock=ScriptedClock(),
+        quota_cooldown_seconds=60,
+    )
+    with pytest.raises(DecisionDeadlineExceeded):
+        await provider.complete(
+            "p", deadline=2.5, turn_id="t"
+        )
+    # deadline 2.5: t=0 pasa el pase, t=1 intenta la clave 0, t=2 fija el
+    # cooldown de la clave 0, t=3 evalua la clave 1 con remaining<0: la
+    # rotacion NUNCA extiende el deadline compartido.
+    assert len(backend.calls) == 1
+    assert backend.calls[0][1] == "k0"
+    assert metrics.snapshot()["turns_deadline_affected"] == 1
+
+
+def _routes_with(provider: str, model: str, protocol: str, **extra) -> dict:
+    from ludex_agent.graph.provider import ModelRoute
+    return {(provider, model): ModelRoute(protocol=protocol, **extra)}
+
+
+def test_protocolo_responses_elige_backend_responses():
+    from ludex_agent.graph.provider import (
+        OpenAIResponsesDecisionProvider,
+        _ResponsesBackend,
+        build_route_provider,
+    )
+    provider = build_route_provider(
+        "open_code_zen", "gpt-5.5",
+        base_url="https://opencode.ai/zen/v1", keys=("k",),
+        metrics=DecisionMetrics(), timeout_seconds=30,
+        route=ModelRoute(protocol="responses", temperature=0.2),
+    )
+    assert isinstance(provider, OpenAIResponsesDecisionProvider)
+    assert isinstance(provider._backend, _ResponsesBackend)
+
+
+def test_protocolo_google_zen_usa_gemini_con_base_url():
+    from ludex_agent.graph.provider import (
+        GeminiDecisionProvider,
+        build_route_provider,
+    )
+    provider = build_route_provider(
+        "open_code_zen", "gemini-3.6-flash",
+        base_url="https://opencode.ai/zen/v1", keys=("k",),
+        metrics=DecisionMetrics(), timeout_seconds=30,
+        route=ModelRoute(protocol="google"),
+    )
+    assert isinstance(provider, GeminiDecisionProvider)
+    assert provider._backend.base_url == "https://opencode.ai/zen/v1"
+
+
+def test_protocolo_messages_usa_anthropic_y_chat_completions_openai():
+    from ludex_agent.graph.provider import (
+        AnthropicDecisionProvider,
+        OpenAICompatibleDecisionProvider,
+        build_route_provider,
+    )
+    messages = build_route_provider(
+        "open_code_zen", "qwen3.6-plus",
+        base_url="https://opencode.ai/zen/v1", keys=("k",),
+        metrics=DecisionMetrics(), timeout_seconds=30,
+        route=ModelRoute(protocol="messages"),
+    )
+    assert isinstance(messages, AnthropicDecisionProvider)
+    chat = build_route_provider(
+        "open_code_zen", "deepseek-v4-flash",
+        base_url="https://opencode.ai/zen/v1", keys=("k",),
+        metrics=DecisionMetrics(), timeout_seconds=30,
+        route=ModelRoute(protocol="chat_completions"),
+    )
+    assert isinstance(chat, OpenAICompatibleDecisionProvider)
+
+
+@pytest.mark.asyncio
+async def test_backend_google_usa_google_api_key_timeout_y_base_url(monkeypatch):
+    """Los campos reales de ChatGoogleGenerativeAI son `google_api_key`,
+    `max_retries`, `timeout` y `base_url`. Los nombres `api_key`/`retries`/
+    `request_timeout` NO existen: pydantic los ignora en silencio y la
+    rotacion de claves jamas rotaba credenciales reales. Este test fija la
+    regresion: si alguien revierte a `api_key=`, el kwargs capturado no
+    contiene `google_api_key` y el test falla."""
+    captured: dict[str, object] = {}
+
+    class FakeMessage:
+        content = '{"action": "move"}'
+        usage_metadata = {
+            "input_tokens": 1, "output_tokens": 1,
+            "input_token_details": {}, "output_token_details": {},
+        }
+        response_metadata = {"model_name": "gemini-2.5-flash"}
+
+    class FakeModel:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def ainvoke(self, prompt):
+            return FakeMessage()
+
+    import langchain_google_genai
+    monkeypatch.setattr(
+        langchain_google_genai, "ChatGoogleGenerativeAI", FakeModel
+    )
+    backend = _LangChainBackend(
+        kind="google", model="gemini-2.5-flash",
+        response_schema=provider_response_schema(DecisionResponse),
+        timeout_seconds=30, base_url="https://opencode.ai/zen/v1",
+        route=ModelRoute(protocol="google", structured_output="text_json"),
+    )
+    result = await backend.complete(
+        "p", api_key="AIza-pool-key", deadline=time.monotonic() + 5
+    )
+    assert captured.get("google_api_key") == "AIza-pool-key"
+    assert captured.get("max_retries") == 0
+    assert captured.get("timeout") == 30
+    assert captured.get("base_url") == "https://opencode.ai/zen/v1"
+    assert "api_key" not in captured
+    assert result.usage.model == "gemini-2.5-flash"
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_posta_exactamente_al_endpoint(monkeypatch):
+    """CONTRATO DE ENDPOINT (D43): `endpoint` es la URL COMPLETA y el
+    backend postea exactamente ahi. Debe fallar si la URL terminara en
+    `/responses/responses` o en cualquier otro endpoint."""
+    captured: dict[str, object] = {}
+    calls: list[tuple[str, dict]] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            calls.append((url, json))
+            return SimpleNamespace(
+                status_code=200,
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "model": "gpt-5.5",
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": '{"action": "switch", "target": "pikachu"}',
+                        }],
+                    }],
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "output_tokens_details": {"reasoning_tokens": 5},
+                    },
+                },
+            )
+
+    import httpx as httpx_module
+    monkeypatch.setattr(httpx_module, "AsyncClient", FakeClient)
+
+    from ludex_agent.graph.provider import _ResponsesBackend
+    backend = _ResponsesBackend(
+        model="gpt-5.5",
+        endpoint="https://opencode.ai/zen/v1/responses",
+        timeout_seconds=60,
+        route=ModelRoute(
+            protocol="responses", temperature=0.2, max_tokens=8000,
+        ),
+    )
+    result = await backend.complete(
+        "p", api_key="sk-zen", deadline=time.monotonic() + 5
+    )
+    assert [url for url, _ in calls] == [
+        "https://opencode.ai/zen/v1/responses"
+    ]
+    body = calls[0][1]
+    assert body["model"] == "gpt-5.5"
+    assert body["input"] == "p"
+    assert body["temperature"] == 0.2
+    assert body["max_output_tokens"] == 8000
+    assert result.payload == {"action": "switch", "target": "pikachu"}
+    assert result.usage.input_tokens == 100
+    assert result.usage.output_tokens == 20
+    assert result.usage.reasoning_tokens == 5
+    assert result.usage.model == "gpt-5.5"
+
+
+@pytest.mark.asyncio
+async def test_responses_endpoint_derivado_no_duplica_el_path(monkeypatch):
+    """Sin `endpoint` en la ruta, se deriva `{base_url}/responses`: nunca
+    `/responses/responses`."""
+    captured: dict[str, object] = {}
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            calls.append(url)
+            return SimpleNamespace(
+                status_code=200,
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "model": "gpt-5.5",
+                    "output": [{"type": "message", "content": []}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+
+    import httpx as httpx_module
+    monkeypatch.setattr(httpx_module, "AsyncClient", FakeClient)
+
+    from ludex_agent.graph.provider import OpenAIResponsesDecisionProvider
+    provider = OpenAIResponsesDecisionProvider(
+        "open_code_zen", ("k",), model="gpt-5.5",
+        base_url="https://opencode.ai/zen/v1", timeout_seconds=60,
+        route=ModelRoute(protocol="responses"),
+    )
+    await provider.complete("p", deadline=time.monotonic() + 5, turn_id="t")
+    assert calls == ["https://opencode.ai/zen/v1/responses"]
+
+
+def test_responses_protocolo_por_defecto_usa_text_json():
+    from ludex_agent.graph.provider import route_structured_output
+    assert route_structured_output(
+        ModelRoute(protocol="responses"), "openai", None
+    ) == "text_json"
+    assert route_structured_output(
+        ModelRoute(protocol="chat_completions"), "openai", None
+    ) == "json_schema"
+    assert route_structured_output(
+        ModelRoute(protocol="messages", structured_output="json_schema"),
+        "openai", "https://zen/v1",
+    ) == "json_schema"
+    assert route_structured_output(
+        ModelRoute(protocol="google"), "google", None
+    ) == "json_schema"
+
+
+@pytest.mark.asyncio
+async def test_responses_backend_atraviesa_el_constructor_real_de_asyncclient(monkeypatch):
+    """Canario L-01 (MON-20): el backend construye el `httpx.AsyncClient`
+    REAL de la version instalada (0.28.1) y solo se sustituye la operacion
+    de red por un transporte falso. En httpx 0.28.1 `max_retries` no es un
+    kwarg de AsyncClient y su constructor lanza TypeError: si el backend
+    volviera a pasarlo, este test se pone rojo exactamente aca. El test
+    anterior reemplazaba todo AsyncClient por un fake permisivo y no
+    detectaba esa regresion."""
+    import httpx as httpx_module
+
+    real_async_client = httpx_module.AsyncClient
+    seen_urls: list[str] = []
+
+    class FakeTransport(httpx_module.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            seen_urls.append(str(request.url))
+            return httpx_module.Response(
+                200,
+                json={
+                    "model": "gpt-5.5",
+                    "output": [{"type": "message", "content": [
+                        {"type": "output_text", "text": '{"action": {"kind": "move", "id": "tackle"}, "target": null, "rationale": "r", "confidence": 0.5, "alternatives": []}'},
+                    ]}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+                request=request,
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    class RealConstructorClient(real_async_client):
+        def __init__(self, *args, **kwargs):
+            # CONSTRUCTOR REAL: TypeError si el codigo pasa max_retries.
+            super().__init__(*args, **kwargs)
+            self._transport = FakeTransport()
+
+    monkeypatch.setattr(httpx_module, "AsyncClient", RealConstructorClient)
+
+    from ludex_agent.graph.provider import _ResponsesBackend
+    backend = _ResponsesBackend(
+        model="gpt-5.5",
+        endpoint="https://opencode.ai/zen/v1/responses",
+        timeout_seconds=60,
+        route=ModelRoute(protocol="responses"),
+    )
+    result = await backend.complete(
+        "p", api_key="sk-zen", deadline=time.monotonic() + 5
+    )
+    assert seen_urls == ["https://opencode.ai/zen/v1/responses"]
+    assert result.usage.model == "gpt-5.5"
+    assert result.usage.input_tokens == 1
+
+
+# --- LATWAN R1A REVIEW (MON-20): L-02 401 upstream, L-03 evidencia
+# sanitizada y adaptacion declarativa text_json de las tres rutas libres ---
+
+
+def test_401_upstream_estructurado_no_es_rechazo_de_nuestra_credencial():
+    """L-02 (R1A): un 401 cuyo body estructurado identifica el fallo como
+    del provider upstream (o no trae senal allowlisted) es
+    FatalProviderError, sin cuarentena ni rotacion. Solo los codes
+    allowlisted de credencial cuarentenan."""
+    assert _http_status_chain(_openai_401("invalid_api_key")) == 401
+    assert _http_status_chain(_google_403("API_KEY_INVALID")) == 403
+
+
+def test_evidencia_estructurada_solo_desde_campos_permitidos():
+    """L-03 (R1A): `provider_error_code` sale SOLO de campos estructurados
+    permitidos (`error.code` de openai/anthropic, `error.details[].reason`
+    de google); jamas de texto libre del mensaje. Sin body estructurado no
+    hay nada que persistir."""
+    assert _structured_provider_error_code(
+        _openai_401("invalid_api_key")
+    ) == "invalid_api_key"
+    assert _structured_provider_error_code(
+        _google_403("API_KEY_INVALID")
+    ) == "API_KEY_INVALID"
+    # Solo mensaje (texto libre): nada que persistir.
+    assert _structured_provider_error_code(_http_error_with_body(
+        401, {"error": {"message": "unauthorized"}}
+    )) is None
+    # Sin body estructurado: nada que persistir.
+    assert _structured_provider_error_code(_http_error(503)) is None
+
+
+def test_rutas_libres_adaptadas_text_json_conservan_chat_completions():
+    """LATWAN R1A: big-pickle, deepseek-v4-flash-free y laguna-s-2.1-free
+    permanecen en `chat_completions` y cambian SOLO su capacidad declarativa
+    a `text_json`; ninguna se migra a `messages` ni gana condicionales por
+    modelo. Mutar cualquiera de las tres de vuelta a `json_schema` (o su
+    protocolo) pone este canario rojo."""
+    routes = load_model_routes()
+    for model in ("big-pickle", "deepseek-v4-flash-free",
+                  "laguna-s-2.1-free"):
+        route = model_route(routes, "open_code_zen", model)
+        assert route.protocol == "chat_completions"
+        assert route.structured_output == "text_json"
+    # Counterweight: el resto de los free de chat_completions siguen en
+    # json_schema; la adaptacion es solo para las tres rutas aprobadas.
+    assert model_route(
+        routes, "open_code_zen", "north-mini-code-free"
+    ).structured_output == "json_schema"
+    assert model_route(
+        routes, "open_code_zen", "mimo-v2.5-free"
+    ).structured_output == "json_schema"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_text_json_omite_response_format_y_agrega_instruccion(monkeypatch):
+    """LATWAN R1A: la adaptacion declarativa `text_json` sobre
+    `chat_completions` NO construye `response_format=json_schema` (nunca
+    llama a `with_structured_output`), agrega la instruccion JSON textual y
+    el payload sigue pasando por la MISMA validacion estricta de
+    DecisionResponse."""
+    captured: dict[str, object] = {}
+    prompts: list[str] = []
+
+    class FakeMessage:
+        content = ('{"action": {"kind": "move", "id": "tackle"}, '
+                   '"target": null, "rationale": "breve", '
+                   '"confidence": 0.9, "alternatives": []}')
+        usage_metadata = {
+            "input_tokens": 1, "output_tokens": 1,
+            "input_token_details": {}, "output_token_details": {},
+        }
+        response_metadata = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def ainvoke(self, prompt):
+            prompts.append(prompt)
+            return FakeMessage()
+
+        def with_structured_output(self, *args, **kwargs):
+            raise AssertionError(
+                "text_json no debe usar with_structured_output "
+                "(response_format=json_schema)"
+            )
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", FakeChatOpenAI)
+    backend = _LangChainBackend(
+        kind="openai", model="big-pickle",
+        response_schema=DecisionResponse, timeout_seconds=30,
+        base_url="https://opencode.ai/zen/v1",
+        route=ModelRoute(protocol="chat_completions",
+                         structured_output="text_json"),
+    )
+    result = await backend.complete(
+        "prompt", api_key="k", deadline=time.monotonic() + 5
+    )
+    assert len(prompts) == 1
+    assert prompts[0] == (
+        "prompt\nRespondé únicamente con un objeto JSON válido, sin "
+        "Markdown ni texto fuera del objeto."
+    )
+    # Misma validacion semantica estricta de D26: el payload del JSON
+    # textual valida como DecisionResponse.
+    DecisionResponse.model_validate(result.payload)
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_json_schema_si_usa_with_structured_output(monkeypatch):
+    """Counterweight LATWAN R1A: la ruta json_schema (sin adaptacion)
+    sigue usando `with_structured_output` con el schema; solo text_json la
+    omite."""
+    captured: dict[str, object] = {}
+
+    class FakeMessage:
+        content = "ignored"
+        usage_metadata = {
+            "input_tokens": 1, "output_tokens": 1,
+            "input_token_details": {}, "output_token_details": {},
+        }
+        response_metadata = {}
+
+    class FakeParsed:
+        def model_dump(self):
+            return {"action": {"kind": "move", "id": "tackle"},
+                    "target": None, "rationale": "r",
+                    "confidence": 0.5, "alternatives": []}
+
+    class FakeStructured:
+        def __init__(self, message, parsed):
+            self._message, self._parsed = message, parsed
+
+        async def ainvoke(self, prompt):
+            return {"raw": self._message, "parsed": self._parsed}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def ainvoke(self, prompt):
+            raise AssertionError(
+                "json_schema no debe invocar ainvoke directo"
+            )
+
+        def with_structured_output(self, schema, *, method, include_raw):
+            captured["structured_method"] = method
+            captured["structured_include_raw"] = include_raw
+            return FakeStructured(FakeMessage(), FakeParsed())
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", FakeChatOpenAI)
+    backend = _LangChainBackend(
+        kind="openai", model="deepseek-v4-flash",
+        response_schema=DecisionResponse, timeout_seconds=30,
+        base_url="https://opencode.ai/zen/v1",
+        route=ModelRoute(protocol="chat_completions",
+                         structured_output="json_schema"),
+    )
+    result = await backend.complete(
+        "prompt", api_key="k", deadline=time.monotonic() + 5
+    )
+    assert captured["structured_method"] == "json_schema"
+    assert captured["structured_include_raw"] is True
+    assert result.payload["action"]["id"] == "tackle"
+
+
+# --- LATWAN OFFLINE REVIEW (MON-20): L-05 provider_error_code acotado ---
+
+
+def test_provider_error_code_acepta_solo_identificadores_acotados():
+    """L-05 (OFFLINE): que el valor provenga de un campo estructurado no lo
+    vuelve seguro. Solo identificadores acotados
+    `^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$` se conservan; URL, slash,
+    whitespace, query, valores largos, patrones de secreto o nombres de
+    variables de entorno -> None COMPLETO, nunca truncado."""
+    # Codigos reales permitidos
+    assert _structured_provider_error_code(
+        _openai_401("invalid_api_key")
+    ) == "invalid_api_key"
+    assert _structured_provider_error_code(
+        _openai_401("invalid_request_error")
+    ) == "invalid_request_error"
+    assert _structured_provider_error_code(
+        _google_403("API_KEY_INVALID")
+    ) == "API_KEY_INVALID"
+    assert _structured_provider_error_code(
+        _openai_401("server_error")
+    ) == "server_error"
+    # URL + query + clave falsa dentro del campo estructurado
+    assert _structured_provider_error_code(_openai_401(
+        "https://provider.invalid/?api_key=sk-FAKE_SECRET-abc"
+    )) is None
+    # Reason de Google inseguro (slash/whitespace) tambien -> None
+    assert _structured_provider_error_code(_google_403(
+        "https://provider.invalid/x"
+    )) is None
+    assert _structured_provider_error_code(_google_403(
+        "API_KEY_INVALID https://evil"
+    )) is None
+    # whitespace y valores largos
+    assert _structured_provider_error_code(_openai_401("bad code")) is None
+    assert _structured_provider_error_code(_openai_401("x" * 200)) is None
+    # nombre de variable de entorno del proyecto
+    assert _structured_provider_error_code(
+        _openai_401("OPEN_CODE_ZEN_API_KEY")
+    ) is None
+    assert _structured_provider_error_code(
+        _openai_401("GEMINI_API_KEYS")
+    ) is None
+    # patrones de secreto dentro del identificador permitido
+    assert _structured_provider_error_code(_openai_401(
+        "sk-zen-abcdefghijklmnopqrstuvwxyz0123456789"
+    )) is None
+    assert _structured_provider_error_code(_openai_401(
+        "AIzaSyD-000000000000000000000"
+    )) is None

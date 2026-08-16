@@ -3,26 +3,33 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import typer
+import websockets
 from poke_env import AccountConfiguration
 from poke_env.player import (
     MaxBasePowerPlayer,
     RandomPlayer,
     SimpleHeuristicsPlayer,
 )
+from websockets.exceptions import WebSocketException
 
 from .benchmark import (
     BenchmarkDeadlineExceeded,
+    BenchmarkFailure,
     BenchmarkResult,
+    InternalCleanupError,
+    ShowdownUnavailableError,
     failure_classification,
     run_benchmark,
 )
@@ -40,14 +47,16 @@ from .graph.provider import (
     DecisionMetrics,
     GeminiDecisionProvider,
     ModelRoute,
-    OpenAICompatibleDecisionProvider,
     PinnedResolver,
     ProviderChain,
     ProviderError,
     ProviderSelectionError,
+    build_route_provider,
     load_model_routes,
     model_route,
     provider_keys,
+    _http_status_chain,
+    _structured_provider_error_code,
 )
 from .graph.workflow import build_decision_graph
 from .eval_cost import DEFAULT_PRICING_PATH, PricingTable
@@ -71,12 +80,17 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_LEDGER_PATH = REPO_ROOT / "docs" / "BENCHMARKS.md"
 DEFAULT_RUNS_PATH = AGENT_ROOT / "evals" / "runs"
 
-# Una batalla de gen6randombattle ronda los 60-120 turnos y tarda segundos.
-# Este techo es holgado a proposito: solo existe para que un server colgado
-# no deje el proceso esperando indefinidamente. Es POR BATALLA (minor de la
-# review final: antes era `* n`, presupuestando el lote entero y haciendose
-# cada vez mas probable de saltar cuanto mas grande el lote).
-BATTLE_TIMEOUT_SECONDS = 180
+
+def _atomic_write_json(target: Path, payload: dict[str, Any]) -> None:
+    """Escritura atomica: primero el .tmp, luego rename. Un fallo a mitad
+    de escritura JAMAS reemplaza el ultimo artefacto valido."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
 
 
 def _progress_summary(record: BenchmarkRecord) -> str:
@@ -95,28 +109,51 @@ def _progress_summary(record: BenchmarkRecord) -> str:
     )
 
 
+_SHOWDOWN_HANDSHAKE_TIMEOUT_SECONDS = 3.0
+_SHOWDOWN_CHALLSTR_PREFIX = "|challstr|"
+
+
+async def _probe_showdown_protocol(ws_url: str) -> None:
+    """Abre el websocket y espera el `|challstr|` real de Showdown.
+
+    `poke_env.ps_client` trata ese mensaje como "confirma conexion al
+    server: podemos loguear" (ps_client.py). Es la señal de protocolo mas
+    temprana y especifica de un Showdown real; un simple accept TCP no la
+    produce.
+    """
+    async with websockets.connect(
+        ws_url, open_timeout=_SHOWDOWN_HANDSHAKE_TIMEOUT_SECONDS
+    ) as ws:
+        while True:
+            frame = await ws.recv()
+            text = frame if isinstance(frame, str) else frame.decode("utf-8", "replace")
+            if any(
+                line.startswith(_SHOWDOWN_CHALLSTR_PREFIX)
+                for line in text.split("\n")
+            ):
+                return
+
+
 async def _check_showdown_reachable(ws_url: str) -> None:
     """Falla en segundos, no en minutos, si el server local no esta arriba.
 
-    Minor triageado a Important en la review final: sin este chequeo, con el
-    server apagado, los tests de integracion (y este runner) tardaban 360s en
-    errar via el timeout del batching en vez de fallar rapido con un mensaje
-    util. `asyncio.open_connection` al host:puerto del websocket es barato y
-    cubre el caso comun (contenedor no levantado).
+    D49 (MON-25): endurecido a handshake real de protocolo. El chequeo
+    anterior (`asyncio.open_connection` + cerrar) daba preflight VERDE
+    contra cualquier listener TCP que aceptara la conexion, hable o no el
+    protocolo de Showdown -- probado empiricamente con un listener mudo
+    (ROOT-CAUSE CHECKPOINT, seccion 7). Mismo presupuesto de 3s que ya
+    tenia el chequeo viejo: no se sube el timeout, se hace mas estricto lo
+    que se exige dentro de el.
     """
-    parts = urlsplit(ws_url.replace("ws://", "http://").replace("wss://", "https://"))
-    host = parts.hostname or "localhost"
-    port = parts.port or 80
     try:
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=3
+        await asyncio.wait_for(
+            _probe_showdown_protocol(ws_url),
+            timeout=_SHOWDOWN_HANDSHAKE_TIMEOUT_SECONDS,
         )
-        writer.close()
-        await writer.wait_closed()
-    except (OSError, asyncio.TimeoutError) as exc:
-        raise RuntimeError(
-            f"No se pudo conectar a Showdown en {host}:{port} ({exc}). "
-            "Levantar el server local con: "
+    except (OSError, WebSocketException) as exc:
+        raise ShowdownUnavailableError(
+            f"Showdown en {ws_url} no completo el handshake de protocolo "
+            f"esperado ({exc}). Levantar el server local con: "
             "docker compose --profile local up -d showdown"
         ) from exc
 
@@ -185,7 +222,7 @@ async def play(n: int, fmt: str, *, source: str = "local") -> list[str]:
             # lote, y la batalla se persiste apenas termina, no despues de
             # jugar las n. Un cuelgue en la batalla 5 de 5 ya no tira a la
             # basura las 4 anteriores, que quedaron commiteadas.
-            battle_timeout = asyncio.timeout(BATTLE_TIMEOUT_SECONDS)
+            battle_timeout = asyncio.timeout(settings.battle_timeout_seconds)
             try:
                 async with battle_timeout:
                     await _battle_against_or_failure(agent, rival)
@@ -356,22 +393,10 @@ def _benchmark_provider(
             keys, model=model, response_schema=DecisionResponse,
             timeout_seconds=timeout, metrics=metrics,
         )
-    elif route is not None and route.protocol == "messages":
-        selected = AnthropicDecisionProvider(
-            keys, name=name, model=model,
-            base_url=os.environ.get(base_env) if base_env else None,
-            response_schema=DecisionResponse, timeout_seconds=timeout,
-            metrics=metrics, route=route,
-        )
-    elif route is not None and route.protocol == "responses":
-        raise RuntimeError(
-            f"{name}/{model}: protocolo responses todavía no implementado"
-        )
     else:
-        selected = OpenAICompatibleDecisionProvider(
-            name, keys, model=model, base_url=os.environ.get(base_env) if base_env else None,
-            response_schema=DecisionResponse, timeout_seconds=timeout,
-            metrics=metrics, route=route,
+        selected = build_route_provider(
+            name, model, base_url=os.environ.get(base_env) if base_env else None,
+            keys=keys, metrics=metrics, timeout_seconds=timeout, route=route,
         )
     # Regla de medición: aunque exista LUDEX_PROVIDER_CHAIN, el benchmark
     # queda fijado al proveedor/modelo elegidos y nunca cruza de proveedor.
@@ -551,46 +576,231 @@ def model_set_command(
     _asyncio.run(run())
 
 
+async def _close_player_sockets(agent: Any, rival: Any) -> list[BaseException]:
+    """L-01 (post-R1B): cierra los PSClient de AMBOS players via la API real
+    de poke-env (`ps_client.stop_listening()`, async y cross-loop: agenda el
+    cierre en el POKE_LOOP propio de poke-env y espera; `Player` no ofrece
+    close()). Sin esto, cada benchmark abortado fuga 2 websockets + sus
+    listener tasks en el POKE_LOOP global, acumulandose entre modelos de
+    una misma ronda de la matriz.
+
+    L-01 (correccion LATWAN): devuelve los errores de cierre de cada player
+    (jamas los traga): la frontera estructurada decide — con primaria en
+    vuelo se preserva; sin primaria, un cierre fallido impide reportar
+    `compatible`. `CancelledError` NO se traga como fallo ordinario: se
+    propaga.
+    """
+    errors: list[BaseException] = []
+    for player in (agent, rival):
+        ps_client = getattr(player, "ps_client", None)
+        stop = getattr(ps_client, "stop_listening", None)
+        if stop is None:
+            continue
+        try:
+            await stop()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001
+            logger.warning(
+                "fallo al cerrar PSClient de %r: %s",
+                getattr(player, "username", type(player).__name__),
+                type(exc).__name__,
+            )
+            errors.append(exc)
+    return errors
+
+
+async def _structured_cleanup(
+    agent: Any,
+    rival: Any,
+    calculator: Any,
+    context_repository: Any,
+    engine: Any,
+) -> list[BaseException]:
+    """L-01 (correccion LATWAN): frontera estructurada del cleanup del
+    benchmark.
+
+    Intenta SIEMPRE y EN ORDEN: drain de decisiones en vuelo (D46) →
+    PSClient del agent → PSClient del rival → CalcClient → context
+    repository → engine. Cada tramo se intenta aunque los anteriores fallen
+    y devuelve los errores de todos los pasos (jamas se tragan): sin
+    excepcion primaria, un fallo de cleanup impide reportar `compatible`.
+
+    `CancelledError` se propaga: un cierre interrumpido por cancelacion no
+    se convierte en fallo ordinario de cleanup. Recursos que no llegaron a
+    crearse (None) se saltan.
+    """
+    errors: list[BaseException] = []
+
+    async def attempt(label: str, step: Any) -> None:
+        if step is None:
+            return
+        try:
+            await step()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001
+            logger.warning("cleanup %s fallo: %s", label, type(exc).__name__)
+            errors.append(exc)
+
+    # D46/MON-23: la decision en vuelo de la ultima batalla corre como task
+    # hermana de `run_benchmark`/`battle_against` en `ps_client.loop`;
+    # cancelar/timeoutear ese wrapper NO la toca. Hay que drenarla antes de
+    # cerrar `CalcClient`/el context repository o una decision huerfana
+    # puede usarlos ya cerrados.
+    await attempt(
+        "drain", agent.drain_inflight_decisions if agent is not None else None
+    )
+    errors.extend(await _close_player_sockets(agent, rival))
+    await attempt("calc", calculator.aclose if calculator is not None else None)
+    await attempt(
+        "context",
+        context_repository.aclose
+        if context_repository is not None else None,
+    )
+    await attempt("engine", engine.dispose if engine is not None else None)
+    return errors
+
+
+def _partial_benchmark_result(
+    exc: BaseException,
+    agent: Any,
+    *,
+    requested: int,
+    provider: str,
+    model: str,
+) -> BenchmarkResult:
+    """L-02 (correccion LATWAN): resultado parcial TIPADO de un fallo del
+    benchmark en la frontera de `_benchmark_command`.
+
+    Preserva el progreso REAL (requested/completed/W/L/T desde los
+    contadores del agente — jamas ceros inventados), la identidad efectiva
+    (provider/model pinneados, los mismos que el smoke ya verifico) y la
+    evidencia sanitizada de la excepcion (`failure_type`/
+    `failure_cause_type` via `failure_classification`; `http_status`/
+    `provider_error_code` solo de campos estructurados). Sin agente (fallo
+    antes de crearlo, p.ej. el preflight de Showdown) el progreso es 0, que
+    es la verdad: no hubo batallas.
+    """
+    if agent is None:
+        completed = wins = losses = ties = 0
+    else:
+        completed = (
+            agent.n_won_battles + agent.n_lost_battles + agent.n_tied_battles
+        )
+        wins = agent.n_won_battles
+        losses = agent.n_lost_battles
+        ties = agent.n_tied_battles
+    failure_type, failure_cause_type = failure_classification(exc)
+    return BenchmarkResult(
+        requested=requested, completed=completed, wins=wins, losses=losses,
+        ties=ties, provider=provider, model=model,
+        failure=f"{type(exc).__name__}: {exc}",
+        failure_type=failure_type, failure_cause_type=failure_cause_type,
+        http_status=_http_status_chain(exc),
+        provider_error_code=_structured_provider_error_code(exc),
+    )
+
+
+def _cleanup_failure_result(
+    agent: Any,
+    errors: Sequence[BaseException],
+    *,
+    requested: int,
+    provider: str,
+    model: str,
+) -> BenchmarkResult:
+    """L-01 (correccion LATWAN): sin excepcion primaria, un fallo del
+    cleanup NO puede dejar la corrida `compatible`: se emite un
+    `BenchmarkResult` con `failure_type=InternalCleanupError` (marcador
+    clasificado que la matriz traduce a `internal-defect`), mensaje
+    sanitizado fijo (jamas mensajes crudos de los pasos) y la clase de la
+    causa real del primer paso fallido como `failure_cause_type`. El
+    progreso real y la identidad efectiva se preservan.
+    """
+    completed = (
+        agent.n_won_battles + agent.n_lost_battles + agent.n_tied_battles
+        if agent is not None else 0
+    )
+    wins = agent.n_won_battles if agent is not None else 0
+    losses = agent.n_lost_battles if agent is not None else 0
+    ties = agent.n_tied_battles if agent is not None else 0
+    first = errors[0]
+    return BenchmarkResult(
+        requested=requested, completed=completed, wins=wins, losses=losses,
+        ties=ties, provider=provider, model=model,
+        failure="internal defect: fallo el cierre de recursos del benchmark",
+        failure_type=InternalCleanupError.__name__,
+        failure_cause_type=type(first).__name__,
+        http_status=_http_status_chain(first),
+        provider_error_code=_structured_provider_error_code(first),
+    )
+
+
+async def _diagnostic_snapshot_monitor(
+    agent: Any,
+    interval: float,
+    emit: Callable[[list[dict[str, Any]]], None],
+) -> None:
+    """Monitor diagnostico opt-in de decisiones en vuelo.
+
+    Corre en el CALLER loop (el que orquesta `run_benchmark`) y cada
+    `interval` segundos captura `agent.decision_snapshot()` — que agenda su
+    propia captura en `ps_client.loop` (POKE_LOOP) — y emite la evidencia
+    sanitizada ({task_id, stage, frames[{module,function,line}]}).
+
+    Un fallo de observabilidad (captura o emision) se registra y NO altera
+    la semantica del benchmark: el monitor no toca el flujo de decision, no
+    cancela nada y su unica accion es leer y emitir. El `CancelledError`
+    del shutdown propaga (el caller hace `gather(return_exceptions=True)`).
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            snapshot = await agent.decision_snapshot()
+            if snapshot:
+                emit(snapshot)
+        except Exception as exc:
+            logger.warning(
+                "monitor diagnostico de snapshots fallo: %s",
+                type(exc).__name__,
+            )
+
+
+def _default_snapshot_emit(snapshot: list[dict[str, Any]]) -> None:
+    """Emision por defecto del monitor: una linea exacta
+    `LUDEX_SNAPSHOT <json>` por tick, en STDERR (R3: `logger.info` quedaba
+    en silencio porque root y `ludex_agent.cli` tienen nivel efectivo
+    WARNING). Consumible por `grep LUDEX_SNAPSHOT 2>&1`. Solo campos
+    sanitizados (task_id, stage, module/function/line); nunca prompts,
+    credenciales, respuestas, filas, payloads ni `f_locals`. Solo existe
+    cuando el flag diagnostico opt-in crea el monitor."""
+    typer.echo(
+        f"LUDEX_SNAPSHOT {json.dumps(snapshot, ensure_ascii=False)}",
+        err=True,
+    )
+
+
 async def _benchmark_command(
     *, n: int, opponent: str, concurrency: int, persist: bool,
     provider_name: str, model: str, fmt: str,
+    battle_timeout_seconds: float,
+    diagnostic_snapshot_interval: float | None = None,
+    snapshot_emit: Callable[[list[dict[str, Any]]], None] | None = None,
     on_progress: Callable[
         [BenchmarkResult, Mapping[str, int | None]], Awaitable[None] | None
     ] | None = None,
 ) -> tuple[BenchmarkResult, dict[str, int | None]]:
     settings = load_settings()
-    await _check_showdown_reachable(settings.showdown_ws_url)
     server = local_server_configuration(settings.showdown_ws_url)
     metrics = DecisionMetrics()
+    # L-05 (post-R1B): la seleccion/validacion local de credenciales ocurre
+    # ANTES del chequeo de Showdown: sin credenciales el comando emite
+    # not-run (ProviderSelectionError, exit 2) sin depender de que el server
+    # local este arriba. El chequeo de Showdown sigue vigente cuando las
+    # credenciales existen (no se debilita).
     selected = _benchmark_provider(
         provider_name, model, settings.llm_request_timeout_seconds, metrics
-    )
-    calculator = CalcClient(
-        os.environ.get("CALC_BASE_URL", "http://127.0.0.1:8200"),
-        timeout_seconds=settings.llm_request_timeout_seconds,
-    )
-    context_repository = PostgresContextRepository(settings.database_url)
-    # F2-09 (D28): el benchmark fija provider/model al inicio y el resolver
-    # pinneado audita cada envelope: cualquier mezcla efectiva dentro de la
-    # corrida aborta con ProviderMixError.
-    pinned = PinnedResolver(
-        selected, provider_name, model, enforce_pin=True,
-    )
-    graph = build_decision_graph(
-        calculator, pinned, metrics, context_repository
-    )
-    suffix = str(time.time_ns())[-8:]
-    common = {
-        "server_configuration": server,
-        "battle_format": fmt,
-        "log_level": 40,
-        "max_concurrent_battles": concurrency,
-    }
-    agent = LudexPlayer(
-        account_configuration=AccountConfiguration(f"Bench{suffix}", None),
-        decision_graph=graph,
-        decision_budget_seconds=settings.decision_budget_seconds,
-        **common,
     )
     opponent_types = {
         "random": RandomPlayer,
@@ -599,62 +809,156 @@ async def _benchmark_command(
     }
     if opponent not in opponent_types:
         raise RuntimeError(f"oponente desconocido: {opponent}")
-    rival = opponent_types[opponent](
-        account_configuration=AccountConfiguration(f"Opp{suffix}", None),
-        **common,
-    )
-    engine = make_engine(settings.database_url)
-    factory = session_factory(engine)
-    repo = BattleRepository(factory) if persist else None
-
-    async def persist_tag(tag: str) -> None:
-        assert repo is not None
-        await _persist_one(agent, repo, tag, fmt, "local")
-
-    async def report_progress(result: BenchmarkResult) -> None:
-        if on_progress is not None:
-            pending = on_progress(result, metrics.snapshot())
-            if pending is not None:
-                await pending
-
+    agent: Any | None = None
+    rival: Any | None = None
+    calculator: Any | None = None
+    context_repository: Any | None = None
+    engine: Any | None = None
+    result: BenchmarkResult | None = None
+    primary: BaseException | None = None
     try:
+        await _check_showdown_reachable(settings.showdown_ws_url)
+        calculator = CalcClient(
+            os.environ.get("CALC_BASE_URL", "http://127.0.0.1:8200"),
+            timeout_seconds=settings.llm_request_timeout_seconds,
+        )
+        context_repository = PostgresContextRepository(settings.database_url)
+        # F2-09 (D28): el benchmark fija provider/model al inicio y el
+        # resolver pinneado audita cada envelope: cualquier mezcla
+        # efectiva dentro de la corrida aborta con ProviderMixError.
+        pinned = PinnedResolver(
+            selected, provider_name, model, enforce_pin=True,
+        )
+        suffix = str(time.time_ns())[-8:]
+        common = {
+            "server_configuration": server,
+            "battle_format": fmt,
+            "log_level": 40,
+            "max_concurrent_battles": concurrency,
+        }
+        # MON-20 DIAG-A: el agente se crea ANTES del grafo para poder
+        # cablearle `on_stage` (los nodos del grafo publican su etapa a
+        # `decision_snapshot`, que corre en ps_client.loop). Construccion
+        # pura: ninguna batalla arranco todavia, y el grafo se asigna antes
+        # del primer `choose_move`.
+        agent = LudexPlayer(
+            account_configuration=AccountConfiguration(f"Bench{suffix}", None),
+            decision_graph=None,
+            decision_budget_seconds=settings.decision_budget_seconds,
+            **common,
+        )
+        graph = build_decision_graph(
+            calculator, pinned, metrics, context_repository,
+            # `getattr`: los fakes de los tests de `_benchmark_command` no
+            # exponen la superficie diagnostica; el cable solo existe cuando
+            # el agente real la tiene.
+            on_stage=getattr(agent, "record_decision_stage", None),
+        )
+        agent.decision_graph = graph
+        rival = opponent_types[opponent](
+            account_configuration=AccountConfiguration(f"Opp{suffix}", None),
+            **common,
+        )
+        engine = make_engine(settings.database_url)
+        factory = session_factory(engine)
+        repo = BattleRepository(factory) if persist else None
+
+        async def persist_tag(tag: str) -> None:
+            assert repo is not None
+            await _persist_one(agent, repo, tag, fmt, "local")
+
+        async def report_progress(result: BenchmarkResult) -> None:
+            if on_progress is not None:
+                pending = on_progress(result, metrics.snapshot())
+                if pending is not None:
+                    await pending
+
+        # MON-20 DIAG-A R2: monitor diagnostico OPT-IN mientras
+        # `run_benchmark` esta en vuelo. Con intervalo ausente (default), la
+        # ejecucion normal no crea el monitor ni cambia su salida, paths ni
+        # semantica. El try/finally interno garantiza el lifecycle: el
+        # monitor se cancela y se espera en exito, fallo (incluida la
+        # excepcion primaria no clasificada) y cancelacion externa, ANTES
+        # del cleanup estructurado (drain → players → calc → contexto →
+        # engine), sin ocultar ni reemplazar la primaria.
+        monitor_task: asyncio.Task[Any] | None = None
+        if (
+            diagnostic_snapshot_interval is not None
+            and diagnostic_snapshot_interval > 0
+        ):
+            monitor_task = asyncio.create_task(
+                _diagnostic_snapshot_monitor(
+                    agent,
+                    diagnostic_snapshot_interval,
+                    snapshot_emit or _default_snapshot_emit,
+                ),
+                name="ludex-snapshot-monitor",
+            )
         try:
-            result = await run_benchmark(
-                agent, rival, n=n, persist=persist,
-                persist_battle=persist_tag if persist else None,
-                provider=provider_name, model=model,
-                on_progress=report_progress,
-                timeout=BATTLE_TIMEOUT_SECONDS,
-            )
-        except (ProviderError, BenchmarkDeadlineExceeded) as exc:
-            completed = (
-                agent.n_won_battles + agent.n_lost_battles
-                + agent.n_tied_battles
-            )
-            # R3 (MON-15): evidencia durable y sanitizada del fallo. El
-            # error clasificado (`TransientProviderError`, etc.) conserva su
-            # `__cause__` original (p.ej. `APITimeoutError`) porque
-            # `KeyRotatingProvider` lo re-lanza con `raise error from raw`.
-            # Persistimos SOLO los nombres de clase, nunca el mensaje crudo.
-            failure_type, failure_cause_type = failure_classification(exc)
-            result = BenchmarkResult(
-                requested=n, completed=completed,
-                wins=agent.n_won_battles, losses=agent.n_lost_battles,
-                ties=agent.n_tied_battles, provider=provider_name,
-                model=model, failure=f"{type(exc).__name__}: {exc}",
-                failure_type=failure_type,
-                failure_cause_type=failure_cause_type,
-            )
-    finally:
-        # D46/MON-23: la decision en vuelo de la ultima batalla corre como
-        # task hermana de `run_benchmark`/`battle_against` en
-        # `ps_client.loop`; cancelar/timeoutear ese wrapper NO la toca.
-        # Hay que drenarla antes de cerrar `CalcClient`/el context
-        # repository o una decision huerfana puede usarlos ya cerrados.
-        await agent.drain_inflight_decisions()
-        await calculator.aclose()
-        await context_repository.aclose()
-        await engine.dispose()
+            try:
+                result = await run_benchmark(
+                    agent, rival, n=n, persist=persist,
+                    persist_battle=persist_tag if persist else None,
+                    provider=provider_name, model=model,
+                    on_progress=report_progress,
+                    timeout=battle_timeout_seconds,
+                )
+            except (ProviderError, BenchmarkDeadlineExceeded) as exc:
+                completed = (
+                    agent.n_won_battles + agent.n_lost_battles
+                    + agent.n_tied_battles
+                )
+                # R3 (MON-15): evidencia durable y sanitizada del fallo. El
+                # error clasificado (`TransientProviderError`, etc.) conserva
+                # su `__cause__` original (p.ej. `APITimeoutError`) porque
+                # `KeyRotatingProvider` lo re-lanza con `raise error from raw`.
+                # Persistimos SOLO los nombres de clase, nunca el mensaje crudo.
+                failure_type, failure_cause_type = failure_classification(exc)
+                # L-03 (R1A): http_status y provider_error_code (solo campo
+                # estructurado permitido) cuando existen; jamas texto libre.
+                result = BenchmarkResult(
+                    requested=n, completed=completed,
+                    wins=agent.n_won_battles, losses=agent.n_lost_battles,
+                    ties=agent.n_tied_battles, provider=provider_name,
+                    model=model, failure=f"{type(exc).__name__}: {exc}",
+                    failure_type=failure_type,
+                    failure_cause_type=failure_cause_type,
+                    http_status=_http_status_chain(exc),
+                    provider_error_code=_structured_provider_error_code(exc),
+                )
+        finally:
+            if monitor_task is not None:
+                monitor_task.cancel()
+                await asyncio.gather(monitor_task, return_exceptions=True)
+    except BaseException as exc:
+        primary = exc
+    # L-01 (correccion LATWAN): frontera estructurada del cleanup. Se
+    # intentan SIEMPRE y en orden drain → ambos players → calc → contexto →
+    # engine, aunque cualquiera falle; los errores de los pasos se recogen,
+    # nunca se tragan.
+    try:
+        cleanup_errors = await _structured_cleanup(
+            agent, rival, calculator, context_repository, engine,
+        )
+    except asyncio.CancelledError:
+        raise
+    if primary is not None:
+        # La primaria se preserva SIEMPRE: cancelacion, KeyboardInterrupt y
+        # SystemExit se re-lanzan tal cual (jamas se convierten en un fallo
+        # de cleanup); el resto viaja como BenchmarkFailure con resultado
+        # parcial tipado y su causa original intacta en `__cause__`.
+        if isinstance(primary, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+            raise primary
+        partial = _partial_benchmark_result(
+            primary, agent, requested=n,
+            provider=provider_name, model=model,
+        )
+        raise BenchmarkFailure(partial) from primary
+    if cleanup_errors and (result is None or result.failure is None):
+        result = _cleanup_failure_result(
+            agent, cleanup_errors, requested=n,
+            provider=provider_name, model=model,
+        )
     return result, metrics.snapshot()
 
 
@@ -671,8 +975,32 @@ def benchmark_command(
     pricing: Path = DEFAULT_PRICING_PATH,
     ledger: Path = DEFAULT_LEDGER_PATH,
     record: bool = True,
+    battle_timeout: float | None = typer.Option(
+        None, "--battle-timeout",
+        help="Deadline por batalla en segundos (default: LUDEX_BATTLE_TIMEOUT_SECONDS o 180). "
+        "La matriz usa 1800. Positivo; independiente del deadline de cada decision.",
+    ),
+    diagnostic_snapshot_interval: float | None = typer.Option(
+        None, "--diagnostic-snapshot-interval",
+        help="DIAGNOSTICO OPT-IN (MON-20 DIAG-A): emite cada N segundos un "
+        "snapshot sanitizado de las decisiones en vuelo (stage + frames "
+        "module/function/line) mientras el benchmark corre. Sin el flag, el "
+        "benchmark no crea monitor y su salida no cambia. Positivo.",
+    ),
 ) -> None:
     settings = load_settings()
+    if battle_timeout is not None and battle_timeout <= 0:
+        raise typer.BadParameter("--battle-timeout debe ser un numero positivo")
+    if (
+        diagnostic_snapshot_interval is not None
+        and diagnostic_snapshot_interval <= 0
+    ):
+        raise typer.BadParameter(
+            "--diagnostic-snapshot-interval debe ser un numero positivo"
+        )
+    effective_battle_timeout = (
+        battle_timeout or settings.battle_timeout_seconds
+    )
     provider_name = provider or settings.llm_provider
     model_name = model or settings.llm_model
     if not model_name:
@@ -708,6 +1036,7 @@ def benchmark_command(
             route=effective_route,
             pricing=pricing_table,
             status="running",
+            battle_timeout_seconds=effective_battle_timeout,
         )
         if record:
             write_run_snapshot(partial, artifact)
@@ -718,6 +1047,8 @@ def benchmark_command(
             n=n, opponent=opponent, concurrency=concurrency, persist=persist,
             provider_name=provider_name, model=model_name,
             fmt=fmt or settings.showdown_battle_format,
+            battle_timeout_seconds=effective_battle_timeout,
+            diagnostic_snapshot_interval=diagnostic_snapshot_interval,
             on_progress=report_progress,
         ))
     except ProviderSelectionError as exc:
@@ -741,6 +1072,7 @@ def benchmark_command(
             "turns_total": 0, "calls_total": 0, "input_tokens": 0,
             "output_tokens": 0, "cached_input_tokens": 0,
             "reasoning_tokens": 0, "key_rotations": 0,
+            "keys_quarantined": 0, "transient_retries_executed": 0,
             "provider_switches": 0, "turns_quota_affected": 0,
             "turns_transient_affected": 0, "turns_deadline_affected": 0,
             "turns_model_invalid": 0, "turns_fallback": 0,
@@ -767,6 +1099,7 @@ def benchmark_command(
             route=effective_route,
             pricing=pricing_table,
             status="not-run",
+            battle_timeout_seconds=effective_battle_timeout,
         )
         if record:
             write_run_snapshot(not_run_record, artifact)
@@ -795,6 +1128,7 @@ def benchmark_command(
         fmt=fmt or settings.showdown_battle_format,
         route=effective_route,
         pricing=pricing_table,
+        battle_timeout_seconds=effective_battle_timeout,
     )
     typer.echo(
         f"usage_calls={metrics.get('calls_total', 0)} "
@@ -808,6 +1142,375 @@ def benchmark_command(
         typer.echo(f"benchmark_record={artifact}")
     if result.failure:
         raise typer.Exit(code=1)
+
+
+@app.command("matrix-plan")
+def matrix_plan_command(
+    inventory: Path = typer.Option(
+        None, "--inventory",
+        help="Inventario baseline commiteado (default: ultimo "
+        "2026*provider-matrix-inventory*.json en evals/runs)",
+    ),
+    manifest: Path = typer.Option(
+        None, "--manifest", help="Archivo de manifiesto de salida",
+    ),
+    budget: Path | None = typer.Option(
+        None, "--budget",
+        help="JSON de presupuesto: {provider: {balance_usd, cap_usd, leave_usd}}",
+    ),
+    overrides: Path | None = typer.Option(
+        None, "--overrides",
+        help="Inventario enriquecido (tier_override/prices/deprecated) que "
+        "matiza el baseline: lo que la tabla de precios no cubre o el tier "
+        "no puede probarse (p.ej. Gemini free-tier no verificado).",
+    ),
+    no_refresh: bool = typer.Option(False, "--no-refresh"),
+) -> None:
+    """Construye el manifiesto reproducible de la matriz SIN consumir cuota.
+
+    Refresca /models (metadata) de google/kimi/open_code_zen, calcula
+    altas/bajas contra el inventario commiteado, y escribe una fila por
+    provider/model con protocolo/ruta, tier, costo estimado y clasificacion
+    (ready / excluded / missing-route / pending-budget). No ejecuta smokes
+    ni batallas: es el plan que Latwan aprueba antes de gastar."
+    """
+    from .matrix import (
+        BudgetSpec,
+        ManifestRow,
+        MatrixModelResult,
+        build_manifest,
+        delta_catalog,
+        manifest_to_dict,
+        plan_budget,
+        refresh_models,
+        run_matrix_round,
+        tier_prices_from_pricing_table,
+    )
+    from .eval_cost import PricingTable
+
+    settings = load_settings()
+    pricing_env = os.environ.get("LUDEX_PRICING_TABLE")
+    pricing_path = Path(pricing_env) if pricing_env else DEFAULT_PRICING_PATH
+    pricing_table = PricingTable.load(pricing_path)
+    tier_prices = tier_prices_from_pricing_table(pricing_table)
+    import asyncio as _asyncio
+
+    previous = {}
+    inventory_path = inventory
+    if inventory_path is None:
+        candidates = sorted(
+            Path(DEFAULT_RUNS_PATH).glob("*provider-matrix-inventory*.json")
+        )
+        if not candidates:
+            raise typer.BadParameter(
+                "no hay inventario baseline en evals/runs; pasalo con --inventory"
+            )
+        inventory_path = candidates[-1]
+    previous = json.loads(inventory_path.read_text(encoding="utf-8"))
+    if overrides is not None:
+        enrichment = json.loads(overrides.read_text(encoding="utf-8"))
+        prev_models = previous.setdefault("models", {})
+        for provider, entries in enrichment.get("models", {}).items():
+            by_id = {
+                entry.get("id"): entry for entry in prev_models.get(provider, [])
+            }
+            for entry in entries:
+                model_id = entry.get("id")
+                if model_id is None:
+                    continue
+                target = by_id.get(model_id)
+                if target is None:
+                    target = {"id": model_id}
+                    by_id[model_id] = target
+                target.update(entry)
+            prev_models[provider] = list(by_id.values())
+
+    budgets: dict[str, BudgetSpec] = {}
+    if budget is not None:
+        raw = json.loads(budget.read_text(encoding="utf-8"))
+        budgets = {
+            name: BudgetSpec(
+                balance_usd=Decimal(str(spec["balance_usd"])),
+                cap_usd=Decimal(str(spec["cap_usd"])),
+                leave_usd=Decimal(str(spec.get("leave_usd", 0))),
+            )
+            for name, spec in raw.items()
+        }
+
+    async def run() -> None:
+        fresh: dict[str, list[str]] = {}
+        if not no_refresh:
+            for provider, (key_env, base_env) in (
+                ("google", ("GEMINI_API_KEY", None)),
+                ("kimi", ("KIMI_API_KEY", "KIMI_BASE_URL")),
+                ("open_code_zen", (
+                    "OPEN_CODE_ZEN_API_KEY", "OPEN_CODE_ZEN_BASE_URL",
+                )),
+            ):
+                key = os.environ.get(key_env, "").strip()
+                base_url = (
+                    os.environ.get(base_env, "").strip()
+                    if base_env else None
+                )
+                if not key:
+                    typer.echo(f"matrix-plan: {provider} sin clave, catalogo no refrescado")
+                    continue
+                models = await refresh_models(
+                    provider, base_url=base_url, api_key=key,
+                    environ=os.environ,
+                )
+                fresh[provider] = models
+                typer.echo(f"matrix-plan: {provider} /models = {len(models)}")
+        else:
+            for provider in ("google", "kimi", "open_code_zen"):
+                prev = previous.get("models", {}).get(provider, [])
+                fresh[provider] = [entry["id"] for entry in prev]
+
+        delta = delta_catalog(
+            {
+                provider: [entry["id"] for entry in previous.get("models", {}).get(provider, [])]
+                for provider in ("google", "kimi", "open_code_zen")
+            },
+            fresh,
+        )
+        for provider, changes in delta.items():
+            typer.echo(
+                f"matrix-plan: delta {provider}: "
+                f"+{len(changes['added'])} -{len(changes['removed'])}"
+            )
+        rows = build_manifest(
+            fresh,
+            previous_inventory=previous,
+            tier_prices=tier_prices,
+        )
+        rows = plan_budget(rows, budgets)
+        target = manifest or (
+            Path(DEFAULT_RUNS_PATH)
+            / f"{datetime.now(timezone.utc).strftime('%Y%m%dt%H%M%Sz')}-matrix-manifest.json"
+        )
+        document = manifest_to_dict(rows)
+        document["delta"] = delta
+        document["baseline_inventory"] = str(inventory_path)
+        # DIAG-B: procedencia reproducible de la tabla que produjo el
+        # manifiesto. `path` es la ruta efectiva usada (default o el valor
+        # verbatim de LUDEX_PRICING_TABLE); nunca expone secretos.
+        document["pricing"] = {
+            "table_id": pricing_table.table_id,
+            "currency": pricing_table.currency,
+            "path": str(pricing_path),
+        }
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(document, indent=2, ensure_ascii=False, default=str) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+        by_status: dict[str, int] = {}
+        for row in rows:
+            by_status[row.status] = by_status.get(row.status, 0) + 1
+        typer.echo(f"matrix-plan: {target} rows={len(rows)} {by_status}")
+
+    _asyncio.run(run())
+
+
+@app.command("matrix-run")
+def matrix_run_command(
+    manifest: Path = typer.Option(..., "--manifest", help="Manifiesto aprobado"),
+    tier: str = typer.Option(..., "--tier", help="Fase: free | paid"),
+    round_name: str = typer.Option("r1", "--round", help="Nombre de la ronda"),
+    battle_timeout: float = typer.Option(
+        1800.0, "--battle-timeout", help="Deadline por batalla (matriz: 1800)",
+    ),
+    smoke_timeout: float = typer.Option(
+        None, "--smoke-timeout",
+        help="Deadline del smoke en segundos (default: request timeout + margen)",
+    ),
+    diagnostic_snapshot_interval: float | None = typer.Option(
+        None, "--diagnostic-snapshot-interval",
+        help="Intervalo opt-in para snapshots D51 durante cada benchmark",
+    ),
+    resume: bool = typer.Option(False, "--resume"),
+    zen_auto_reload_confirmed: bool = typer.Option(
+        False, "--zen-auto-reload-confirmed",
+        help="Confirmacion explicita de que el auto-reload de OpenCode Zen "
+        "esta DESACTIVADO. Obligatorio si la fase toca open_code_zen.",
+    ),
+) -> None:
+    """Ejecuta una fase de la matriz de forma fail-closed.
+
+    - `--tier` es obligatorio: solo se ejecutan filas `ready` de ESE tier;
+    - refresca /models antes de la ronda (metadata, sin cuota);
+    - 1 smoke por modelo; si pasa, EXACTAMENTE 2 batallas pinneadas
+      (enforce_pin=True, sin chains, concurrency=1, persist=false,
+      opponent=simple_heuristics, formato configurado);
+    - artefacto atomico por modelo + estado de reanudacion;
+    - un parcial/abortado nunca publica winrate comparable.
+    """
+    from .matrix import (
+        ManifestRow, MatrixModelResult, refresh_models, run_matrix_round
+    )
+
+    settings = load_settings()
+    if battle_timeout <= 0:
+        raise typer.BadParameter("--battle-timeout debe ser positivo")
+    if (
+        diagnostic_snapshot_interval is not None
+        and diagnostic_snapshot_interval <= 0
+    ):
+        raise typer.BadParameter(
+            "--diagnostic-snapshot-interval debe ser un numero positivo"
+        )
+    if tier not in {"free", "paid"}:
+        raise typer.BadParameter("--tier debe ser free o paid")
+
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    rows = _manifest_rows_from_document(document)
+    if any(row.tier == "free" and row.provider == "open_code_zen"
+           for row in rows if row.status == "ready"):
+        if not zen_auto_reload_confirmed:
+            raise typer.BadParameter(
+                "fase que toca open_code_zen requiere "
+                "--zen-auto-reload-confirmed (auto-reload desactivado)"
+            )
+
+    run_dir = Path(DEFAULT_RUNS_PATH)
+    state_path = run_dir / f"{round_name}-matrix-run-state.json"
+    previous: dict[str, MatrixModelResult] = {}
+    if resume and state_path.exists():
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+        for key, value in raw.items():
+            previous[key] = MatrixModelResult(**value)
+
+    import asyncio as _asyncio
+
+    async def refresh_catalog() -> dict[str, list[str]]:
+        fresh: dict[str, list[str]] = {}
+        for provider, (key_env, base_env) in (
+            ("google", ("GEMINI_API_KEY", None)),
+            ("kimi", ("KIMI_API_KEY", "KIMI_BASE_URL")),
+            ("open_code_zen", (
+                "OPEN_CODE_ZEN_API_KEY", "OPEN_CODE_ZEN_BASE_URL",
+            )),
+        ):
+            key = os.environ.get(key_env, "").strip()
+            base_url = (
+                os.environ.get(base_env, "").strip() if base_env else None
+            )
+            if not key:
+                continue
+            fresh[provider] = await refresh_models(
+                provider, base_url=base_url, api_key=key,
+                environ=os.environ,
+            )
+        return fresh
+
+    def on_result(result: MatrixModelResult) -> None:
+        key = f"{result.provider}/{result.model}"
+        previous[key] = result
+        state: dict[str, Any] = {
+            k: v.to_dict() for k, v in previous.items()
+        }
+        _atomic_write_json(state_path, state)
+        if result.status == "already-finalized":
+            return
+        _atomic_write_json(
+            run_dir / f"{round_name}-{result.provider}-{result.model}-matrix.json",
+            result.to_dict(),
+        )
+        typer.echo(
+            f"matrix-run: {key} -> {result.status} "
+            f"battles={result.battles_completed}/{result.battles_requested}"
+        )
+
+    async def run_battles(provider_name, model_name, *, n, battle_timeout_seconds,
+                          fmt, opponent):
+        return await _benchmark_command(
+            n=n, opponent=opponent, concurrency=1, persist=False,
+            provider_name=provider_name, model=model_name,
+            fmt=fmt, battle_timeout_seconds=battle_timeout_seconds,
+            diagnostic_snapshot_interval=diagnostic_snapshot_interval,
+        )
+
+    def build_provider(provider_name: str, model_name: str):
+        from .graph.provider import load_model_routes, model_route
+
+        metrics = DecisionMetrics()
+        if provider_name in {"kimi", "open_code_zen"}:
+            model_route(load_model_routes(), provider_name, model_name)
+        return _benchmark_provider(
+            provider_name, model_name,
+            settings.llm_request_timeout_seconds, metrics,
+        )
+
+    effective_smoke_timeout = smoke_timeout or (
+        max(settings.llm_request_timeout_seconds, 60.0) + 30.0
+    )
+
+    # I4 (MON-20 R2): cada artefacto de la corrida es auditable sin contexto
+    # externo: identidad de ronda + referencia y SHA-256 del manifiesto.
+    manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
+
+    _asyncio.run(run_matrix_round(
+        rows=rows,
+        tier=tier,
+        battle_timeout_seconds=battle_timeout,
+        fmt=settings.showdown_battle_format,
+        opponent="simple_heuristics",
+        smoke_deadline_seconds=effective_smoke_timeout,
+        build_provider=build_provider,
+        run_battles=run_battles,
+        refresh_catalog=refresh_catalog,
+        previous=previous,
+        on_result=on_result,
+        round_name=round_name,
+        manifest_ref=manifest.name,
+        manifest_sha256=manifest_sha256,
+    ))
+    summary = _matrix_run_summary(previous)
+    typer.echo(f"matrix-run: {round_name} terminado: {summary}")
+
+
+def _manifest_rows_from_document(document: dict[str, Any]) -> list[ManifestRow]:
+    from .matrix import ManifestRow
+    rows: list[ManifestRow] = []
+    for raw in document.get("rows", []):
+        pin = raw.get("pin")
+        rows.append(ManifestRow(
+            provider=raw["provider"], model=raw["model"],
+            protocol=raw.get("protocol"),
+            endpoint=raw.get("endpoint"),
+            structured_output=raw.get("structured_output"),
+            tier=raw.get("tier", "unknown"),
+            status=raw.get("status", "pending"),
+            battles=int(raw.get("battles", 0)),
+            concurrency=int(raw.get("concurrency", 1)),
+            persist=bool(raw.get("persist", False)),
+            pin=(pin[0], pin[1]) if isinstance(pin, list) and len(pin) == 2
+            else (raw["provider"], raw["model"]),
+            estimated_cost_usd=(
+                Decimal(str(raw["estimated_cost_usd"]))
+                if raw.get("estimated_cost_usd") is not None else None
+            ),
+            estimated_smoke_usd=(
+                Decimal(str(raw["estimated_smoke_usd"]))
+                if raw.get("estimated_smoke_usd") is not None else None
+            ),
+            cumulative_cost_usd=(
+                Decimal(str(raw["cumulative_cost_usd"]))
+                if raw.get("cumulative_cost_usd") is not None else None
+            ),
+            classification_note=raw.get("classification_note"),
+        ))
+    return rows
+
+
+def _matrix_run_summary(previous: Mapping[str, Any]) -> dict[str, int]:
+    from collections import Counter
+    counter: Counter[str] = Counter()
+    for result in previous.values():
+        counter[result.status] += 1
+    return dict(counter)
 
 
 if __name__ == "__main__":

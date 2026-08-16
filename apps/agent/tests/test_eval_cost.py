@@ -51,18 +51,18 @@ def test_tabla_versionada_carga_modelos_y_fuentes_oficiales():
     table = PricingTable.load()
 
     minimax = table.price("open_code_zen", "minimax-m2.7")
-    assert table.table_id == "2026-07-28-official"
+    assert table.table_id == "2026-08-14-zen-moonshot-modelsdev"
     assert minimax.input_per_million == Decimal("0.30")
     assert minimax.output_per_million == Decimal("1.20")
     assert minimax.cached_input_per_million == Decimal("0.06")
-    assert minimax.checked_at == "2026-07-28"
+    assert minimax.checked_at == "2026-08-07"
     assert minimax.source_url == "https://opencode.ai/docs/zen/"
 
     deepseek_flash = table.price("open_code_zen", "deepseek-v4-flash")
     assert deepseek_flash.input_per_million == Decimal("0.14")
     assert deepseek_flash.output_per_million == Decimal("0.28")
     assert deepseek_flash.cached_input_per_million == Decimal("0.028")
-    assert deepseek_flash.checked_at == "2026-07-28"
+    assert deepseek_flash.checked_at == "2026-08-07"
     assert deepseek_flash.source_url == "https://opencode.ai/docs/zen/"
 
 

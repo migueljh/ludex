@@ -2383,6 +2383,80 @@ el modelo que efectivamente ejecutó: `20260808-opencode-claude-haiku-4-5-screen
 notas. Un artefacto pinneado jamás se identifica por un modelo distinto del
 efectivo.
 
+## D43 — matriz de compatibilidad de proveedores con protocolos declarativos y presupuesto por provider (F2-10B/MON-20)
+
+**Contexto.** MON-20 exige probar en batallas aisladas cada modelo accesible
+de Gemini, Kimi y OpenCode Zen. La documentación oficial de Zen (2026-08-07)
+asigna familias a endpoints distintos: GPT y Grok → `/responses`, Claude y
+Qwen → `/messages`, familias chinas (DeepSeek, MiniMax, GLM, Kimi, MiMo,
+libres) → `/chat/completions`, y Gemini → su endpoint nativo por modelo
+(`/models/<id>`). El repo reconocía `responses` en el schema de rutas pero lo
+rechazaba en runtime, y no había deadline por batalla configurable.
+
+**Decisiones:**
+
+1. **Protocolo por ruta, no por ensayo.** `model-routes.json` declara por
+   provider/model: protocolo, structured output, temperature/thinking,
+   max_tokens, timeout y endpoint opcional. `build_route_provider` es el
+   ÚNICO punto de despacho (responses → backend OpenAI Responses,
+   messages → Anthropic, google → Gemini nativo con base_url del gateway,
+   chat_completions → OpenAI-compatible). Un modelo sin ruta se clasifica
+   `missing-route` en la matriz: NUNCA se prueba "chat_completions y si
+   falla messages" pagando. `responses` usa JSON textual estricto
+   (`text_json`) sometido a la misma validación semántica de D26; el
+   método puede sobreescribirse por ruta (`structured_output`).
+
+2. **Cuarentena de credenciales distinta del cooldown de cuota.** Un
+   401/403 es específico de UNA clave (vencida/revocada): nueva clase
+   `CredentialRejected`; `KeyRotatingProvider` pone esa clave en
+   cuarentena PERMANENTE para el proceso y sigue con la siguiente, con
+   contador propio `keys_quarantined` (no confundir con `key_rotations`,
+   que es de 429/cooldown). Un error model-wide (404, 400, fatal)
+   detiene la corrida en la primera clave: el pool de 11 no se quema en
+   vano (canario). Pool completo rechazado → `ProviderPoolExhausted`
+   ("quarantined"), clasificado `credential/model unavailable` — nunca
+   un falso incompatible.
+
+3. **Fix real: la rotación de Gemini jamas rotaba credenciales.** Los
+   campos reales de `ChatGoogleGenerativeAI` son `google_api_key`,
+   `max_retries`, `timeout` y `base_url`; el código pasaba
+   `api_key`/`retries`/`request_timeout`, que pydantic ignora en silencio
+   (extra=ignore): cada llamada usaba la clave del entorno y las 11 del
+   pool nunca se rotaban de verdad. Se corrigió con TDD y mutación
+   (revertir `google_api_key` rompe el test). `base_url` además habilita
+   el protocolo nativo de Gemini detrás del gateway Zen.
+
+4. **Deadline por batalla configurable.** `LUDEX_BATTLE_TIMEOUT_SECONDS`
+   (default productivo 180, positivo, `--battle-timeout` en CLI), se
+   propaga hasta `run_benchmark` y se persiste en TODOS los artefactos
+   (`battle_timeout_seconds`), sin tocar el deadline compartido de cada
+   decisión (D26). La matriz usa 1800. Mutaciones verificadas: ignorar el
+   valor configurado, persistir otro valor o volver a una constante fija
+   rompen tests.
+
+5. **Matriz dinámica con presupuesto.** `agent matrix-plan` refresca
+   /models (metadata, sin cuota) antes de cada ronda, publica altas/bajas
+   contra el inventario commiteado, y escribe un manifiesto con una fila
+   por provider/model: pin estricto, concurrency=1, persist=false, dos
+   batallas solo si el smoke pasa, tier/precio/costo estimado por modelo.
+   Presupuesto por provider (addendum): orden ascendente por costo,
+   reserva smoke + dos batallas antes de iniciar, hard-stop antes del cap
+   (Zen cap 10 USD dejando 1; Kimi 5.50 dejando 0.50; Gemini solo free
+   tier confirmado). Si el saldo no alcanza → `pending-budget`/`not-run`,
+   NUNCA unsupported/incompatible/externally-limited, preservando
+   protocolo/ruta/costo y sin publicar winrate. Gemini NO se asume gratis:
+   tier por modelo con fuente; sin prueba de costo cero → pending-budget.
+
+**Límite documentado.** El free tier de Gemini no pudo verificarse contra
+la página oficial (no accesible desde esta máquina); las 11 claves son free
+tier según el usuario, pero el tier por modelo queda marcado `unknown`
+(excepto Gemma 4, $0.00 con pesos abiertos) hasta confirmarse en la cuenta
+al ejecutar. `moonshot-v1-auto` y `claude-sonnet-4` (deprecado) no tienen
+precio publicable → pending-budget. `ling-3.0-flash-free` no figura en la
+documentación de Zen → `missing-route` hasta verificación. Los modelos
+deprecados (docs Zen) siguen listados en /models y en scope, marcados como
+deprecados.
+
 ## D44 — `training` exige trayectoria ÍNTEGRAMENTE `state_schema_version=2`, con al menos un paso; una mezcla v1/v2 se excluye completa (MON-11 R3, corregido R4)
 
 **Nota de numeración.** D42 pertenece a MON-15 y D43 a MON-20 -- no se
@@ -2471,6 +2545,59 @@ el `EXISTS` de R4 (el test de cero pasos, y únicamente ese, se pone rojo).
 corpus vacío real de hoy en vez de asumir `training` no vacío -- incluyendo
 un test que fija a propósito que si algún día deja de ser cero hay que
 revisar esa aserción, no relajarla en silencio.
+
+**D43 R3 — 403 ambiguo y contrato de endpoint responses (MON-20, post-merge
+de la integración MON-11/D44).** Dos correcciones sobre D43:
+
+1. **403 NO es siempre credencial.** Latwan reprodujo contra 5af25c7 un 403
+   model-wide con pool de 11 claves que terminó en calls=11,
+   keys_quarantined=11 y `ProviderPoolExhausted`: todo 403 clasificaba
+   `CredentialRejected`. Ahora: **401 → `CredentialRejected` siempre**
+   (por definición es rechazo de credencial); **403 → `CredentialRejected`
+   SOLO si una señal estructurada demuestra rechazo de credencial**:
+   - Google: `details[].reason` en la whitelist de razones de clave
+     (`API_KEY_*`, `KEY_*`, `CONSUMER_*`, `USER_*`, `MISSING_API_KEY`,
+     `DOMAIN_BLOCKED`); `ACCESS_DENIED`, `PERMISSION_DENIED`,
+     `SERVICE_DISABLED` y ausencia de señal quedan fuera → model-wide.
+   - OpenAI-compatible: `error.code` en la whitelist (`invalid_api_key`,
+     `api_key_expired`, `api_key_revoked`, `api_key_not_found`,
+     `authentication_error`, `account_deactivated`, `account_disabled`);
+     `insufficient_quota`, `model_not_accessible`, `access_denied` → model-wide.
+   - Anthropic: 403 (`permission_error`) nunca rota (sin señal de credencial).
+   El cuerpo estructurado se lee caminando la cadena de causas
+   (`__cause__`): `langchain_google_genai` envuelve el `APIError` de Google
+   en `ChatGoogleGenerativeAIError`, y el wrapper no conserva
+   status/details — la señal vive en la causa. Sin señal estructurada, un
+   403 es `FatalProviderError` y **se detiene en la primera clave** (el
+   pool de 11 hace exactamente 1 llamada; canario). Nunca se decide por
+   texto libre: la sanitización de claves en logs/artefactos sigue siendo
+   la de siempre.
+
+2. **`ModelRoute.endpoint` = URL COMPLETA del endpoint** (p.ej.
+   `https://opencode.ai/zen/v1/responses`, tal como la publica la doc de
+   Zen). El backend `_ResponsesBackend` postea con httpx EXACTAMENTE a esa
+   URL y NO usa el SDK de openai (que volvería a agregar `/responses` y
+   produciría `/responses/responses`). Sin `endpoint` en la ruta, se
+   deriva `{base_url}/responses`. Test en la frontera HTTP: el POST va a
+   `https://opencode.ai/zen/v1/responses`, nunca a `/responses/responses`.
+
+3. **`matrix-run` fail-closed (R1).** Ejecutor versionado y probado:
+   `--tier` obligatorio (free/paid), selección SOLO de filas `ready` del
+   tier pedido con revalidación del tier antes del primer provider
+   (mutación verificada: quitar el filtro pone rojo antes de llamar),
+   refresh de `/models` antes de la ronda (`removed-from-catalog` para
+   modelos que ya no están), 1 smoke → exactamente 2 batallas pinneadas
+   (enforce_pin=True, sin chains, concurrency=1, persist=false,
+   opponent=simple_heuristics, formato configurado, battle timeout 1800),
+   artefacto atómico por modelo + estado de reanudación (un modelo
+   finalizado no se repite; uno sin clasificar se reejecuta), parcial/
+   abortado nunca publica winrate, `ProviderMixError` → internal-defect.
+   Fase que toca open_code_zen exige `--zen-auto-reload-confirmed`
+   (auto-reload desactivado); sin confirmación, no hay requests.
+   L-02: la disponibilidad por provider es `min(cap_usd,
+   balance_usd - leave_usd)` — el margen de saldo mínimo NO se resta dos
+   veces. Con la autorización real (Zen 11/10/1 y Kimi 6/5.50/0.50) los
+   límites efectivos son exactamente 10.00 y 5.50 (no 9.00/5.00).
 
 ## D45 — el respaldo de Encore rival en `_find_action_line` confirma con la repetición forzada, no con su propio anuncio (MON-21, hallazgo de MON-11 R4)
 
@@ -2790,3 +2917,1212 @@ cambio. No se investigó si el mismo
 patrón (`Unobtainable` referenciado por un catálogo random-battle)
 aplica a `items`/`abilities` en alguna generación; `simple.ts` queda sin
 tocar por falta de evidencia (alcance explícito del DESIGN VERDICT).
+
+## D48 — LATWAN R1A + OFFLINE REVIEW (MON-20): métricas reales en fallos de smoke, 401 por señal estructurada, evidencia durable sanitizada y adaptación declarativa `text_json` de las tres rutas libres
+
+> Numeración: D46 pertenece a MON-23 y D47 a MON-24 (ambas arriba).
+> La decisión de MON-20 es D48.
+
+**Contexto.** La revisión R1A de Latwan sobre la evidencia R1A (10 artefactos
++ state file) encontró tres blockers internos: (1) `_smoke_failed` fijaba
+`retries=0/rotations=0/quarantined=0`, por eso el artefacto de
+`north-mini-code-free` decía `quarantined=0` mientras el checkpoint afirmaba
+cuarentena + `ProviderPoolExhausted`, y el de `ling-3.0-tiny-free` no podía
+demostrar los retries del 503; (2) `_classified` convertía todo HTTP 401 en
+`CredentialRejected`, pero R1A demostró que Zen puede devolver 401 originado
+en el provider upstream de un modelo mientras la misma credencial funciona en
+modelos vecinos (cuarentenarlo es incorrecto y convierte indisponibilidad de
+modelo en `ProviderPoolExhausted`); (3) la evidencia durable persistida
+(`failure_type`/`failure_cause_type`) no alcanzaba: faltaba etapa, status HTTP
+y código estructurado. Además autorizó offline la adaptación declarativa de
+los tres 400 (`big-pickle`, `deepseek-v4-flash-free`, `laguna-s-2.1-free`).
+La revisión OFFLINE posterior (LATWAN) corrigió dos fugas de la primera
+implementación: `provider_error_code` podía filtrar datos (que el valor
+provenga de un campo estructurado no lo vuelve seguro) y el delta de métricas
+restaba percentiles (matemáticamente inválido).
+
+**Decisiones:**
+
+1. **Métricas reales en fallos de smoke (L-01/L-06).** `KeyRotatingProvider`
+   y `ProviderChain` exponen `metrics_snapshot()`; `_run_one` toma un
+   snapshot ANTES del smoke y persiste el DELTA en el artefacto, tanto en
+   éxito como en fallo. `_smoke_failed` jamas vuelve a fijar
+   `retries/rotations/quarantined` en cero por omisión. Nuevo contador
+   `transient_retries_executed`: un retry REAL ejecutado por reintento de
+   infraestructura (el dedupe `turns_transient_affected` solo dice si el
+   turno se vio afectado, no cuántas veces se reintentó). El `retries` del
+   artefacto sale de ese contador. Canarios: North (401 credential →
+   quarantined=1) y Ling (503 ×3 → retries=2).
+   **Delta matemáticamente válido (L-06):** `max/p50/p95` NO se restan
+   nunca. El delta de latencias exige un provider/`DecisionMetrics` fresco
+   por modelo; si el snapshot inicial ya tiene muestras de latencia
+   (`completion_latency_ms_count`/`decision_latency_ms_count` > 0) el delta
+   falla cerrado (`None`): no se publican percentiles inventados ni se
+   devuelven gauges comparables falsos. Contadores, tokens, total y count se
+   calculan por diferencia; `max/p50/p95` se copian del snapshot posterior
+   (válido únicamente porque el baseline fresco tiene count=0, así que la
+   población posterior ES la única).
+
+2. **401 por señal estructurada (L-02).** Un 401 solo es
+   `CredentialRejected` (cuarentena) cuando una señal ESTRUCTURADA
+   allowlisted demuestra rechazo de NUESTRA credencial (`error.code` de
+   openai/anthropic en `_OPENAI_CREDENTIAL_CODES`, `error.details[].reason`
+   de google en `_GOOGLE_CREDENTIAL_REASONS`). 401 sin esa señal o marcado
+   como upstream/model-wide → `FatalProviderError` en la primera clave, sin
+   rotación ni cuarentena. Nunca se decide por texto libre. Se reemplazó el
+   test que esperaba `ProviderPoolExhausted` para un 401 sin señal y se
+   agregaron counterweights (`invalid_api_key` estructurado vs. upstream).
+   El `ProviderPoolExhausted` por pool totalmente en cuarentena ahora se
+   lanza `from` el último rechazo de credencial, conservando la causa en
+   vivo.
+
+3. **Evidencia durable sanitizada (L-03/L-05).** `MatrixModelResult` agrega
+   `failure_stage` (`smoke`/`battle`), `http_status` (cuando existe) y
+   `provider_error_code`; `BenchmarkResult` agrega SOLO `http_status` y
+   `provider_error_code` (que la alimenta en la fase de batalla; el
+   `failure_stage` de la fase de batalla lo fija la matriz, no el
+   BenchmarkResult). `provider_error_code` se acepta únicamente como
+   identificador acotado `^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$` y SOLO desde
+   campos estructurados permitidos (`error.code`, `error.details[].reason`):
+   que el valor provenga de un campo estructurado no lo vuelve seguro. URL,
+   slash, whitespace, query, valores largos, patrones de secreto
+   (`sk-…`/`AIza…`/`key=…`) o nombres de variables de entorno del proyecto →
+   `None` completo, nunca truncado. Prohibido persistir mensajes, URLs,
+   headers, bodies completos, nombres/valores de variables o secretos
+   (canarios con URL+clave en el campo estructurado y en el mensaje crudo).
+   Los campos tienen default `None` para que los state files viejos sigan
+   cargando.
+
+4. **Adaptación declarativa `text_json` (autorizada offline).** Las tres
+   rutas libres de 400 permanecen en `chat_completions` y cambian SOLO su
+   capacidad declarativa `structured_output` a `text_json`: el backend NO
+   construye `response_format=json_schema` (nunca llama a
+   `with_structured_output`), agrega la instrucción JSON textual y el
+   payload sigue pasando por la MISMA validación estricta de `DecisionResponse`
+   (D26). Sin `messages`, sin condicionales por `model_id` (D43: protocolo
+   por ruta). Mutar cualquiera de las tres de vuelta a `json_schema` pone
+   rojo su canario.
+
+**Verificación.** TDD rojo→verde en `test_provider.py` y `test_matrix.py`:
+**16 rojos** (medidos en la última corrida roja legítima, antes de la
+implementación; el primer conteo de 19 incluía 3 fallos por un error del
+propio helper de test, no del código bajo prueba) → 101 verdes en la suite
+focal; 633 verdes + 68 skipped en `apps/agent` completo, los skipped son
+integración con DB/Showdown — ronda offline. Mutaciones dirigidas
+verificadas: revertir los zeros fijos de `_smoke_failed` (rojo North + 503),
+revertir el 401 incondicional (rojo 401-fatal), extraer `provider_error_code`
+de texto libre (rojo sanitización), revertir cada ruta a `json_schema` (rojo
+canario de rutas), quitar la validación de identificador acotado de
+`_structured_provider_error_code` (rojo canarios L-05) y restar todos los
+ints del delta incluyendo percentiles (rojo canario L-06). Secret scan
+compartido (L-03 previo) sigue en verde sobre `evals/**`.
+
+**Límites.** La fase de batalla obtiene `http_status`/`provider_error_code`
+vía `BenchmarkResult`; un `BenchmarkResult` construido por otros llamadores
+sin esos campos los deja en `None`. Los artefactos R1A ya commiteados no se
+regeneran (son evidencia histórica aceptada); los campos nuevos aparecen en
+las corridas siguientes. `ProviderPoolExhausted` por cooldown de cuota sigue
+sin causa enganchada (no es rechazo de credencial). El delta de latencias
+solo es válido con un `DecisionMetrics` fresco por modelo (la matriz lo
+garantiza al construir un provider nuevo por fila); un baseline sucio queda
+`None` (fail-closed).
+
+**Addendum post-R1B (LATWAN DESIGN VERDICT) — corrección offline implementada:**
+
+5. **Lifecycle completo del benchmark (L-01).** `_benchmark_command` ahora
+   cierra AMBOS PSClient (agent y rival) via la API real
+   `ps_client.stop_listening()` (async, cross-loop sobre el POKE_LOOP de
+   poke-env; `Player` no ofrece `close()`), después del drain D46 y ANTES de
+   cerrar calc/repository/engine. El cierre intenta ambos players aunque uno
+   falle y nunca oculta la excepción primaria ni impide el cierre de los
+   recursos. Motivo: cada benchmark abortado fugaba 2 websockets + sus
+   listener tasks en el POKE_LOOP global, acumulándose entre modelos de una
+   misma ronda de la matriz. Canarios: orden drain → ambos players → recursos;
+   un solo `stop_listening` por player; fallo de un player no impide el resto;
+   reproducción con el POKE_LOOP real (websockets CLOSED + listeners done).
+
+6. **Separación entre fallo de infraestructura y compatibilidad del modelo
+   (L-03).** `ConnectionClosedError` de Showdown durante batalla y la
+   indisponibilidad local comprobada (`ShowdownUnavailableError`, un
+   `RuntimeError from OSError` del preflight `_check_showdown_reachable`)
+   se clasifican `externally-limited` con stage=battle, nunca
+   `internal-defect` ni incompatibilidad del modelo. Clase/causa preservadas
+   sanitizadas; sin retry automático ni ajuste de ping.
+
+7. **Preservación de fase post-smoke (L-02).** Todo fallo después de un
+   smoke verde conserva `smoke_ok=True`, `failure_stage="battle"`,
+   `battles_requested=2` (objetivo, no batallas iniciadas — finding #4 del
+   TECH LEAD), `battles_completed=0`, las métricas del smoke disponibles
+   (delta del provider) y la clase/causa sanitizadas. Una excepción interna
+   genuina sigue siendo `internal-defect` pero con la fase preservada; el
+   `except Exception` exterior de `run_matrix_round` queda solo para fallos
+   pre-smoke.
+
+8. **Clasificación 401/403 model-wide (L-04).** `FatalProviderError` con
+   HTTP 401/403 upstream/model-wide (sin señal key-specific; el provider ya
+   no rota ni cuarentena) → `credential/model unavailable`;
+   `unsupported-protocol` queda reservado para rechazo de
+   protocolo/structured output (HTTP 400 de response_format). Solo por
+   status HTTP estructurado, nunca texto libre.
+
+9. **not-run hermético (L-05).** La selección/validación local de
+   credenciales precede al chequeo de Showdown en `_benchmark_command`: sin
+   credenciales el comando emite artefacto `not-run`
+   (`failure_type=ProviderSelectionError`, exit 2) sin tocar Showdown. El
+   chequeo de Showdown no se debilita cuando las credenciales existen.
+
+10. **Presupuesto R1C (L-06).** El manifiesto unitario no ejecutado corrige
+    su `cumulative_cost_usd` stale (0.66056 → 0.45976 = smoke 0.00616 + 2
+    batallas 0.4536, hard cap de ronda 0.60); `plan_budget` falla cerrado
+    ante una reserva que exceda el cap. R1C sigue NO AUTORIZADA; no existe
+    artefacto de resultado.
+
+**Addendum post-corrección LATWAN (OFFLINE, 2026-08-12) — blockers L-01 y L-02:**
+
+11. **Frontera estructurada del cleanup (L-01).** El `finally` lineal de
+    `_benchmark_command` (cli.py) se reemplaza por `_structured_cleanup`:
+    intenta SIEMPRE y EN ORDEN drain (D46) → PSClient del agent → PSClient
+    del rival → CalcClient → context repository → engine, aunque cualquier
+    tramo falle; los errores de los pasos se recogen y devuelven, jamas se
+    tragan. Reglas de salida: (a) con excepción primaria en vuelo se
+    preserva — `CancelledError`/`KeyboardInterrupt`/`SystemExit` se
+    re-lanzan tal cual, el resto viaja como `BenchmarkFailure` con su causa
+    original en `__cause__`; (b) sin primaria, un fallo de cleanup NO puede
+    dejar la corrida `compatible`: se emite un resultado
+    `failure_type=InternalCleanupError` (marcador clasificado, mensaje
+    sanitizado fijo, clase de la causa real del primer paso como
+    `failure_cause_type`) que la matriz traduce a `internal-defect`; el
+    progreso real y la identidad efectiva se preservan. `CancelledError`
+    nunca se traga como fallo ordinario. `engine.dispose()` queda observado
+    explícitamente en los canarios de orden (antes las listas terminaban en
+    `context_aclose`). Motivo: un fallo de drain o Calc podía ocultar la
+    primaria, abandonar los tramos posteriores y (vía el `BaseException`
+    tragado en `_close_player_sockets`) permitir reportar `compatible` con
+    websockets vivos.
+
+12. **Resultado parcial tipado post-smoke (L-02).** `_matrix._battle_failed`
+    ya no fija `battles_completed=0`, `effective_provider=None` ni
+    `effective_model=None` para todo fallo: la frontera real de
+    `_benchmark_command` envuelve toda excepción no clasificada de
+    `run_benchmark` (p.ej. `ConnectionClosedError` en la batalla 2) en
+    `BenchmarkFailure` (benchmark.py) con un `BenchmarkResult` PARCIAL —
+    campo tipado, no atributos ad hoc sobre excepciones genéricas — con
+    `requested`/`completed`/W/L/T reales desde los contadores del agente,
+    provider/model efectivos (el pin), y evidencia sanitizada
+    (`failure_type`/`failure_cause_type`/`http_status`/
+    `provider_error_code`). `_battle_failed` lee el partial cuando existe y
+    cae al pin de la fila cuando no (preflight de Showdown antes de crear
+    players: completed=0, identidad del smoke preservada). `MatrixModelResult`
+    agrega `battles_wins`/`battles_losses`/`battles_ties` (aditivo; los
+    artefactos históricos no se regeneran). Canario vinculante: batalla 1
+    completa, batalla 2 lanza `ConnectionClosedError` → requested=2,
+    completed=1, identidad = pin, stage=battle, externally-limited,
+    winrate=None; counterweight preflight → completed=0 con identidad
+    preservada. Mutaciones demostradas: completed=0, borrar
+    effective_provider/model, perder W/L/T o métricas parciales ponen los
+    canarios rojos.
+
+## D49 — `_check_showdown_reachable` endurecido a handshake de protocolo real; el defecto de R1C no era `seasons` (MON-25, LATWAN DESIGN VERDICT sobre ROOT-CAUSE CHECKPOINT)
+
+**Contexto.** MON-25 diagnosticó el bloqueo de ~16 min de MON-20/R1C
+atribuido en los logs a crash-loops del plugin `seasons`. El ROOT-CAUSE
+CHECKPOINT (Linear, 2026-08-13) probó, con reproducción local y timestamps
+sanitizados, que **no hubo crash-loop**: `RestartCount=0`, ningún worker se
+reinició nunca, `seasons` falla open (`getLadderTop` captura el `HttpError`
+y devuelve `null`; la escalada a lockdown es código muerto en
+`crashlogger.ts` de la 0.11.10 pineada), y los ~16 min de R1C ocurrieron
+enteramente en reintentos del gateway del proveedor -- `matrix.py` nunca
+alcanza `run_battles` sin un smoke verde, así que Showdown nunca llegó a
+abrir un websocket en esa ronda. LATWAN aceptó el diagnóstico y autorizó
+un único defecto real, no causal de R1C pero genuino: `_check_showdown_reachable`
+(`apps/agent/src/ludex_agent/cli.py`) era un `asyncio.open_connection` +
+`close()` desnudo -- daba preflight VERDE contra cualquier listener TCP que
+aceptara la conexión, hablara o no el protocolo de Showdown.
+
+**Arreglo.** `_check_showdown_reachable` abre un websocket real contra
+`ws_url` (`websockets.connect(..., open_timeout=3.0)`) y espera, dentro de
+ese mismo presupuesto de 3.0s, un frame que contenga la línea
+`|challstr|` -- el mensaje que `poke_env.ps_client` (la librería que ya usa
+Ludex para jugar) trata como "confirma conexión al server: podemos
+loguear" (`ps_client.py:177-179`). No se subió ningún timeout: el nuevo
+chequeo mantiene el mismo techo de 3.0s del viejo TCP-connect, sólo exige
+más contenido dentro de ese techo. `ShowdownUnavailableError(RuntimeError)`
+se agregó a `benchmark.py` (antes sólo declarada por adelantado en un
+comentario de `matrix.py` en la rama `nebula/mon-20-provider-matrix`, leída
+vía `git show` sin tocar esa rama) y se levanta `from` la causa real
+(`OSError`/`TimeoutError` del handshake mudo, o `websockets.exceptions.WebSocketException`
+del rechazo de protocolo), preservada en vivo.
+
+**El frame real se inspeccionó antes de escribir el fix, no de memoria.**
+Contra el Showdown local pineado: el primer frame trae `|updateuser|` +
+`|customgroups|` + `|formats|` concatenados con `\n` (7618 bytes); el
+segundo frame, separado, es exactamente `|challstr|4|<hex>` (268 bytes).
+El chequeo revisa cada línea de cada frame recibido, no asume que
+`challstr` llega en un frame dedicado.
+
+**Hallazgo de plataforma, no de este código (documentado para quien lo
+retome).** `asyncio.Server.wait_closed()` cambió de semántica en Python
+3.12: además de esperar al cierre del socket de escucha, espera a que
+*todas* las conexiones activas terminen. Un handler de test que nunca
+retorna (`await asyncio.sleep(3600)`, para simular un listener mudo)
+cuelga `wait_closed()` para siempre si se lo espera. Los tests de listener
+mudo en `test_cli.py` hacen sólo `server.close()`, sin `await
+wait_closed()`, con el porqué documentado inline.
+
+**TDD rojo→verde, ejecutado (no narrado).**
+
+- *Canario 1* (`test_check_showdown_reachable_falla_contra_listener_tcp_mudo`):
+  listener que acepta y nunca completa el handshake HTTP. Rojo contra el
+  código viejo (`DID NOT RAISE ShowdownUnavailableError`); verde contra el
+  nuevo (`ShowdownUnavailableError` con `__cause__` `TimeoutError`, subclase
+  de `OSError`).
+- *Canario 2* (`test_check_showdown_reachable_falla_contra_endpoint_http_invalido`):
+  servidor que responde HTTP 200 real pero rechaza el upgrade a websocket.
+  Rojo contra el viejo; verde contra el nuevo (`__cause__`
+  `websockets.exceptions.InvalidStatus`, subclase de `WebSocketException`).
+- *Counterweight* (`tests/integration/test_showdown_reachable.py`, sin DB,
+  gateado en runtime a si el Showdown local real está arriba): pasa sin
+  excepción contra el Showdown pinneado real.
+- *Mutación dirigida*: `git stash` acotado a `cli.py` (restaura exactamente
+  la implementación TCP-connect vieja, dejando benchmark.py/tests
+  intactos), corrida de los dos canarios -> **rojo** (`DID NOT RAISE`,
+  confirmado en los dos), `git stash pop` restaura el fix, canarios vuelven
+  a verde. Suite completa `test_cli.py`: 32/32 verdes, sin regresiones.
+- *Clasificación del caller*: verificado (sin tocar la rama de MON-20) que
+  la lógica real de `_battle_infrastructure_status`
+  (`nebula/mon-20-provider-matrix:apps/agent/src/ludex_agent/matrix.py`,
+  leída vía `git show`) sigue clasificando la excepción real levantada por
+  el nuevo `_check_showdown_reachable` como `externally-limited` --
+  `isinstance(cause, (ConnectionClosedError, ShowdownUnavailableError))` da
+  `True` contra la instancia real capturada en un probe contra un listener
+  mudo.
+
+**No se tocó.** `seasons` no se modificó, desactivó ni reconfiguró (no es
+ causal de R1C, D-ROOT-CAUSE CHECKPOINT §2/§4). `exports.routes` en
+ `docker/showdown/config.js` no se tocó (el ruido histórico de `CRASH` no
+ fue causal; higiene de logs queda fuera de este issue). `ping_interval`/
+ `ping_timeout` de poke-env no se tocaron. La rama/worktree de MON-20 no se
+ modificó -- todo lo que se necesitó de ella se leyó vía `git show`.
+
+ > Alcance histórico (aclaración post-reconciliación): las frases
+ > anteriores eran ciertas para el commit fuente MON-25 (6d40018) antes de
+ > la integración. En el HEAD combinado de MON-20, D49 quedó aplicada
+ > dentro de la rama mediante el cherry-pick `b9bc21b` (más los commits de
+ > reconciliación `a83e6eb` y `665b42c`), que es donde vive hoy el preflight
+ > endurecido. Ninguna conclusión, límite ni clasificación cambia por esta
+ > aclaración.
+
+**Limitación conocida.** El counterweight de integración depende de que el
+Showdown local real esté arriba (`docker compose --profile local up -d
+showdown`); se salta en runtime si no lo está, en vez de fallar la suite.
+No se corrió `matrix-run` real de MON-20 con el preflight nuevo (exigiría
+un request pago, prohibido en esta ronda) -- la prueba de que la
+clasificación se preserva es contra la lógica real leída, no contra una
+ejecución end-to-end de la matriz.
+
+## D50 — el opt-in del counterweight de `_check_showdown_reachable` deja de invocar la funcion bajo prueba (MON-25, changes requested por Latwan sobre D49)
+
+**Contexto.** D49 documentó como limitación conocida que el counterweight de
+integración (`tests/integration/test_showdown_reachable.py`) se salta en
+runtime si Showdown local no está arriba. La revisión de Latwan encontró que
+el mecanismo de ese salto era peor que una limitación: `_showdown_up()`
+llamaba a `_check_showdown_reachable()` -- la misma función bajo prueba --
+para decidir el `skipif`. Si el reconocimiento de `|challstr|` en producción
+se rompe, esa llamada de gate también falla, y el `skipif` clasifica la
+regresión como "Showdown no disponible": el test se salta en vez de fallar.
+El counterweight no era independiente del código que verifica y no
+satisfacía verificación por mutación.
+
+**Arreglo.** Se reemplazó el gate por un opt-in explícito por variable de
+entorno (`RUN_SHOWDOWN_INTEGRATION`), sin ningún probe de producto en la
+decisión de skip -- el mismo patrón que ya usan `test_play.py` y
+`test_graph_play.py` con `TEST_DATABASE_URL`/`DATABASE_URL`. Quien corre la
+suite declara a mano que el Showdown local real está arriba; si lo declaró
+y `_check_showdown_reachable` falla igual (por regresión o porque el server
+no estaba arriba de verdad), el test falla, no se salta. Se eliminó
+`_showdown_up()` y el `asyncio.run()` a nivel de módulo que quedó sin uso.
+
+**Mutación dirigida, ejecutada.** Con Showdown local real arriba
+(`docker compose --profile local up -d showdown`, `COMPOSE_PROJECT_NAME=ludex`)
+y `RUN_SHOWDOWN_INTEGRATION=1`:
+
+- Canarios negativos (`test_cli.py::test_check_showdown_reachable_falla_*`,
+  los mismos dos de D49): 2/2 verdes, sin tocar.
+- Counterweight positivo contra código intacto: 1 passed (ejecutado de
+  verdad, no salteado).
+- `_SHOWDOWN_CHALLSTR_PREFIX` mutado a un valor que ninguna línea del
+  protocolo real puede matchear (`cli.py`, restaurado después desde backup):
+  counterweight -> 1 failed, `ShowdownUnavailableError` real levantada desde
+  el `TimeoutError` del handshake que nunca completa. No hubo SKIP.
+- Código restaurado, counterweight -> 1 passed de nuevo.
+- Suite completa `tests/test_cli.py` + el counterweight: 33 passed.
+
+**No se tocó.** El endurecimiento de D49 (`_probe_showdown_protocol`,
+ `_check_showdown_reachable`) no cambió. `SHOWDOWN_WS_URL` sigue con el mismo
+ default y el mismo rol de configurar la URL, no de gatear el skip. MON-20 y
+ la rama de integración no se tocaron.
+
+ > Alcance histórico (aclaración post-reconciliación): igual que en D49,
+ > la frase anterior describía el estado de los commits fuente MON-25
+ > (6d40018, 84a2f13) antes de la integración. En el HEAD combinado de
+ > MON-20, D50 quedó aplicada dentro de la rama mediante `a83e6eb` (sobre
+ > `b9bc21b`, con la corrección documental `665b42c`);
+ > `integration/phase-2-accepted` sigue sin recibir este trabajo, como se
+ > indicó. Ninguna conclusión, límite ni clasificación cambia por esta
+ > aclaración.
+
+## D51 — MON-20 DIAG-A R2/R3 (review Tasos/Latwan): monitor diagnóstico opt-in del benchmark (`--diagnostic-snapshot-interval`)
+
+La ronda 1 (c143e0b) introdujo `LudexPlayer.decision_snapshot()` (etapas +
+stacks sanitizados de decisiones en vuelo), pero su único caller era el test:
+`_benchmark_command()` espera completamente a `run_benchmark()`, así que
+durante un cuelgue no existía un monitor vivo que capturara la etapa. La
+revisión (CHANGES_REQUESTED) pidió el wiring productivo mínimo, explícito y
+opt-in. Decisiones de esta ronda (commit `c143e0b` + ronda 2):
+
+1. **Ownership del `POKE_LOOP`.** `poke_env.concurrency.POKE_LOOP` es un
+   loop global en su propio thread. Las decisiones (`choose_move` →
+   `run_graph`) corren ahí como tasks hermanas de `battle_against`
+   (`ps_client.py:260`, `asyncio.create_task` por frame): cancelar o
+   timeoutear el wrapper del benchmark nunca las toca (D46) y
+   `asyncio.all_tasks()` desde el loop del caller NO las ve. Todo lo que
+   inspeccione una decisión debe agendarse en `ps_client.loop` vía
+   `run_coroutine_threadsafe`, que es lo que hace `decision_snapshot()`.
+
+2. **Wrapper-task vs node-task.** `run_graph` es la wrapper-task registrada
+   en `_decision_tasks`. LangGraph ejecuta cada nodo en una task PROPIA
+   (`_executor` de langgraph, `run_coroutine_threadsafe` + `copy_context`):
+   `asyncio.current_task()` dentro de un nodo es la node-task, y es ella la
+   que tiene el chain de awaits profundo (`cr_await`/`ag_await`) con la
+   línea exacta esperada. Por eso `record_decision_stage` registra la etapa
+   bajo la NODE-task y `_release_decision` barre los stages de tasks done.
+   `Task.get_stack()` no alcanza (solo el frame del coroutine raíz): el
+   chain se camina con `cr_frame`/`cr_await` (+ `ag_frame`/`ag_await`,
+   LangGraph `astream` es un async generator).
+
+3. **Campos permitidos del snapshot.** Por entrada: `task_id` (`id()` de la
+   task), `stage`, `frames` = `[{module, function, line}]`. PROHIBIDO
+   `f_locals` — una variable local de un frame del proveedor puede contener
+   una clave API, y los frames de contexto traen filas y payloads. Nunca
+   prompts, credenciales, respuestas de provider, filas, payloads de
+   batalla ni secretos. El monitor emite `LUDEX_SNAPSHOT <json>` por tick.
+
+4. **Flag, intervalo y canal de salida efectivo (R3).**
+   `benchmark --diagnostic-snapshot-interval N` (opt-in; default ausente →
+   el benchmark no crea monitor y su salida, paths y semántica no cambian).
+   Con `N > 0`, `_benchmark_command` agenda desde el caller loop un monitor
+   que cada `N` segundos emite `agent.decision_snapshot()`; `snapshot_emit`
+   es inyectable para tests y un intervalo no positivo es
+   `typer.BadParameter`. El emisor por defecto es `typer.echo(..., err=True)`
+   con una línea exacta `LUDEX_SNAPSHOT <json>` por tick en STDERR
+   (`grep LUDEX_SNAPSHOT 2>&1`). NO usa `logger.info`: root y
+   `ludex_agent.cli` tienen nivel efectivo WARNING y un canal de log
+   silencioso haría el diagnóstico invisible (blocker confirmado de la
+   ronda 3). El canal solo existe cuando el flag opt-in crea el monitor; la
+   ejecución normal no escribe nada nuevo.
+
+5. **Cleanup y lifecycle del monitor.** El monitor se cancela y se espera
+   (`cancel()` + `gather(return_exceptions=True)`) en un `finally` interno
+   que cubre éxito, fallo (incluida la primaria no clasificada que propaga
+   al `except BaseException` existente) y cancelación externa, ANTES del
+   cleanup estructurado (drain → players → calc → contexto → engine, D46/
+   L-01). El monitor no deja tasks ni reemplaza la primaria: un fallo de
+   observabilidad (captura o emisión) se registra con `logger.warning` y NO
+   altera la semántica del benchmark — canario con `emit` que lanza en la
+   primera llamada: mismo `failure_type` (`BenchmarkDeadlineExceeded`).
+
+6. **DIAG-A no es un fix.** Ni la ronda 1, la 2 ni la 3 tocan el
+   comportamiento de decisión: no agregan timeouts, no cancelan nada. El cuelgue de R1C
+   (ausencia de progreso ~6 min antes del timeout de batalla de 1800 s)
+   sigue pendiente de localización con el monitor en vivo; los únicos awaits
+   sin deadline del camino de decisión son los SQL (model_repository vía
+   `resolve_provider`, context_repository vía `retrieve_context`) y la
+   persistencia post-batalla.
+
+7. **Stop condition de R1C.** Durante el diagnóstico en vivo: si una
+    decisión permanece en la MISMA etapa más de `decision_budget_seconds`
+    (240 s) o la batalla muestra cero decisiones completadas tras
+    2×`decision_budget_seconds`+60 s, detener la corrida SIN reintentar el
+    modelo ni rotar claves, clasificar con el snapshot como evidencia y pedir
+    veredicto a Latwan. R1C sigue NO AUTORIZADA hasta nuevo veredicto.
+
+## D52 — MON-20 DIAG-B: precedencia tier/precio en `build_manifest`, tabla de precios vigente explícita y cinco modelos nuevos declarativos (2026-08-14)
+
+**Contexto.** El ROOT-CAUSE CHECKPOINT DIAG-B (Linear, 2026-08-14) detectó
+que `build_manifest` degradaba la información del inventario al enriquecer
+el catálogo fresco: en la rama sin hit de tabla de precios el tier salía de
+`prev_row["tier"]` (no de `tier_override`) y en la rama sin tabla ni precios
+se forzaba `unknown`, perdiendo overrides explícitos y convirtiendo en
+"unknown" modelos que ya estaban verificados como free/paid. Además
+`plan_budget` trataba `unknown` como ejecutable en una fase, con riesgo de
+gastar cuota sobre un tier no probado. La tabla vigente además no cubría los
+cinco modelos publicados por Zen docs entre el 08-08 y el 08-14
+(`gemini-3.7-flash`, `grok-4.6`, `muse-spark-1.2`, `hy3-free`,
+`nemotron-3.5-lightning-free`).
+
+**Decisiones:**
+
+1. **Precedencia de tier/precio en `build_manifest` (fail-closed, nunca
+   inventar precios).** La tabla de precios manda para precios y fuente;
+   `tier_override` del inventario manda SOLO sobre el tier, incluso cuando
+   vale `unknown` sobre un hit paid de tabla (el override explícito expresa
+   "no pruebo este tier", y `plan_budget` lo deja pending-budget). Sin hit
+   de tabla, los precios del inventario derivan el tier: free SOLO con
+   input y output exactamente 0; cualquier precio no cero infiere paid. Sin
+   tabla ni precios se conserva el `tier_override` explícito (free
+   verificado sin precio sigue free, costo 0) y solo queda `unknown` cuando
+   no hay override ni dato alguno — jamas al reves.
+
+2. **`unknown` en `plan_budget` es pending-budget, no ejecutable.** Un tier
+   desconocido no puede probar costo cero ni correr en una fase (free|paid):
+   queda `pending-budget` conservando protocolo/ruta/costo estimado (extiende
+   D43: "sin prueba de costo cero → pending-budget", que antes solo cubría
+   filas sin precio). Un `unknown` jamás se convierte en free por tener
+   precios 0/0 sin fuente verificada.
+
+3. **Tabla de precios vigente explícita y trazable.** `DEFAULT_PRICING_PATH`
+   apunta a `pricing-2026-08-14.json` (`2026-08-14-zen-moonshot-modelsdev`,
+   USD, 97 filas, fuentes `opencode.ai/docs/zen/` y docs de Moonshot). El
+   manifiesto de `matrix-plan` registra la procedencia efectiva:
+   `pricing.table_id`, `currency` y `path` (default resuelto por el CLI o el
+   valor verbatim de `LUDEX_PRICING_TABLE`, sin secretos). Las tablas
+   anteriores quedan como histórico versionado, no se borran.
+
+4. **Cinco modelos nuevos, declarativos.** Rutas en `model-routes.json`:
+   `gemini-3.7-flash` (google/json_schema), `grok-4.6` y `muse-spark-1.2`
+   (responses/text_json), `hy3-free` y `nemotron-3.5-lightning-free`
+   (chat_completions/text_json, conservador; el smoke posterior valida
+   compatibilidad). Precios en la tabla 08-14 desde Zen docs (checked_at
+   2026-08-14): gemini-3.7-flash 1.50/7.50 (cached 0.15), grok-4.6 2.00/6.00
+   (cached 0.50), muse-spark-1.2 1.25/4.25 (cached 0.15), hy3-free y
+   nemotron-3.5-lightning-free 0/0. Cero condicionales runtime por nombre de
+   modelo: todo sale de las rutas y la tabla, y el catálogo sigue
+   refrescándose en runtime desde /models (D43).
+
+**Límite documentado (Grok).** La fila oficial de Zen para `grok-4.6` es la
+de <=200K tokens (input 2.00/output 6.00); el runner usa una completion por
+decisión y la ancla existente es 40K por smoke/por llamada, pero el schema
+actual no expresa pricing escalonado, así que se presupuesta con la fila
+<=200K y el resto del rango no se estima. Impacto: el costo estimado puede
+subestimar llamadas con contexto muy largo; dentro de los usos actuales
+(smoke 40K, batallas con ancla 1.5M/60K por batalla) es la cota oficial
+menor disponible y se valida en vivo con el uso real antes de cerrar R1C.
+
+**Verificación.** 6 tests DIAG-B nuevos en `test_matrix.py` (A1-A5 + C),
+procedencia en `test_cli.py`, tabla en `test_eval_cost.py`/`test_eval_report.py`.
+Mutaciones RED confirmadas, una por corrección: perder `tier_override` en la
+rama sin tabla (A4), ignorar override/derivación de tier en la rama de
+precios (A1/A3), quitar el branch `unknown` de `plan_budget` (A2), quitar la
+ruta de `grok-4.6` (C → missing-route), quitar la procedencia del manifiesto
+(CLI), y revertir la tabla default a 07-28 (table_id). GREEN restaurado:
+125 passed en la suite focal. Sin red, sin Docker, sin DB.
+
+## D53 — MON-20: el monitor D51 también es opt-in desde `matrix-run` (2026-08-14)
+
+**Contexto.** D51 cableó `--diagnostic-snapshot-interval` solamente en el
+comando `benchmark`. `matrix-run` construía un callback `run_battles` que
+invocaba `_benchmark_command()` sin ese argumento. Por eso cuatro filas
+pagas que entraron en benchmark y superaron el umbral diagnóstico fueron
+interrumpidas sin `LUDEX_SNAPSHOT` y antes de que `on_result` pudiera escribir
+el artefacto atómico. El silencio del log no permite reconstruir la etapa de
+decisión ni autoriza inventar una clase de fallo.
+
+**Decisión.** `matrix-run` expone el mismo flag opt-in y lo propaga sin
+transformación a cada `_benchmark_command`. Ausente conserva exactamente el
+default `None`; presente debe ser mayor que cero o el CLI falla antes de
+refrescar catálogos o ejecutar modelos. No se agregan timeouts, cancelaciones,
+reintentos ni cambios de clasificación: la semántica y los campos seguros del
+snapshot siguen siendo exclusivamente los de D51.
+
+**Límite.** Este wiring evita repetir el defecto, pero no recupera snapshots
+retroactivamente. DeepSeek V4 Flash, GPT-5.6 Luna, MiniMax M2.5 y Kimi K2.6
+conservan como evidencia sus intentos únicos y logs sanitizados; cualquier
+nueva llamada requiere autoridad de gasto y veredicto de Latwan.
+
+**Verificación TDD.** El canario de propagación falló primero porque el CLI no
+reconocía el flag; el de intervalo cero falló porque la corrida terminaba con
+exit 0. Tras el cambio mínimo ambos pasan. Suite focal
+`tests/test_cli.py tests/test_diagnostic_monitor.py`: 62 passed; sin red, DB ni
+llamadas de proveedor.
+
+## D54 — MON-20: cobertura final separa estado runtime, clasificación y fuerza de evidencia (2026-08-14)
+
+**Contexto.** El catálogo vivo final contiene 112 filas, pero sólo 22 quedaron
+`ready` dentro del tier/presupuesto autorizado. Dieciocho produjeron artefacto
+atómico; cuatro fueron interrumpidas antes de `on_result` por el hueco D53. El
+status runtime incluye `aborted`, mientras el contrato público de MON-20 pide
+una clasificación de compatibilidad. Mezclar ambos perdería la clase original
+o convertiría un defecto de evidencia en un falso veredicto sobre el modelo.
+
+**Decisión.** `20260814-provider-matrix-coverage.json` conserva por separado:
+
+1. `manifest_status` y su razón original;
+2. `runtime_status`, clase, causa, stage y métricas verbatim del artefacto;
+3. `final_classification` normalizada: `aborted` → `externally-limited`,
+   `pending-budget` → `externally-limited`, exclusión explícita de una
+   capacidad no-chat → `unsupported-protocol`; las demás clases conservan su
+   valor;
+4. `evidence_kind`: `atomic-runtime-artifact`,
+   `sanitized-diagnostic-stop` o `manifest-classification`.
+
+Los cuatro stops quedan `internal-defect` de observabilidad con
+`compatibility_result=indeterminate-current-run`, stage `battle` y terminal
+`CancelledError`; nunca `externally-limited` del modelo porque no existe
+snapshot retroactivo. Sus hashes y eventos saneados viven en
+`20260814-paid-diagnostic-stops.json`; los logs crudos de `/tmp` no se
+versionan. DeepSeek y Kimi incluyen evidencia histórica sólo como suplemento.
+
+**Alcance operativo posterior.** Por instrucción del usuario,
+`gpt-5.6-luna` queda `operator-prohibited-never-retry`; toda futura ejecución
+live se limita a modelos chinos y Gemini free tier. Los resultados históricos
+no habilitan nuevas corridas y cualquier repetición paga china requiere un
+nuevo tope explícito.
+
+**Invariantes.** 112 pares provider/model únicos = 38 Google + 12 Kimi + 62
+Zen; 22/22 filas ready tienen evidencia (18 atómicas + 4 stops); 75 quedan
+pending-budget, 15 excluidas por capacidad; cero filas comparables, cero
+persistencia y cero secretos. La matriz demuestra compatibilidad funcional,
+nunca calidad ni winrate.
+
+**D54 R1 — reconciliación con D43 tras revisión independiente (MON-20 R2,
+2026-08-15).** La regla 3 de la decisión original normalizaba
+`pending-budget → externally-limited` y `aborted → externally-limited`, lo
+que contradecía a D43 punto 5, al docstring de `matrix.py` y a un canario
+enforced (`test_plan_budget_pending_nunca_es_unsupported`). La revisión
+independiente (Neoblex) lo señaló como C1/C2. Corrección efectiva:
+
+1. Una fila NUNCA contactada (evidence_kind `manifest-classification`: 75
+   pending-budget + 15 excluidas por capacidad) queda
+   `final_classification: null` con `disposition: not-attempted` y
+   `not_attempted_reason` explícito: fuera de los buckets medidos, jamás
+   unsupported/incompatible/externally-limited. La exclusión por capacidad
+   conserva su razón en `manifest_status`/`not_attempted_reason` (no se
+   convierte en un `unsupported-protocol` medido).
+2. `aborted` se normaliza SÓLO con evidencia estructurada y la misma
+   taxonomía del runner (smoke/batalla): `FatalProviderError` + HTTP 400 →
+   `unsupported-protocol`; `FatalProviderError` + 401/403 →
+   `credential/model unavailable`; transitorio/deadline/pool →
+   `externally-limited`; defecto interno (ProviderMixError,
+   InternalCleanupError) → `internal-defect`; sin evidencia estructurada →
+   `internal-defect` (nunca se infiere un límite externo de texto libre).
+   `runtime_status`, `failure_type`, `failure_cause_type`, `failure_stage`
+   y `http_status` originales se preservan verbatim. Efecto medido sobre
+   las 22 filas ready: `externally-limited` baja de 12 a 10 (las dos Kimi
+   con 400 fatal pasan a `unsupported-protocol`); `unsupported-protocol`
+   pasa de 3 a 5 (medido en smoke 404/400 + batalla 400).
+3. `counts` y `invariants` se regeneran: 112 pares únicos, cobertura exacta
+   del manifiesto, 22 ready con evidencia 18+4, 0 comparables, 0
+   persistidos, 0 filas no ejecutadas en bucket medido, 2 aborted 400
+   clasificados unsupported-protocol.
+4. El generador ya no vive en `/tmp`: `apps/agent/evals/build_matrix_coverage.py`
+   reconstruye el coverage byte a byte desde fuentes versionadas
+   (manifiesto + artefactos + ledger) con `--check`; los tests
+   (`test_matrix_coverage.py`) recomputan las invariantes commiteadas y se
+   ponen rojos si se reintroducen los mapeos C1/C2.
+
+## D55 — MON-20 R2: política declarativa de operador, stop durable ante interrupción y artefactos autosuficientes (2026-08-15)
+
+**Contexto.** La revisión independiente (Neoblex) dejó cinco requerimientos
+fuera de la normalización: la prohibición de `gpt-5.6-luna` era sólo prosa
+(I3), una interrupción seguía perdiendo la fila entera (I2), los artefactos
+no eran auditable sin contexto externo ni el N=2 marcado como no comparable
+(I4/I5), y faltaban dos correcciones menores (M1/M2). Todos se implementan
+offline, sin providers, sin red, sin DB.
+
+**Decisiones.**
+
+1. **Política declarativa de operador (I3).** `apps/agent/evals/operator-policy.json`
+   versiona la prohibición: `open_code_zen/gpt-5.6-luna` →
+   `operator-prohibited-never-retry`, sin condicionales por nombre en `src/`.
+   `build_manifest` marca la fila `operator-prohibited` (battles=0, sin
+   costo, razón en la nota) en manifiestos NUEVOS; el manifiesto final
+   versionado `20260814t183716z-matrix-manifest.json` marca la fila con
+   `operator_prohibited` conservando su historial (status ready + evidencia
+   de stop, para no romper la invariante 22/18+4); `run_matrix_round`
+   rechaza cualquier fila prohibida con `ValueError` ANTES del primer
+   request (canarios de cero llamadas a proveedor y cero refrescos de
+   catálogo).
+
+2. **Stop durable ante interrupción (I2).** Si una fila es interrumpida por
+   `CancelledError`/`KeyboardInterrupt`/`SystemExit` durante smoke o
+   batalla, `run_matrix_round` emite SINCRONICAMENTE por `on_result` un
+   artefacto de stop sanitizado — `internal-defect`,
+   `compatibility_result=indeterminate-current-run`, etapa REAL
+   (`failure_stage` smoke|battle), `failure_type` = terminal original,
+   progreso disponible (`battles_requested` 2 si el smoke pasó, 0 si no) —
+   y RE-LANZA exactamente la misma excepción (nunca se traga ni se
+   convierte en fallo ordinario). La fila deja evidencia durable y el
+   `--resume` no la vuelve a ejecutar. Canarios a nivel runner y a nivel
+   CLI (artefacto en disco + excepción que escapa).
+
+3. **Artefactos autosuficientes (I4/I5).** `MatrixModelResult` persiste
+   `battle_timeout_seconds`, identidad de ronda (`round`), `generated_at` y
+   referencia + SHA-256 del manifiesto (`manifest`, `manifest_sha256`).
+   `win_rate` queda `null` SIEMPRE: N=2 prueba compatibilidad funcional,
+   nunca calidad; se publican W/L/T + `comparable=false` + `sample_size`
+   (batallas completadas). `already-finalized` también anula win_rate.
+
+4. **Correcciones menores (M1/M2).** `matrix.py` importa `Awaitable`/
+   `Callable` (verificado con `typing.get_type_hints(run_matrix_round)`).
+   La evidencia versionada elimina rutas absolutas del operador: el
+   manifiesto y el coverage registran `pricing.path` relativo a la raíz del
+   repo, y el ledger usa `log_reference` (basename) + `location_note` en
+   lugar de `/tmp/ludex-coordination/...`.
+
+**Verificación.** 128 tests focales nuevos/actualizados (test_matrix.py,
+test_cli.py, test_matrix_coverage.py) con 9 mutaciones deliberadas RED
+verificadas una por una: mapeo C1, mapeo C2, handler de stop I2, política
+I3 en runner, política I3 en build_manifest, win_rate I5, contexto I4,
+imports M1, rutas M2. Suite hermética completa (todo fuera de tests/db y
+tests/integration, `--noconftest`, env sanitizado): 626 passed, 37 skipped
+(module de integración con DB), exit 0. Sin red, sin providers, sin .env,
+sin DB, sin Docker.
+
+## D56 — MON-20 R3: cierre de los findings de la revisión independiente de Tasos (T-01..T-07) (2026-08-15)
+
+**Contexto.** La revisión independiente (Tasos, Opus) sobre el R2 confirmó
+los nueve requisitos (C1/C2/I1..I5/M1/M2) y emitió CHANGES_REQUESTED por un
+único ítem bloqueante (T-01) más seis menores (T-02..T-07). El veredicto de
+Latwan adjudicó los siete como correcciones de esta ronda, todo offline y
+hermético (sin providers, sin red, sin .env, sin DB, sin Docker).
+
+**Decisiones.**
+
+1. **T-01 — el artefacto de stop conserva su marca en la cobertura
+   (IMPORTANT).** `_atomic_row` ahora propaga `compatibility_result`,
+   `sample_size`, `round`, `manifest`, `manifest_sha256`, `generated_at` y
+   `battle_timeout_seconds` del artefacto, y cuando
+   `compatibility_result == "indeterminate-current-run"` publica la fila
+   como `evidence_kind: sanitized-diagnostic-stop` — NUNCA como un
+   `internal-defect` medido cualquiera — conservando la indeterminación que
+   I2 existe para producir. Canario end-to-end: artefacto de stop sintético
+   en un `runs/` temporal pasa por `scan_executed_artifacts` +
+   `build_coverage` y la fila conserva la marca y el contexto. Las 22 filas
+   commiteadas no cambian de clasificación (los 18 artefactos atómicos
+   históricos no traen `compatibility_result`).
+
+2. **T-02 — `already-finalized` conserva la marca del stop (MINOR).** La
+   rama de resume copia `compatibility_result` y `note` de la fila previa:
+   un stop indeterminado no pierde su marca en el state file al reanudar.
+   El marcador "ya finalizado en una corrida anterior" queda como fallback
+   cuando no hay nota previa.
+
+3. **T-03 — `FatalProviderError` aborted: sólo HTTP 400 es
+   `unsupported-protocol` (MINOR).** La normalización del generador
+   restringe el rechazo de protocolo a `http_status == 400` estructurado;
+   401/403 siguen siendo `credential/model unavailable` y 404/500/None
+   caen a `internal-defect` (fail-closed: sin la señal exacta del contrato
+   no se afirma un rechazo de protocolo sobre el modelo). Se alinean
+   docstring y D54 R1 con la regla efectiva; las 22 filas medidas no
+   cambian (las únicas aborted FatalProviderError reales son HTTP 400).
+
+4. **T-04 — `comparable`/`win_rate`/`sample_size` salen del artefacto
+   (MINOR).** `_atomic_row` y `_stop_row` leen los tres campos de la fuente
+   (artefacto o ledger), no de literales: la invariante `comparable_rows ==
+   0` deja de ser tautológica y mide datos reales. `win_rate` sólo se
+   publica si la fuente declara `comparable=true` (la matriz nunca lo hace
+   por I5). El coverage commiteado se regeneró con los campos nuevos
+   (`sample_size`, contexto I4) en null para los artefactos históricos;
+   `generator --check` sigue byte a byte.
+
+5. **T-05 — variable muerta borrada (MINOR).** `win_rate = None` local en
+   `_run_one` no se usaba (el return pasa `None` literal); se eliminó para
+   no invitar a reintroducir el cálculo.
+
+6. **T-06 — aserción de Luna sobre el campo exacto (MINOR).** El canario
+   del ledger ahora fija `future_execution == "operator-prohibited-never-retry"`
+   en lugar de una disyunción de texto sobre toda la fila.
+
+7. **T-07 — artefacto reciente por `generated_at`, no por nombre (MINOR).**
+   `scan_executed_artifacts` ordena por el `generated_at` que I4 persiste
+   dentro del artefacto (ISO, orden lexicográfico válido), con el nombre
+   como desempate; los históricos sin fecha caen al fallback lexicográfico
+   documentado (prefijos de ronda cronológicos de este repo). **T-10
+   (MON-20 R4):** la garantía "la ronda `r9` ya no puede ganarle a `r10`"
+   vale SOLO cuando los artefactos traen `generated_at` (I4); los históricos
+   sin fecha siguen resolviéndose por nombre, y hoy ninguno de los 36
+   artefactos versionados lo trae, así que el orden efectivo es el fallback.
+
+**Verificación.** 4 tests nuevos y 1 reforzado (132 focales totales) con 6
+mutaciones deliberadas RED verificadas una por una (T-01 propagación+stop,
+T-02 resume, T-03 404/500/None, T-04 lectura desde artefacto, T-06 campo
+exacto del ledger, T-07 orden por generated_at) y restauradas. Suite
+hermética completa (todo fuera de tests/db y tests/integration,
+`--noconftest`, env sanitizado): 630 passed, 37 skipped (module de
+integración con DB), exit 0. `generator --check` byte a byte, JSONs parsean,
+secret scan 0 infractores, `typing.get_type_hints(run_matrix_round)` OK.
+Sin red, sin providers, sin .env, sin DB, sin Docker.
+
+## D57 — MON-20 R4: la taxonomía de FatalProviderError es una sola, en runner y cobertura (T-08, T-10) (2026-08-15)
+
+**Contexto.** La revisión independiente de Tasos sobre el R3 (T-08, IMPORTANT)
+encontró que T-03 se había corregido sólo en el generador: el runner de smoke
+seguía clasificando cualquier `FatalProviderError` no-401/403 como
+`unsupported-protocol`, y como esa clase pasaba verbatim por `_FAITHFUL`, la
+fila histórica `google/gemini-2.5-flash-lite` (HTTP 404) quedaba publicada
+como `unsupported-protocol` — una afirmación que su propia evidencia no
+sostiene y que contradice el principio de D56 §3.
+
+**Decisión.**
+
+1. **T-08 — el runner y la cobertura comparten UNA tabla structured-only.**
+   `matrix.py` introduce `_fatal_status(exc)` para el smoke:
+   `FatalProviderError` + HTTP 400 → `unsupported-protocol`; 401/403 →
+   `credential/model unavailable`; 404/500/None → `internal-defect`
+   (fail-closed). `normalize_final_classification` deja de tratar
+   `unsupported-protocol` como clase fiel: tanto `aborted` como
+   `unsupported-protocol` (histórico viejo del runner) se re-derivan con la
+   misma tabla. La cobertura conserva el `runtime_status` histórico verbatim
+   pero la `final_classification` sale de failure_type/http_status.
+
+2. **Conteos regenerados.** `by_final_classification` pasa a
+   unsupported-protocol 4, internal-defect 5 (4 stops + la 404 histórica),
+   total medido 22; el resto de invariantes idéntico (externally-limited 10,
+   compatible 1, credential/model unavailable 1, invalid-semantic-response 1,
+   comparable 0, persist 0, fatal_400_aborted 2). **T-12 (MON-20 R5):** la
+   composición exacta de los 4 `unsupported-protocol` es DOS smoke HTTP 400
+   (`gpt-5-nano`, `gpt-5.1-codex-mini`, runtime unsupported-protocol) + DOS
+   aborted HTTP 400 (`moonshot-v1-8k`, `moonshot-v1-8k-vision-preview`,
+   runtime aborted), todos con `http_status: 400`.
+
+3. **Canario cruzado runner+coverage.** `test_taxonomia_runner_y_coverage_son_la_misma_tabla`
+   verifica para 400/401/403/404/500/None que el smoke del runner y la
+   normalización histórica (aborted y unsupported-protocol) producen el mismo
+   veredicto; `test_fila_historica_404_deriva_internal_defect_preservando_runtime`
+   fija la fila histórica 404 y sus pares 400.
+
+4. **T-10 — acotar la garantía de T-07 en D56 §7** (ver §7 de D56, corregido).
+
+**T-09 (MINOR, descubierto por Tasos, NO implementado).** Los artefactos
+ejecutados cuyo par (provider, model) no figura en el manifiesto final
+(`ling-3.0-tiny-free`, `longcat-2.0-free`, `north-mini-code-free`) se ignoran
+en silencio por `build_coverage` y ninguna invariante los registra. Queda
+como follow-up de MON-16 (contrato de consumo de la cobertura): agregar una
+invariante `execution_artifacts_without_manifest_row` con nota de por qué es
+esperable.
+
+**Verificación.** 5 tests nuevos/actualizados (132 → 136 focales), mutaciones
+deliberadas RED verificadas y restauradas: runner que vuelve a mapear
+cualquier FatalProviderError no-401/403 a unsupported-protocol (3 canarios
+rojos), y cobertura que vuelve a tratar unsupported-protocol como clase fiel
+(5 canarios rojos: normalización, fila histórica 404, conteos, el canario
+byte a byte y test_taxonomia_runner_y_coverage_son_la_misma_tabla; la tabla
+de R4 decía 2, corregido en T-12 de R5; el conteo exacto se midió en el
+árbol de R4 — git archive 2f8d075, baseline 136 passed, mutación
+`_FAITHFUL += "unsupported-protocol"` → 5 failed — y se inscribió en F4 de
+R7). Suite hermética completa (fuera de tests/db e
+integration, `--noconftest`, env sanitizado): 635 passed, 37 skipped, exit 0.
+`generator --check` byte a byte, JSONs parsean, secret scan 0 infractores,
+sin rutas absolutas, `typing.get_type_hints(run_matrix_round)` OK. Sin red,
+sin providers, sin .env, sin DB, sin Docker.
+
+## D58 — MON-20 R5: cierre de la taxonomía estructurada única (T-11, T-12) (2026-08-15)
+
+**Contexto.** La revisión formal del R4 dejó abierto T-11 (IMPORTANT): la
+ruta de excepción DIRECTA durante batalla en `run_matrix_round` seguía
+mapeando todo `ProviderError` salvo `ProviderMixError` a
+`externally-limited`, con la taxonomía del smoke aplicada sólo por nombre de
+clase. El mismo fallo del proveedor recibía veredictos distintos según la
+etapa, y la tabla quedaba duplicada en el generador de cobertura.
+
+**Decisión.**
+
+1. **T-11 — una única fuente de taxonomía en las tres rutas.**
+   `provider_failure_class(failure_type, http_status)` en `matrix.py` es la
+   tabla única structured-only (FatalProviderError 400 →
+   unsupported-protocol; 401/403 → credential/model unavailable; 404/500/None
+   u otro status → internal-defect; ProviderMixError/InternalCleanupError →
+   internal-defect; transitorio/deadline/pool → externally-limited; sin
+   clase → internal-defect fail-closed). La usan: el smoke
+   (`_fatal_status`), la excepción directa de batalla (antes el colapso
+   `ProviderMixError else externally-limited`), las clases terminales del
+   resultado parcial tipado (`_TERMINAL_BATTLE_CLASSES` → la misma función,
+   con `aborted` preservado para el resto) y la normalización histórica de
+   la cobertura (`build_matrix_coverage.normalize_final_classification`
+   importa `provider_failure_class` y eliminó sus `_TRANSIENT`/
+   `_INTERNAL_DEFECT` locales). Nunca se infiere de texto libre: sólo clase
+   y cadena de status.
+
+2. **T-12 — composición de counts y sub-conteo de mutaciones.** La
+   composición de los 4 `unsupported-protocol` queda declarada en D57 §2
+   (dos smoke HTTP 400 + dos aborted HTTP 400) y fijada por
+   `test_counts_t08_unsupported_4_internal_defect_5` (smoke_400 = {gpt-5-nano,
+   gpt-5.1-codex-mini}, aborted_400 = {moonshot-v1-8k,
+   moonshot-v1-8k-vision-preview}, todos http 400). El sub-conteo de
+   mutaciones de D57 se corrige a 3 canarios rojos por la re-verificación
+   de R4.
+
+**Verificación.** Canario absoluto de tres rutas ampliado:
+`test_taxonomia_runner_y_coverage_son_la_misma_tabla` (smoke + excepción
+directa de batalla + normalización aborted/unsupported-protocol para
+400/401/403/404/500/None) y `test_excepcion_directa_de_batalla_usa_la_misma_taxonomia`
+(tabla completa con ProviderMixError y transitorio). Mutaciones deliberadas
+RED y restauradas: colapso del camino de batalla a `ProviderMixError else
+externally-limited` (2 canarios rojos) y colapso de la normalización de
+cobertura a `externally-limited` (4 canarios rojos, incluido el byte a byte).
+Focales 137 passed; suite hermética completa (fuera de tests/db e
+integration, `--noconftest`, env sanitizado): 635 passed, 37 skipped, exit 0.
+`generator --check` byte a byte (sin cambios en el coverage commiteado),
+JSONs parsean, secret scan 0 infractores, sin rutas absolutas,
+`typing.get_type_hints(run_matrix_round)` OK. Sin red, sin providers, sin
+.env, sin DB, sin Docker.
+
+## D59 — MON-20 R6: cierre de diseño de la taxonomía completa (T-13..T-16) (2026-08-15)
+
+**Contexto.** Cuarta recurrencia consecutiva sobre la misma causa raíz (la
+taxonomía de fallos aplicada en sitios separados): T-03 (R2→R3), T-08
+(R3→R4), T-11 (R4→R5) y T-13 (R5→R6). `code_review_best_practices.md` §7
+exige volver a diseño cuando tres rondas revelan la misma causa bajo formas
+nuevas. Latwan adjudicó este cierre de diseño en R6 con reconciliación
+explícita de D43.2 ↔ D54 R1.
+
+**Decisión.**
+
+1. **T-13 — reconciliación estructurada D43.2 ↔ D54 R1.** La tabla única
+   queda definida por señales estructuradas, nunca por texto libre:
+   - `FatalProviderError` + 400 → `unsupported-protocol`; 401/403 →
+     `credential/model unavailable`; 404/500/None u otro status →
+     `internal-defect`;
+   - `CredentialRejected` → `credential/model unavailable` (D43.2);
+   - `ProviderPoolExhausted` CON `failure_cause_type == "CredentialRejected"`
+     (pool totalmente en cuarentena por 401/403 credential-specific) →
+     `credential/model unavailable` (D43.2); SIN esa causa (cooldown/cuota/
+     pool transitorio) → `externally-limited` (D54 R1);
+   - `ProviderMixError`/`InternalCleanupError` → `internal-defect`;
+   - `TransientProviderError`, `BenchmarkDeadlineExceeded`,
+     `DecisionDeadlineExceeded` y `ProviderError` genérico →
+     `externally-limited`;
+   - `ProviderSelectionError` en construcción → `credential/model unavailable`;
+   - clase desconocida o `None` → `internal-defect` fail-closed.
+2. **Fuente única stdlib-only.** La tabla vive en
+   `apps/agent/src/ludex_agent/provider_taxonomy.py` (sin imports de
+   SDK/DB/httpx) con firma `provider_failure_class(failure_type,
+   http_status, failure_cause_type=None)`. Runner y generador la importan.
+3. **Los SIETE sitios del inventario pasan por la fuente única.**
+   `matrix.py` rutea `build_provider` (sitio 1), smoke (sitios 2-4 con un
+   solo `except ProviderError`), excepción directa de batalla (sitio 5) y
+   clases terminales del resultado parcial (sitio 6) por
+   `_fatal_status`/`provider_failure_class`; la cobertura (sitio 7) la
+   importa y pasa `failure_cause_type`. Los únicos literales que quedan son
+   `aborted` (preservación para re-derivación por la misma fuente) y
+   `compatible`/`invalid-semantic-response`/`missing-route` (clases no
+   provider). `runtime_status`, `failure_type`, `failure_cause_type`,
+   `failure_stage` y `http_status` se preservan verbatim.
+4. **Canario clase × status × ruta no vacuo.** `test_canario_clase_x_status_x_ruta_no_vacuo`
+   cruza 13 clases (Fatal 400/401/403/404/500/None, ProviderMixError,
+   CredentialRejected, ProviderPoolExhausted con/sin causa, Transient,
+   DecisionDeadlineExceeded, ProviderError genérico) × 4 rutas (smoke,
+   batalla directa, coverage aborted y unsupported-protocol);
+   `test_pool_agotado_por_credencial_no_es_limite_externo` y
+   `test_pool_transitorio_sin_causa_credencial_es_limite_externo` fijan los
+   dos lados de la reconciliación; `test_build_provider_provider_selection_error_es_credential`
+   fija el sitio 1. Mutaciones por bypass de los 7 sitios: todas RED y
+   restauradas.
+5. **T-14 — generador standalone.** `build_matrix_coverage.py` bootstrapa
+   `sys.path` con `apps/agent/src` y importa la taxonomía desde
+   `ludex_agent.provider_taxonomy` (stdlib-only): su comando documentado
+   corre con `/usr/bin/python3` bajo env mínimo, sin instalar `ludex_agent`
+   ni SDKs y sin DB/red/.env. Canario subprocess
+   (`test_generador_corre_con_python3_del_sistema_env_minimo`). R5 lo había
+   roto al importar transitivamente `ludex_agent.matrix`.
+6. **T-15/T-16 — correcciones documentales.** D58: 637 → 635 (el valor real
+   de la suite hermética R5). D57: sub-conteo de mutaciones de la cobertura
+   3 → 4, incluyendo el canario byte a byte.
+
+**Impacto sobre evidencia.** Cero: la reconciliación sólo afecta rutas
+futuras; el coverage commiteado y sus counts permanecen byte a byte
+(verificado con `--check` bajo el venv y bajo `/usr/bin/python3`).
+
+**Verificación.** 142 tests focales (137 + 5 nuevos), suite hermética
+completa (fuera de tests/db e integration, `--noconftest`, env sanitizado):
+640 passed, 37 skipped, exit 0. `generator --check` byte a byte con ambas
+interpretes, JSONs parsean, secret scan 0 infractores, sin rutas absolutas,
+`typing.get_type_hints(run_matrix_round)` OK, invariantes recomputadas (112
+únicos, 22 ready con 18+4, comparable 0, persist 0, 0 no intentadas en
+bucket medido). Sin red, sin providers, sin .env, sin DB, sin Docker.
+
+## D60 — MON-20 R7: cierre de la clase por INVARIANTE EJECUTABLE (F1..F8) (2026-08-15)
+
+**Contexto.** Quinta aparición de la misma familia (T-03 → T-08 → T-11 →
+T-13 → F1). R6 resolvió "la tabla está en varios lugares" pero no cerró la
+clase: F1, introducida por el propio arreglo de R6, demostró que la causa
+raíz de fondo es que NO existía ningún invariante enforced que ligara lo que
+el runner decide con lo que el artefacto persiste. R7 ataca eso.
+
+**Los tres invariantes (nuevos, enforced).**
+
+1. **Round-trip runner → serialización → normalize.**
+   `test_round_trip_runner_serializacion_normalize`: para cada clase de la
+   tabla, clasifica la excepción con el runner REAL, serializa el
+   `MatrixModelResult` tal como se persiste y re-deriva desde ese JSON con
+   `normalize_final_classification`, exigiendo igualdad en las rutas
+   alcanzables (smoke y batalla directa; QuotaExceeded por la tabla). Con
+   el código pre-R7 este test estaba ROJO: demostraba F1.
+2. **Introspección de subclases.**
+   `test_introspeccion_subclases_provider_error_entran_en_tabla`: enumera
+   por introspección las 9 clases de la jerarquía de `ProviderError` y
+   exige que TODAS estén en `EXPLICIT_CLASSES` (fuente única). El
+   fail-closed queda como red de seguridad, no como absorbedor silencioso
+   de clases olvidadas.
+
+   **Corrección R8 (F-A):** `EXPLICIT_CLASSES` nunca fue la fuente única:
+   era un frozenset escrito a mano desacoplado de las ramas de la tabla, y
+   1b lo validaba contra sí mismo (introspección ⊆ frozenset; el frozenset
+   contra nada). Medido por la revisión de R7 (MUT-E3): subclase nueva en
+   el frozenset sin rama en la tabla se publica como `internal-defect` con
+   146 passed y cero rojos — el fail-closed siguió siendo absorbedor
+   silencioso con un invariante en verde dándole cobertura. R8 borró el
+   frozenset y 1b deriva la membresía DE la tabla (ver D61).
+3. **Literales vivos.**
+   `test_literales_taxonomia_solo_en_sitios_allowlist`: enumera los
+   literales de la taxonomía que aparecen en `matrix.py` FUERA de la
+   fuente única y falla si aparece uno nuevo fuera de la allowlist
+   justificada (sitios: `except Exception` del runner, `_terminal_stop_result`,
+   conteo parcial sin failure y `_battle_infrastructure_status`).
+
+   **Corrección R8:** "falla si aparece uno nuevo fuera de la allowlist"
+   era falso en tres formas medidas por la revisión de R7: no escaneaba
+   `build_matrix_coverage.py`, no veía literales construidos dinámicamente
+   ni multilínea, y la enumeración del residuo cubría 5 de los 9 sitios
+   reales de `matrix.py`. R8 extendió el scan a ambos archivos y D61
+   declara el alcance real y las limitaciones por escrito.
+
+**Decisiones.**
+
+1. **F1 — la decisión se limita a la causa DIRECTA.** El tech lead decidió:
+   alinear el runner con lo que se persiste, no agrandar el artefacto.
+   `_structured_cause_type` mira únicamente `exc.__cause__`; el principio
+   inscripto: *la evidencia persistida debe alcanzar para reproducir su
+   propia decisión*. Agrandar lo persistido para justificar una decisión
+   más profunda invierte esa relación y agranda la superficie del artefacto
+   sin necesidad. (Corrección R8: la razón técnica que contradice la
+   presentación original SÍ existe y se aceptó deliberadamente — se pierde
+   precisión diagnóstica en cadenas anidadas: `ProviderPoolExhausted` con
+   credencial a profundidad ≥ 2 queda `externally-limited` donde antes la
+   evidencia decía `credential/model unavailable`. Es un costo aceptado,
+   no un costo inexistente.)
+2. **F3 — canario de RUTEO del sitio 1.** `test_ruteo_sitio1_build_provider_por_la_fuente_unica`
+   usa `TransientProviderError` (veredicto `externally-limited`, distinto
+   del literal viejo `credential/model unavailable`): un bypass del sitio 1
+   al literal fijo lo pone ROJO (verificado).
+3. **F5 — `QuotaExceeded` entra a la tabla como `externally-limited`.** Es
+   el caso arquetípico de límite externo y el fail-closed lo estaba
+   absorbiendo como internal-defect. Hoy es inalcanzable como excepción en
+   la matriz (`KeyRotatingProvider` la captura), pero D60 no quiere otra
+   ronda por omisión: entrada explícita en la tabla y en `EXPLICIT_CLASSES`
+   (R8: `EXPLICIT_CLASSES` ya no existe; la membresía se deriva de la
+   tabla — ver D61).
+4. **F6 — la fila publicada SÍ se corrige; el coverage commiteado CAMBIA.**
+   `credential/model unavailable` sale de `_FAITHFUL` y se re-deriva
+   exactamente como T-08 hizo con `unsupported-protocol`. La fila
+   `open_code_zen/mimo-v2.5-free` afirmaba credential con `quarantined=0`,
+   `failure_cause_type=null`, 2 rotaciones y 1 reintento: su propia
+   evidencia dice cooldown/cuota → `externally-limited` bajo D54 R1.
+   Counts nuevos: credential/model unavailable **0**, externally-limited
+   **11**, total medido **22**; ninguna otra fila, count o invariante
+   cambió (verificado sobre el diff exacto del JSON regenerado con el
+   generador versionado).
+5. **F2 — residuo completo, enumerado y justificado POR SITIO.**
+   Los literales de la taxonomía que quedan fuera de la fuente única:
+   (a) `matrix.py` `except Exception` del runner → `internal-defect`
+   (defecto del runner, no fallo de provider); (b) `_terminal_stop_result`
+   → `internal-defect` (I2, stop por interrupción, compatibilidad
+   indeterminada);    (c) conteo parcial sin `failure` y
+   `completed != requested` → `externally-limited` (conteo de benchmark,
+   no veredicto de provider: se conserva con razón explícita, la
+   alternativa fail-closed acusaría a la casa un parcial reportado sin
+   error de proveedor); (d) `_battle_infrastructure_status` (L-03) →
+   `externally-limited`/`internal-defect`, **declarado deliberadamente
+   FUERA de la fuente única**: clasifica infraestructura LOCAL de Showdown
+   (`ConnectionClosedError`/`ShowdownUnavailableError`). Corrección R8
+   (F-C): la afirmación original "no fallos del proveedor" era
+   descriptivamente falsa — el `else` de ese sitio clasifica como
+   internal-defect cualquier excepción que llegue post-smoke, incluidas
+   las de proveedor (medido: `CredentialRejected` → internal-defect donde
+   la tabla diría credential/model unavailable); hoy ninguna llega por el
+   ORDEN de los `except` de `_run_one`, no por diseño del sitio. El
+   comentario inscripto en el propio sitio se corrigió en R8;
+   (e) `_stop_row`
+   del generador → passthrough de la fuente versionada (ledger de stops),
+   nunca una derivación paralela.
+   R8 completó la enumeración, que en R7 cubría 5 de los 9 sitios reales
+   de `matrix.py` y ninguno de `build_matrix_coverage.py`:
+   (f) `FINAL_STATUSES` (módulo de `matrix.py`) → los cuatro literales,
+   vocabulario de validación del artefacto persistido, no una derivación
+   de veredicto; (g) `build_matrix_coverage.py`: `_FAITHFUL` →
+   `internal-defect` (passthrough de clases terminales no re-derivables),
+   el set de re-derivación de `normalize_final_classification` →
+   `unsupported-protocol`/`credential/model unavailable`, y la comparación
+   T-12 en `build_invariants` → `unsupported-protocol` (comparación, no
+   producción).
+6. **F4 — el número de D57 es 5.** Medido en el árbol de R4
+   (`git archive 2f8d075`, baseline 136 passed, mutación
+   `_FAITHFUL += "unsupported-protocol"` → `5 failed, 131 passed`): los
+   cuatro nombrados más `test_taxonomia_runner_y_coverage_son_la_misma_tabla`.
+   D57 corregido con el valor que imprimió el comando.
+7. **F7 — sin cambio de código, declarado.** El passthrough de `_stop_row`
+   copia `final_classification` del ledger versionado (no es una
+   derivación paralela); queda enumerado en el residuo.
+8. **F8 — follow-up explícito, preexistente, FUERA de R7.** La
+   sanitización del `note` no tiene canario propio (el código es correcto
+   y el control de fuga pasa, pero nada protege la propiedad). Queda como
+   issue de seguimiento.
+
+**Cierre de la quinta recurrencia — corregido en R8.** La afirmación
+original ("1a falsa cualquier divergencia futura sin importar la forma
+nueva que tome") no resiste medición: `normalize_final_classification`
+sólo re-deriva `aborted`, `unsupported-protocol` y
+`credential/model unavailable`; todo lo demás es passthrough, así que la
+aserción de round-trip es un no-op en 10 de los 15 casos (medido caso por
+caso por la revisión de R7), incluido "Pool cadena profunda Credential".
+Alcance real de 1a: es load-bearing para las clases re-derivables; para
+`externally-limited` e `internal-defect` la protección efectiva es la
+tabla de valores esperados (columna `expected`), no el round-trip. Y 1a
+sólo muerde en la cadena profunda porque F6 sacó
+`credential/model unavailable` de `_FAITHFUL` en esta misma ronda; bajo el
+`_FAITHFUL` de R6 la misma aserción habría sido passthrough ciego. Ver
+D61.
+
+**Verificación.** 146 tests focales (142 + 4 nuevos), suite hermética
+completa (fuera de tests/db e integration, `--noconftest`, env sanitizado):
+644 passed, 37 skipped, exit 0. `generator --check` byte a byte con .venv y
+con `/usr/bin/python3` bajo env mínimo. Mutaciones deliberadas POR SITIO,
+todas ROJAS en el canario correcto y restauradas: reintroducir el chain-walk
+(F1) → round-trip rojo; bypass del sitio 1 al literal (F3) → ruteo rojo;
+sacar QuotaExceeded (F5) → introspección + round-trip rojos; volver a
+tratar credential como fiel (F6) → conteos + byte a byte rojos; literal
+nuevo fuera de la allowlist (1c) → guard rojo. `git diff --check` limpio;
+JSONs parsean; secret scan 0 infractores; sin rutas absolutas;
+`typing.get_type_hints(run_matrix_round)` OK. Invariantes: 112 únicos,
+cobertura == manifiesto, 22 medidas con 18+4, 0 comparables, 0 persistidas,
+90 no intentadas, 0 no intentadas en bucket medido, counts nuevos F6
+(credential 0, externally-limited 11). Sin red, sin providers, sin .env,
+sin DB, sin Docker.
+
+## D61 — MON-20 R8: la membresía de la tabla se DERIVA, no se declara; alcance real de cada invariante con mutaciones medidas (2026-08-15)
+
+**Contexto.** La revisión de R7 demostró que los tres invariantes de D60
+no protegían lo que decían proteger: 1b validaba `EXPLICIT_CLASSES` contra
+sí mismo (introspección ⊆ frozenset; el frozenset contra nada) y abría la
+sexta instancia de la causa raíz; 1a era un test de tabla disfrazado de
+round-trip, vacuo en 10 de 15 casos; 1c no escaneaba el generador. El
+tech lead asumió el diagnóstico: el defecto estaba en su diseño de los
+invariantes, no en la ejecución de R7.
+
+**REGLA DE PROCESO (de D61 en adelante).** Ninguna afirmación de que un
+test protege una propiedad puede escribirse sin la mutación MEDIDA que la
+respalde, y las limitaciones del test van escritas al lado. No se escribe
+"el invariante X cierra la familia": se escribe "X detecta las mutaciones
+M1..Mn, verificadas y listadas; X NO detecta la clase C por la razón R".
+Si una afirmación no se puede medir, no se escribe. Esta regla se aplica
+a todo lo que sigue en esta decisión.
+
+**F-A — borrar `EXPLICIT_CLASSES` y derivar la membresía DE la tabla.**
+`provider_taxonomy.py` ahora tiene la tabla en `explicit_failure_class
+(...) -> str | None`: cada rama explícita devuelve su categoría; la
+ausencia de rama devuelve `None` (fail-closed). `provider_failure_class`
+es un wrapper de dos líneas sin ninguna rama: mapea `None` a
+`internal-defect` y nada más. La corrección QUITA la fuente de verdad
+duplicada y no agrega ningún objeto que haya que mantener en sincronía
+con otro: las ramas existen una sola vez y el sentinel `None` es la forma
+en que la tabla reporta su propia decisión. La firma pública y la
+semántica de `provider_failure_class` no cambian para ninguno de los 5
+callers (medido por la suite completa).
+
+1b reescrito deriva la membresía de la tabla: introspecciona la jerarquía
+de `ProviderError` (9 clases) y le exige a `explicit_failure_class` una
+rama explícita para cada una (`explicit_failure_class(nombre, None, None)
+is not None`), más las dos clases de `benchmark.py` que la tabla
+clasifica y NO heredan de `ProviderError` (`InternalCleanupError`,
+`BenchmarkDeadlineExceeded`), importadas como objetos de clase, nunca
+como strings a mano.
+
+Mutaciones medidas (copias `git archive` en scratch, `PYTHONPATH`
+pineado, baseline 146 passed; cada una restaurada y verificada por
+sha256 contra el worktree):
+
+| mutación | canario(s) rojo(s) | resultado |
+|---|---|---|
+| subclase nueva `ProviderThrottled` SIN rama en la tabla (reproducción de MUT-E3 del reviewer) | 1b | 1 failed, 145 passed |
+| sacar `InternalCleanupError` de la rama (reproducción de MUT-E2) | 1b | 1 failed, 145 passed |
+| sacar `BenchmarkDeadlineExceeded` de la rama (reproducción de MUT-E1) | 1b + `test_normalizacion_aborted_usa_la_tabla_del_runner` | 2 failed, 144 passed |
+
+Las tres mutaciones eran VERDES en el árbol de R7 (146 passed, medido por
+el reviewer); ahora las tres ponen 1b en rojo. Límite escrito de 1b: una
+clase nueva agregada FUERA de la jerarquía de `ProviderError` y fuera de
+las dos clases de `benchmark.py` importadas no entra al universo de
+probes y el fail-closed la absorbe; no se intentó cubrir ese caso, queda
+escrito en el docstring del test.
+
+**F-B — alcance real de 1a (documental; el test no cambia).** 1a es
+load-bearing para las clases re-derivables (`aborted`,
+`unsupported-protocol`, `credential/model unavailable`); para
+`externally-limited` e `internal-defect` la protección efectiva es la
+tabla de valores esperados (columna `expected`), porque
+`normalize_final_classification` devuelve esos status verbatim. 1a sólo
+muerde en la cadena profunda porque F6 sacó `credential/model
+unavailable` de `_FAITHFUL` en la misma ronda; bajo el `_FAITHFUL` de R6
+la aserción habría sido passthrough ciego. Medido sobre el árbol de R8
+(mismas mutaciones que la revisión de R7, reproducción propia):
+MUT-F: aserciones de valor esperado neutralizadas (queda SÓLO el
+round-trip) + chain-walk de F1 reintroducido → 1a ROJO (1 failed);
+MUT-G: misma neutralización + flip del expected de un caso passthrough
+("Pool sin causa" → internal-defect) → 1 passed, VERDE: el round-trip no
+ve divergencias que aterricen en `externally-limited`. D60 corregido con
+este alcance.
+
+**1c — extendido a `build_matrix_coverage.py`.** El scan corre sobre los
+DOS archivos con allowlists por (archivo, función, literal) y
+justificación escrita en el test: matrix.py (5 sitios R7 + los 4
+literales de `FINAL_STATUSES`, vocabulario de validación) y
+build_matrix_coverage.py (`_FAITHFUL` → internal-defect passthrough;
+set de re-derivación de `normalize_final_classification`). Mutaciones
+medidas: MUT-D literal nuevo producido en
+`build_matrix_coverage.py` (frozenset con `externally-limited`) → 1c ROJO
+exclusivo (1 failed, 145 passed); MUT-E literal nuevo producido en
+`matrix.py` (sitio no allowlisted) → 1c ROJO exclusivo (1 failed, 145
+passed). Limitaciones escritas en el docstring del test: NO detecta
+literales construidos dinámicamente, NO detecta literales partidos en
+varias líneas, sólo mira contextos de producción en una línea
+(asignación `status =`, `return `, `_fail("`, `_smoke_failed(x, "`,
+miembros de set/frozenset precedidos por `{`/`,` o solos en su línea) y
+sólo escanea los dos archivos listados. No se intentó cubrir los casos
+fuera de ese alcance.
+
+**F-C — comentario de L-03 corregido, sin tocar el código.** La
+afirmación de R7 ("NO fallos del proveedor") era descriptivamente falsa
+para la ruta `BenchmarkFailure`: el `else` de
+`_battle_infrastructure_status` clasifica como internal-defect cualquier
+excepción que llegue post-smoke, incluidas las de proveedor (medido por
+la revisión: `CredentialRejected` → internal-defect donde la tabla diría
+credential/model unavailable). Hoy es inalcanzable por el ORDEN de los
+`except` de `_run_one` (el `except ProviderError` captura antes), no por
+diseño del sitio. El comentario ahora dice esa verdad verificable; la
+taxonomía de infraestructura local sigue deliberadamente fuera de la
+fuente única.
+
+**Trampa del PYTHONPATH (método, no código).** El install editable del
+venv resuelve `ludex_agent` al src del worktree real; una copia
+`git archive` mutada sin `PYTHONPATH` pineado testea el árbol SIN mutar y
+da falso verde en silencio. Medido en esta ronda con la misma mutación y
+el mismo comando: MUT-A sin pin → 1 passed (falso verde); MUT-A con
+`PYTHONPATH=$PWD/src` → FAILED. Tres de las cinco mutaciones de R7
+habrían dado falso verde sin el pin (medido por la revisión de R7 §2.1).
+El método canónico quedó escrito en `.claude/verification/SKILL.md`.
+
+**Verificación.** 146 focales (`test_matrix.py` + `test_cli.py` +
+`test_matrix_coverage.py`, `--noconftest`, env sanitizado); suite
+hermética completa (todos los paths de `tests/` salvo `tests/db` y
+`tests/integration`, por paths explícitos): 644 passed, 37 skipped, exit
+0. `generator --check` byte a byte con `.venv/bin/python` y con
+`/usr/bin/python3` bajo env mínimo: el coverage commiteado NO cambió.
+`git diff --check` limpio; JSONs parsean; secret scan 0 infractores
+nuevos (el único hit es el fixture falso `sk-fake…` preexistente en
+`test_matrix.py`); sin rutas absolutas en el diff;
+`typing.get_type_hints` OK en ambas funciones nuevas. TDD: 1b nuevo ROJO
+contra la taxonomía vieja (ImportError de `explicit_failure_class`),
+VERDE con el cambio, restaurado y verificado por sha256.
+
+**Modelo efectivo:** deepseek-v4-pro (opencode-go/deepseek-v4-pro),
+agente Nebula. Recomendación: In Review (el tech lead interino es la
+única autoridad de veredicto e integración).

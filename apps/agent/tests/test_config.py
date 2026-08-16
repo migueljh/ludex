@@ -84,3 +84,25 @@ def test_rechaza_base_url_no_http():
             "LUDEX_PROVIDER": "kimi",
             "KIMI_BASE_URL": "file:///tmp/socket",
         })
+
+
+def test_battle_timeout_default_180(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgres://u:p@localhost:15432/db")
+    monkeypatch.delenv("LUDEX_BATTLE_TIMEOUT_SECONDS", raising=False)
+    s = load_settings()
+    assert s.battle_timeout_seconds == 180.0
+
+
+def test_battle_timeout_se_configura_por_env(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgres://u:p@localhost:15432/db")
+    monkeypatch.setenv("LUDEX_BATTLE_TIMEOUT_SECONDS", "1800")
+    s = load_settings()
+    assert s.battle_timeout_seconds == 1800.0
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "abc"])
+def test_battle_timeout_debe_ser_positivo(monkeypatch, value):
+    monkeypatch.setenv("DATABASE_URL", "postgres://u:p@localhost:15432/db")
+    monkeypatch.setenv("LUDEX_BATTLE_TIMEOUT_SECONDS", value)
+    with pytest.raises(RuntimeError, match="LUDEX_BATTLE_TIMEOUT_SECONDS"):
+        load_settings()

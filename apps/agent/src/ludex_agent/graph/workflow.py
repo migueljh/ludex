@@ -23,20 +23,35 @@ def build_decision_graph(
     *,
     parser: Callable[[dict[str, Any]], dict[str, Any]] = allowlisted_state,
     clock: Callable[[], float] = time.monotonic,
+    on_stage: Callable[[str], None] | None = None,
 ):
+    """Construye el grafo de decision.
+
+    ``on_stage`` (MON-20 DIAG-A) es observabilidad, no comportamiento: cada
+    nodo async reporta su etapa ANTES de su await, para que
+    `LudexPlayer.decision_snapshot()` pueda localizar una decision atascada
+    (un await SQL sin deadline, el proveedor, el calc). Corre dentro de la
+    task de la decision; el callback decide como mapearla a su contexto.
+    """
     async def resolve_node(state: GraphState) -> dict[str, Any]:
         # F2-09 (MON-14): la seleccion activa se resuelve en CADA invocacion
         # del grafo, nunca al compilarlo ni al arrancar la batalla. Cambiar
         # el modelo activo en la DB surte efecto en la decision siguiente.
+        if on_stage is not None:
+            on_stage("resolve_provider")
         return {"resolved_provider": await resolver.resolve()}
 
     async def parse_node(state: GraphState) -> dict[str, Any]:
         return {"battle_state": parser(state["raw_state"])}
 
     async def calc_node(state: GraphState) -> dict[str, Any]:
+        if on_stage is not None:
+            on_stage("calc_damage")
         return await calc_damage(state, calculator)
 
     async def context_node(state: GraphState) -> dict[str, Any]:
+        if on_stage is not None:
+            on_stage("retrieve_context")
         return await retrieve_context(state, repository)
 
     async def decide_node(state: GraphState) -> dict[str, Any]:
@@ -52,6 +67,8 @@ def build_decision_graph(
         if "deadline" in state:
             decision_state["deadline"] = state["deadline"]
         resolved = state["resolved_provider"]
+        if on_stage is not None:
+            on_stage("decide")
         return await decide(decision_state, resolved.provider, metrics, clock=clock)
 
     builder = StateGraph(GraphState)

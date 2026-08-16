@@ -23,6 +23,7 @@ class Settings:
     llm_request_timeout_seconds: float
     decision_budget_seconds: float
     showdown_turn_limit_seconds: float
+    battle_timeout_seconds: float
 
 
 _PROVIDERS: dict[str, tuple[str, str | None, str | None]] = {
@@ -96,6 +97,9 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     turn_limit = _positive_number(
         env, "LUDEX_SHOWDOWN_TURN_LIMIT_SECONDS", 300,
     )
+    battle_timeout = _positive_number(
+        env, "LUDEX_BATTLE_TIMEOUT_SECONDS", 180,
+    )
     if decision_budget >= turn_limit:
         raise RuntimeError(
             "LUDEX_DECISION_BUDGET_SECONDS debe ser menor que el reloj "
@@ -132,4 +136,5 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         llm_request_timeout_seconds=request_timeout,
         decision_budget_seconds=decision_budget,
         showdown_turn_limit_seconds=turn_limit,
+        battle_timeout_seconds=battle_timeout,
     )
