@@ -444,12 +444,14 @@ CURRENT_FRAME_SEQ: contextvars.ContextVar[int | None] = contextvars.ContextVar(
 )
 
 
-# Cuantos frames se retienen por batalla EN VUELO. Una decision mira uno o
-# dos frames mas alla de su cursor (el `|request|` y la narracion que lo
-# sigue), asi que 128 son dos ordenes de magnitud de margen; sin tope, una
-# corrida de miles de batallas acumula cada frame de cada una para siempre.
-# Desalojar nunca puede devolver una respuesta equivocada: si el frame que
-# seguia al cursor ya se fue, `wait_for_resolution` falla CERRADO (ver ahi).
+# Cuantos frames se retienen por batalla EN VUELO. Una decision mira unos
+# pocos frames atras: desde el watermark de la proyeccion anterior hasta el
+# primer frame de resolucion posterior a su request (MON-26 amplio la ventana
+# de uno a "los que haya entre watermark y cierre", tipicamente 1-2), asi que
+# 128 son dos ordenes de magnitud de margen; sin tope, una corrida de miles
+# de batallas acumula cada frame de cada una para siempre. Desalojar nunca
+# puede devolver una respuesta equivocada: si se desalojo cualquier frame
+# posterior al watermark, `wait_for_resolution` falla CERRADO (ver ahi).
 MAX_RETAINED_FRAMES = 128
 
 
@@ -547,13 +549,36 @@ class RawFrameInbox:
         return self._evicted.get(tag, 0) > after_seq
 
     async def wait_for_resolution(
-        self, tag: str, *, after_seq: int, timeout: float
-    ) -> RawFrame:
-        """Primer frame de resolucion con `seq > after_seq`.
+        self,
+        tag: str,
+        *,
+        after_seq: int,
+        until_seq: int,
+        timeout: float,
+    ) -> list[RawFrame]:
+        """Ventana de frames de resolucion de una decision (MON-26).
 
-        `after_seq` es el cursor capturado SINCRONICAMENTE al empezar la
-        decision, asi que dos decisiones nunca pueden consumir el mismo
-        frame: cada una espera mas alla del suyo.
+        `after_seq` (watermark) es el seq del ultimo frame entregado a la
+        proyeccion ANTERIOR de este tag; `until_seq` es el seq del frame del
+        request PROPIO de esta decision. Devuelve, en orden, todos los frames
+        de resolucion con `after_seq < seq <= closing.seq`, donde `closing`
+        es el PRIMER frame de resolucion con `seq > until_seq`.
+
+        La API anterior devolvia solo `closing`. Eso asumia "[request] seguido
+        de [narracion]" y dejaba HUERFANA cualquier narracion que un request
+        `wait:true` interpusiera antes del request activo: medido en
+        `battle-gen6randombattle-67`, turno 2 -- el frame con `-enditem`
+        llego entre el request de espera y el request activo, ninguna decision
+        lo proyecto, y la memoria de item (D40) reafirmo el item consumido
+        durante el resto de la batalla (21 violaciones de hidden_information).
+        La ventana cierra ese gap: sin request interpuesto devuelve
+        exactamente el mismo frame unico de siempre.
+
+        El watermark es POR TAG (el seq es global; ver el docstring de
+        `publish`): dos batallas concurrentes no pueden pisarse la ventana.
+        Falla cerrado si se desalojo cualquier frame posterior al watermark
+        (la ventana no seria demostrablemente la de esta decision), y espera
+        hasta que `closing` exista o la batalla cierre.
         """
         cond = self._cond(tag)
         try:
@@ -562,28 +587,34 @@ class RawFrameInbox:
                     await cond.wait_for(
                         lambda: (
                             self._lost_frames_after(tag, after_seq)
-                            or self._first_resolution_after(tag, after_seq) is not None
+                            or self._first_resolution_after(tag, until_seq) is not None
                             or tag in self._closed
                         )
                     )
         except TimeoutError as exc:
             raise ProjectionTimeoutError(
                 f"la narracion previa de {tag} no llego en {timeout}s "
-                f"(cursor={after_seq}): no se decide con estado stale"
+                f"(watermark={after_seq}, request={until_seq}): no se decide "
+                "con estado stale"
             ) from exc
         if self._lost_frames_after(tag, after_seq):
             raise ProjectionTimeoutError(
-                f"{tag} desalojo frames posteriores a cursor={after_seq} "
+                f"{tag} desalojo frames posteriores a watermark={after_seq} "
                 f"(tope {self._max_frames}): no se puede demostrar cual es la "
                 "narracion de esta decision"
             )
-        frame = self._first_resolution_after(tag, after_seq)
-        if frame is None:
+        closing = self._first_resolution_after(tag, until_seq)
+        if closing is None:
             raise ProjectionTimeoutError(
                 f"{tag} cerro sin narracion de resolucion despues de "
-                f"cursor={after_seq}"
+                f"request={until_seq}"
             )
-        return frame
+        return [
+            frame
+            for frame in self._frames.get(tag, ())
+            if after_seq < frame.seq <= closing.seq
+            and is_resolution_frame(frame.lines)
+        ]
 
 
 class ObservableVocabulary(Protocol):
@@ -891,6 +922,34 @@ def project_observable_state(
             if canon(normalize_id(mon.get("species") or "")) == objetivo:
                 return mon
         return None
+
+    def enditem_target(ident: str) -> dict | None:
+        """El miembro del equipo rival que NOMBRA este `-enditem` (MON-26).
+
+        Resuelve por identidad canonica (`find`, por `base_species`), NO por
+        "quien esta activo ahora": en una ventana con gap (request
+        `wait:true`, ver `wait_for_resolution`) la narracion puede traer
+        `-enditem` seguido de `switch` en el MISMO frame, y el snapshot --
+        post-narracion -- ya tiene al nombrado fuera de cancha. Resolver por
+        `active()` limpiaria el item del REEMPLAZO y dejaria la memoria del
+        nombrado con el item stale (mismo patron que `own_mon_named` corrige
+        del lado propio). Bajo Illusion el disfraz ES la entrada del equipo,
+        asi que `find` devuelve el mismo objeto que `active()`.
+
+        Si el nombre no esta en el equipo (mon jamas revelado -- el
+        `-enditem` tambien quedo en un gap sin su `-item`), se conserva el
+        fallback al activo actual: es el comportamiento previo, y en ese
+        caso la ranura activa es lo unico publicamente resoluble.
+        """
+        if not ident.startswith(active_prefix):
+            return None
+        nombre = ident.split(":", 1)[-1].strip() if ":" in ident else ""
+        especie = normalize_id(nombre)
+        if especie:
+            target = find(especie)
+            if target is not None:
+                return target
+        return active()
 
     def switch_out(mon: dict) -> None:
         """Saca del campo, replicando `Pokemon.switch_out` (`pokemon.py:
@@ -1709,7 +1768,7 @@ def project_observable_state(
             if mon is not None:
                 remember_item(mon, normalize_id(parts[3]))
         elif tag == "-enditem":
-            mon = active()
+            mon = enditem_target(parts[2])
             if mon is not None:
                 remember_item(mon, None)
         elif tag == "-ability" and len(parts) > 3:

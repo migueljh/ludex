@@ -366,6 +366,77 @@ async def test_swapboost_falla_cerrado_sin_dejar_fila_ni_invocar_proveedor():
     assert player.projection_ambiguity_count == 1
 
 
+async def test_el_watermark_de_proyeccion_es_por_batalla():
+    """MON-26 (condicion del tech lead): el watermark que acota la ventana de
+    frames de `_resolve_state` es POR TAG, nunca global. Con concurrencia > 1,
+    un watermark compartido haria que una batalla salte frames que se
+    publicaron mientras la otra decidia -- perdida SILENCIOSA de evidencia,
+    peor que el defecto que este arreglo corrige. Un frame publicado antes
+    de que la batalla B cierre su ventana tiene que sobrevivir para la
+    SIGUIENTE decision de la batalla A."""
+    class EchoGraph:
+        async def ainvoke(self, graph_input):
+            return {"action": {"kind": "move", "id": "tackle"}, "action_path": "llm"}
+
+    player = _player(decision_graph=EchoGraph())
+    CURRENT_FRAME_SEQ.set(None)
+
+    def serializado(b):
+        return {
+            "turn": 3, "opponent": {"pokemon": []},
+            "field": {"weather": {}, "field_effects": {},
+                      "my_side": {}, "opponent_side": {}},
+            "legal_actions": [{"kind": "move", "id": "tackle"}],
+        }
+
+    async def decidir(tag, *, frames_a_publicar):
+        # La decision anterior del MISMO tag se resuelve como lo haria el
+        # request real del servidor: la orden ya fue enviada ("sent") y llega
+        # el request nuevo.
+        if tag in player._pending_choices:
+            player._pending_choices[tag].outbound_phase = "sent"
+            player._observe_request(tag, '{"rqid": 2}')
+        battle = _fake_battle(
+            battle_tag=tag, available_moves=[SimpleNamespace(id="tackle")]
+        )
+        with patch.object(client_module, "serialize_battle", serializado):
+            pending = player.choose_move(battle)
+        for frame in frames_a_publicar:
+            await player.frame_inbox.publish(tag, frame)
+        await pending
+        return player._last_projection[tag]
+
+    await decidir(
+        "battle-a",
+        frames_a_publicar=[("|switch|p2a: Latias|Latias, L77, F|100/100",)],
+    )
+    watermark_a = player._projected_until["battle-a"]
+    # Un frame de A publicado AHORA, antes de que B decida: A todavia no lo
+    # consumio, y un watermark global lo perderia en la decision siguiente.
+    await player.frame_inbox.publish(
+        "battle-a", ("|switch|p2a: Mandibuzz|Mandibuzz, L84, F|100/100",)
+    )
+    await decidir(
+        "battle-b",
+        frames_a_publicar=[("|switch|p2a: Weezing|Weezing, L83, M|100/100",)],
+    )
+    watermark_b = player._projected_until["battle-b"]
+
+    estado_a2 = await decidir(
+        "battle-a",
+        frames_a_publicar=[("|switch|p2a: Drapion|Drapion, L80, F|100/100",)],
+    )
+    especies = [m["species"] for m in estado_a2["opponent"]["pokemon"]]
+    assert "mandibuzz" in especies, (
+        "el frame de A publicado mientras B decida no puede perderse"
+    )
+    # Evidencia estructural: el watermark es un dict POR TAG y cada tag
+    # avanza sobre SUS frames, no sobre los de la otra batalla.
+    assert player._projected_until["battle-a"] > watermark_a
+    assert player._projected_until["battle-b"] == watermark_b
+    assert player._projected_until["battle-a"] != player._projected_until["battle-b"]
+
+
 async def test_timeout_consume_el_presupuesto_de_decision():
     """La espera no puede exceder el presupuesto de la decision."""
     player = _player(

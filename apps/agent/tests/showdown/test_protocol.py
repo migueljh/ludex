@@ -404,6 +404,9 @@ class FakeVocabulary:
         # pasa a decir "meloettapirouette" (`-formechange` no escribe
         # especie), asi que no hace falta una entrada en BASE para ella.
         "meloettapirouette": ["NORMAL", "FIGHTING"],
+        # MON-26: las especies de la batalla real battle-gen6randombattle-67.
+        "probopass": ["ROCK", "STEEL"],
+        "malamar": ["DARK", "PSYCHIC"],
     }
     # `baseSpecies` del dex, ya normalizado. Es lo que usa
     # `Pokemon.identifies_as` (`pokemon.py:435-438`) para decidir si dos
@@ -530,10 +533,13 @@ async def test_el_inbox_devuelve_la_primera_narracion_posterior_al_cursor():
     tag = "battle-x"
     req = await inbox.publish(tag, ("|request|{}",))
     await inbox.publish(tag, ("|c:|1785|☆Rival|hola",))
-    await inbox.publish(tag, ("|switch|p2a: Latias|Latias, L77, F|100/100",))
+    narr = await inbox.publish(tag, ("|switch|p2a: Latias|Latias, L77, F|100/100",))
 
-    frame = await inbox.wait_for_resolution(tag, after_seq=req.seq, timeout=1)
-    assert frame.lines[0].startswith("|switch|")
+    window = await inbox.wait_for_resolution(
+        tag, after_seq=0, until_seq=req.seq, timeout=1
+    )
+    assert [f.seq for f in window] == [narr.seq]
+    assert window[0].lines[0].startswith("|switch|")
 
 
 async def test_dos_decisiones_no_consumen_el_mismo_frame():
@@ -544,8 +550,12 @@ async def test_dos_decisiones_no_consumen_el_mismo_frame():
     r2 = await inbox.publish(tag, ("|request|2",))
     n2 = await inbox.publish(tag, ("|move|p2a: A|Surf|p1a: B",))
 
-    assert (await inbox.wait_for_resolution(tag, after_seq=r1.seq, timeout=1)).seq == n1.seq
-    assert (await inbox.wait_for_resolution(tag, after_seq=r2.seq, timeout=1)).seq == n2.seq
+    d1 = await inbox.wait_for_resolution(tag, after_seq=0, until_seq=r1.seq, timeout=1)
+    assert [f.seq for f in d1] == [n1.seq]
+    # El watermark de la decision siguiente es la ventana anterior: sin ese
+    # tope, dos decisiones consumirian el mismo frame de cierre.
+    d2 = await inbox.wait_for_resolution(tag, after_seq=n1.seq, until_seq=r2.seq, timeout=1)
+    assert [f.seq for f in d2] == [n2.seq]
 
 
 async def test_el_inbox_espera_a_una_narracion_que_todavia_no_llego():
@@ -557,14 +567,14 @@ async def test_el_inbox_espera_a_una_narracion_que_todavia_no_llego():
         await inbox.publish(tag, ("|faint|p2a: Latias",))
 
     asyncio.create_task(publicar_tarde())
-    frame = await inbox.wait_for_resolution(tag, after_seq=0, timeout=2)
-    assert frame.lines[0].startswith("|faint|")
+    window = await inbox.wait_for_resolution(tag, after_seq=0, until_seq=0, timeout=2)
+    assert [f.lines for f in window] == [("|faint|p2a: Latias",)]
 
 
 async def test_el_inbox_falla_cerrado_al_vencer_el_timeout():
     inbox = RawFrameInbox()
     with pytest.raises(ProjectionTimeoutError):
-        await inbox.wait_for_resolution("battle-x", after_seq=0, timeout=0.01)
+        await inbox.wait_for_resolution("battle-x", after_seq=0, until_seq=0, timeout=0.01)
 
 
 async def test_cerrar_la_batalla_despierta_al_que_espera():
@@ -579,7 +589,7 @@ async def test_cerrar_la_batalla_despierta_al_que_espera():
 
     asyncio.create_task(cerrar())
     with pytest.raises(ProjectionTimeoutError):
-        await inbox.wait_for_resolution(tag, after_seq=0, timeout=2)
+        await inbox.wait_for_resolution(tag, after_seq=0, until_seq=0, timeout=2)
 
 
 async def test_el_inbox_acota_cuantos_frames_retiene_por_batalla():
@@ -604,7 +614,9 @@ async def test_el_inbox_falla_cerrado_si_desalojo_el_frame_del_cursor():
     for i in range(3):
         await inbox.publish("battle-x", (f"|turn|{i + 2}",))
     with pytest.raises(ProjectionTimeoutError, match="desaloj"):
-        await inbox.wait_for_resolution("battle-x", after_seq=cursor, timeout=0.01)
+        await inbox.wait_for_resolution(
+            "battle-x", after_seq=cursor, until_seq=cursor, timeout=0.01
+        )
 
 
 async def test_cerrar_la_batalla_libera_los_frames_retenidos():
@@ -621,15 +633,85 @@ async def test_el_tope_por_defecto_no_estorba_a_una_batalla_normal():
     cursor = (await inbox.publish("battle-x", ("|t:|1",))).seq
     for i in range(64):
         await inbox.publish("battle-x", (f"|turn|{i + 2}",))
-    frame = await inbox.wait_for_resolution(
-        "battle-x", after_seq=cursor, timeout=0.5
+    window = await inbox.wait_for_resolution(
+        "battle-x", after_seq=cursor, until_seq=cursor, timeout=0.5
     )
     # La relacion (el frame del cursor sigue alcanzable) Y el valor exacto: si
     # el tope bajara a 64 el `retained` cambia y este test lo dice, en vez de
     # quedar del lado correcto de una desigualdad.
-    assert frame.lines == ("|turn|2",)
+    assert [f.lines for f in window] == [("|turn|2",)]
     assert inbox.retained("battle-x") == 65
     assert MAX_RETAINED_FRAMES == 128, "poke-env 0.15.0, gen6randombattle"
+
+
+# --- MON-26: ventana de frames por decision ---
+
+
+async def test_la_ventana_incluye_la_narracion_anterior_al_request_wait():
+    """MON-26 (medido en battle-gen6randombattle-67, turno 2): un request
+    `wait:true` entre la narracion de la decision anterior y el request
+    activo dejaba esa narracion HUERFANA -- la espera solo miraba hacia
+    adelante del request propio y el frame con `-enditem` nunca se
+    proyectaba. La ventana tiene que entregar los frames de resolucion entre
+    el watermark (ultima proyeccion) y el frame de cierre, incluidos los que
+    llegaron ANTES del request activo."""
+    inbox = RawFrameInbox()
+    tag = "battle-x"
+    r1 = await inbox.publish(tag, ("|request|1",))
+    n1 = await inbox.publish(tag, ("|move|p2a: A|Tackle|p1a: B",))
+    await inbox.publish(tag, ("|request|2",))  # wait:true
+    n2 = await inbox.publish(tag, (
+        "|-damage|p2a: A|0 fnt",
+        "|-enditem|p2a: A|Air Balloon",
+        "|faint|p2a: A",
+    ))
+    r2 = await inbox.publish(tag, ("|request|3",))  # request activo
+    n3 = await inbox.publish(tag, ("|switch|p2a: C|C, L80|100/100",))
+
+    d1 = await inbox.wait_for_resolution(tag, after_seq=0, until_seq=r1.seq, timeout=1)
+    assert [f.seq for f in d1] == [n1.seq]
+
+    d2 = await inbox.wait_for_resolution(tag, after_seq=n1.seq, until_seq=r2.seq, timeout=1)
+    assert [f.seq for f in d2] == [n2.seq, n3.seq], (
+        "la narracion anterior al request activo no puede quedar huerfana"
+    )
+    assert any(l.startswith("|-enditem|") for f in d2 for l in f.lines)
+
+
+async def test_sin_request_wait_la_ventana_es_el_frame_unico_de_siempre():
+    """MON-26 (condicion del tech lead, no-regresion del flujo normal): sin un
+    request `wait:true` interpuesto, la ventana devuelve EXACTAMENTE el mismo
+    frame unico que devolvia la API anterior. Esta es la garantia de la que
+    depende todo el arreglo."""
+    inbox = RawFrameInbox()
+    tag = "battle-x"
+    r1 = await inbox.publish(tag, ("|request|1",))
+    n1 = await inbox.publish(tag, ("|move|p2a: A|Tackle|p1a: B",))
+    r2 = await inbox.publish(tag, ("|request|2",))
+    n2 = await inbox.publish(tag, ("|move|p2a: A|Surf|p1a: B",))
+
+    d1 = await inbox.wait_for_resolution(tag, after_seq=0, until_seq=r1.seq, timeout=1)
+    d2 = await inbox.wait_for_resolution(tag, after_seq=n1.seq, until_seq=r2.seq, timeout=1)
+    assert [(f.seq, f.lines) for f in d1] == [(n1.seq, n1.lines)]
+    assert [(f.seq, f.lines) for f in d2] == [(n2.seq, n2.lines)]
+    assert len(d1) == len(d2) == 1
+
+
+async def test_el_watermark_es_por_batalla_no_global():
+    """MON-26 (condicion del tech lead): dos batallas intercaladas no pueden
+    pisarse el watermark -- si fuera global, con concurrencia > 1 una batalla
+    perderia frames en silencio, un defecto peor que el que este arreglo
+    corrige."""
+    inbox = RawFrameInbox()
+    ra1 = await inbox.publish("battle-a", ("|request|1",))
+    rb1 = await inbox.publish("battle-b", ("|request|1",))
+    na1 = await inbox.publish("battle-a", ("|move|p2a: A|Tackle|p1a: B",))
+    nb1 = await inbox.publish("battle-b", ("|move|p2a: X|Surf|p1a: Y",))
+
+    da = await inbox.wait_for_resolution("battle-a", after_seq=0, until_seq=ra1.seq, timeout=1)
+    db = await inbox.wait_for_resolution("battle-b", after_seq=0, until_seq=rb1.seq, timeout=1)
+    assert [f.seq for f in da] == [na1.seq]
+    assert [f.seq for f in db] == [nb1.seq]
 
 
 # --- project_observable_state ---
@@ -2399,6 +2481,83 @@ def test_enditem_persiste_none_y_sobrevive_snapshot_fresco():
     snapshot2["opponent"]["pokemon"][0]["item"] = "sitrusberry"
     tras_snapshot_corrupto = _proyectar([], snapshot2, persistent_state=memoria)
     assert _por_especie(tras_snapshot_corrupto)["ludicolo"]["item"] is None
+
+
+def test_enditem_limpia_al_nombrado_aunque_ya_no_este_activo():
+    """MON-26 (pieza B): `-enditem` NOMBRA al mon (`p2a: Ludicolo`). En un
+    frame de gap (ver tests del inbox) la narracion puede traer `-enditem`
+    seguido de `switch` en el MISMO frame, y el snapshot -- post-narracion --
+    ya tiene al nombrado fuera de cancha. Resolver por `active()` limpiaria
+    el item del REEMPLAZO y dejaria la memoria del nombrado con el item
+    stale para siempre."""
+    memoria: dict[str, dict] = {}
+    snapshot = _snapshot(gen=6)
+    snapshot["opponent"]["pokemon"][0]["active"] = False
+    snapshot["opponent"]["pokemon"][0]["fainted"] = True
+    snapshot["opponent"]["pokemon"][0]["status"] = "FNT"
+    snapshot["opponent"]["pokemon"][0]["hp_fraction"] = 0.0
+    snapshot["opponent"]["pokemon"][0]["item"] = "airballoon"
+    snapshot["opponent"]["pokemon"].append({
+        "species": "latias", "hp_fraction": 1.0, "active": True,
+        "fainted": False, "status": None, "level": 77,
+        "item": "unknown_item", "ability": None, "types": ["DRAGON", "PSYCHIC"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [],
+    })
+    out = _proyectar(
+        ["|-enditem|p2a: Ludicolo|Air Balloon",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        snapshot, persistent_state=memoria,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["item"] is None, (
+        "el item del NOMBRADO se limpia aunque ya no este activo"
+    )
+    assert por_especie["latias"]["item"] == "unknown_item", (
+        "el item del reemplazo no se toca"
+    )
+    assert memoria["ludicolo"]["item"] is None
+
+
+def test_secuencia_completa_de_la_batalla_67_limpia_el_item():
+    """MON-26: la ventana de la decision del turno 3 (battle-gen6randombattle-
+    67) trae la narracion del turno 2 (`-damage|0 fnt`, `-enditem`, `faint`)
+    seguida del `switch` del reemplazo, sobre el snapshot post-narracion
+    (fainted=True, active=True, item=None en poke-env) con la memoria D40 en
+    airballoon. El item del desmayado queda None y el reemplazo intacto.
+
+    La linea `-damage` PRECEDE a `-enditem` (hipotesis original del tech
+    lead): medido, `active` NO se limpia ni ahi ni en `faint`, y la
+    resolucion por identidad de la pieza B no depende de eso."""
+    memoria: dict[str, dict] = {"probopass": {"item": "airballoon"}}
+    probopass = {
+        "species": "probopass", "hp_fraction": 0.0, "active": True,
+        "fainted": True, "status": "FNT", "level": 91,
+        "item": None, "ability": None, "types": ["ROCK", "STEEL"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [{"id": "flashcannon", "pp": 15, "max_pp": 16}],
+    }
+    snapshot = _snapshot(gen=6)
+    snapshot["opponent"]["pokemon"] = [probopass]
+    out = _proyectar(
+        ["|move|p1a: Hariyama|Close Combat|p2a: Probopass",
+         "|-supereffective|p2a: Probopass",
+         "|-damage|p2a: Probopass|0 fnt",
+         "|-unboost|p1a: Hariyama|def|1",
+         "|-unboost|p1a: Hariyama|spd|1",
+         "|-enditem|p2a: Probopass|Air Balloon",
+         "|faint|p2a: Probopass",
+         "|switch|p2a: Malamar|Malamar, L81, F|100/100"],
+        snapshot, persistent_state=memoria,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["probopass"]["item"] is None
+    assert por_especie["probopass"]["fainted"] is True
+    assert por_especie["probopass"]["active"] is False
+    assert por_especie["malamar"]["item"] == "unknown_item"
+    assert memoria["probopass"]["item"] is None
 
 
 def test_adquisicion_posterior_reemplaza_la_memoria_anterior():
