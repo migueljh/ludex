@@ -12,3 +12,6 @@ dist/
 
 # Archivo de trabajo local
 chat.md
+
+# Config local de opencode con secrets
+opencode.json
