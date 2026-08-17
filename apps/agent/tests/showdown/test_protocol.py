@@ -2669,6 +2669,24 @@ def _ramas_del_despacho(src: str):
     return ramas
 
 
+def _subarbol_propio(node: ast.If):
+    """Los nodos del CUERPO de la rama, sin bajar por el `orelse`.
+
+    El despacho es una cadena de `elif`: cada rama vive en el `orelse` de la
+    anterior. Si el escaneo bajara por `orelse`, cada rama acumularia las
+    llamadas de TODAS las siguientes y la violacion de una quedaria tapada
+    por el `named_target` de las demas (vacuidad medida en R2). Los `if`
+    ANIDADOS dentro del cuerpo (p.ej. la logica de Trace) si se recorren
+    completos: son logica propia de la rama."""
+    out: list[ast.AST] = []
+    pila = list(node.body)
+    while pila:
+        actual = pila.pop()
+        out.append(actual)
+        pila.extend(ast.iter_child_nodes(actual))
+    return out
+
+
 def test_el_despacho_resuelve_identidad_persistente_por_named_target():
     """MON-26 R2 (alcance 2): ninguna rama del despacho que escriba identidad
     persistente (`remember_item` / `reveal_ability` / lectura de
@@ -2688,11 +2706,12 @@ def test_el_despacho_resuelve_identidad_persistente_por_named_target():
     resueltas = set()
     violaciones = []
     for tags, node in ramas:
+        subarbol = _subarbol_propio(node)
         llamadas = {
-            c.func.id for c in ast.walk(node)
+            c.func.id for c in subarbol
             if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
         }
-        nombres = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        nombres = {n.id for n in subarbol if isinstance(n, ast.Name)}
         escribe_identidad = (
             "remember_item" in llamadas
             or "reveal_ability" in llamadas
