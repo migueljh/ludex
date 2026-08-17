@@ -437,6 +437,63 @@ async def test_el_watermark_de_proyeccion_es_por_batalla():
     assert player._projected_until["battle-a"] != player._projected_until["battle-b"]
 
 
+async def test_ventana_vacia_falla_cerrado_sin_dejar_fila():
+    """MON-26 R2 (F4): el contrato de `wait_for_resolution` permite lista
+    VACIA cuando el cursor de la decision quedo por detras del watermark
+    (dos decisiones resolviendo al mismo `closing`; medido por Tasos con
+    probe). `window[-1]` sin guarda lanzaria `IndexError`, que escapa de los
+    dos `except` de fallo cerrado SIN `_drop_step` -- justo la propiedad que
+    el resto del modulo cuida. La guarda lo convierte en
+    `ProjectionTimeoutError` y el paso reservado se descarta."""
+    class EchoGraph:
+        async def ainvoke(self, graph_input):
+            return {"action": {"kind": "move", "id": "tackle"}, "action_path": "llm"}
+
+    player = _player(decision_graph=EchoGraph())
+    tag = "battle-ventana-vacia"
+    r1 = await player.frame_inbox.publish(tag, ("|request|1",))
+
+    def serializado(b):
+        return {
+            "turn": 3, "opponent": {"pokemon": []},
+            "field": {"weather": {}, "field_effects": {},
+                      "my_side": {}, "opponent_side": {}},
+            "legal_actions": [{"kind": "move", "id": "tackle"}],
+        }
+
+    async def decidir(cursor_ctx):
+        battle = _fake_battle(
+            battle_tag=tag, available_moves=[SimpleNamespace(id="tackle")]
+        )
+        with patch.object(client_module, "serialize_battle", serializado):
+            CURRENT_FRAME_SEQ.set(cursor_ctx)
+            return player.choose_move(battle)
+
+    # Decision 1: cursor cae a last_seq (= r1) y consume la narracion n1;
+    # el watermark queda en n1.seq.
+    pending1 = await decidir(None)
+    n1 = await player.frame_inbox.publish(tag, ("|upkeep",))
+    order = await pending1
+    assert order.order.id == "tackle"
+    assert player._projected_until[tag] == n1.seq
+
+    # La decision 1 se resuelve como lo haria el request real del servidor.
+    player._pending_choices[tag].outbound_phase = "sent"
+    player._observe_request(tag, '{"rqid": 2}')
+
+    # Decision 2: el cursor (r1.seq) queda por DETRAS del watermark
+    # (n1.seq). El frame de cierre es el de n1, ya consumido: la ventana es
+    # vacia y tiene que fallar CERRADO, no con IndexError.
+    with pytest.raises(client_module.ProjectionTimeoutError):
+        await (await decidir(r1.seq))
+
+    assert len(player.steps[tag]) == 1, (
+        "la decision con ventana vacia no puede dejar un paso persistible: "
+        "queda solo el paso de la decision 1"
+    )
+    assert player.projection_timeout_count == 1
+
+
 async def test_timeout_consume_el_presupuesto_de_decision():
     """La espera no puede exceder el presupuesto de la decision."""
     player = _player(

@@ -923,23 +923,27 @@ def project_observable_state(
                 return mon
         return None
 
-    def enditem_target(ident: str) -> dict | None:
-        """El miembro del equipo rival que NOMBRA este `-enditem` (MON-26).
+    def named_target(ident: str) -> dict | None:
+        """El miembro del equipo rival que NOMBRA este ident de evento
+        (MON-26 R2; antes `enditem_target`).
 
         Resuelve por identidad canonica (`find`, por `base_species`), NO por
         "quien esta activo ahora": en una ventana con gap (request
         `wait:true`, ver `wait_for_resolution`) la narracion puede traer
-        `-enditem` seguido de `switch` en el MISMO frame, y el snapshot --
-        post-narracion -- ya tiene al nombrado fuera de cancha. Resolver por
-        `active()` limpiaria el item del REEMPLAZO y dejaria la memoria del
-        nombrado con el item stale (mismo patron que `own_mon_named` corrige
-        del lado propio). Bajo Illusion el disfraz ES la entrada del equipo,
-        asi que `find` devuelve el mismo objeto que `active()`.
+        lineas de identidad persistente (`-item`, `-enditem`, `-ability`,
+        `-endability`) seguidas de `switch` en el MISMO frame, y el
+        snapshot -- post-narracion -- ya tiene al nombrado fuera de cancha.
+        Resolver por `active()` le escribe el dato al REEMPLAZO y envenena
+        la memoria D40 (misatribucion medida, LINEAR_VERDICT MON-26 R1 F1).
+        Bajo Illusion el disfraz ES la entrada del equipo, asi que `find`
+        devuelve el mismo objeto que `active()`.
 
-        Si el nombre no esta en el equipo (mon jamas revelado -- el
-        `-enditem` tambien quedo en un gap sin su `-item`), se conserva el
+        Si el nombre no esta en el equipo (mon jamas revelado -- la linea
+        tambien quedo en un gap sin su revelacion previa), se conserva el
         fallback al activo actual: es el comportamiento previo, y en ese
-        caso la ranura activa es lo unico publicamente resoluble.
+        caso la ranura activa es lo unico publicamente resoluble. Un ident
+        que no sea la ranura activa del rival (`pXa:`) no resuelve a nadie:
+        en singles las lineas de identidad siempre nombran al activo.
         """
         if not ident.startswith(active_prefix):
             return None
@@ -1764,15 +1768,15 @@ def project_observable_state(
             if mon is not None:
                 reveal_ability(mon, "illusion")
         elif tag == "-item" and len(parts) > 3:
-            mon = active()
+            mon = named_target(parts[2])
             if mon is not None:
                 remember_item(mon, normalize_id(parts[3]))
         elif tag == "-enditem":
-            mon = enditem_target(parts[2])
+            mon = named_target(parts[2])
             if mon is not None:
                 remember_item(mon, None)
         elif tag == "-ability" and len(parts) > 3:
-            mon = active()
+            mon = named_target(parts[2])
             if mon is not None:
                 # Trace: poke-env corrige la base a "trace" ANTES de aplicar
                 # el override temporal con la ability copiada
@@ -1792,7 +1796,7 @@ def project_observable_state(
                         reveal_ability(mon, "trace")
                 reveal_ability(mon, parts[3])
         elif tag == "-endability":
-            mon = active()
+            mon = named_target(parts[2])
             if mon is not None:
                 # Restaura la base persistente si habia un override activo;
                 # si no lo hay, no toca nada -- `temporary_ability = None`

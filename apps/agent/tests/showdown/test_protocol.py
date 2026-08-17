@@ -697,11 +697,13 @@ async def test_sin_request_wait_la_ventana_es_el_frame_unico_de_siempre():
     assert len(d1) == len(d2) == 1
 
 
-async def test_el_watermark_es_por_batalla_no_global():
-    """MON-26 (condicion del tech lead): dos batallas intercaladas no pueden
-    pisarse el watermark -- si fuera global, con concurrencia > 1 una batalla
-    perderia frames en silencio, un defecto peor que el que este arreglo
-    corrige."""
+async def test_el_inbox_aisla_los_frames_por_batalla():
+    """MON-26 R2 (F3): el inbox entrega a cada batalla SOLO sus frames,
+    aunque otra batalla publique entre medio. NOTA de honestidad (medido por
+    Tasos): este test NO verifica el watermark compartido -- el inbox no
+    guarda watermark alguno y aca se pasa `after_seq=0` a mano. La evidencia
+    comportamental del watermark por tag la da UNICAMENTE
+    `test_el_watermark_de_proyeccion_es_por_batalla` (client)."""
     inbox = RawFrameInbox()
     ra1 = await inbox.publish("battle-a", ("|request|1",))
     rb1 = await inbox.publish("battle-b", ("|request|1",))
@@ -2520,16 +2522,213 @@ def test_enditem_limpia_al_nombrado_aunque_ya_no_este_activo():
     assert memoria["ludicolo"]["item"] is None
 
 
+# --- MON-26 R2: la clase completa es "identidad persistente resuelta por
+# quien la linea NOMBRA". La pieza A concatena la narracion huerfana con el
+# switch de cierre sobre un snapshot POST-narracion: cualquier handler que
+# resuelva por `active()` le escribe al REEMPLAZO (misatribucion, envenena la
+# memoria D40). Medido por el tech lead y por Tasos: los volatiles se
+# autocorrigen con el switch de cierre; los persistentes no.
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_con_gap(*, item="unknown_item", ability=None, fainted=True):
+    """Snapshot POST-narracion de una ventana con gap: ludicolo salio del
+    campo (o se desmayo) y latias ya esta activa. `active()` resuelve al mon
+    EQUIVOCADO para las lineas que nombran a ludicolo."""
+    snapshot = _snapshot(gen=6)
+    ludicolo = snapshot["opponent"]["pokemon"][0]
+    ludicolo["active"] = False
+    ludicolo["fainted"] = fainted
+    ludicolo["status"] = "FNT" if fainted else None
+    ludicolo["hp_fraction"] = 0.0 if fainted else 1.0
+    ludicolo["item"] = item
+    ludicolo["ability"] = ability
+    snapshot["opponent"]["pokemon"].append({
+        "species": "latias", "hp_fraction": 1.0, "active": True,
+        "fainted": False, "status": None, "level": 77,
+        "item": "unknown_item", "ability": None, "types": ["DRAGON", "PSYCHIC"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [],
+    })
+    return snapshot
+
+
+def test_item_revelado_en_gap_se_le_escribe_al_nombrado_no_al_reemplazo():
+    """MON-26 R2 (F1): `-item` escribe informacion de identidad persistente
+    (`remember_item`) y resuelve por `active()` -- en una ventana con gap eso
+    le escribe el item del desmayado al REEMPLAZO y envenena la memoria D40
+    (reproduccion del tech lead). Resolver por el ident NOMBRADO lo arregla."""
+    memoria: dict[str, dict] = {}
+    out = _proyectar(
+        ["|-item|p2a: Ludicolo|Air Balloon",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        _snapshot_con_gap(), persistent_state=memoria,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["item"] == "airballoon", (
+        "el item se le escribe al NOMBRADO, no al activo post-narracion"
+    )
+    assert por_especie["latias"]["item"] == "unknown_item", (
+        "el reemplazo no es nombrado por la linea y no recibe el item"
+    )
+    assert memoria.get("ludicolo", {}).get("item") == "airballoon"
+    assert "item" not in memoria.get("latias", {}), (
+        "la memoria D40 no puede sembrar un item con la identidad equivocada"
+    )
+
+
+def test_ability_revelada_en_gap_se_le_escribe_al_nombrado_no_al_reemplazo():
+    """MON-26 R2 (F1): `-ability` resuelve por `active()` y escribe via
+    `reveal_ability`. En una ventana con gap la ability revelada del que
+    salio se le escribe al REEMPLAZO."""
+    out = _proyectar(
+        ["|-ability|p2a: Ludicolo|Drizzle",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        _snapshot_con_gap(), persistent_state={},
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["ability"] == "drizzle", (
+        "la ability se le escribe al NOMBRADO"
+    )
+    assert por_especie["latias"]["ability"] is None, (
+        "el reemplazo no es nombrado por la linea y no recibe la ability"
+    )
+
+
+def test_endability_en_gap_restaura_al_nombrado_no_al_reemplazo():
+    """MON-26 R2 (F1): `-endability` restaura la base persistente de la
+    identidad que la linea NOMBRA. Con `active()` (post-narracion) leería la
+    entrada del REEMPLAZO y el override temporal del nombrado quedaría
+    colgado para siempre."""
+    memoria: dict[str, dict] = {"ludicolo": {"ability": "swiftswim"}}
+    out = _proyectar(
+        ["|-endability|p2a: Ludicolo",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        _snapshot_con_gap(ability="intimidate"), persistent_state=memoria,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["ability"] == "swiftswim", (
+        "el override temporal del NOMBRADO termina y vuelve su base"
+    )
+    assert por_especie["latias"]["ability"] is None, (
+        "la entrada del reemplazo no se toca"
+    )
+
+
+# ---------------------------------------------------------------------------
+# MON-26 R2 (alcance 2): invariante ejecutable que cierra la CLASE.
+#
+# La clase adjudicada: "rama del despacho que escribe identidad persistente
+# (llama a `remember_item` o `reveal_ability`, o lee `persistent_state`)
+# resolviendo por `active()` en vez de por `named_target`". Sin este escaneo,
+# la proxima linea de protocolo que agregue alguien reabre la clase en
+# silencio (lo que paso ocho rondas seguidas en MON-20).
+# ---------------------------------------------------------------------------
+
+import ast
+from pathlib import Path
+
+# Allowlist JUSTIFICADA por escrito (adjudicacion del tech lead, R2 §4.1):
+# la clase tiene CUATRO miembros (-item, -enditem, -ability, -endability).
+#   - `-end` (Illusion): fuera del alcance adjudicado. La linea
+#     `|-end|p2a: X|Illusion` nombra al activo cuyo disfraz ACABA de
+#     romperse; en la misma ventana viaja el `|replace|` que lo desenmascara,
+#     y la ability que escribe ("illusion") es la del Zoroark real detras del
+#     disfraz. Patron latente, adjudicado a otro issue si hace falta.
+_ALLOWLIST_R2 = frozenset({"-end"})
+
+
+def _ramas_del_despacho(src: str):
+    """Las ramas `if/elif tag ...` del despacho de `project_observable_state`,
+    como pares (tags, nodo If)."""
+    tree = ast.parse(src)
+    fn = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "project_observable_state"
+    )
+    ramas = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.If):
+            continue
+        tags = set()
+        for test in ([node.test] if not isinstance(node.test, ast.BoolOp)
+                     else node.test.values):
+            if (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
+                    and test.left.id == "tag"):
+                for cmp_ in test.comparators:
+                    if isinstance(cmp_, ast.Constant) and isinstance(cmp_.value, str):
+                        tags.add(cmp_.value)
+                    elif isinstance(cmp_, ast.Tuple):
+                        tags.update(
+                            el.value for el in cmp_.elts
+                            if isinstance(el, ast.Constant) and isinstance(el.value, str)
+                        )
+        if tags:
+            ramas.append((frozenset(tags), node))
+    return ramas
+
+
+def test_el_despacho_resuelve_identidad_persistente_por_named_target():
+    """MON-26 R2 (alcance 2): ninguna rama del despacho que escriba identidad
+    persistente (`remember_item` / `reveal_ability` / lectura de
+    `persistent_state`) puede resolver su objetivo por `active()` en vez de
+    `named_target`. Allowlist escrita arriba con justificacion.
+
+    Canario de no-vacuidad: el escaneo tiene que haber VISTO el despacho
+    real (>= 25 ramas) y las cuatro ramas de la clase resueltas por
+    `named_target`. Mutacion medida: volver `-item` a `active()` pone ESTE
+    test en rojo nombrando la rama (ver tabla de mutaciones en D62)."""
+    src = Path(__file__).resolve().parents[2] / "src" / "ludex_agent" / "showdown" / "protocol.py"
+    ramas = _ramas_del_despacho(src.read_text())
+
+    assert len(ramas) >= 25, (
+        "el escaneo no vio el despacho real: sin ramas que revisar seria vacuo"
+    )
+    resueltas = set()
+    violaciones = []
+    for tags, node in ramas:
+        llamadas = {
+            c.func.id for c in ast.walk(node)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+        }
+        nombres = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        escribe_identidad = (
+            "remember_item" in llamadas
+            or "reveal_ability" in llamadas
+            or "persistent_state" in nombres
+        )
+        if "named_target" in llamadas:
+            resueltas.update(tags)
+            continue
+        if escribe_identidad and "active" in llamadas and not tags <= _ALLOWLIST_R2:
+            violaciones.append(sorted(tags))
+    assert violaciones == [], (
+        f"ramas que escriben identidad persistente resolviendo por active(): "
+        f"{violaciones} -- la clase adjudicada exige named_target"
+    )
+    assert {"-item", "-enditem", "-ability", "-endability"} <= resueltas, (
+        "las cuatro ramas de la clase tienen que resolver por named_target"
+    )
+
+
 def test_secuencia_completa_de_la_batalla_67_limpia_el_item():
-    """MON-26: la ventana de la decision del turno 3 (battle-gen6randombattle-
-    67) trae la narracion del turno 2 (`-damage|0 fnt`, `-enditem`, `faint`)
-    seguida del `switch` del reemplazo, sobre el snapshot post-narracion
-    (fainted=True, active=True, item=None en poke-env) con la memoria D40 en
-    airballoon. El item del desmayado queda None y el reemplazo intacto.
+    """CARACTERIZACION del proyector, no prueba del arreglo (MON-26 R2, F2):
+    este test PASA en la base 093296c y queda verde bajo las dos mutaciones
+    de R1 (verificado por Tasos). Su valor es dejar escrita, con las lineas
+    exactas de battle-gen6randombattle-67, la refutacion de la hipotesis del
+    `-damage` (el proyector nunca fue el problema) y pinar el resultado
+    correcto de la ventana completa.
+
+    La ventana de la decision del turno 3 trae la narracion del turno 2
+    (`-damage|0 fnt`, `-enditem`, `faint`) seguida del `switch` del
+    reemplazo, sobre el snapshot post-narracion (fainted=True, active=True,
+    item=None en poke-env) con la memoria D40 en airballoon. El item del
+    desmayado queda None y el reemplazo intacto.
 
     La linea `-damage` PRECEDE a `-enditem` (hipotesis original del tech
     lead): medido, `active` NO se limpia ni ahi ni en `faint`, y la
-    resolucion por identidad de la pieza B no depende de eso."""
+    resolucion por identidad no depende de eso."""
     memoria: dict[str, dict] = {"probopass": {"item": "airballoon"}}
     probopass = {
         "species": "probopass", "hp_fraction": 0.0, "active": True,

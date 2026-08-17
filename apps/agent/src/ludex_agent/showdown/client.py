@@ -1700,6 +1700,22 @@ class LudexPlayer(RandomPlayer):
         # la proyeccion falla cerrado (`-swapboost`), los frames ya fueron
         # consumidos y la decision siguiente no tiene que volver a tropezar
         # con el mismo frame envenenado.
+        # MON-26 R2 (F4): el contrato del inbox permite ventana VACIA cuando
+        # el cursor de esta decision quedo por DETRAS del watermark (dos
+        # decisiones resolviendo al mismo frame de cierre; medido). Sin
+        # guarda, `window[-1]` lanzaria `IndexError`, que escapa de los dos
+        # `except` de fallo cerrado SIN `_drop_step`. Se convierte en el
+        # mismo fallo cerrado de siempre: ni proveedor con estado ambiguo ni
+        # fila persistida.
+        if not window:
+            self.projection_timeout_count += 1
+            self._drop_step(tag, step)
+            raise ProjectionTimeoutError(
+                f"{tag} entrego una ventana de frames vacia para la decision "
+                f"(watermark={self._projected_until.get(tag, 0)}, "
+                f"request={cursor}): no se puede demostrar cual es la "
+                "narracion de esta decision"
+            )
         self._projected_until[tag] = window[-1].seq
         try:
             projected = project_observable_state(
