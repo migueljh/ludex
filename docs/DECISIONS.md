@@ -4176,20 +4176,22 @@ no envenenan la decisión siguiente. El reintento no consume frames y no
 toca el watermark. El chequeo de desalojo ahora protege todo el rango
 `(watermark, closing]`, no sólo el cierre.
 
-**B — `-enditem` resuelve por identidad, no por activo actual.** La
-línea nombra al mon (`p2a: Probopass`). En una ventana con gap la
-narración puede traer `-enditem` seguido de `switch` en el MISMO frame y
-el snapshot —post-narración— ya tiene al nombrado fuera de cancha;
-`active()` resolvería al REEMPLAZO: corrompería su item y dejaría la
-memoria del nombrado stale. `enditem_target` resuelve por `find`
-(`base_species`) sobre el equipo, con fallback a `active()` sólo si el
-nombre no está en el equipo (comportamiento previo). Bajo Illusion el
-disfraz ES la entrada del equipo: `find` y `active()` devuelven el mismo
-objeto, cero cambio para D40 T-02.
+**B — identidad persistente resuelta por el ident NOMBRADO.** La línea
+nombra al mon (`p2a: Probopass`). En una ventana con gap la narración
+puede traer la línea seguida de `switch` en el MISMO frame y el snapshot
+—post-narración— ya tiene al nombrado fuera de cancha; `active()`
+resolvería al REEMPLAZO: corrompería su dato y dejaría la memoria del
+nombrado stale. En R1 la pieza cubría sólo `-enditem` (`enditem_target`);
+**en R2 se generalizó a `named_target`** y se aplicó a los cuatro
+handlers de la clase (ver R2 abajo). Resuelve por `find` (`base_species`)
+sobre el equipo, con fallback a `active()` sólo si el nombre no está en
+el equipo (comportamiento previo). Bajo Illusion el disfraz ES la
+entrada del equipo: `find` y `active()` devuelven el mismo objeto, cero
+cambio para D40 T-02.
 
-**Mutaciones medidas** (in-place sobre el worktree, `PYTHONPATH` pineado
-al árbol mutado, restauradas con `git checkout` y verificadas por
-sha256):
+**Mutaciones medidas (R1)** (in-place sobre el worktree, `PYTHONPATH`
+pineado al árbol mutado, restauradas con `git checkout` y verificadas
+por sha256):
 
 | mutación | tests rojos | otros tests nuevos |
 |---|---|---|
@@ -4199,31 +4201,42 @@ sha256):
 La afirmación de no-regresión del flujo normal tiene mutación medida
 (condición del tech lead): `test_sin_request_wait_la_ventana_es_el_frame_
 unico_de_siempre` fija que, sin `wait:true`, la ventana entrega
-exactamente el mismo frame único de la API anterior; al revertir A ese
-test sigue verde porque el contrato se preserva, y los DOS tests de la
-ventana son los que muerden. El aislamiento por tag tiene doble
-evidencia: estructural (`_projected_until` es dict por tag; el test
-aserta los valores por separado) y comportamental (un frame de A
-publicado mientras B decide sobrevive para la decisión siguiente de A —
-la mutación A lo pierde).
+exactamente el mismo frame único de la API anterior; la mutación que lo
+pone rojo es la ENSANCHADORA (off-by-one `after_seq <` → `<=`, medida
+por Tasos: 2 failed), no la de colapsar la ventana. El aislamiento por
+tag del INBOX (`test_el_inbox_aisla_los_frames_por_batalla`, renombrado
+en R2 por F3) verifica que cada tag recibe sus frames; la evidencia
+comportamental del WATERMARK compartido la da ÚNICAMENTE el test de
+client `test_el_watermark_de_proyeccion_es_por_batalla` (un frame de A
+publicado mientras B decide sobrevive para la decisión siguiente de A;
+con watermark global se pierde — medido por Tasos).
 
 **Limitaciones conocidas.** (1) `active()` devolviendo `None` en tags de
-evidencia observada (`-item`, boosts, `-ability`) sigue siendo
-SILENCIOSO; MON-26 no lo cambió (item 6 del alcance, aceptado por el
-tech lead): B elimina el caso agudo de `-enditem` y el silencio global
-queda como candidato a issue aparte. (2) `-item` que caiga completo en
-un gap (sin su `-enditem` posterior) deja la memoria sin sembrar; el
-defecto de MON-26 era el par revelación→consumo y la pieza A lo cierra
-para toda la clase, pero ese caso puntual no tiene test propio —si el
-mon nunca se reveló, `enditem_target` cae al fallback `active()`
-documentado. (3) Las violaciones ya persistidas de la batalla 67 (y las
-v1 de D44) no se re-persisten: fuera de alcance por el issue. (4) El
-watermark se inicializa en 0 y avanza por entrega; una decisión que
-falla cerrado por timeout no avanza el watermark (no consumió frames),
-que es lo correcto.
+evidencia observada sigue siendo SILENCIOSO; MON-26 no lo cambió (item 6
+del alcance, aceptado por el tech lead): `named_target` elimina el caso
+agudo de la clase y el silencio global queda como candidato a issue
+aparte. (2) RETIRADA en R2 — la redacción anterior decía que `-item` en
+gap "deja la memoria sin sembrar" y que "la pieza A lo cierra para toda
+la clase". **La medición (tech lead + Tasos) dice lo contrario**: `-item`
+en gap SIEMBRA la memoria, pero con el mon EQUIVOCADO (misatribución al
+reemplazo), el mecanismo idéntico que produjo las 21 violaciones. R2
+cerró esa boca (ver abajo). (3) Las violaciones ya persistidas de la
+batalla 67 (y las v1 de D44) no se re-persisten: fuera de alcance por el
+issue. (4) El watermark se inicializa en 0 y avanza por entrega; una
+decisión que falla cerrado por timeout no avanza el watermark (no
+consumió frames), que es lo correcto. (5) R2/F5: un reintento dentro de
+un gap devuelve `_last_projection[tag]` y persiste esa fila SIN la
+narración del gap (item viejo). Es semántica PREEXISTENTE del retry, no
+la introduce MON-26; la decisión real siguiente consume el gap y corrige.
+Se documenta, NO se arregla acá.
 
-**Verificación.** TDD rojo antes (11 tests rojos: firma nueva + defecto
-B), verde después. Suite Python completa con base descartable
+**Verificación (R1).** TDD: los 6 tests nuevos estaban rojos en la base
+093296c en 5 de 6 casos, y 4 de esos 5 por firma/atributo
+(`until_seq`/`_projected_until`), no por semántica — la evidencia real
+la dan las mutaciones, no el rojo en la base. `test_secuencia_completa_
+de_la_batalla_67_limpia_el_item` PASA en la base y queda verde bajo las
+dos mutaciones (medido por Tasos): es CARACTERIZACIÓN del proyector, no
+prueba del arreglo (F2). Suite Python completa con base descartable
 (`TEST_DATABASE_URL` DSN PLANO — la variante `postgresql+asyncpg` la
 rechaza el fixture; medido): worktree 795 passed / 1 skipped / 0 failed;
 base limpia 093296c (archive completo, mismo env, `PYTHONPATH` pineado)
@@ -4231,3 +4244,98 @@ base limpia 093296c (archive completo, mismo env, `PYTHONPATH` pineado)
 TypeScript: no aplica (ningún archivo TS tocado; el auditor no cambia).
 `git diff --check` limpio; sin rutas absolutas; sin secretos; commit en
 inglés con rutas explícitas.
+
+---
+
+## D62-R2 — MON-26: la clase completa es identidad persistente resuelta por el ident NOMBRADO; ventana vacía falla cerrado (2026-08-16)
+
+**Contexto (LINEAR_VERDICT R1 F1).** La pieza A concatena la narración
+huérfana con el frame de cierre sobre un snapshot POST-narración: el
+reemplazo ya está en cancha cuando se procesan las líneas que nombran al
+que salió. Eso expone a toda la familia de handlers que resuelven por
+`active()`. Medido por el tech lead y por Tasos, handler por handler,
+viendo el estado DESPUÉS del `switch` de cierre:
+
+| Handler | Qué escribe | Tras el `switch` de cierre |
+|---|---|---|
+| `-damage 0 fnt` + `faint` | volátil | se autocorrige |
+| `-status` | volátil | se autocorrige |
+| `-boost` | volátil | se autocorrige |
+| `-enditem` | persistente | cerrado por la pieza B (R1) |
+| `-item` | persistente | 🔴 misatribuye + envenena D40 |
+| `-ability` | persistente | 🔴 misatribuye |
+| `-endability` | persistente | 🔴 lee la entrada equivocada |
+
+**La clase:** handlers que escriben información de identidad persistente
+(`remember_item` / `reveal_ability` / lectura de `persistent_state`)
+resolviendo por `active()` en vez de por el ident que la línea NOMBRA.
+Cuatro miembros: `-item`, `-enditem`, `-ability`, `-endability`.
+Alcanzable, medido contra el corpus: 890 turnos con línea `-item`, 151
+con `-item` + `faint` en el mismo turno, 92 con `-item` seguido de
+`switch` del mismo lado.
+
+**1. `named_target` en los cuatro.** `enditem_target` se renombró a
+`named_target` y ahora lo usan `-item`, `-enditem`, `-ability` y
+`-endability`. La resolución por identidad cambia QUIÉN recibe el dato,
+nunca QUÉ se escribe: la lógica de Trace (`-ability`) y la restauración
+(`-endability`) no se tocan. Fuera de una ventana con gap
+`find(nombrado) == active()`, así que ninguna ruta existente cambia de
+comportamiento — verificado corriendo la suite completa de integración
+(batallas reales) en verde, sin divergencias.
+
+**2. Invariante ejecutable (AST) que cierra la clase.**
+`test_el_despacho_resuelve_identidad_persistente_por_named_target`
+escanea el despacho de `project_observable_state` y falla si una rama
+escribe identidad persistente resolviendo por `active()` en vez de
+`named_target`. Allowlist escrita con justificación: `-end` (Illusion),
+adjudicada fuera de R2 (la clase tiene cuatro miembros; la línea nombra
+al activo cuyo disfraz acaba de romperse y en la misma ventana viaja el
+`|replace|` que lo desenmascara). Dos canarios de no-vacuidad en el
+propio test: el escaneo vio >= 25 ramas del despacho real, y las cuatro
+ramas de la clase resuelven por `named_target`.
+
+**3. F4 — ventana vacía falla cerrado.** `wait_for_resolution` puede
+devolver lista vacía cuando el cursor de la decisión queda por detrás del
+watermark (dos decisiones resolviendo al mismo `closing`). Guarda en
+`client._resolve_state`: `raise ProjectionTimeoutError` dentro del fallo
+cerrado existente (con `_drop_step`), en vez de `IndexError` que escapaba
+sin descartar el paso.
+
+**Mutaciones medidas (R2, in-place, `PYTHONPATH` pineado, restauradas
+con `git checkout` y sha256 verificado):**
+
+| mutación | tests rojos | precisión |
+|---|---|---|
+| M1 `-item` → `active()` | invariante AST (nombra `['-item']`) + `test_item_revelado_en_gap_se_le_escribe_al_nombrado_no_al_reemplazo` | los tests de `-ability`/`-endability` siguen verdes |
+| M2 `-ability` → `active()` | invariante AST + `test_ability_revelada_en_gap_...` | el de `-item` sigue verde |
+| M3 `-endability` → `active()` | invariante AST (nombra `['-endability']`) + `test_endability_en_gap_restaura_...` | los demás verdes |
+| M4 guarda F4 quitada | `test_ventana_vacia_falla_cerrado_sin_dejar_fila` con `IndexError` exacto en client.py:1703 | solo ese |
+| M5 M1 + allowlist ampliada a `-item` | invariante AST ROJO por el CANARIO de las cuatro ramas (no por la lista de violaciones) | la allowlist no puede esconder una mutación de un miembro de la clase |
+
+**Sobre la no-vacuidad del invariante (lección medida).** La primera
+versión del escáner recorría cada rama con `ast.walk` completo, que baja
+por el `orelse` de la cadena `elif`: cada rama acumulaba las llamadas de
+todas las siguientes y la violación de `-item` quedaba tapada por el
+`named_target` de `-enditem` — M1 daba VERDE con el invariante roto. Se
+midió, se corrigió (escaneo del cuerpo propio de cada rama) y se
+commiteó aparte (`cebc400`). La regla de proceso D61 se aplica al propio
+invariante: su vacuidad también se demuestra con mutación.
+
+**F2/F3.** `test_secuencia_completa_de_la_batalla_67_limpia_el_item`
+pasaba en la base y queda verde bajo las mutaciones: es caracterización
+del proyector (deja escrita la refutación de la hipótesis del
+`-damage`), no prueba del arreglo; su docstring lo dice ahora.
+`test_el_watermark_es_por_batalla_no_global` se renombró a
+`test_el_inbox_aisla_los_frames_por_batalla`: verifica aislamiento de
+frames por tag (queda verde con watermark compartido, medido por Tasos);
+la cobertura del watermark por tag la da el test de client.
+
+**Verificación (R2).** Suite completa en serie, DSN plano, base
+descartable `ludex_mon16_gate`: 800 passed / 1 skipped / 0 failed (delta
+5 sobre R1: 3 tests de gap + invariante AST + F4). Los 5 nuevos estaban
+rojos antes del arreglo por la razón correcta (los 3 de gap por
+misatribución real, el AST por las ramas violadoras, F4 por `IndexError`
+exacto en client.py:1703). Worktree limpio salvo los 2 artefactos del
+tech lead (no commiteados, fuera de rango). Sin segunda fuente de verdad
+agregada: el canario del invariante es un oráculo de test, no una lista
+que la producción tenga que mantener en sincronía.
