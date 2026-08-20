@@ -748,6 +748,7 @@ def project_observable_state(
     opponent_side: str,
     vocabulary: ObservableVocabulary,
     persistent_state: dict[str, dict] | None = None,
+    pre_applied: int = 0,
 ) -> dict:
     """Aplica al snapshot inmutable la evidencia PUBLICA de un frame crudo.
 
@@ -761,6 +762,18 @@ def project_observable_state(
     Singles: en `p2a:` el sufijo `a` ES la ranura activa, asi que las lineas
     de HP/status/boost se aplican al activo proyectado sin depender del
     apodo (que puede no ser la especie).
+
+    MON-26 R3 (`pre_applied`): las PRIMERAS `pre_applied` lineas vienen de
+    frames que poke-env YA proceso antes de que el snapshot se capturara
+    (frames de gap: llegaron entre el request `wait:true` y el request
+    activo; el caller deriva el corte comparando el `seq` de cada frame de
+    la ventana con el `seq` del request). Sus efectos ya estan en el
+    snapshot, asi que el unico efecto NO idempotente -- el descuento de PP
+    de `apply_move` -- no se reaplica: poke-env ya llamo `Move.use()` al
+    parsear la narracion y re-descontar da el doble descuento medido
+    (pp=14 con el protocolo derivando 15/16). Todo lo demas (HP, status,
+    boosts absolutos, items, abilities) es idempotente o se reescribe con
+    el switch de cierre.
 
     `persistent_state` es la UNICA memoria que sobrevive entre llamadas
     (por eso es un parametro explicito, mutado in-place, y no un cache
@@ -1158,11 +1171,24 @@ def project_observable_state(
         (`move.py:114` y `move.py:477-478`): es una regla fija de la
         generacion, no informacion oculta. Sin generacion en el snapshot el PP
         no es derivable y va en null (schema v2).
+
+        MON-26 R3: el transformer se resuelve por el ident NOMBRADO
+        (`named_target(parts[2])`), no por `active()` -- en una ventana con
+        gap el reemplazo recibia el moveset y la ability copiados. La fuente
+        se resuelve IGUAL que antes cuando es propia (`own_mon_named`) y por
+        nombre cuando es rival (`named_target`): `mon_for_ident` NO se
+        generaliza porque sus otros llamadores (typechange y afines) son
+        ramas medidas como no-miembros y quedan fuera del alcance de R3.
         """
-        mon = active()
+        mon = named_target(parts[2])
         if mon is None or len(parts) < 4:
             return
-        source = mon_for_ident(parts[3].strip())
+        source_ident = parts[3].strip()
+        source = (
+            named_target(source_ident)
+            if source_ident.startswith(active_prefix)
+            else own_mon_named(source_ident)
+        )
         if source is None:
             return
         gen = snapshot.get("gen")
@@ -1262,7 +1288,7 @@ def project_observable_state(
         mon["item"] = value
         entry["item"] = value
 
-    def register_move(mon: dict, raw_move: str, *, use: bool) -> None:
+    def register_move(mon: dict, raw_move: str, *, use: bool, pre_applied: bool = False) -> None:
         """Revela un movimiento del rival y descuenta su PP.
 
         `use=False` revela sin consumir: es lo que hace poke-env para el
@@ -1273,6 +1299,15 @@ def project_observable_state(
         la contabilidad de poke-env) y para un movimiento nuevo desde el
         `max_pp` del dex. Cuando no es derivable con exactitud va en `null`
         (schema v2): dejar el numero anterior seria afirmar un PP stale.
+
+        MON-26 R3 (`pre_applied`): para lineas de frames que poke-env YA
+        proceso antes del snapshot, el descuento NO se reaplica -- la
+        bandera se deriva UNICAMENTE del orden de frames (seq < seq del
+        request), no del estado del snapshot ni de si hay un switch despues.
+        Regla: descuenta iff `not pre_applied`. Con eso las cuatro celdas
+        del oraculo dan el PP post-uso exacto (16 sin-gap -> 15; 15
+        pre-aplicada -> 15, la firma de battle-120) y los usos repetidos
+        del flujo normal siguen descontando uno por uno (10 sin-gap -> 9).
         """
         move_id = normalize_id(raw_move)
         # Hidden Power: Showdown narra siempre "Hidden Power", nunca el tipo.
@@ -1286,7 +1321,7 @@ def project_observable_state(
             max_pp = vocabulary.move_max_pp(move_id)
             existing = {"id": move_id, "pp": max_pp, "max_pp": max_pp}
             mon["moves"].append(existing)
-        if not use:
+        if not use or pre_applied:
             return
         if pressure_on_us():
             # `Move.use` descuenta 2 con Pressure (`move.py:123-127`) y la regla
@@ -1320,11 +1355,14 @@ def project_observable_state(
         A diferencia de `mon_for_ident`, devuelve `None` (no `own_active()`)
         cuando el ident es nuestro: nuestro lado ya llega fresco por el
         `|request|` y no hay nada que proyectar sobre `me`.
+
+        MON-26 R3: resuelve por el ident NOMBRADO (`named_target`), no por
+        `active()`: en una ventana con gap el `[of] p2a: X` de una linea
+        `-damage`/`-item` puede nombrar a un mon que ya salio del campo, y
+        `active()` le escribe el dato al REEMPLAZO (misatribucion medida,
+        misma clase que R2 cerro para los handlers directos).
         """
-        ident = ident.strip()
-        if ident.startswith(active_prefix):
-            return active()
-        return None
+        return named_target(ident.strip())
 
     def apply_damage_or_heal_ownership(parts: list[str], *, heal: bool) -> None:
         """Item/ability revelados por el sufijo de una linea `-damage`/`-heal`.
@@ -1424,7 +1462,7 @@ def project_observable_state(
         if victima is not None:
             remember_item(victima, None)
 
-    def apply_move(parts: list[str]) -> None:
+    def apply_move(parts: list[str], *, pre_applied: bool = False) -> None:
         """`|move|{side}a: X|Nombre|objetivo|sufijos...`.
 
         Reproduce las excepciones de pertenencia que poke-env 0.15.0 ya
@@ -1433,8 +1471,21 @@ def project_observable_state(
         narrado pertenece al actor: en el corpus hay 39 lineas `|move|` con
         `[from] ability:`, casi todas Magic Bounce, donde el movimiento
         reflejado era del rival de ese actor.
+
+        MON-26 R3: el actor se resuelve por el ident NOMBRADO (`named_target`),
+        no por `active()` -- en una ventana con gap el reemplazo recibia el
+        movimiento del que salio (2817 turnos del corpus con move + switch del
+        mismo lado). `pre_applied=True` marca lineas de frames que poke-env YA
+        proceso antes del snapshot (frames de gap, ver `wait_for_resolution`):
+        el descuento de PP NO se reaplica -- `mon.moved(..., use=True)` de
+        poke-env ya lo hizo y re-descontarlo da el doble descuento medido
+        (pp=14 con el protocolo derivando 15/16, la firma de las 4 violaciones
+        de hidden_information/moves de battle-gen6randombattle-120). El
+        reveal SÍ se reaplica: es idempotente (si el movimiento ya esta en el
+        snapshot no se agrega; si no esta, poke-env tampoco lo revelo y el
+        `reveal` de aca sigue sus mismas reglas).
         """
-        mon = active()
+        mon = named_target(parts[2])
         if mon is None:
             return
         event = list(parts)
@@ -1479,7 +1530,7 @@ def project_observable_state(
                 continue
             break
         if reveal and len(event) > 3:
-            register_move(mon, event[3], use=use)
+            register_move(mon, event[3], use=use, pre_applied=pre_applied)
 
     def forme_change(forme: str, *, permanent: bool) -> None:
         """`detailschange` (Mega/Primal, `permanent=True`) y `-formechange`
@@ -1583,7 +1634,7 @@ def project_observable_state(
             if move.get("id") in desconocidos:
                 move["pp"] = None
 
-    for line in lines:
+    for idx, line in enumerate(lines):
         parts = line.split("|")
         tag = parts[1] if len(parts) > 1 else ""
         if tag == "turn" and len(parts) > 2:
@@ -1757,7 +1808,7 @@ def project_observable_state(
             if mon is not None:
                 mon["boosts"] = {k: -v for k, v in mon["boosts"].items()}
         elif tag == "move" and len(parts) > 3:
-            apply_move(parts)
+            apply_move(parts, pre_applied=idx < pre_applied)
         elif tag == "-end" and len(parts) > 3 and normalize_id(parts[3]) == "illusion":
             # `|-end|{side}a: Zoroark|Illusion` es la linea publica que declara
             # que el activo tenia Illusion. poke-env llega al mismo valor por

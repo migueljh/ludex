@@ -1717,6 +1717,14 @@ class LudexPlayer(RandomPlayer):
                 "narracion de esta decision"
             )
         self._projected_until[tag] = window[-1].seq
+        # MON-26 R3: las lineas de frames con seq < cursor (los del gap,
+        # interpuestos por un request `wait:true`) llegan de frames que
+        # poke-env YA proceso antes de capturar el snapshot: sus efectos
+        # (incluido el descuento de PP de `Move.use()`) ya estan aplicados
+        # y el proyector no debe reaplicar el unico efecto NO idempotente.
+        pre_applied = sum(
+            len(frame.lines) for frame in window if frame.seq < cursor
+        )
         try:
             projected = project_observable_state(
                 snapshot,
@@ -1728,6 +1736,7 @@ class LudexPlayer(RandomPlayer):
                 # ESTA decision seguir siendo correcto varias decisiones
                 # despues, cuando recien ahi llegue su switch-out.
                 persistent_state=self._temporary_state.setdefault(tag, {}),
+                pre_applied=pre_applied,
             )
         except ProjectionAmbiguityError:
             # Mismo fallo CERRADO que el timeout: la alternativa era copiar

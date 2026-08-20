@@ -366,6 +366,172 @@ async def test_swapboost_falla_cerrado_sin_dejar_fila_ni_invocar_proveedor():
     assert player.projection_ambiguity_count == 1
 
 
+async def test_el_cableado_pre_applied_no_descuenta_pp_de_frames_de_gap():
+    """MON-26 R3: el cliente deriva `pre_applied` comparando el seq de cada
+    frame de la ventana con el cursor del request propio, y el proyector no
+    reaplica el descuento de PP de las lineas de gap (poke-env ya llamo
+    `Move.use()` al parsear esa narracion). End-to-end: ventana con gap
+    real, snapshot post-narracion pp=15 -> proyectado pp=15, no 14."""
+    class EchoGraph:
+        async def ainvoke(self, graph_input):
+            return {"action": {"kind": "move", "id": "tackle"}, "action_path": "llm"}
+
+    player = _player(decision_graph=EchoGraph())
+    tag = "battle-pre-applied"
+
+    def serializado(b):
+        return {
+            "turn": 3, "player_role": "p1",
+            "opponent": {"pokemon": [
+                {
+                    "species": "ludicolo", "hp_fraction": 0.0, "active": False,
+                    "fainted": True, "status": "FNT", "level": 88,
+                    "item": "unknown_item", "ability": None,
+                    "types": ["WATER", "GRASS"],
+                    "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                               "evasion": 0, "accuracy": 0},
+                    "moves": [{"id": "energyball", "pp": 15, "max_pp": 16}],
+                },
+            ]},
+            "field": {"weather": {}, "field_effects": {},
+                      "my_side": {}, "opponent_side": {}},
+            "legal_actions": [{"kind": "move", "id": "tackle"}],
+        }
+
+    # Frame de gap (llego ANTES del request): la narracion del rival.
+    await player.frame_inbox.publish(
+        tag, ("|move|p2a: Ludicolo|Energy Ball|p1a: Tentacruel",)
+    )
+    # Request propio posterior al gap: el cursor queda DESPUES del frame.
+    request = await player.frame_inbox.publish(tag, ("|request|{}",))
+    battle = _fake_battle(
+        battle_tag=tag, available_moves=[SimpleNamespace(id="tackle")]
+    )
+    with patch.object(client_module, "serialize_battle", serializado):
+        CURRENT_FRAME_SEQ.set(request.seq)
+        pending = player.choose_move(battle)
+    # Frame de cierre: el switch del reemplazo.
+    await player.frame_inbox.publish(
+        tag, ("|switch|p2a: Latias|Latias, L77, F|100/100",)
+    )
+    await pending
+
+    estado = player._last_projection[tag]
+    por_especie = {m["species"]: m for m in estado["opponent"]["pokemon"]}
+    assert por_especie["ludicolo"]["moves"] == [
+        {"id": "energyball", "pp": 15, "max_pp": 16}
+    ], (
+        "la linea de gap ya estaba en el snapshot: el PP no se descuenta "
+        "dos veces (criterio R3: 15, no 14)"
+    )
+    assert por_especie["latias"]["moves"] == []
+
+
+async def test_frame_move_antes_del_request_sin_switch_deriva_pre_aplicado():
+    """MON-26 R3 (canario de cableado): la bandera `pre_applied` se deriva
+    del ORDEN de frames (move ANTES del request -> poke-env ya lo proceso),
+    aun SIN switch de por medio. Snapshot POST-narracion pp=15 -> 15."""
+    class EchoGraph:
+        async def ainvoke(self, graph_input):
+            return {"action": {"kind": "move", "id": "tackle"}, "action_path": "llm"}
+
+    player = _player(decision_graph=EchoGraph())
+    tag = "battle-pre-aplicado-sin-switch"
+
+    def serializado(b):
+        return {
+            "turn": 3, "player_role": "p1",
+            "opponent": {"pokemon": [
+                {
+                    "species": "ludicolo", "hp_fraction": 0.5, "active": True,
+                    "fainted": False, "status": None, "level": 88,
+                    "item": "unknown_item", "ability": None,
+                    "types": ["WATER", "GRASS"],
+                    "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                               "evasion": 0, "accuracy": 0},
+                    "moves": [{"id": "energyball", "pp": 15, "max_pp": 16}],
+                },
+            ]},
+            "field": {"weather": {}, "field_effects": {},
+                      "my_side": {}, "opponent_side": {}},
+            "legal_actions": [{"kind": "move", "id": "tackle"}],
+        }
+
+    await player.frame_inbox.publish(
+        tag, ("|move|p2a: Ludicolo|Energy Ball|p1a: Tentacruel",)
+    )
+    request = await player.frame_inbox.publish(tag, ("|request|{}",))
+    battle = _fake_battle(
+        battle_tag=tag, available_moves=[SimpleNamespace(id="tackle")]
+    )
+    with patch.object(client_module, "serialize_battle", serializado):
+        CURRENT_FRAME_SEQ.set(request.seq)
+        pending = player.choose_move(battle)
+    await player.frame_inbox.publish(tag, ("|upkeep",))
+    await pending
+
+    estado = player._last_projection[tag]
+    por_especie = {m["species"]: m for m in estado["opponent"]["pokemon"]}
+    assert por_especie["ludicolo"]["moves"] == [
+        {"id": "energyball", "pp": 15, "max_pp": 16}
+    ], (
+        "el frame de move llego ANTES del request: la bandera deriva "
+        "pre_aplicado y el PP no se re-descuenta (celda 2 del oraculo)"
+    )
+
+
+async def test_frame_move_despues_del_request_no_deriva_pre_aplicado():
+    """MON-26 R3 (canario de cableado): un frame de move que llega DESPUES
+    del request (frame de cierre) NO es pre-aplicado: el snapshot es PRE-
+    narracion y el descuento SI corre (pp=10 -> 9, uso repetido)."""
+    class EchoGraph:
+        async def ainvoke(self, graph_input):
+            return {"action": {"kind": "move", "id": "tackle"}, "action_path": "llm"}
+
+    player = _player(decision_graph=EchoGraph())
+    tag = "battle-no-pre-aplicado"
+
+    def serializado(b):
+        return {
+            "turn": 3, "player_role": "p1",
+            "opponent": {"pokemon": [
+                {
+                    "species": "ludicolo", "hp_fraction": 0.5, "active": True,
+                    "fainted": False, "status": None, "level": 88,
+                    "item": "unknown_item", "ability": None,
+                    "types": ["WATER", "GRASS"],
+                    "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                               "evasion": 0, "accuracy": 0},
+                    "moves": [{"id": "energyball", "pp": 10, "max_pp": 16}],
+                },
+            ]},
+            "field": {"weather": {}, "field_effects": {},
+                      "my_side": {}, "opponent_side": {}},
+            "legal_actions": [{"kind": "move", "id": "tackle"}],
+        }
+
+    request = await player.frame_inbox.publish(tag, ("|request|{}",))
+    battle = _fake_battle(
+        battle_tag=tag, available_moves=[SimpleNamespace(id="tackle")]
+    )
+    with patch.object(client_module, "serialize_battle", serializado):
+        CURRENT_FRAME_SEQ.set(request.seq)
+        pending = player.choose_move(battle)
+    await player.frame_inbox.publish(
+        tag, ("|move|p2a: Ludicolo|Energy Ball|p1a: Tentacruel",)
+    )
+    await pending
+
+    estado = player._last_projection[tag]
+    por_especie = {m["species"]: m for m in estado["opponent"]["pokemon"]}
+    assert por_especie["ludicolo"]["moves"] == [
+        {"id": "energyball", "pp": 9, "max_pp": 16}
+    ], (
+        "el frame de move llego DESPUES del request: no es pre-aplicado y "
+        "el descuento corre una vez (uso repetido)"
+    )
+
+
 async def test_el_watermark_de_proyeccion_es_por_batalla():
     """MON-26 (condicion del tech lead): el watermark que acota la ventana de
     frames de `_resolve_state` es POR TAG, nunca global. Con concurrencia > 1,
