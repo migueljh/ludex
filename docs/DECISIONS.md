@@ -4339,3 +4339,119 @@ exacto en client.py:1703). Worktree limpio salvo los 2 artefactos del
 tech lead (no commiteados, fuera de rango). Sin segunda fuente de verdad
 agregada: el canario del invariante es un oráculo de test, no una lista
 que la producción tenga que mantener en sincronía.
+
+---
+
+## D62-R3 — MON-26: los miembros vivos del despacho delegado, el escáner transitivo y el doble descuento de PP (2026-08-16)
+
+**Contexto (adjudicación del tech lead, reproducida con sonda propia).** El
+escáner de R2 miraba el cuerpo propio de cada rama; las ramas que DELEGAN en
+un helper quedaban fuera de su universo. Escáner transitivo sobre el HEAD de
+R2: **33 ramas, 21 helpers**, 8 ramas escriben identidad resolviendo por
+`active()` DENTRO de un helper. Medidas una por una en el escenario de gap
+(narración huérfana + switch de cierre, sonda propia coincidente con la del
+tech lead):
+
+| Rama | Helper | Contamina | ¿Miembro? |
+|---|---|---|---|
+| `move` | `apply_move` | `moves` (movimiento ajeno al reemplazo) | 🔴 sí — **2.817 turnos** del corpus con move+switch del mismo lado (~7%) |
+| `-transform` | `apply_transform` | `ability`, `moves` | 🔴 sí |
+| `-damage` con `[of]` | `apply_damage_or_heal_ownership` | `ability` | 🔴 sí |
+| `-item` transferencia | `apply_item_transfer_ownership` | `item` + memoria D40 | 🔴 sí |
+| `-start` typechange / `-formechange` / `detailschange` / `-heal` con `[of]` / `replace` | `apply_typechange` / `forme_change` / `end_illusion` | — (el switch de cierre descarta la escritura) | no |
+
+**1. Los cuatro miembros por identidad nombrada (QUIÉN, nunca QUÉ).**
+- `apply_move`: `mon = named_target(parts[2])`; el actor nombrado recibe el
+  movimiento, el reemplazo queda limpio.
+- `apply_transform`: el transformer por `named_target(parts[2])` Y la fuente
+  resuelta LOCALMENTE (rival: `named_target`; propia: `own_mon_named`).
+  **`mon_for_ident` NO se generalizó** (adjudicación expresa): sus otros
+  llamadores (typechange y afines) son ramas medidas como no-miembros.
+- `apply_damage_or_heal_ownership` y `apply_item_transfer_ownership`:
+  `_owner_of` resuelve por `named_target` (era el resolver compartido de las
+  rutas `[of]`). Los canarios de `-heal` fijan que la salida final del
+  reemplazo NO cambia: `test_heal_por_item_propio_en_gap_...` y
+  `test_heal_con_of_en_gap_...` (la ruta Hospitality es inalcanzable en
+  singles — hospitality exige aliado —; con la resolución por nombre la
+  escritura va al mon que la línea nombra).
+
+**2. Escáner TRANSITIVO (invariante ejecutable).** La clausura de cada rama
+sigue las llamadas a helpers anidados de `project_observable_state` de forma
+transitiva — la frontera se DERIVA por alcanzabilidad, no se declara.
+`escribe_identidad` ahora incluye `remember_item`, `reveal_ability`,
+`register_move`, lecturas de `persistent_state` Y asignaciones directas de
+campos de identidad sobre `mon` (`species`/`ability`/`item`/`moves`/`types`;
+`hp`/`status`/`boosts` quedan fuera: los reescribe el switch de cierre).
+Reglas:
+- Una rama que escribe identidad no puede contener `active` en su clausura
+  EN ABSOLUTO (fuera del cuerpo de `named_target`, el trust anchor cuyo
+  fallback documentado a `active()` no puede autodenunciar al invariante) —
+  ni siquiera junto a un `named_target` de otro dato: **medido** con
+  M-transform, donde el `named_target` de la fuente tapaba el `active()` del
+  transformer antes de endurecer la regla.
+- Canario POR RAMA, no por tag: cada rama de un miembro tiene `named_target`
+  en su clausura; una rama duplicada del mismo tag no queda tapada por otra
+  que sí resuelve bien, y la allowlist no puede ocultar un miembro (medido:
+  M-allowlist).
+- Allowlist escrita con justificación medida: `-end` (Illusion, adjudicada
+  fuera de R2/R3), `-start`, `-formechange`, `detailschange`, `replace`
+  (sus escrituras las descarta el switch de cierre).
+
+**3. El doble descuento de PP (lo que era MON-27 es ESTA clase).** poke-env
+procesa `|move|` con `mon.moved(..., use=True)` (`abstract_battle.py:740`,
+`Move.use()`): el PP del rival YA está descontado en el snapshot cuando la
+narración drenó antes del request (gap). El proyector re-aplicaba la línea y
+descontaba otra vez: snapshot PRE pp=16 → 15 (correcto), snapshot POST
+pp=15 → **14** — la firma exacta de las 4 violaciones de
+`hidden_information/moves` de `battle-gen6randombattle-120`. FIX:
+`pre_applied` se deriva ÚNICAMENTE del orden de frames (`seq < seq del
+request`, calculado en `client._resolve_state`), nunca del estado del
+snapshot ni de si hay un switch después; `register_move` descuenta iff
+`not pre_applied`. Oráculo de CUATRO celdas, todas → 15:
+(1) PRE16 sin switch, pre=0; (2) POST15 sin switch, pre=1 (battle-120);
+(3) PRE16 con switch, pre=0 → Ludicolo 15 + reemplazo limpio;
+(4) POST15 con switch, pre=1 → Ludicolo 15 + reemplazo limpio. Pin aparte:
+uso repetido sin gap (pp=10, pre=0 → 9) — queda PROHIBIDA por adjudicación
+cualquier regla por-estado (`pp == max_pp` y afines) que lo rompa. Canarios
+de cableado en client: pre=1 con y sin switch cuando el frame de move llega
+ANTES del request; pre=0 cuando llega después.
+
+**Mutaciones medidas (R3, in-place, `PYTHONPATH` pineado, restauradas con
+copia byte a byte y sha256 verificado):**
+
+| mutación | rojos |
+|---|---|
+| M-canario-profundidad-2: rama NUEVA `-endmove` → helper → helper que escribe por `active()` | invariante nombra `['-endmove']` (el write vive a profundidad 2) |
+| M-move: `apply_move` → `active()` | invariante `['move']` + gap test de move |
+| M-owner: `_owner_of` → `active()` | invariante + gap de `-damage [of]`, transfer y Rocky Helmet |
+| M-transform: mon → `active()` (con el `named_target` de la fuente intacto) | invariante (tras endurecer la regla) + gap de transform |
+| M-allowlist: `-item` en allowlist + main `-item` → `active()` | invariante POR EL CANARIO por rama (la allowlist no oculta) |
+| M-pp: `pre_applied = 0` en client | los 2 canarios de cableado (celdas 2/4) |
+| M-transitiva: clausura eliminada (solo cuerpo propio) | invariante por el canario por rama |
+
+**Verificación.** Entorno recreado con `uv sync` (el worktree mon-20 y su
+venv dejaron de existir entre R2 y R3; Python 3.12.12, uv 0.9.27). Corrida
+válida: `env -i` + `PYTHONPATH` pineado + SOLO `TEST_DATABASE_URL` (DSN
+plano) + `DATABASE_URL=` vacío (para que el conftest no repueble la base
+compartida desde `.env`) + `--ignore=tests/integration/test_langgraph_
+battle.py`: **723 passed, 94 skipped (motivo explicado), 0 failed, 1
+exclusión documentada** (el langgraph test es un gate live de MON-16 que
+exige DATABASE_URL y el server; NO se le agrega skip). Suite focal showdown:
+280 passed. Desviación registrada: dos corridas anteriores inválidas
+(suite2 cuelgue en test_graph_play por DATABASE_URL repoblado desde `.env`
+con los servicios de juego apagados; suite3 idem — causas confirmadas por el
+tech lead y documentadas aquí como procedimiento, no como defecto).
+
+**Limitaciones que quedan (R3).** (1) La ruta `-heal` con `[of]`
+(Hospitality) es inalcanzable en singles; con `_owner_of` por nombre su
+escritura va al mon nombrado. (2) `mon_for_ident` conserva su rama
+`active()` para idents rivales: sus llamadores restantes (typechange,
+afines) son no-miembros medidos; patrón latente, adjudicado fuera. (3) La
+ability de Mega Evolution (`intimidate` vs `hugepower` de
+mawile/mawilemega) es MON-27 GENUINO, fuera de R3. (4) F5 (retry en gap
+persiste una fila con item viejo) documentado, no arreglado. (5) El
+escáner es estructural: una reescritura del despacho que extraiga los
+handlers del cuerpo del proyector lo dejaría sin clausura que seguir — el
+canario de >= 25 ramas/15 helpers lo denuncia. No se afirma que la clase
+queda cerrada sin la mutación medida que lo respalde: las mutaciones de
+arriba son la evidencia.
