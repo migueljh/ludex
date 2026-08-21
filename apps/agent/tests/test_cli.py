@@ -1223,6 +1223,189 @@ def test_benchmark_rechaza_battle_timeout_no_positivo(monkeypatch):
     assert "positivo" in result.stdout
 
 
+# --- MON-28: fail-fast de `--run-id` antes de cualquier efecto live -------
+#
+# Evidencia real (MON-16): `--run-id 20260821t131800z-mon27-e2e-google-
+# gemini-2.5-flash` (el punto de "gemini-2.5-flash") llego hasta DESPUES de
+# una batalla real y su persistencia -- `build_benchmark_record` solo se
+# alcanzaba por primera vez desde `report_progress`. `battle-id=3981`/
+# `trajectory-id=2725`: 29 decisiones persistidas, cero artefacto de
+# corrida, `ValueError` enmascarando el resultado.
+# ---------------------------------------------------------------------------
+
+
+def _fail_if_called(name: str):
+    def _boom(*args, **kwargs):
+        raise AssertionError(
+            f"{name} no debe llamarse: el run_id invalido tiene que "
+            f"fallar ANTES de cualquier efecto live"
+        )
+    return _boom
+
+
+def test_benchmark_rechaza_run_id_con_punto_antes_de_efectos_live(
+    monkeypatch, tmp_path
+):
+    """MON-28 R1: un `--run-id` con punto (reproduccion exacta del bug real)
+    tiene que fallar con el error de validacion de `[a-z0-9-]+` ANTES de
+    `_benchmark_command`, `write_run_snapshot` o `append_ledger_row`. Los
+    tres espian con un `AssertionError` propio si se los llega a invocar --
+    un mock que simplemente no se ejercita no demuestra nada por si solo,
+    asi que ademas se confirma que ni el artefacto ni el ledger existen en
+    disco."""
+    monkeypatch.setattr(
+        cli_module, "_benchmark_command", _fail_if_called("_benchmark_command")
+    )
+    monkeypatch.setattr(
+        cli_module, "write_run_snapshot", _fail_if_called("write_run_snapshot")
+    )
+    monkeypatch.setattr(
+        cli_module, "append_ledger_row", _fail_if_called("append_ledger_row")
+    )
+    monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path)
+    ledger_path = tmp_path / "ledger.md"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark", "--n", "1", "--opponent", "random",
+            "--provider", "google", "--model", "gemini-2.5-flash",
+            "--run-id", "20260821t131800z-mon27-e2e-google-gemini-2.5-flash",
+            "--ledger", str(ledger_path), "--no-record",
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "GEMINI_API_KEY": "fake-key",
+        },
+    )
+    assert result.exit_code != 0, result.stdout
+    assert "[a-z0-9-]+" in str(result.exception), result.exception
+    assert list(tmp_path.iterdir()) == [], (
+        "ningun artefacto se escribe con un run_id invalido"
+    )
+    assert not ledger_path.exists()
+
+
+def test_benchmark_rechaza_run_id_con_ruta_o_espacio_antes_de_efectos_live(
+    monkeypatch, tmp_path
+):
+    """Contrapeso del canario anterior con un id de forma distinta (ruta +
+    espacio) para no depender solo del caso puntual del punto -- mismo
+    mecanismo, `RUN_ID_PATTERN` completo."""
+    monkeypatch.setattr(
+        cli_module, "_benchmark_command", _fail_if_called("_benchmark_command")
+    )
+    monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark", "--n", "1", "--opponent", "random",
+            "--provider", "google", "--model", "gemini-2.5-flash",
+            "--run-id", "../bad id", "--no-record",
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "GEMINI_API_KEY": "fake-key",
+        },
+    )
+    assert result.exit_code != 0, result.stdout
+    assert "[a-z0-9-]+" in str(result.exception), result.exception
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_benchmark_acepta_run_id_valido_y_llega_a_efectos_live(monkeypatch, tmp_path):
+    """Control positivo: un `--run-id` que YA cumple `[a-z0-9-]+` conserva
+    el flujo normal -- `_benchmark_command` SI se invoca, con exactamente el
+    run_id pedido."""
+    captured: dict[str, object] = {}
+
+    async def fake_benchmark_command(*, on_progress, **kwargs):
+        captured["called"] = True
+        metrics = {
+            "turns_total": 1, "calls_total": 1,
+            "input_tokens": 10, "output_tokens": 2,
+            "cached_input_tokens": 0, "reasoning_tokens": 0,
+            "turns_model_invalid": 0, "turns_fallback": 0,
+            "turns_deadline_affected": 0, "key_rotations": 0,
+        }
+        return (
+            BenchmarkResult(
+                requested=1, completed=1, wins=1, losses=0, ties=0,
+                provider="google", model="gemini-2.5-flash",
+            ),
+            metrics,
+        )
+
+    monkeypatch.setattr(cli_module, "_benchmark_command", fake_benchmark_command)
+    monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark", "--n", "1", "--opponent", "random",
+            "--provider", "google", "--model", "gemini-2.5-flash",
+            "--run-id", "mon27-e2e-google-gemini-2-5-flash",
+            "--ledger", str(tmp_path / "ledger.md"),
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "GEMINI_API_KEY": "fake-key",
+        },
+    )
+    assert result.exit_code == 0, result.stdout
+    assert captured.get("called") is True
+    artifact = tmp_path / "mon27-e2e-google-gemini-2-5-flash.json"
+    assert artifact.exists()
+
+
+def test_benchmark_sin_run_id_genera_uno_valido(monkeypatch, tmp_path):
+    """Control por defecto: omitir `--run-id` sigue generando un id que
+    pasa `validate_run_id` sin cambiar el contrato -- el default ya
+    reemplaza `_`/`.` por `-` (`effective_run_id`, `cli.py`), asi que este
+    control tiene que seguir en verde sin que el fix lo toque."""
+    captured: dict[str, object] = {}
+
+    async def fake_benchmark_command(*, on_progress, **kwargs):
+        captured["called"] = True
+        metrics = {
+            "turns_total": 1, "calls_total": 1,
+            "input_tokens": 10, "output_tokens": 2,
+            "cached_input_tokens": 0, "reasoning_tokens": 0,
+            "turns_model_invalid": 0, "turns_fallback": 0,
+            "turns_deadline_affected": 0, "key_rotations": 0,
+        }
+        return (
+            BenchmarkResult(
+                requested=1, completed=1, wins=1, losses=0, ties=0,
+                provider="google", model="gemini-2.5-flash",
+            ),
+            metrics,
+        )
+
+    monkeypatch.setattr(cli_module, "_benchmark_command", fake_benchmark_command)
+    monkeypatch.setattr(cli_module, "DEFAULT_RUNS_PATH", tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark", "--n", "1", "--opponent", "random",
+            "--provider", "google", "--model", "gemini-2.5-flash",
+            "--ledger", str(tmp_path / "ledger.md"),
+        ],
+        env={
+            "DATABASE_URL": "postgresql+asyncpg://x:x@localhost:15432/x",
+            "GEMINI_API_KEY": "fake-key",
+        },
+    )
+    assert result.exit_code == 0, result.stdout
+    assert captured.get("called") is True
+    artifacts = [p for p in tmp_path.iterdir() if p.suffix == ".json"]
+    assert len(artifacts) == 1, artifacts
+    # el default reemplaza "." de "gemini-2.5-flash" por "-": sin punto.
+    assert "." not in artifacts[0].stem
+
+
 @pytest.mark.asyncio
 async def test_battle_timeout_llega_a_run_benchmark(monkeypatch):
     """La propagacion NO puede volver a una constante fija: el timeout que

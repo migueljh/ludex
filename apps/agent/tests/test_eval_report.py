@@ -8,6 +8,7 @@ from ludex_agent.eval_cost import PricingTable
 from ludex_agent.eval_report import (
     append_ledger_row,
     build_benchmark_record,
+    validate_run_id,
     write_run_json,
     write_run_snapshot,
 )
@@ -212,6 +213,30 @@ def test_snapshot_parcial_se_reemplaza_atomicamente(tmp_path):
     assert '"completed": 2' in rendered
     assert '"wins": 1' in rendered
     assert not artifact.with_suffix(".json.tmp").exists()
+
+
+def test_validate_run_id_no_permite_rutas_ni_espacios():
+    """MON-28: `validate_run_id` es la gramática pública y única -- este es
+    el mismo caso que `test_run_id_no_permite_rutas_ni_espacios` (abajo)
+    ejerce a través de `build_benchmark_record`, pero contra la función
+    centralizada directamente, sin pasar por el resto del record."""
+    with pytest.raises(ValueError, match=r"\[a-z0-9-\]\+"):
+        validate_run_id("../bad id")
+
+
+def test_validate_run_id_rechaza_un_punto():
+    """MON-28: reproducción directa del bug real medido en vivo --
+    `20260821t131800z-mon27-e2e-google-gemini-2.5-flash` (el nombre del
+    modelo `gemini-2.5-flash` trae un punto) llegaba hasta después de la
+    batalla real antes de esta ronda."""
+    with pytest.raises(ValueError, match=r"\[a-z0-9-\]\+"):
+        validate_run_id("20260821t131800z-mon27-e2e-google-gemini-2.5-flash")
+
+
+def test_validate_run_id_acepta_un_id_valido():
+    """Control positivo: un run id que ya cumple `[a-z0-9-]+` no levanta
+    nada -- `validate_run_id` no muta ni transforma, solo valida."""
+    assert validate_run_id("20260821t131800z-mon27-e2e-google-gemini-2-5-flash") is None
 
 
 def test_run_id_no_permite_rutas_ni_espacios():

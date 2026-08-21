@@ -4632,3 +4632,97 @@ coordinador (no Opus 5 High, pese a que `code_review_best_practices.md` §8
 recomienda Opus para diagnóstico multi-frontera — el diagnóstico ya estaba
 adjudicado antes de esta ronda; R1 es implementación acotada sobre diseño
 aprobado). Recomendación: `In Review`.
+
+---
+
+## D64 — MON-28 R1: `--run-id` inválido falla ANTES de cualquier efecto live (2026-08-21)
+
+**Contexto.** Medido en vivo durante MON-16
+(`/tmp/ludex-mon27-live-gemini.log`): `benchmark --run-id
+20260821t131800z-mon27-e2e-google-gemini-2.5-flash` (el punto de
+`gemini-2.5-flash`) violaba `RUN_ID_PATTERN = [a-z0-9-]+`, pero esa
+validación solo vivía dentro de `build_benchmark_record`, alcanzada por
+primera vez desde `report_progress` — **después** de que la batalla real
+ya corrió. Resultado: `battle-id=3981`/`trajectory-id=2725` con 29
+decisiones persistidas, cero artefacto de corrida, y un `ValueError`
+enmascarando el resultado en vez de rechazar el argumento en la frontera
+CLI antes de gastar nada.
+
+**Fix — gramática única, un solo punto de fallo.**
+`eval_report.py` gana `validate_run_id(run_id: str) -> None`: la misma
+regex y el mismo mensaje (`"run_id must match [a-z0-9-]+"`) que antes vivía
+inline dentro de `build_benchmark_record`, ahora extraídos a una función
+pública. `build_benchmark_record` la llama en su primera línea (sin
+cambiar su contrato ni su firma). `benchmark_command` (`cli.py`) la llama
+inmediatamente después de calcular `effective_run_id` — antes de
+`model_route`, `_benchmark_command`, cualquier selección de provider,
+Showdown, DB, escritura de artifact o de ledger.
+
+**Reordenamiento mínimo, sin refactor.** En la base, `selected_route =
+model_route(...)` corría ANTES de calcular `effective_run_id` (el route no
+depende del run id). Se movió esa línea a DESPUÉS de
+`validate_run_id(effective_run_id)`: `model_route`/`load_model_routes`
+son lecturas locales puras (JSON de rutas ya vendorizado, sin red ni
+efectos), así que moverlas no cambia su comportamiento — solo el orden en
+que un `run_id` inválido las precede. No se tocó la gramática
+`[a-z0-9-]+`, la generación del id por defecto, la ruta de artifacts,
+providers, retries, Showdown, el recorder ni ningún handler de MON-27.
+
+**Tests agregados.**
+
+- `test_eval_report.py`: `test_validate_run_id_no_permite_rutas_ni_espacios`
+  y `test_validate_run_id_rechaza_un_punto` (reproducción directa del id
+  real medido en vivo) contra la función centralizada, sin pasar por
+  `build_benchmark_record`; `test_validate_run_id_acepta_un_id_valido`
+  como control positivo. El test previo,
+  `test_run_id_no_permite_rutas_ni_espacios` (contra
+  `build_benchmark_record`), no se tocó — sigue verde porque
+  `build_benchmark_record` sigue validando, ahora a través de la función
+  compartida.
+- `test_cli.py`: `test_benchmark_rechaza_run_id_con_punto_antes_de_efectos_live`
+  (canario de frontera real, reproduce el id exacto del log) y
+  `test_benchmark_rechaza_run_id_con_ruta_o_espacio_antes_de_efectos_live`
+  (contrapeso de forma). Ambos espían `_benchmark_command`,
+  `write_run_snapshot` y `append_ledger_row` con un `AssertionError` propio
+  si se llegan a invocar, y además confirman en disco que ni el artifact ni
+  el ledger se escriben — un mock que simplemente no se ejercita no
+  demuestra nada por sí solo. Controles:
+  `test_benchmark_acepta_run_id_valido_y_llega_a_efectos_live` (un id ya
+  válido conserva el flujo, `_benchmark_command` SÍ se invoca) y
+  `test_benchmark_sin_run_id_genera_uno_valido` (omitir `--run-id` sigue
+  generando un id válido, sin cambiar el contrato del default).
+
+**Mutación medida (in-place, `PYTHONPATH` pineado, restaurada y verificada
+por sha256).** Quitar la llamada a `validate_run_id(effective_run_id)` de
+`benchmark_command` (dejando intacta la de `build_benchmark_record`): los
+dos canarios de frontera real se ponen rojos, y en ambos casos el mensaje
+de la falla es el `AssertionError` propio de `_benchmark_command` — es
+decir, la mutación se detecta exactamente porque `_benchmark_command` SÍ
+se invocó con el run_id inválido, la misma firma del bug real. Restaurado
+byte a byte (`shasum -a 256` idéntico antes/después:
+`640b7fb1…` para `cli.py`, `3fc74e00…` para `eval_report.py`); la suite
+proporcional completa vuelve a 183/183 tras la restauración.
+
+**Verificación.** `tests/test_cli.py` + `tests/test_eval_report.py`: 80
+passed. Suite proporcional (`test_cli.py`, `test_eval_report.py`,
+`test_benchmark.py`, `test_matrix.py`, `test_matrix_coverage.py`): 183
+passed. Suite completa offline (`DATABASE_URL=''`, sin `TEST_DATABASE_URL`
+— sin Docker ni Postgres: `tests/db/conftest.py` saltea con
+`pytest.skip` en su ausencia, no falla — `PYTHONPATH` pineado al `src` de
+este worktree, `--ignore=tests/integration/test_langgraph_battle.py`, el
+único ignore live ya documentado): **693 passed, 138 skipped, 0 failed**.
+`git diff --check` limpio. Escaneo de rutas absolutas y secretos sobre el
+diff: sin coincidencias. No se tocó `.env`: no existe en este worktree
+(`_load_dotenv()` es un no-op).
+
+**Limitaciones conocidas.** (1) No se amplió a ningún otro argumento CLI
+del comando `benchmark` ni de otros comandos — explícitamente fuera de
+alcance. (2) No se tocó `_benchmark_command` ni su firma: la validación
+vive enteramente en la frontera síncrona de `benchmark_command`, antes de
+`asyncio.run(_benchmark_command(...))`. (3) `ProviderSelectionError`
+sigue siendo la única excepción que produce un artefacto `not-run`
+explícito; un `run_id` inválido nunca llega a ese camino — falla antes,
+sin ningún artefacto.
+
+**Modelo efectivo:** Sonnet 5 (Neoblex), fijado explícitamente por el
+coordinador. Recomendación: `In Review`.

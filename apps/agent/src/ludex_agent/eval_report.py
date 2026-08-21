@@ -19,6 +19,23 @@ from .graph.provider import ModelRoute
 RUN_ID_PATTERN = re.compile(r"[a-z0-9-]+")
 
 
+def validate_run_id(run_id: str) -> None:
+    """Gramática pública y única de `run_id` (MON-28).
+
+    `build_benchmark_record` y la frontera CLI de `benchmark_command`
+    comparten esta función: la misma regex, el mismo mensaje, sin
+    duplicación. Antes, la validación solo ocurría dentro de
+    `build_benchmark_record`, alcanzada por primera vez desde
+    `report_progress` -- DESPUÉS de que la batalla real ya corrió (medido:
+    `battle-id=3981`/`trajectory-id=2725`, 29 decisiones persistidas, cero
+    artefacto de corrida, `ValueError` enmascarando el resultado). La
+    frontera CLI llama a esta función inmediatamente después de calcular
+    `effective_run_id`, antes de cualquier efecto live.
+    """
+    if RUN_ID_PATTERN.fullmatch(run_id) is None:
+        raise ValueError("run_id must match [a-z0-9-]+")
+
+
 @dataclass(frozen=True)
 class BenchmarkRecord:
     run_id: str
@@ -102,8 +119,7 @@ def build_benchmark_record(
     status: str | None = None,
     battle_timeout_seconds: float | None = None,
 ) -> BenchmarkRecord:
-    if RUN_ID_PATTERN.fullmatch(run_id) is None:
-        raise ValueError("run_id must match [a-z0-9-]+")
+    validate_run_id(run_id)
     provider = result.provider or ""
     model = result.model or ""
     try:
