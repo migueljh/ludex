@@ -407,16 +407,27 @@ class FakeVocabulary:
         # MON-26: las especies de la batalla real battle-gen6randombattle-67.
         "probopass": ["ROCK", "STEEL"],
         "malamar": ["DARK", "PSYCHIC"],
+        # MON-27: battle-gen6randombattle-120. Mawile NO cambia de tipos al
+        # mega evolucionar (a diferencia de Charizard-X) -- a proposito, para
+        # que el canario de ability no dependa de una diferencia de tipos.
+        "mawile": ["STEEL", "FAIRY"],
+        "mawilemega": ["STEEL", "FAIRY"],
     }
     # `baseSpecies` del dex, ya normalizado. Es lo que usa
     # `Pokemon.identifies_as` (`pokemon.py:435-438`) para decidir si dos
     # nombres son el MISMO pokemon.
-    BASE = {"cameruptmega": "camerupt", "charizardmegax": "charizard"}
+    BASE = {
+        "cameruptmega": "camerupt", "charizardmegax": "charizard",
+        "mawilemega": "mawile",
+    }
     # Ability cuando el dex lista exactamente una y la forma no es Mega/Primal
     # (`pokemon.py:658-661`, con `gen >= 3`).
     UNICA = {"zoroark": "illusion", "weezing": "levitate"}
     # `abilities["0"]` de una forma Mega/Primal (`pokemon.py:650-655`).
-    FORMA = {"cameruptmega": "sheerforce", "charizardmegax": "toughclaws"}
+    FORMA = {
+        "cameruptmega": "sheerforce", "charizardmegax": "toughclaws",
+        "mawilemega": "hugepower",
+    }
     # `entry["pp"] * 8 // 5` (`move.py:476`).
     MAX_PP = {"energyball": 16, "scald": 24, "sludgebomb": 16,
               "transform": 16, "toxic": 16, "copycat": 32, "sleeptalk": 16}
@@ -1442,6 +1453,40 @@ def test_la_primera_ability_revelada_se_persiste_sin_sembrar_memoria():
         "ludicolo": {"canonical_types": ["WATER", "GRASS"]},
         "mandibuzz": {"canonical_types": ["DARK", "FLYING"]},
     }
+
+
+def test_segunda_revelacion_identica_de_ability_no_siembra_backup():
+    """MON-27 causa raiz (aislada de Mega): revelar la MISMA ability dos
+    veces (p.ej. Intimidate re-anunciandose en cada switch-in ordinario,
+    medido en `battle-gen6randombattle-120` turnos 12 y 14) no es un
+    override -- es la misma evidencia otra vez. `reveal_ability` no puede
+    sembrar backup en `persistent_state` para un valor que no cambio: sin
+    este guard, cualquier `switch_out` posterior restauraria ese backup
+    espurio sobre lo que sea que la identidad tenga en ese momento,
+    incluida una Mega evolution que ya volvio la ability permanente."""
+    memoria: dict[str, dict] = {}
+    snapshot1 = _snapshot()
+    snapshot1["opponent"]["pokemon"][0]["ability"] = None
+    tras_primera = _proyectar(
+        ["|-ability|p2a: Ludicolo|Swift Swim"],
+        snapshot1, persistent_state=memoria,
+    )
+    assert _por_especie(tras_primera)["ludicolo"]["ability"] == "swiftswim"
+    assert "ludicolo" not in memoria
+
+    # Snapshot fresco INDEPENDIENTE: la ability ya conocida llega en el
+    # snapshot (asi la reportaria poke-env), y la MISMA linea la re-anuncia.
+    snapshot2 = _snapshot()
+    snapshot2["opponent"]["pokemon"][0]["ability"] = "swiftswim"
+    tras_segunda = _proyectar(
+        ["|-ability|p2a: Ludicolo|Swift Swim"],
+        snapshot2, persistent_state=memoria,
+    )
+    assert _por_especie(tras_segunda)["ludicolo"]["ability"] == "swiftswim"
+    assert "ability" not in memoria.get("ludicolo", {}), (
+        "revelar la MISMA ability otra vez no es un override: no debe "
+        "sembrar ningun backup en persistent_state"
+    )
 
 
 def _snapshot_weezing():
@@ -2800,6 +2845,34 @@ def test_item_transferido_en_gap_se_le_quita_a_la_victima_nombrada():
     )
 
 
+def test_pickpocket_en_gap_revela_la_ability_del_receptor_nombrado_no_del_reemplazo():
+    """MON-27 + MON-26 R3 (canario pedido en la prep adversarial de Tasos,
+    `/tmp/ludex-coordination/tasos-mon27-r1-prep.md` T-PP-5): el RECEPTOR de
+    Pickpocket/Magician (`ident`, parts[2]) se resuelve por `named_target`,
+    igual que el resto de la clase -- nunca por `active()`. En una ventana
+    con gap, resolver por el activo post-narracion le escribiria la ability
+    al REEMPLAZO en vez de al que de verdad la tiene."""
+    memoria: dict[str, dict] = {}
+    out = _proyectar(
+        ["|-item|p2a: Ludicolo|Leftovers|[from] ability: Pickpocket|[of] p1a: Tentacruel",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        _snapshot_con_gap(), persistent_state=memoria,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["item"] == "leftovers", (
+        "el item robado se le escribe al RECEPTOR nombrado"
+    )
+    assert por_especie["ludicolo"]["ability"] == "pickpocket", (
+        "la ability se revela en el RECEPTOR nombrado, no en el reemplazo"
+    )
+    assert por_especie["latias"]["ability"] is None, (
+        "el reemplazo no es nombrado por la linea y no recibe la ability"
+    )
+    assert "ability" not in memoria.get("latias", {}), (
+        "la memoria no puede sembrarse con la identidad equivocada"
+    )
+
+
 # --- MON-26 R3: canarios pedidos por la revision (Tasos) ---
 # Magic Bounce y Rocky Helmet en gap: las rutas con sufijos [from] ability/
 # [of] item no pueden salpicar al reemplazo. Y los canarios de `-heal`, que
@@ -3349,6 +3422,12 @@ def test_transferencia_de_item_hacia_nuestro_lado_limpia_al_rival(suffix):
     )
     assert _por_especie(tras_robo)["ludicolo"]["item"] is None
     assert memoria["ludicolo"]["item"] is None
+    assert "ability" not in memoria.get("ludicolo", {}), (
+        "MON-27: la ability de la VICTIMA (Ludicolo, a quien le robaron) "
+        "nunca se toca -- Pickpocket/Magician revelan la ability de quien "
+        "RECIBE el item (nuestro lado en este caso, ya conocido por "
+        "el request privado), no de quien lo pierde"
+    )
 
     # Snapshot fresco: poke-env todavia cree que Ludicolo tiene lifeorb (no
     # se entera de que lo perdio) -- la memoria tiene que sostener el None.
@@ -3358,19 +3437,42 @@ def test_transferencia_de_item_hacia_nuestro_lado_limpia_al_rival(suffix):
     assert _por_especie(tras_snapshot_stale)["ludicolo"]["item"] is None
 
 
-def test_transferencia_de_item_desde_nuestro_lado_actualiza_al_rival():
+@pytest.mark.parametrize(
+    ("suffix", "ability_esperada"),
+    [
+        ("[from] move: Thief", None),
+        ("[from] move: Covet", None),
+        ("[from] ability: Pickpocket", "pickpocket"),
+        ("[from] ability: Magician", "magician"),
+    ],
+)
+def test_transferencia_de_item_desde_nuestro_lado_actualiza_al_rival(suffix, ability_esperada):
     """Contrapeso: cuando el RIVAL es quien adquiere nuestro item, el
     `ident` de la linea YA es el rival -- el handler normal de `-item`
-    (tras el filtro generico) sigue cubriendo esta direccion sin cambios."""
+    (tras el filtro generico) sigue cubriendo esta direccion sin cambios.
+
+    MON-27: cuando la causa es una ABILITY (Pickpocket/Magician), esta misma
+    linea es la UNICA evidencia publica de que el receptor la tiene --
+    Showdown nunca manda una linea `-ability` separada para estas dos
+    (D40 T-01). Se revela en el receptor NOMBRADO por la linea (mecanismo
+    `named_target` de MON-26), nunca por `active()`. Thief/Covet son
+    MOVIMIENTOS: no revelan ninguna ability."""
     memoria: dict[str, dict] = {}
     snapshot = _snapshot(gen=6)
     snapshot["opponent"]["pokemon"][0]["item"] = "unknown_item"
+    snapshot["opponent"]["pokemon"][0]["ability"] = None
     out = _proyectar(
-        ["|-item|p2a: Ludicolo|Leftovers|[from] move: Thief|[of] p1a: Tentacruel"],
+        [f"|-item|p2a: Ludicolo|Leftovers|{suffix}|[of] p1a: Tentacruel"],
         snapshot, persistent_state=memoria,
     )
-    assert _por_especie(out)["ludicolo"]["item"] == "leftovers"
+    ludicolo = _por_especie(out)["ludicolo"]
+    assert ludicolo["item"] == "leftovers"
     assert memoria["ludicolo"]["item"] == "leftovers"
+    assert ludicolo["ability"] == ability_esperada
+    if ability_esperada is None:
+        assert "ability" not in memoria.get("ludicolo", {}), (
+            "Thief/Covet no revelan ninguna ability: no hay nada que backupear"
+        )
 
 
 def test_transferencia_de_item_no_contamina_otra_identidad_rival():
@@ -3652,6 +3754,19 @@ def _charizard_rival(types, active=True, species="charizard"):
     }
 
 
+def _mawile_rival(ability, active=True, species="mawile"):
+    """`battle-gen6randombattle-120` real (MON-27): Mawile no cambia de
+    tipos al mega evolucionar, a diferencia de Charizard-X."""
+    return {
+        "species": species, "hp_fraction": 1.0, "active": active,
+        "fainted": False, "status": None, "level": 76,
+        "item": "unknown_item", "ability": ability, "types": ["STEEL", "FAIRY"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [],
+    }
+
+
 def test_meloetta_relic_song_revierte_tras_switch_out_con_snapshot_fresco():
     """Reproduccion exacta de `battles.id=2787` (`battle-gen6randombattle-
     2719`): Aria -> Relic Song (`-formechange` a Pirouette) -> Pirouette
@@ -3803,6 +3918,86 @@ def test_mega_conserva_permanentemente_sus_tipos_con_snapshot_fresco_independien
     charizard_dentro = _por_especie(tras_switch_in)["charizardmegax"]
     assert charizard_dentro["active"] is True
     assert charizard_dentro["types"] == ["FIRE", "DRAGON"]
+
+
+def test_mega_mawile_conserva_hugepower_pese_a_dos_revelaciones_identicas_de_intimidate():
+    """MON-27 causa raiz, reproduccion de `battle-gen6randombattle-120`
+    (turnos 12/14/15/19 reales, ver
+    `/tmp/ludex-coordination/neoblex-mon27-mega-diagnosis.md`).
+
+    Intimidate se revela dos veces con el MISMO valor: switch-in ordinario
+    (T12) y un cambio forzado que la trae de vuelta, todavia en forma base
+    (T14). Con `reveal_ability` sin el guard de igualdad, la segunda
+    revelacion sembraba un backup espurio `persistent_state["mawile"]
+    ["ability"] = "intimidate"`. Luego Mega Mawile (T15, `detailschange`
+    PERMANENTE) pasa a `hugepower` -- pero `forme_change` nunca toca ese
+    backup, y `switch_out` (T19, snapshot fresco INDEPENDIENTE) lo restauraba
+    incondicionalmente SOBRE la ability de la Mega. Verificado con snapshots
+    frescos genuinamente independientes en cada paso, como
+    `test_mega_conserva_permanentemente_sus_tipos_con_snapshot_fresco_
+    independiente`."""
+    memoria: dict[str, dict] = {}
+
+    # T12: switch-in, primera revelacion de Intimidate (actual=None -> pasa
+    # a ser la base persistente; no siembra backup).
+    snapshot1 = _snapshot(gen=6)
+    snapshot1["opponent"]["pokemon"] = [_mawile_rival(None)]
+    tras_primera = _proyectar(
+        ["|switch|p2a: Mawile|Mawile, L76, M|100/100",
+         "|-ability|p2a: Mawile|Intimidate|boost"],
+        snapshot1, persistent_state=memoria,
+    )
+    assert _por_especie(tras_primera)["mawile"]["ability"] == "intimidate"
+    # `switch_in` SI siembra `canonical_types` (D41, no relacionado): lo que
+    # la primera revelacion de ability no puede sembrar es un backup.
+    assert "ability" not in memoria.get("mawile", {})
+
+    # T14: Mawile vuelve a entrar, todavia en forma base -- Intimidate se
+    # re-anuncia con el MISMO valor. Snapshot fresco INDEPENDIENTE: la
+    # ability ya conocida llega en el snapshot, como la reportaria poke-env.
+    snapshot2 = _snapshot(gen=6)
+    snapshot2["opponent"]["pokemon"] = [_mawile_rival("intimidate")]
+    tras_segunda = _proyectar(
+        ["|switch|p2a: Mawile|Mawile, L76, M|100/100",
+         "|-ability|p2a: Mawile|Intimidate|boost"],
+        snapshot2, persistent_state=memoria,
+    )
+    assert _por_especie(tras_segunda)["mawile"]["ability"] == "intimidate"
+    assert "ability" not in memoria.get("mawile", {}), (
+        "la re-revelacion IDENTICA no puede sembrar backup"
+    )
+
+    # T15: detailschange a Mega -- PERMANENTE, ability pasa a hugepower.
+    snapshot3 = _snapshot(gen=6)
+    snapshot3["opponent"]["pokemon"] = [_mawile_rival("intimidate")]
+    tras_mega = _proyectar(
+        ["|detailschange|p2a: Mawile|Mawile-Mega, L76, M"],
+        snapshot3, persistent_state=memoria,
+    )
+    assert _por_especie(tras_mega)["mawile"]["ability"] == "hugepower"
+    assert "ability" not in memoria.get("mawile", {})
+
+    # T19: switch-out (Weezing entra). Snapshot fresco INDEPENDIENTE con la
+    # Mega ya en hugepower -- asi lo reporta la property `ability` real de
+    # poke-env (confirmado con una simulacion local de poke_env==0.15.0
+    # contra esta misma secuencia, ver el diagnostico). Sin el fix,
+    # switch_out restauraba el backup espurio "intimidate" sobre esto.
+    snapshot4 = _snapshot(gen=6)
+    snapshot4["opponent"]["pokemon"] = [
+        _mawile_rival("hugepower", active=True, species="mawilemega"),
+        _weezing_rival(active=False),
+    ]
+    tras_switch_out = _proyectar(
+        ["|switch|p2a: Weezing|Weezing, L83, F|100/100"],
+        snapshot4, persistent_state=memoria,
+    )
+    mawile_fuera = _por_especie(tras_switch_out)["mawilemega"]
+    assert mawile_fuera["active"] is False
+    assert mawile_fuera["ability"] == "hugepower", (
+        "la ability de la Mega es permanente: switch_out no puede restaurar "
+        "un backup sembrado por una re-revelacion identica anterior"
+    )
+    assert "ability" not in memoria.get("mawile", {})
 
 
 def test_typechange_temporal_sigue_activo_con_canonical_types_presente():

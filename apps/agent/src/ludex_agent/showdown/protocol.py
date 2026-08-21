@@ -1226,25 +1226,47 @@ def project_observable_state(
         ]
 
     def reveal_ability(mon: dict, raw: str) -> None:
-        """Ability revelada por un evento publico. Espejo EXACTO del setter
-        de poke-env (`pokemon.py:873-878`): si TODAVIA no hay ability
-        conocida para este pokemon, este valor la fija como PERSISTENTE (no
-        hay nada que restaurar despues -- por eso NO se siembra
-        `persistent_state`, a diferencia de si ya habia una). Si YA habia
-        una, este valor es un override TEMPORAL: se registra la persistente
-        (solo la PRIMERA vez que se tapa, `setdefault`) para que
+        """Ability revelada por un evento publico. Para un valor NUEVO,
+        espejo EXACTO del setter de poke-env (`pokemon.py:873-878`): si
+        TODAVIA no hay ability conocida para este pokemon, este valor la
+        fija como PERSISTENTE (no hay nada que restaurar despues -- por eso
+        NO se siembra `persistent_state`, a diferencia de si ya habia una).
+        Si YA habia una, este valor es un override TEMPORAL: se registra la
+        persistente (solo la PRIMERA vez que se tapa, `setdefault`) para que
         `switch_out` o `-endability` puedan revertir.
 
         Se usa en TODOS los caminos que revelan una ability -- `-ability`,
         Trace, Magic Bounce/Dancer (via `apply_move`), y la copiada por
         Transform -- para que la regla persistente-vs-temporal sea una sola,
         nunca reinventada por cada camino.
+
+        MON-27 -- divergencia deliberada del setter para un valor IDENTICO.
+        El setter real de poke-env (`pokemon.py:874-878`) manda TODA
+        asignacion a `_temporary_ability` en cuanto `_ability` ya existe,
+        incluso si el valor coincide -- ahi no es un bug porque
+        `mega_evolve()` resetea `temporary_ability=None` antes de aplicar
+        una Mega (`pokemon.py:450`). Este proyector no tiene un evento
+        equivalente a `mega_evolve()`: `forme_change` (el handler de
+        `detailschange`/`-formechange`) muta `mon["ability"]` directo y
+        nunca limpia `persistent_state[identidad]["ability"]`. Sin este
+        guard, re-revelar la MISMA ability (medido en
+        `battle-gen6randombattle-120`: Intimidate se re-anuncia en CADA
+        switch-in ordinario de Mawile, turnos 12 y 14) sembraba un backup
+        espurio que `switch_out` restauraba mas tarde -- incluso sobre una
+        Mega evolution ya permanente. El estado FINAL coincide con el de
+        poke-env (`hugepower` sobrevive); el mecanismo interno, para este
+        caso puntual, ya no es un espejo byte a byte del setter. Overrides
+        REALES (Trace, Skill Swap, Entrainment) siguen sembrando backup sin
+        cambios: el guard solo salta cuando el valor NUEVO es IDENTICO al ya
+        observable, nunca por similitud ni por tipo de evento.
         """
         ability = normalize_id(raw)
         if not ability:
             return
         actual = mon.get("ability")
         if actual is not None:
+            if actual == ability:
+                return
             identidad = canon(normalize_id(mon.get("species") or ""))
             persistent_state.setdefault(identidad, {}).setdefault("ability", actual)
         mon["ability"] = ability
@@ -1453,6 +1475,17 @@ def project_observable_state(
         sola ranura activa por lado) y el unico que `apps/agent` juega en
         la practica (`SHOWDOWN_BATTLE_FORMAT` por defecto es
         `gen6randombattle`). No se implementa: seria logica muerta.
+
+        MON-27: cuando la causa es una ABILITY (Pickpocket/Magician), esta
+        misma linea es la UNICA evidencia publica de que el RECEPTOR
+        (`ident`, parts[2]) la tiene -- Showdown nunca manda una linea
+        `-ability` separada para estas dos. Se revela en el receptor
+        NOMBRADO por la linea (`named_target`, el mismo mecanismo integrado
+        por MON-26 para el resto de la clase), nunca por `active()`. Cuando
+        el receptor es nuestro propio lado, `named_target` devuelve `None`
+        (no arranca con `active_prefix`) y no hay nada que revelar: ya
+        conocemos nuestra propia ability por el `|request|` privado. Nunca
+        para `[from] move:` (Thief/Covet): son movimientos, no abilities.
         """
         if len(parts) != 6 or not parts[5].startswith("[of]"):
             return
@@ -1465,6 +1498,9 @@ def project_observable_state(
             causa = prefix.split(":", 1)[-1].strip()
             if causa not in _ITEM_TRANSFER_ABILITIES:
                 return
+            receptor = named_target(parts[2].strip())
+            if receptor is not None:
+                reveal_ability(receptor, causa)
         else:
             return
         victima = _owner_of(parts[5].split("[of]", 1)[-1].strip())
