@@ -4478,3 +4478,157 @@ handlers del cuerpo del proyector lo dejaría sin clausura que seguir — el
 canario de >= 25 ramas/15 helpers lo denuncia. No se afirma que la clase
 queda cerrada sin la mutación medida que lo respalde: las mutaciones de
 arriba son la evidencia.
+
+---
+
+## D63 — MON-27 R1: re-revelación idéntica de ability no es override; Pickpocket/Magician revelan al receptor nombrado (2026-08-21)
+
+**Contexto.** Diagnóstico previo
+(`/tmp/ludex-coordination/neoblex-mon27-mega-diagnosis.md`, aceptado por
+Latwan) y prep adversarial de Tasos
+(`/tmp/ludex-coordination/tasos-mon27-r1-prep.md`) sobre las 3 violaciones
+de `hidden_information/ability` de `battle-gen6randombattle-120`, medidas
+tras MON-26 R2/R3/R4 (`f9e37a9`). Ambos defectos son **ortogonales** a la
+resolución por identidad de MON-26 (D62/R2/R3): no hay ningún gap ni
+narración huérfana en la secuencia real de Mawile — `active()` y
+`named_target` coinciden ahí. El defecto es sobre **qué valor** se
+persiste para la identidad correcta, no sobre **qué identidad** lo recibe
+(D62-R3 ya adjudicó esta distinción explícitamente fuera de alcance de su
+escáner transitivo).
+
+### Defecto B — Mega Mawile: backup espurio de una re-revelación idéntica
+
+Medido en `battle-gen6randombattle-120` (turnos 12/14/15/19 reales):
+Intimidate se re-anuncia con el **mismo valor** en cada switch-in ordinario
+de Mawile (turno 12, primera vez: `_ability is None` en poke-env → pasa a
+persistente; turno 14, segunda vez: `_ability` ya existe → el setter real de
+poke-env (`pokemon.py:874-878`) la manda a `_temporary_ability`). Nuestro
+`reveal_ability` reproducía esa misma ruta sin comparar el valor nuevo
+contra el actual: la segunda revelación sembraba
+`persistent_state["mawile"]["ability"] = "intimidate"` como si fuera un
+override real. `forme_change` (handler de `detailschange`/`-formechange`,
+turno 15, Mega **permanente**) muta `mon["ability"] = "hugepower"` directo
+pero nunca toca ese backup — no tiene un canal permanente para `ability`
+como sí tiene `canonical_types` para tipos. `switch_out` (turno 19) restaura
+el backup con `peek`, nunca `pop` (a propósito, para que un override real
+sobreviva para el próximo evento) — y lo restauraba **incondicionalmente**
+sobre la ability de la Mega, sin ninguna noción de que ya era permanente.
+
+**Fix.** Un guard de igualdad en `reveal_ability`
+(`protocol.py`, dentro de `project_observable_state`): si la ability nueva
+normalizada es idéntica a `mon.get("ability")`, retorna sin sembrar backup
+ni mutar nada — es un no-op genuino, no una revelación. No se tocó
+`forme_change` ni `switch_out`: la alternativa de que `forme_change` limpie
+el backup (`persistent_state[identidad].pop("ability")`) fue evaluada y
+descartada (Tasos, prep §2) porque cubre Mega pero deja el agujero para
+cualquier re-revelación idéntica sin Mega de por medio — el guard en
+`reveal_ability` es la causa raíz real y es estrictamente más general.
+
+**Divergencia deliberada del setter de poke-env, documentada.** El setter
+real manda TODA asignación a `_temporary_ability` en cuanto `_ability` ya
+existe, incluso con el mismo valor — ahí no es un bug porque
+`mega_evolve()` resetea `temporary_ability=None` antes de aplicar la Mega
+(`pokemon.py:450`). Este proyector no tiene un evento equivalente a
+`mega_evolve()` (solo `forme_change`, que muta directo y no resetea nada).
+El estado FINAL coincide con poke-env (`hugepower` sobrevive); el mecanismo
+interno, para el caso de un valor idéntico, deja de ser un espejo byte a
+byte del setter. El docstring de `reveal_ability` ya no afirma paridad
+incondicional (corregido en este commit, hallazgo de Tasos §5.3).
+
+### Defecto A — Pickpocket/Magician: la ability del receptor nunca se revelaba
+
+`apply_item_transfer_ownership` usaba la causa estructurada
+(`[from] ability: Pickpocket|Magician`) solo para filtrar la línea y para
+`remember_item(víctima, None)` — nunca para revelar que el **receptor**
+(`ident`, `parts[2]`) tiene esa ability. Es la única evidencia pública:
+Showdown nunca manda una línea `-ability` separada para Pickpocket/Magician
+(D40 T-01).
+
+**Fix.** En la rama `[from] ability:` de `apply_item_transfer_ownership`,
+tras confirmar `causa in _ITEM_TRANSFER_ABILITIES`, se resuelve el receptor
+con `named_target(parts[2].strip())` — el mismo mecanismo de identidad
+nombrada que MON-26 R2/R3 integró para el resto de la clase (`_owner_of`,
+usado para la víctima dos líneas más abajo, ya es un wrapper de
+`named_target`) — y se llama `reveal_ability(receptor, causa)`. Cuando el
+receptor es nuestro propio lado, `named_target` devuelve `None` (el ident no
+arranca con `active_prefix`) y no hay nada que revelar: ya conocemos
+nuestra propia ability por el `|request|` privado. Nunca para
+`[from] move:` (Thief/Covet): son movimientos, no abilities.
+
+**Corrección post-prep de Tasos.** El diseño original (diagnóstico previo)
+proponía resolver el receptor con `mon_for_ident`/`active()` — válido
+**antes** de MON-26 R3, pero desactualizado: `f9e37a9` ya integra
+`named_target` como el resolver de identidad de toda la clase. Usar
+`active()` para el receptor reabriría la misma clase de defecto que R2/R3
+cerraron (misatribución en una ventana con gap). Corregido antes de
+implementar: `apply_item_transfer_ownership` usa `named_target` para el
+receptor, igual que ya usaba `_owner_of`/`named_target` para la víctima.
+
+### Mutaciones medidas (in-place sobre el worktree, `PYTHONPATH` pineado, restauradas y verificadas por sha256 tras cada una)
+
+| mutación | tests rojos | resultado |
+|---|---|---|
+| M1: quitar el guard de igualdad en `reveal_ability` | `test_segunda_revelacion_identica_de_ability_no_siembra_backup`, `test_mega_mawile_conserva_hugepower_pese_a_dos_revelaciones_identicas_de_intimidate` | 2 failed, 182 passed |
+| M2: omitir `reveal_ability` en la transferencia por ability | `test_transferencia_de_item_desde_nuestro_lado_actualiza_al_rival[Pickpocket]` y `[Magician]` | 2 failed, 182 passed |
+| M3: revelar también en la rama `[from] move:` (Thief/Covet) | `test_transferencia_de_item_desde_nuestro_lado_actualiza_al_rival[Thief]` y `[Covet]` | 2 failed, 182 passed |
+| M4: eliminar el backup/restore real en vez de distinguir igualdad (`if actual == ability: return; mon["ability"]=ability`, sin `setdefault`) | `test_al_salir_del_transform_se_limpia_todo_el_estado_temporal`, `test_transform_sobrevive_a_la_decision_y_se_limpia_en_otra_llamada`, `test_finding2_ability_ya_conocida_es_temporal_y_se_restaura_en_otra_llamada`, `test_finding2_trace_real_copia_temporal_y_restaura_trace_como_base`, `test_finding2_endability_restaura_la_base_sin_esperar_al_switch` | 5 failed, 179 passed — prueba que el mecanismo de backup sigue siendo load-bearing para overrides reales (Trace, Skill Swap/Entrainment, Transform/Imposter) |
+| M5: resolver el receptor de Pickpocket/Magician por `active()` en vez de `named_target` (canario de gap pedido por Tasos, T-PP-5) | `test_pickpocket_en_gap_revela_la_ability_del_receptor_nombrado_no_del_reemplazo` **y** el invariante AST `test_el_despacho_resuelve_identidad_persistente_por_named_target` (nombra la rama `['-item']` como violación) | 2 failed, 183 passed — la mutación la detectan dos mecanismos independientes |
+
+Cada mutación restaurada y verificada con `shasum -a 256` contra el archivo
+fijo antes de la mutación (`54e42ed8…` tras los fixes A+B, `830f9226…` tras
+el ajuste de docstring); la suite completa vuelve a verde después de cada
+restauración.
+
+### Controles que se mantienen verdes sin cambios
+
+Illusion (`test_illusion_registra_la_ability_publica_del_imitador`,
+`test_end_illusion_solo_tambien_registra_la_ability` — la doble revelación
+`illusion` del dex + `-end` explícito es exactamente el caso que el guard
+trata como no-op), Transform/Imposter, Trace, Skill Swap/Entrainment,
+`-endability`, el oráculo de PP de 4 celdas + pin 10→9 + Pressure R4
+(D62-R3/R4 — **no se reabrió**, ninguna línea de `register_move` ni
+`apply_move` se tocó), y el invariante AST completo de D62-R3.
+
+### Alcance — lo que NO se tocó
+
+`apply_damage_or_heal_ownership` (escritura directa de ability por
+`-damage`/`-heal` con `[of]`) queda fuera: sin defecto medido de las 3
+violaciones de `battle-120`, señalado como finding especulativo en el
+diagnóstico previo y confirmado fuera de alcance por Tasos (prep §5.6) y
+por la adjudicación de Latwan. El criterio de aceptación de PP off-by-one
+que todavía lista `mon27-issue-PENDIENTE.md` está obsoleto: los 4 casos ya
+quedaron absorbidos por MON-26 R3/R4 e integrados en `f9e37a9` — no se
+reimplementó ningún test de PP en esta ronda.
+
+### Verificación
+
+`tests/showdown/test_protocol.py`: 185 passed (`--noconftest`,
+`PYTHONPATH` pineado). `tests/showdown/`: 287 passed. Suite completa
+offline (`DATABASE_URL=''`, `TEST_DATABASE_URL=postgresql://ludex:ludex@
+127.0.0.1:15432/ludex_mon16_gate`, `--ignore=tests/integration/
+test_langgraph_battle.py`, conftest cargado — sin `--noconftest`, que
+solo aplica a la corrida focal aislada): **730 passed, 94 skipped, 0
+failed** (delta +7 sobre los 723 de D62-R3: +2 canarios focales Mega, +1
+gap Pickpocket, +3 por la expansión del parametrize de transferencia a 4
+casos, +1 aserción agregada sobre un test existente que no crea fila
+nueva). `git diff --check` limpio sobre el rango; sin rutas absolutas ni
+secretos en el diff (`grep` dirigido, sin coincidencias).
+
+### Limitaciones conocidas
+
+(1) La verificación end-to-end con una batalla real nueva
+(`benchmark --persist` + auditor) queda pendiente, autorizada solo después
+de la revisión formal e integración, con un modelo permitido/free y bajo
+control de Latwan — no se ejecutó en esta ronda (fuera de alcance
+explícito del brief). (2) El diagnóstico previo a esta ronda proponía
+`mon_for_ident`/`active()` para el receptor de Pickpocket; quedó
+desactualizado por MON-26 R3 y se corrigió a `named_target` antes de
+implementar, con su propio canario de gap (T-PP-5) — documentado acá para
+que no se repita el mismo desfase en una futura ronda que use el
+diagnóstico original como referencia sin leer esta decisión.
+
+**Modelo efectivo:** Sonnet 5 (Neoblex), fijado explícitamente por el
+coordinador (no Opus 5 High, pese a que `code_review_best_practices.md` §8
+recomienda Opus para diagnóstico multi-frontera — el diagnóstico ya estaba
+adjudicado antes de esta ronda; R1 es implementación acotada sobre diseño
+aprobado). Recomendación: `In Review`.
