@@ -404,6 +404,9 @@ class FakeVocabulary:
         # pasa a decir "meloettapirouette" (`-formechange` no escribe
         # especie), asi que no hace falta una entrada en BASE para ella.
         "meloettapirouette": ["NORMAL", "FIGHTING"],
+        # MON-26: las especies de la batalla real battle-gen6randombattle-67.
+        "probopass": ["ROCK", "STEEL"],
+        "malamar": ["DARK", "PSYCHIC"],
     }
     # `baseSpecies` del dex, ya normalizado. Es lo que usa
     # `Pokemon.identifies_as` (`pokemon.py:435-438`) para decidir si dos
@@ -472,11 +475,12 @@ def _snapshot(**overrides):
     return base
 
 
-def _proyectar(lines, snapshot=None, *, persistent_state=None):
+def _proyectar(lines, snapshot=None, *, persistent_state=None, pre_applied=0):
     return project_observable_state(
         snapshot or _snapshot(), tuple(lines),
         opponent_side="p2", vocabulary=FakeVocabulary(),
         persistent_state=persistent_state,
+        pre_applied=pre_applied,
     )
 
 
@@ -530,10 +534,13 @@ async def test_el_inbox_devuelve_la_primera_narracion_posterior_al_cursor():
     tag = "battle-x"
     req = await inbox.publish(tag, ("|request|{}",))
     await inbox.publish(tag, ("|c:|1785|☆Rival|hola",))
-    await inbox.publish(tag, ("|switch|p2a: Latias|Latias, L77, F|100/100",))
+    narr = await inbox.publish(tag, ("|switch|p2a: Latias|Latias, L77, F|100/100",))
 
-    frame = await inbox.wait_for_resolution(tag, after_seq=req.seq, timeout=1)
-    assert frame.lines[0].startswith("|switch|")
+    window = await inbox.wait_for_resolution(
+        tag, after_seq=0, until_seq=req.seq, timeout=1
+    )
+    assert [f.seq for f in window] == [narr.seq]
+    assert window[0].lines[0].startswith("|switch|")
 
 
 async def test_dos_decisiones_no_consumen_el_mismo_frame():
@@ -544,8 +551,12 @@ async def test_dos_decisiones_no_consumen_el_mismo_frame():
     r2 = await inbox.publish(tag, ("|request|2",))
     n2 = await inbox.publish(tag, ("|move|p2a: A|Surf|p1a: B",))
 
-    assert (await inbox.wait_for_resolution(tag, after_seq=r1.seq, timeout=1)).seq == n1.seq
-    assert (await inbox.wait_for_resolution(tag, after_seq=r2.seq, timeout=1)).seq == n2.seq
+    d1 = await inbox.wait_for_resolution(tag, after_seq=0, until_seq=r1.seq, timeout=1)
+    assert [f.seq for f in d1] == [n1.seq]
+    # El watermark de la decision siguiente es la ventana anterior: sin ese
+    # tope, dos decisiones consumirian el mismo frame de cierre.
+    d2 = await inbox.wait_for_resolution(tag, after_seq=n1.seq, until_seq=r2.seq, timeout=1)
+    assert [f.seq for f in d2] == [n2.seq]
 
 
 async def test_el_inbox_espera_a_una_narracion_que_todavia_no_llego():
@@ -557,14 +568,14 @@ async def test_el_inbox_espera_a_una_narracion_que_todavia_no_llego():
         await inbox.publish(tag, ("|faint|p2a: Latias",))
 
     asyncio.create_task(publicar_tarde())
-    frame = await inbox.wait_for_resolution(tag, after_seq=0, timeout=2)
-    assert frame.lines[0].startswith("|faint|")
+    window = await inbox.wait_for_resolution(tag, after_seq=0, until_seq=0, timeout=2)
+    assert [f.lines for f in window] == [("|faint|p2a: Latias",)]
 
 
 async def test_el_inbox_falla_cerrado_al_vencer_el_timeout():
     inbox = RawFrameInbox()
     with pytest.raises(ProjectionTimeoutError):
-        await inbox.wait_for_resolution("battle-x", after_seq=0, timeout=0.01)
+        await inbox.wait_for_resolution("battle-x", after_seq=0, until_seq=0, timeout=0.01)
 
 
 async def test_cerrar_la_batalla_despierta_al_que_espera():
@@ -579,7 +590,7 @@ async def test_cerrar_la_batalla_despierta_al_que_espera():
 
     asyncio.create_task(cerrar())
     with pytest.raises(ProjectionTimeoutError):
-        await inbox.wait_for_resolution(tag, after_seq=0, timeout=2)
+        await inbox.wait_for_resolution(tag, after_seq=0, until_seq=0, timeout=2)
 
 
 async def test_el_inbox_acota_cuantos_frames_retiene_por_batalla():
@@ -604,7 +615,9 @@ async def test_el_inbox_falla_cerrado_si_desalojo_el_frame_del_cursor():
     for i in range(3):
         await inbox.publish("battle-x", (f"|turn|{i + 2}",))
     with pytest.raises(ProjectionTimeoutError, match="desaloj"):
-        await inbox.wait_for_resolution("battle-x", after_seq=cursor, timeout=0.01)
+        await inbox.wait_for_resolution(
+            "battle-x", after_seq=cursor, until_seq=cursor, timeout=0.01
+        )
 
 
 async def test_cerrar_la_batalla_libera_los_frames_retenidos():
@@ -621,15 +634,87 @@ async def test_el_tope_por_defecto_no_estorba_a_una_batalla_normal():
     cursor = (await inbox.publish("battle-x", ("|t:|1",))).seq
     for i in range(64):
         await inbox.publish("battle-x", (f"|turn|{i + 2}",))
-    frame = await inbox.wait_for_resolution(
-        "battle-x", after_seq=cursor, timeout=0.5
+    window = await inbox.wait_for_resolution(
+        "battle-x", after_seq=cursor, until_seq=cursor, timeout=0.5
     )
     # La relacion (el frame del cursor sigue alcanzable) Y el valor exacto: si
     # el tope bajara a 64 el `retained` cambia y este test lo dice, en vez de
     # quedar del lado correcto de una desigualdad.
-    assert frame.lines == ("|turn|2",)
+    assert [f.lines for f in window] == [("|turn|2",)]
     assert inbox.retained("battle-x") == 65
     assert MAX_RETAINED_FRAMES == 128, "poke-env 0.15.0, gen6randombattle"
+
+
+# --- MON-26: ventana de frames por decision ---
+
+
+async def test_la_ventana_incluye_la_narracion_anterior_al_request_wait():
+    """MON-26 (medido en battle-gen6randombattle-67, turno 2): un request
+    `wait:true` entre la narracion de la decision anterior y el request
+    activo dejaba esa narracion HUERFANA -- la espera solo miraba hacia
+    adelante del request propio y el frame con `-enditem` nunca se
+    proyectaba. La ventana tiene que entregar los frames de resolucion entre
+    el watermark (ultima proyeccion) y el frame de cierre, incluidos los que
+    llegaron ANTES del request activo."""
+    inbox = RawFrameInbox()
+    tag = "battle-x"
+    r1 = await inbox.publish(tag, ("|request|1",))
+    n1 = await inbox.publish(tag, ("|move|p2a: A|Tackle|p1a: B",))
+    await inbox.publish(tag, ("|request|2",))  # wait:true
+    n2 = await inbox.publish(tag, (
+        "|-damage|p2a: A|0 fnt",
+        "|-enditem|p2a: A|Air Balloon",
+        "|faint|p2a: A",
+    ))
+    r2 = await inbox.publish(tag, ("|request|3",))  # request activo
+    n3 = await inbox.publish(tag, ("|switch|p2a: C|C, L80|100/100",))
+
+    d1 = await inbox.wait_for_resolution(tag, after_seq=0, until_seq=r1.seq, timeout=1)
+    assert [f.seq for f in d1] == [n1.seq]
+
+    d2 = await inbox.wait_for_resolution(tag, after_seq=n1.seq, until_seq=r2.seq, timeout=1)
+    assert [f.seq for f in d2] == [n2.seq, n3.seq], (
+        "la narracion anterior al request activo no puede quedar huerfana"
+    )
+    assert any(l.startswith("|-enditem|") for f in d2 for l in f.lines)
+
+
+async def test_sin_request_wait_la_ventana_es_el_frame_unico_de_siempre():
+    """MON-26 (condicion del tech lead, no-regresion del flujo normal): sin un
+    request `wait:true` interpuesto, la ventana devuelve EXACTAMENTE el mismo
+    frame unico que devolvia la API anterior. Esta es la garantia de la que
+    depende todo el arreglo."""
+    inbox = RawFrameInbox()
+    tag = "battle-x"
+    r1 = await inbox.publish(tag, ("|request|1",))
+    n1 = await inbox.publish(tag, ("|move|p2a: A|Tackle|p1a: B",))
+    r2 = await inbox.publish(tag, ("|request|2",))
+    n2 = await inbox.publish(tag, ("|move|p2a: A|Surf|p1a: B",))
+
+    d1 = await inbox.wait_for_resolution(tag, after_seq=0, until_seq=r1.seq, timeout=1)
+    d2 = await inbox.wait_for_resolution(tag, after_seq=n1.seq, until_seq=r2.seq, timeout=1)
+    assert [(f.seq, f.lines) for f in d1] == [(n1.seq, n1.lines)]
+    assert [(f.seq, f.lines) for f in d2] == [(n2.seq, n2.lines)]
+    assert len(d1) == len(d2) == 1
+
+
+async def test_el_inbox_aisla_los_frames_por_batalla():
+    """MON-26 R2 (F3): el inbox entrega a cada batalla SOLO sus frames,
+    aunque otra batalla publique entre medio. NOTA de honestidad (medido por
+    Tasos): este test NO verifica el watermark compartido -- el inbox no
+    guarda watermark alguno y aca se pasa `after_seq=0` a mano. La evidencia
+    comportamental del watermark por tag la da UNICAMENTE
+    `test_el_watermark_de_proyeccion_es_por_batalla` (client)."""
+    inbox = RawFrameInbox()
+    ra1 = await inbox.publish("battle-a", ("|request|1",))
+    rb1 = await inbox.publish("battle-b", ("|request|1",))
+    na1 = await inbox.publish("battle-a", ("|move|p2a: A|Tackle|p1a: B",))
+    nb1 = await inbox.publish("battle-b", ("|move|p2a: X|Surf|p1a: Y",))
+
+    da = await inbox.wait_for_resolution("battle-a", after_seq=0, until_seq=ra1.seq, timeout=1)
+    db = await inbox.wait_for_resolution("battle-b", after_seq=0, until_seq=rb1.seq, timeout=1)
+    assert [f.seq for f in da] == [na1.seq]
+    assert [f.seq for f in db] == [nb1.seq]
 
 
 # --- project_observable_state ---
@@ -1597,6 +1682,53 @@ def test_pp_desconocido_por_pressure_se_reaplica_con_snapshot_fresco():
     )
 
 
+def test_pressure_propio_con_linea_pre_aplicada_va_en_null_y_marca():
+    """MON-26 R4 (T-01): `pre_applied` salta SOLO el `pp - 1`, nunca la rama
+    D37 de Pressure. En una ventana con gap el snapshot POST-narracion trae
+    el numero de poke-env (ciego a Pressure, por eso existe D37): con
+    Pressure propio, el PP del rival NOMBRADO tiene que quedar `None` y la
+    marca `unknown_pp_moves` persistir -- tambien cuando la linea es
+    pre-aplicada. Y la marca tiene que sobrevivir al snapshot fresco de la
+    decision siguiente (mismo patron que
+    `test_pp_desconocido_por_pressure_se_reaplica_con_snapshot_fresco`)."""
+    memoria: dict[str, dict] = {}
+    snap = _snapshot_con_gap()
+    snap["opponent"]["pokemon"][0]["moves"] = [
+        {"id": "energyball", "pp": 15, "max_pp": 16}
+    ]
+    snap["me"]["pokemon"] = [{
+        "species": "dusknoir", "active": True, "ability": "pressure",
+    }]
+    tras_uso = _proyectar(
+        ["|move|p2a: Ludicolo|Energy Ball|p1a: Dusknoir",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        snap, persistent_state=memoria, pre_applied=1,
+    )
+    assert _por_especie(tras_uso)["ludicolo"]["moves"] == [
+        {"id": "energyball", "pp": None, "max_pp": 16}
+    ], (
+        "Pressure propio + linea pre-aplicada: el PP NO es derivable y va "
+        "en None, no en el numero de poke-env"
+    )
+    assert memoria.get("ludicolo", {}).get("unknown_pp_moves") == {"energyball"}, (
+        "la marca D37 se siembra tambien en lineas pre-aplicadas"
+    )
+
+    # Snapshot FRESCO de la decision siguiente (poke-env ya recontó sin
+    # saber de Pressure): la marca tiene que forzar None de nuevo.
+    snap2 = _snapshot_con_gap()
+    snap2["opponent"]["pokemon"][0]["moves"] = [
+        {"id": "energyball", "pp": 14, "max_pp": 16}
+    ]
+    tras_segunda = _proyectar([], snap2, persistent_state=memoria)
+    assert _por_especie(tras_segunda)["ludicolo"]["moves"] == [
+        {"id": "energyball", "pp": None, "max_pp": 16}
+    ], (
+        "el snapshot fresco trae pp=14; la marca persistida lo fuerza de "
+        "nuevo a None"
+    )
+
+
 def test_pp_desconocido_sobrevive_un_switch_ordinario():
     """A diferencia de `types`/`moves`/`ability` copiados por Transform, la
     marca de Pressure NO es un evento puntual: tiene que sobrevivir un
@@ -2399,6 +2531,676 @@ def test_enditem_persiste_none_y_sobrevive_snapshot_fresco():
     snapshot2["opponent"]["pokemon"][0]["item"] = "sitrusberry"
     tras_snapshot_corrupto = _proyectar([], snapshot2, persistent_state=memoria)
     assert _por_especie(tras_snapshot_corrupto)["ludicolo"]["item"] is None
+
+
+def test_enditem_limpia_al_nombrado_aunque_ya_no_este_activo():
+    """MON-26 (pieza B): `-enditem` NOMBRA al mon (`p2a: Ludicolo`). En un
+    frame de gap (ver tests del inbox) la narracion puede traer `-enditem`
+    seguido de `switch` en el MISMO frame, y el snapshot -- post-narracion --
+    ya tiene al nombrado fuera de cancha. Resolver por `active()` limpiaria
+    el item del REEMPLAZO y dejaria la memoria del nombrado con el item
+    stale para siempre."""
+    memoria: dict[str, dict] = {}
+    snapshot = _snapshot(gen=6)
+    snapshot["opponent"]["pokemon"][0]["active"] = False
+    snapshot["opponent"]["pokemon"][0]["fainted"] = True
+    snapshot["opponent"]["pokemon"][0]["status"] = "FNT"
+    snapshot["opponent"]["pokemon"][0]["hp_fraction"] = 0.0
+    snapshot["opponent"]["pokemon"][0]["item"] = "airballoon"
+    snapshot["opponent"]["pokemon"].append({
+        "species": "latias", "hp_fraction": 1.0, "active": True,
+        "fainted": False, "status": None, "level": 77,
+        "item": "unknown_item", "ability": None, "types": ["DRAGON", "PSYCHIC"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [],
+    })
+    out = _proyectar(
+        ["|-enditem|p2a: Ludicolo|Air Balloon",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        snapshot, persistent_state=memoria,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["item"] is None, (
+        "el item del NOMBRADO se limpia aunque ya no este activo"
+    )
+    assert por_especie["latias"]["item"] == "unknown_item", (
+        "el item del reemplazo no se toca"
+    )
+    assert memoria["ludicolo"]["item"] is None
+
+
+# --- MON-26 R2: la clase completa es "identidad persistente resuelta por
+# quien la linea NOMBRA". La pieza A concatena la narracion huerfana con el
+# switch de cierre sobre un snapshot POST-narracion: cualquier handler que
+# resuelva por `active()` le escribe al REEMPLAZO (misatribucion, envenena la
+# memoria D40). Medido por el tech lead y por Tasos: los volatiles se
+# autocorrigen con el switch de cierre; los persistentes no.
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_con_gap(*, item="unknown_item", ability=None, fainted=True):
+    """Snapshot POST-narracion de una ventana con gap: ludicolo salio del
+    campo (o se desmayo) y latias ya esta activa. `active()` resuelve al mon
+    EQUIVOCADO para las lineas que nombran a ludicolo."""
+    snapshot = _snapshot(gen=6)
+    ludicolo = snapshot["opponent"]["pokemon"][0]
+    ludicolo["active"] = False
+    ludicolo["fainted"] = fainted
+    ludicolo["status"] = "FNT" if fainted else None
+    ludicolo["hp_fraction"] = 0.0 if fainted else 1.0
+    ludicolo["item"] = item
+    ludicolo["ability"] = ability
+    snapshot["opponent"]["pokemon"].append({
+        "species": "latias", "hp_fraction": 1.0, "active": True,
+        "fainted": False, "status": None, "level": 77,
+        "item": "unknown_item", "ability": None, "types": ["DRAGON", "PSYCHIC"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [],
+    })
+    return snapshot
+
+
+def test_item_revelado_en_gap_se_le_escribe_al_nombrado_no_al_reemplazo():
+    """MON-26 R2 (F1): `-item` escribe informacion de identidad persistente
+    (`remember_item`) y resuelve por `active()` -- en una ventana con gap eso
+    le escribe el item del desmayado al REEMPLAZO y envenena la memoria D40
+    (reproduccion del tech lead). Resolver por el ident NOMBRADO lo arregla."""
+    memoria: dict[str, dict] = {}
+    out = _proyectar(
+        ["|-item|p2a: Ludicolo|Air Balloon",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        _snapshot_con_gap(), persistent_state=memoria,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["item"] == "airballoon", (
+        "el item se le escribe al NOMBRADO, no al activo post-narracion"
+    )
+    assert por_especie["latias"]["item"] == "unknown_item", (
+        "el reemplazo no es nombrado por la linea y no recibe el item"
+    )
+    assert memoria.get("ludicolo", {}).get("item") == "airballoon"
+    assert "item" not in memoria.get("latias", {}), (
+        "la memoria D40 no puede sembrar un item con la identidad equivocada"
+    )
+
+
+def test_ability_revelada_en_gap_se_le_escribe_al_nombrado_no_al_reemplazo():
+    """MON-26 R2 (F1): `-ability` resuelve por `active()` y escribe via
+    `reveal_ability`. En una ventana con gap la ability revelada del que
+    salio se le escribe al REEMPLAZO."""
+    out = _proyectar(
+        ["|-ability|p2a: Ludicolo|Drizzle",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        _snapshot_con_gap(), persistent_state={},
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["ability"] == "drizzle", (
+        "la ability se le escribe al NOMBRADO"
+    )
+    assert por_especie["latias"]["ability"] is None, (
+        "el reemplazo no es nombrado por la linea y no recibe la ability"
+    )
+
+
+def test_endability_en_gap_restaura_al_nombrado_no_al_reemplazo():
+    """MON-26 R2 (F1): `-endability` restaura la base persistente de la
+    identidad que la linea NOMBRA. Con `active()` (post-narracion) leería la
+    entrada del REEMPLAZO y el override temporal del nombrado quedaría
+    colgado para siempre."""
+    memoria: dict[str, dict] = {"ludicolo": {"ability": "swiftswim"}}
+    out = _proyectar(
+        ["|-endability|p2a: Ludicolo",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        _snapshot_con_gap(ability="intimidate"), persistent_state=memoria,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["ability"] == "swiftswim", (
+        "el override temporal del NOMBRADO termina y vuelve su base"
+    )
+    assert por_especie["latias"]["ability"] is None, (
+        "la entrada del reemplazo no se toca"
+    )
+
+
+# --- MON-26 R3: los cuatro miembros vivos que el escaner de R2 no veia
+# (delegan en helpers). Misma regla que R2: quien recibe el dato, nunca que.
+# ---------------------------------------------------------------------------
+
+
+def test_move_en_gap_se_registra_al_actor_nombrado_no_al_reemplazo():
+    """MON-26 R3: `apply_move` resolvia por `active()`. En una ventana con
+    gap el movimiento del que se desmayo se le registraba al REEMPLAZO
+    (medido contra el corpus: 2817 turnos con move + switch del mismo lado,
+    ~7%). La linea nombra al actor (`p2a: Ludicolo`)."""
+    snap = _snapshot_con_gap()
+    snap["opponent"]["pokemon"][0]["moves"] = [
+        {"id": "energyball", "pp": 15, "max_pp": 16}
+    ]
+    out = _proyectar(
+        ["|move|p2a: Ludicolo|Energy Ball|p1a: Tentacruel",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        snap, pre_applied=1,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["latias"]["moves"] == [], (
+        "el movimiento NO es del reemplazo: la linea nombra a ludicolo"
+    )
+    assert por_especie["ludicolo"]["moves"] == [
+        {"id": "energyball", "pp": 15, "max_pp": 16}
+    ], (
+        "la linea es PRE-aplicada (el snapshot ya trae el uso): el PP del "
+        "nombrado no se vuelve a descontar (criterio R3: 15, no 14)"
+    )
+
+
+def test_pp_no_se_descuenta_dos_veces_con_snapshot_post_narracion():
+    """MON-26 R3: el doble descuento. poke-env ya descontó el PP al parsear
+    la narracion del gap (`mon.moved(..., use=True)`), asi que el snapshot
+    post-narracion trae pp=15; el proyector no puede volver a descontar la
+    MISMA linea (quedaria 14 -- la firma de las 4 violaciones de
+    hidden_information/moves de battle-gen6randombattle-120)."""
+    snap = _snapshot_con_gap()
+    snap["opponent"]["pokemon"][0]["moves"] = [
+        {"id": "energyball", "pp": 15, "max_pp": 16}
+    ]
+    out = _proyectar(
+        ["|move|p2a: Ludicolo|Energy Ball|p1a: Tentacruel",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        snap, pre_applied=1,
+    )
+    assert _por_especie(out)["ludicolo"]["moves"] == [
+        {"id": "energyball", "pp": 15, "max_pp": 16}
+    ]
+
+    # Flujo NORMAL (linea del frame de cierre, snapshot PRE-narracion): el
+    # descuento SÍ se aplica, exactamente una vez.
+    snap2 = _snapshot_con_gap()
+    snap2["opponent"]["pokemon"][0]["moves"] = [
+        {"id": "energyball", "pp": 16, "max_pp": 16}
+    ]
+    out2 = _proyectar(
+        ["|move|p2a: Ludicolo|Energy Ball|p1a: Tentacruel",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        snap2, pre_applied=0,
+    )
+    assert _por_especie(out2)["ludicolo"]["moves"] == [
+        {"id": "energyball", "pp": 15, "max_pp": 16}
+    ]
+
+
+def test_transform_en_gap_copia_desde_el_nombrado_no_al_reemplazo():
+    """MON-26 R3: `apply_transform` resolvia el transformer por `active()`.
+    En una ventana con gap el reemplazo recibia moves/ability ajenos (y el
+    transformer quedaba intacto). La linea nombra al transformer."""
+    snap = _snapshot_con_gap()
+    snap["me"]["pokemon"][0]["moves"] = [
+        {"id": "sludgebomb", "pp": 16, "max_pp": 16}
+    ]
+    out = _proyectar(
+        ["|-transform|p2a: Ludicolo|p1a: Tentacruel|[from] ability: Imposter",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        snap,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["latias"]["moves"] == [], (
+        "el moveset copiado NO es del reemplazo"
+    )
+    assert por_especie["latias"]["ability"] is None, (
+        "la ability copiada NO es del reemplazo"
+    )
+    assert por_especie["ludicolo"]["moves"] == [
+        {"id": "sludgebomb", "pp": 5, "max_pp": 5}
+    ], (
+        "el transformer NOMBRADO recibe el moveset copiado (tope 5 de "
+        "Transform en gen >= 5)"
+    )
+    assert por_especie["ludicolo"]["ability"] == "imposter"
+
+
+def test_damage_con_of_revela_la_ability_del_nombrado_no_del_reemplazo():
+    """MON-26 R3: la ruta `[of]` de `apply_damage_or_heal_ownership` que
+    revela ability resolvia por `active()`. En una ventana con gap la
+    ability del nombrado se le escribia al REEMPLAZO."""
+    out = _proyectar(
+        ["|-damage|p1a: Tentacruel|91/100|[from] ability: Drizzle|[of] p2a: Ludicolo",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        _snapshot_con_gap(),
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["ability"] == "drizzle", (
+        "la ability se escribe al NOMBRADO por el [of]"
+    )
+    assert por_especie["latias"]["ability"] is None, (
+        "el reemplazo no recibe la ability ajena"
+    )
+
+
+def test_item_transferido_en_gap_se_le_quita_a_la_victima_nombrada():
+    """MON-26 R3: `apply_item_transfer_ownership` resolvia la victima del
+    Thief/Covet/Pickpocket por `active()`. En una ventana con gap el item
+    se le quitaba al REEMPLAZO y la memoria D40 quedaba con la identidad
+    equivocada."""
+    memoria: dict[str, dict] = {}
+    out = _proyectar(
+        ["|-item|p1a: Tentacruel|Leftovers|[from] move: Thief|[of] p2a: Ludicolo",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        _snapshot_con_gap(item="leftovers"), persistent_state=memoria,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["item"] is None, (
+        "el item se le quita a la VICTIMA nombrada por el [of]"
+    )
+    assert por_especie["latias"]["item"] == "unknown_item", (
+        "el reemplazo no es la victima y conserva su item"
+    )
+    assert "item" not in memoria.get("latias", {}), (
+        "la memoria D40 no puede sembrarse con la identidad equivocada"
+    )
+
+
+# --- MON-26 R3: canarios pedidos por la revision (Tasos) ---
+# Magic Bounce y Rocky Helmet en gap: las rutas con sufijos [from] ability/
+# [of] item no pueden salpicar al reemplazo. Y los canarios de `-heal`, que
+# fijan que `_owner_of -> named_target` NO cambia la salida final de las
+# rutas de heal (ramas medidas como no-miembros).
+# ---------------------------------------------------------------------------
+
+
+def test_magic_bounce_en_gap_revela_la_ability_del_actor_nombrado():
+    """`|move|p2a: X|...|[from] ability: Magic Bounce` en ventana con gap: la
+    ability se revela del ACTOR nombrado (use/reveal=False para el eco), el
+    reemplazo no recibe ni el movimiento ni la ability."""
+    out = _proyectar(
+        ["|move|p2a: Ludicolo|Toxic|p1a: Tentacruel|[from] ability: Magic Bounce",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        _snapshot_con_gap(), pre_applied=1,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["ability"] == "magicbounce", (
+        "la ability del sufijo es del actor NOMBRADO"
+    )
+    assert por_especie["latias"]["ability"] is None
+    assert por_especie["latias"]["moves"] == [], (
+        "el eco reflejado no es evidencia de pertenencia (ni para el "
+        "reemplazo ni para el actor)"
+    )
+
+
+def test_rocky_helmet_en_gap_se_le_atribuye_al_dueño_nombrado():
+    """`-damage|p1a: X|...|[from] item: Rocky Helmet|[of] p2a: Y` en gap: el
+    item es de Y (el rival NOMBRADO por el [of]), el reemplazo no lo recibe
+    y la memoria no se siembra con la identidad equivocada."""
+    memoria: dict[str, dict] = {}
+    out = _proyectar(
+        ["|-damage|p1a: Tentacruel|88/100|[from] item: Rocky Helmet|[of] p2a: Ludicolo",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        _snapshot_con_gap(), persistent_state=memoria,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["item"] == "rockyhelmet", (
+        "el item es del dueno NOMBRADO por el [of]"
+    )
+    assert por_especie["latias"]["item"] == "unknown_item"
+    assert "item" not in memoria.get("latias", {})
+
+
+def test_heal_por_item_propio_en_gap_no_cambia_la_salida_del_reemplazo():
+    """Canario de `_owner_of -> named_target` (adjudicacion R3): la ruta de
+    heal por item propio (`-heal|p2a: X|...|[from] item: Leftovers`) es una
+    rama medida como NO-miembro; con la resolucion por nombre el reemplazo
+    queda intacto y el item se le revela al NOMBRADO (que es a quien la
+    linea se lo atribuye)."""
+    memoria: dict[str, dict] = {}
+    out = _proyectar(
+        ["|-heal|p2a: Ludicolo|78/100|[from] item: Leftovers",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        _snapshot_con_gap(), persistent_state=memoria,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["latias"]["item"] == "unknown_item", (
+        "la salida final del reemplazo no cambia"
+    )
+    assert por_especie["ludicolo"]["item"] == "leftovers"
+    assert memoria.get("ludicolo", {}).get("item") == "leftovers"
+
+
+def test_heal_con_of_en_gap_no_cambia_la_salida_del_reemplazo():
+    """Canario de `_owner_of -> named_target`: la ruta `-heal` con `[of]`
+    (Hospitality) resuelve al NOMBRADO y el reemplazo queda intacto."""
+    out = _proyectar(
+        ["|-heal|p2a: Latias|100/100|[from] ability: Hospitality|[of] p2a: Ludicolo",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        _snapshot_con_gap(),
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["latias"]["ability"] is None, (
+        "la salida final del reemplazo no cambia"
+    )
+    assert por_especie["ludicolo"]["ability"] == "hospitality"
+
+
+def _snapshot_con_pp(pp: int) -> dict:
+    snap = _snapshot_con_gap()
+    snap["opponent"]["pokemon"][0]["moves"] = [
+        {"id": "energyball", "pp": pp, "max_pp": 16}
+    ]
+    return snap
+
+
+# ORACULO PP (MON-26 R3, las CUATRO celdas exactas adjudicadas):
+# `pre_applied` significa estrictamente "linea procesada por poke-env ANTES
+# del snapshot" (derivada del orden de frames: seq < seq del request), NO
+# "hay un switch despues". Celdas 1/2 sin switch; celdas 3/4 con switch de
+# cierre y ademas "reemplazo limpio".
+@pytest.mark.parametrize("pp_snapshot,pre_applied,con_switch,esperado_nombrado", [
+    (16, 0, False, 15),  # celda 1: PRE16 sin gap -> un descuento
+    (15, 1, False, 15),  # celda 2: POST15 sin gap -> no re-descuenta (battle-120)
+    (16, 0, True, 15),   # celda 3: PRE16 con gap -> un descuento
+    (15, 1, True, 15),   # celda 4: POST15 con gap -> no re-descuenta
+])
+def test_oraculo_pp_cuatro_celdas(pp_snapshot, pre_applied, con_switch, esperado_nombrado):
+    lineas = ["|move|p2a: Ludicolo|Energy Ball|p1a: Tentacruel"]
+    if con_switch:
+        lineas.append("|switch|p2a: Latias|Latias, L77, F|100/100")
+    out = _proyectar(lineas, _snapshot_con_pp(pp_snapshot), pre_applied=pre_applied)
+    por_especie = _por_especie(out)
+    assert por_especie["ludicolo"]["moves"] == [
+        {"id": "energyball", "pp": esperado_nombrado, "max_pp": 16}
+    ]
+    if con_switch:
+        assert por_especie["latias"]["moves"] == [], (
+            "el reemplazo no recibe el movimiento del nombrado"
+        )
+
+
+def test_pin_de_uso_repetido_sin_gap_sigue_descontando():
+    """La bandera es el UNICO eje del descuento: un uso repetido del flujo
+    normal (snapshot pp=10, linea del frame de cierre) descuenta igual. Una
+    regla por-estado (p.ej. `pp == max_pp`) romperia este caso y queda
+    prohibida por adjudicacion."""
+    out = _proyectar(
+        ["|move|p2a: Ludicolo|Energy Ball|p1a: Tentacruel"],
+        _snapshot_con_pp(10), pre_applied=0,
+    )
+    assert _por_especie(out)["ludicolo"]["moves"] == [
+        {"id": "energyball", "pp": 9, "max_pp": 16}
+    ]
+
+
+# ---------------------------------------------------------------------------
+# MON-26 R2/R3: invariante ejecutable que cierra la CLASE.
+#
+# La clase adjudicada: "rama del despacho que escribe identidad persistente
+# (llama a `remember_item` o `reveal_ability`, o lee `persistent_state`)
+# resolviendo por `active()` en vez de por `named_target`". Sin este escaneo,
+# la proxima linea de protocolo que agregue alguien reabre la clase en
+# silencio (lo que paso ocho rondas seguidas en MON-20).
+#
+# R3: el escaneo es TRANSITIVO -- sigue las llamadas a los helpers anidados
+# de `project_observable_state` e incluye sus cuerpos. La frontera de que
+# helpers se siguen se DERIVA (alcance por llamadas), no se declara. Sin
+# esto, los miembros que delegan en un helper (move/apply_move, -transform/
+# apply_transform, -damage/-heal y -item-transferencia por `_owner_of`)
+# quedaban invisibles (medido: 8 ramas C, 4 miembros vivos).
+# ---------------------------------------------------------------------------
+
+import ast
+from collections import defaultdict
+from pathlib import Path
+
+# Allowlist JUSTIFICADA por escrito (medicion del tech lead, reproducida en
+# R3 con sonda propia sobre el escenario de gap: narracion huerfana + switch
+# de cierre). Son las ramas que escriben identidad resolviendo por active()
+# pero cuyo efecto el switch de cierre DESCARTA, asi que no son miembros:
+#   - `-start` (typechange): tipos temporales; el switch de cierre re-deriva.
+#   - `-formechange` / `detailschange` (forme_change): idem.
+#   - `replace` (end_illusion): la linea ES el desenmascaramiento; el
+#     `|switch|` posterior confirma la identidad real.
+#   - `-end` (Illusion): fuera del alcance adjudicado (R2). La linea
+#     `|-end|p2a: X|Illusion` nombra al activo cuyo disfraz ACABA de
+#     romperse; en la misma ventana viaja el `|replace|` que lo desenmascara,
+#     y la ability que escribe ("illusion") es la del Zoroark real detras del
+#     disfraz. Patron latente, adjudicado a otro issue si hace falta.
+_ALLOWLIST_R3 = frozenset({"-end", "-start", "-formechange", "detailschange", "replace"})
+
+
+def _ramas_del_despacho(src: str):
+    """Las ramas `if/elif tag ...` del despacho de `project_observable_state`,
+    como pares (tags, nodo If)."""
+    tree = ast.parse(src)
+    fn = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "project_observable_state"
+    )
+    ramas = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.If):
+            continue
+        tags = set()
+        for test in ([node.test] if not isinstance(node.test, ast.BoolOp)
+                     else node.test.values):
+            if (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
+                    and test.left.id == "tag"):
+                for cmp_ in test.comparators:
+                    if isinstance(cmp_, ast.Constant) and isinstance(cmp_.value, str):
+                        tags.add(cmp_.value)
+                    elif isinstance(cmp_, ast.Tuple):
+                        tags.update(
+                            el.value for el in cmp_.elts
+                            if isinstance(el, ast.Constant) and isinstance(el.value, str)
+                        )
+        if tags:
+            ramas.append((frozenset(tags), node))
+    return ramas
+
+
+def _subarbol_propio(node: ast.If):
+    """Los nodos del CUERPO de la rama, sin bajar por el `orelse`.
+
+    El despacho es una cadena de `elif`: cada rama vive en el `orelse` de la
+    anterior. Si el escaneo bajara por `orelse`, cada rama acumularia las
+    llamadas de TODAS las siguientes y la violacion de una quedaria tapada
+    por el `named_target` de las demas (vacuidad medida en R2). Los `if`
+    ANIDADOS dentro del cuerpo (p.ej. la logica de Trace) si se recorren
+    completos: son logica propia de la rama."""
+    out: list[ast.AST] = []
+    pila = list(node.body)
+    while pila:
+        actual = pila.pop()
+        out.append(actual)
+        pila.extend(ast.iter_child_nodes(actual))
+    return out
+
+
+def _helpers_del_proyector(src: str) -> dict[str, ast.FunctionDef]:
+    tree = ast.parse(src)
+    fn = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "project_observable_state"
+    )
+    return {n.name: n for n in fn.body if isinstance(n, ast.FunctionDef)}
+
+
+def _clausura(node: ast.If, helpers: dict[str, ast.FunctionDef]) -> list[ast.AST]:
+    """Nodos de la rama MAS los de todos los helpers anidados que invoca, de
+    forma transitiva. La frontera se DERIVA: solo se siguen funciones
+    definidas dentro del proyector y alcanzables por llamada."""
+    vistos: set[str] = set()
+    nodos = _subarbol_propio(node)
+    while True:
+        nuevas = []
+        for actual in nodos:
+            if (isinstance(actual, ast.Call) and isinstance(actual.func, ast.Name)
+                    and actual.func.id in helpers
+                    and actual.func.id not in vistos):
+                vistos.add(actual.func.id)
+                nuevas.extend(_subarbol_propio(helpers[actual.func.id]))
+        if not nuevas:
+            return nodos
+        nodos.extend(nuevas)
+
+
+def _nodos_del_resolver_ordenado(helpers: dict[str, ast.FunctionDef]) -> set[int]:
+    """Los nodos DENTRO de `named_target`, el resolver que la clase exige.
+
+    `named_target` degrada documentadamente a `active()` cuando el nombre no
+    esta en el equipo. Ese `active()` no puede contar como violacion, o el
+    invariante se autodemanda: el mandato es que las ramas USEN el resolver
+    por identidad, no que el resolver reimplemente la busqueda. Un
+    `named_target` que resolviera mal es otro defecto, cubierto por los
+    tests de gap."""
+    if "named_target" not in helpers:
+        return set()
+    return {id(n) for n in ast.walk(helpers["named_target"])}
+
+
+# Campos de IDENTIDAD persistente: los que el auditor audita como
+# `UnresolvedField` (packages/dataset-audit/src/projection.ts:57) y que
+# sobreviven entre decisiones. `hp`, `status` y `boosts` son volatiles y
+# quedan fuera a proposito: los reescribe el switch de cierre.
+_CAMPOS_IDENTIDAD = frozenset({"species", "ability", "item", "moves", "types"})
+
+
+def _asignacion_de_identidad(nodo: ast.AST) -> bool:
+    """`mon["ability"] = ...` / `mon["item"] = ...` / etc.: escritura directa
+    de un campo de identidad sin pasar por remember_item/reveal_ability."""
+    if not isinstance(nodo, ast.Assign):
+        return False
+    for target in nodo.targets:
+        if (isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "mon"
+                and isinstance(target.slice, ast.Constant)
+                and target.slice.value in _CAMPOS_IDENTIDAD):
+            return True
+    return False
+
+
+def test_el_despacho_resuelve_identidad_persistente_por_named_target():
+    """MON-26 R2/R3: ninguna rama del despacho que escriba identidad
+    persistente (llama a `remember_item`, `reveal_ability` o `register_move`,
+    lee `persistent_state`, o ASIGNA un campo de identidad sobre `mon`) puede
+    resolver su objetivo por `active()` en vez de `named_target`, ni
+    directamente NI a traves de un helper anidado. Allowlist escrita arriba
+    con justificacion medida.
+
+    Canarios de no-vacuidad: (1) el escaneo vio el despacho real (>= 25
+    ramas y >= 15 helpers derivados); (2) POR RAMA, no por tag: cada rama de
+    un miembro tiene `named_target` en su clausura -- una rama DUPLICADA del
+    mismo tag no puede quedar tapada por otra que si resuelve bien (medido
+    con la mutacion de allowlist). Mutaciones medidas (ver D62-R3): volver
+    cualquiera de los miembros a `active()` pone ESTE test en rojo nombrando
+    la rama, y una rama NUEVA que escriba identidad por active() a traves de
+    un helper NUEVO tambien (canario obligatorio de R3)."""
+    src = Path(__file__).resolve().parents[2] / "src" / "ludex_agent" / "showdown" / "protocol.py"
+    helpers = _helpers_del_proyector(src.read_text())
+    ramas = _ramas_del_despacho(src.read_text())
+
+    assert len(ramas) >= 25, (
+        "el escaneo no vio el despacho real: sin ramas que revisar seria vacuo"
+    )
+    assert len(helpers) >= 15, (
+        "la frontera derivada no vio los helpers del proyector: el escaneo "
+        "transitivo no tendria nada que seguir"
+    )
+    excluidos = _nodos_del_resolver_ordenado(helpers)
+    violaciones = []
+    por_tag: dict[str, list[bool]] = defaultdict(list)
+    for tags, node in ramas:
+        clausura = _clausura(node, helpers)
+        llamadas = {
+            c.func.id for c in clausura
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            and id(c) not in excluidos
+        }
+        nombres = {
+            n.id for n in clausura
+            if isinstance(n, ast.Name) and id(n) not in excluidos
+        }
+        escribe_identidad = (
+            "remember_item" in llamadas
+            or "reveal_ability" in llamadas
+            or "register_move" in llamadas
+            or "persistent_state" in nombres
+            or any(_asignacion_de_identidad(n) for n in clausura)
+        )
+        if not escribe_identidad:
+            continue
+        resuelve_por_nombre = "named_target" in llamadas
+        for tag in tags:
+            por_tag[tag].append(resuelve_por_nombre)
+        # Regla FUERTE (R3): la clausura de una rama que escribe identidad
+        # no puede contener `active` EN ABSOLUTO (fuera del resolver
+        # ordenado) -- ni siquiera junto a un `named_target` de otro dato:
+        # medido con la mutacion M-transform (el mon del transformer a
+        # `active()` quedaba tapado por el `named_target` de la fuente).
+        if "active" in llamadas and not tags <= _ALLOWLIST_R3:
+            violaciones.append(sorted(tags))
+    assert violaciones == [], (
+        f"ramas que escriben identidad persistente resolviendo por active(): "
+        f"{violaciones} -- la clase adjudicada exige named_target (R3: "
+        f"incluso a traves de helpers anidados, register_move y asignaciones)"
+    )
+    miembros = {
+        "-item", "-enditem", "-ability", "-endability",
+        "move", "-transform", "-damage", "-heal",
+    }
+    for tag in sorted(miembros):
+        assert por_tag.get(tag) and all(por_tag[tag]), (
+            f"CADA rama del miembro {tag!r} tiene que resolver por "
+            f"named_target en su clausura -- una rama duplicada del mismo "
+            f"tag no puede quedar tapada por otra (y la allowlist no puede "
+            f"ocultar un miembro)"
+        )
+
+
+def test_secuencia_completa_de_la_batalla_67_limpia_el_item():
+    """CARACTERIZACION del proyector, no prueba del arreglo (MON-26 R2, F2):
+    este test PASA en la base 093296c y queda verde bajo las dos mutaciones
+    de R1 (verificado por Tasos). Su valor es dejar escrita, con las lineas
+    exactas de battle-gen6randombattle-67, la refutacion de la hipotesis del
+    `-damage` (el proyector nunca fue el problema) y pinar el resultado
+    correcto de la ventana completa.
+
+    La ventana de la decision del turno 3 trae la narracion del turno 2
+    (`-damage|0 fnt`, `-enditem`, `faint`) seguida del `switch` del
+    reemplazo, sobre el snapshot post-narracion (fainted=True, active=True,
+    item=None en poke-env) con la memoria D40 en airballoon. El item del
+    desmayado queda None y el reemplazo intacto.
+
+    La linea `-damage` PRECEDE a `-enditem` (hipotesis original del tech
+    lead): medido, `active` NO se limpia ni ahi ni en `faint`, y la
+    resolucion por identidad no depende de eso."""
+    memoria: dict[str, dict] = {"probopass": {"item": "airballoon"}}
+    probopass = {
+        "species": "probopass", "hp_fraction": 0.0, "active": True,
+        "fainted": True, "status": "FNT", "level": 91,
+        "item": None, "ability": None, "types": ["ROCK", "STEEL"],
+        "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+                   "evasion": 0, "accuracy": 0},
+        "moves": [{"id": "flashcannon", "pp": 15, "max_pp": 16}],
+    }
+    snapshot = _snapshot(gen=6)
+    snapshot["opponent"]["pokemon"] = [probopass]
+    out = _proyectar(
+        ["|move|p1a: Hariyama|Close Combat|p2a: Probopass",
+         "|-supereffective|p2a: Probopass",
+         "|-damage|p2a: Probopass|0 fnt",
+         "|-unboost|p1a: Hariyama|def|1",
+         "|-unboost|p1a: Hariyama|spd|1",
+         "|-enditem|p2a: Probopass|Air Balloon",
+         "|faint|p2a: Probopass",
+         "|switch|p2a: Malamar|Malamar, L81, F|100/100"],
+        snapshot, persistent_state=memoria,
+    )
+    por_especie = _por_especie(out)
+    assert por_especie["probopass"]["item"] is None
+    assert por_especie["probopass"]["fainted"] is True
+    assert por_especie["probopass"]["active"] is False
+    assert por_especie["malamar"]["item"] == "unknown_item"
+    assert memoria["probopass"]["item"] is None
 
 
 def test_adquisicion_posterior_reemplaza_la_memoria_anterior():

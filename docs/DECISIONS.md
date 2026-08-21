@@ -4126,3 +4126,355 @@ VERDE con el cambio, restaurado y verificado por sha256.
 **Modelo efectivo:** deepseek-v4-pro (opencode-go/deepseek-v4-pro),
 agente Nebula. Recomendación: In Review (el tech lead interino es la
 única autoridad de veredicto e integración).
+
+## D62 — MON-26: la narración que un request `wait:true` interpone no queda huérfana; `-enditem` resuelve por identidad (2026-08-16)
+
+**Contexto.** El gate MON-16 detectó 21 violaciones de
+`hidden_information/item` en `battle-gen6randombattle-67` (schema v2): el
+item de Probopass (`airballoon`, revelado en el turno 0) sobrevivió al
+`-enditem` del turno 2 y quedó persistido hasta el turno 15. La hipótesis
+del tech lead decía que el handler `-enditem` (protocol.py) perdía la
+mutación porque `active()` devolvía `None` tras el `-damage|0 fnt`
+precedente. **Refutada con replay empírico** contra el proyector real y
+los estados persistidos como ground truth: ni el handler `-damage` ni el
+de `faint` ni `Pokemon.faint()` (poke-env 0.15.0, pokemon.py:422-429)
+tocan `active`, y la secuencia exacta proyectada A NIVEL DE PROYECTOR
+produce `item=None` correcto.
+
+**Causa raíz medida.** Los frames reales (límites por `>` en
+`protocol_lines`; `|turn|N` cierra el frame que narra N-1) muestran que
+la narración del turno 2 —la que contiene `-enditem`— llegó ENTRE un
+request `wait:true` (rqid 6, publicado cuando la elección se mandó
+temprano y el servidor espera al rival) y el request activo (rqid 8). La
+espera de cada decisión sólo miraba hacia adelante de su propio request,
+así que esa narración no la proyectó NINGUNA decisión: la del turno 2
+tomó la narración del turno 1 y la del turno 3 tomó el frame del switch
+del reemplazo. Mientras tanto poke-env SÍ procesó `-enditem`
+(`end_item()` → item None) y el snapshot fresco lo traía correcto, pero
+el bucle de reaplicación D40 (memoria de item contra la corrupción de
+Trick) pisa el snapshot con `entry["item"]="airballoon"` al inicio de
+CADA proyección, y la línea que actualizaría esa memoria nunca llegó:
+por eso fainted llegaba bien (snapshot) y el item no (memoria stale
+reafirmada). Verificación: replay de las decisiones D0-D3 sobre los
+frames reales reproduce EXACTAMENTE los cuatro estados persistidos,
+incluida la fila defectuosa D2.
+
+**A — la espera devuelve una VENTANA, no un frame suelto.**
+`RawFrameInbox.wait_for_resolution` recibe ahora dos seq: `after_seq`
+(watermark: último frame entregado a la proyección anterior de ESTE tag)
+y `until_seq` (seq del request propio). Devuelve, en orden, todos los
+frames de resolución con `after_seq < seq <= closing`, donde `closing`
+es el primer frame de resolución posterior al request —el mismo frame
+único que la API anterior devolvía—. Sin request interpuesto la ventana
+es exactamente la de antes; con un `wait:true` interpuesto, la narración
+huérfana entra en la ventana de la decisión siguiente. El watermark vive
+en `client._projected_until`, dict POR TAG (nunca global: con
+concurrencia > 1 un cursor compartido haría que dos batallas se salteen
+frames en silencio). Avanza al ENTREGAR la ventana, antes de proyectar:
+si la proyección falla cerrado (`-swapboost`), los frames ya consumidos
+no envenenan la decisión siguiente. El reintento no consume frames y no
+toca el watermark. El chequeo de desalojo ahora protege todo el rango
+`(watermark, closing]`, no sólo el cierre.
+
+**B — identidad persistente resuelta por el ident NOMBRADO.** La línea
+nombra al mon (`p2a: Probopass`). En una ventana con gap la narración
+puede traer la línea seguida de `switch` en el MISMO frame y el snapshot
+—post-narración— ya tiene al nombrado fuera de cancha; `active()`
+resolvería al REEMPLAZO: corrompería su dato y dejaría la memoria del
+nombrado stale. En R1 la pieza cubría sólo `-enditem` (`enditem_target`);
+**en R2 se generalizó a `named_target`** y se aplicó a los cuatro
+handlers de la clase (ver R2 abajo). Resuelve por `find` (`base_species`)
+sobre el equipo, con fallback a `active()` sólo si el nombre no está en
+el equipo (comportamiento previo). Bajo Illusion el disfraz ES la
+entrada del equipo: `find` y `active()` devuelven el mismo objeto, cero
+cambio para D40 T-02.
+
+**Mutaciones medidas (R1)** (in-place sobre el worktree, `PYTHONPATH`
+pineado al árbol mutado, restauradas con `git checkout` y verificadas
+por sha256):
+
+| mutación | tests rojos | otros tests nuevos |
+|---|---|---|
+| A revertida (`return [closing]`) | `test_la_ventana_incluye_la_narracion_anterior_al_request_wait` (inbox) y `test_el_watermark_de_proyeccion_es_por_batalla` (client) | el de no-regresión del flujo normal y el de la pieza B quedan verdes |
+| B revertida (`mon = active()`) | `test_enditem_limpia_al_nombrado_aunque_ya_no_este_activo`, SOLO ese | secuencia batalla-67 y berry (`-enditem` con mon activo) quedan verdes |
+
+La afirmación de no-regresión del flujo normal tiene mutación medida
+(condición del tech lead): `test_sin_request_wait_la_ventana_es_el_frame_
+unico_de_siempre` fija que, sin `wait:true`, la ventana entrega
+exactamente el mismo frame único de la API anterior; la mutación que lo
+pone rojo es la ENSANCHADORA (off-by-one `after_seq <` → `<=`, medida
+por Tasos: 2 failed), no la de colapsar la ventana. El aislamiento por
+tag del INBOX (`test_el_inbox_aisla_los_frames_por_batalla`, renombrado
+en R2 por F3) verifica que cada tag recibe sus frames; la evidencia
+comportamental del WATERMARK compartido la da ÚNICAMENTE el test de
+client `test_el_watermark_de_proyeccion_es_por_batalla` (un frame de A
+publicado mientras B decide sobrevive para la decisión siguiente de A;
+con watermark global se pierde — medido por Tasos).
+
+**Limitaciones conocidas.** (1) `active()` devolviendo `None` en tags de
+evidencia observada sigue siendo SILENCIOSO; MON-26 no lo cambió (item 6
+del alcance, aceptado por el tech lead): `named_target` elimina el caso
+agudo de la clase y el silencio global queda como candidato a issue
+aparte. (2) RETIRADA en R2 — la redacción anterior decía que `-item` en
+gap "deja la memoria sin sembrar" y que "la pieza A lo cierra para toda
+la clase". **La medición (tech lead + Tasos) dice lo contrario**: `-item`
+en gap SIEMBRA la memoria, pero con el mon EQUIVOCADO (misatribución al
+reemplazo), el mecanismo idéntico que produjo las 21 violaciones. R2
+cerró esa boca (ver abajo). (3) Las violaciones ya persistidas de la
+batalla 67 (y las v1 de D44) no se re-persisten: fuera de alcance por el
+issue. (4) El watermark se inicializa en 0 y avanza por entrega; una
+decisión que falla cerrado por timeout no avanza el watermark (no
+consumió frames), que es lo correcto. (5) R2/F5: un reintento dentro de
+un gap devuelve `_last_projection[tag]` y persiste esa fila SIN la
+narración del gap (item viejo). Es semántica PREEXISTENTE del retry, no
+la introduce MON-26; la decisión real siguiente consume el gap y corrige.
+Se documenta, NO se arregla acá.
+
+**Verificación (R1).** TDD: los 6 tests nuevos estaban rojos en la base
+093296c en 5 de 6 casos, y 4 de esos 5 por firma/atributo
+(`until_seq`/`_projected_until`), no por semántica — la evidencia real
+la dan las mutaciones, no el rojo en la base. `test_secuencia_completa_
+de_la_batalla_67_limpia_el_item` PASA en la base y queda verde bajo las
+dos mutaciones (medido por Tasos): es CARACTERIZACIÓN del proyector, no
+prueba del arreglo (F2). Suite Python completa con base descartable
+(`TEST_DATABASE_URL` DSN PLANO — la variante `postgresql+asyncpg` la
+rechaza el fixture; medido): worktree 795 passed / 1 skipped / 0 failed;
+base limpia 093296c (archive completo, mismo env, `PYTHONPATH` pineado)
+789 passed / 1 skipped / 0 failed; delta = los 6 tests nuevos. Suite
+TypeScript: no aplica (ningún archivo TS tocado; el auditor no cambia).
+`git diff --check` limpio; sin rutas absolutas; sin secretos; commit en
+inglés con rutas explícitas.
+
+---
+
+## D62-R2 — MON-26: la clase completa es identidad persistente resuelta por el ident NOMBRADO; ventana vacía falla cerrado (2026-08-16)
+
+**Contexto (LINEAR_VERDICT R1 F1).** La pieza A concatena la narración
+huérfana con el frame de cierre sobre un snapshot POST-narración: el
+reemplazo ya está en cancha cuando se procesan las líneas que nombran al
+que salió. Eso expone a toda la familia de handlers que resuelven por
+`active()`. Medido por el tech lead y por Tasos, handler por handler,
+viendo el estado DESPUÉS del `switch` de cierre:
+
+| Handler | Qué escribe | Tras el `switch` de cierre |
+|---|---|---|
+| `-damage 0 fnt` + `faint` | volátil | se autocorrige |
+| `-status` | volátil | se autocorrige |
+| `-boost` | volátil | se autocorrige |
+| `-enditem` | persistente | cerrado por la pieza B (R1) |
+| `-item` | persistente | 🔴 misatribuye + envenena D40 |
+| `-ability` | persistente | 🔴 misatribuye |
+| `-endability` | persistente | 🔴 lee la entrada equivocada |
+
+**La clase:** handlers que escriben información de identidad persistente
+(`remember_item` / `reveal_ability` / lectura de `persistent_state`)
+resolviendo por `active()` en vez de por el ident que la línea NOMBRA.
+Cuatro miembros: `-item`, `-enditem`, `-ability`, `-endability`.
+Alcanzable, medido contra el corpus: 890 turnos con línea `-item`, 151
+con `-item` + `faint` en el mismo turno, 92 con `-item` seguido de
+`switch` del mismo lado.
+
+**1. `named_target` en los cuatro.** `enditem_target` se renombró a
+`named_target` y ahora lo usan `-item`, `-enditem`, `-ability` y
+`-endability`. La resolución por identidad cambia QUIÉN recibe el dato,
+nunca QUÉ se escribe: la lógica de Trace (`-ability`) y la restauración
+(`-endability`) no se tocan. Fuera de una ventana con gap
+`find(nombrado) == active()`, así que ninguna ruta existente cambia de
+comportamiento — verificado corriendo la suite completa de integración
+(batallas reales) en verde, sin divergencias.
+
+**2. Invariante ejecutable (AST) que cierra la clase.**
+`test_el_despacho_resuelve_identidad_persistente_por_named_target`
+escanea el despacho de `project_observable_state` y falla si una rama
+escribe identidad persistente resolviendo por `active()` en vez de
+`named_target`. Allowlist escrita con justificación: `-end` (Illusion),
+adjudicada fuera de R2 (la clase tiene cuatro miembros; la línea nombra
+al activo cuyo disfraz acaba de romperse y en la misma ventana viaja el
+`|replace|` que lo desenmascara). Dos canarios de no-vacuidad en el
+propio test: el escaneo vio >= 25 ramas del despacho real, y las cuatro
+ramas de la clase resuelven por `named_target`.
+
+**3. F4 — ventana vacía falla cerrado.** `wait_for_resolution` puede
+devolver lista vacía cuando el cursor de la decisión queda por detrás del
+watermark (dos decisiones resolviendo al mismo `closing`). Guarda en
+`client._resolve_state`: `raise ProjectionTimeoutError` dentro del fallo
+cerrado existente (con `_drop_step`), en vez de `IndexError` que escapaba
+sin descartar el paso.
+
+**Mutaciones medidas (R2, in-place, `PYTHONPATH` pineado, restauradas
+con `git checkout` y sha256 verificado):**
+
+| mutación | tests rojos | precisión |
+|---|---|---|
+| M1 `-item` → `active()` | invariante AST (nombra `['-item']`) + `test_item_revelado_en_gap_se_le_escribe_al_nombrado_no_al_reemplazo` | los tests de `-ability`/`-endability` siguen verdes |
+| M2 `-ability` → `active()` | invariante AST + `test_ability_revelada_en_gap_...` | el de `-item` sigue verde |
+| M3 `-endability` → `active()` | invariante AST (nombra `['-endability']`) + `test_endability_en_gap_restaura_...` | los demás verdes |
+| M4 guarda F4 quitada | `test_ventana_vacia_falla_cerrado_sin_dejar_fila` con `IndexError` exacto en client.py:1703 | solo ese |
+| M5 M1 + allowlist ampliada a `-item` | invariante AST ROJO por el CANARIO de las cuatro ramas (no por la lista de violaciones) | la allowlist no puede esconder una mutación de un miembro de la clase |
+
+**Sobre la no-vacuidad del invariante (lección medida).** La primera
+versión del escáner recorría cada rama con `ast.walk` completo, que baja
+por el `orelse` de la cadena `elif`: cada rama acumulaba las llamadas de
+todas las siguientes y la violación de `-item` quedaba tapada por el
+`named_target` de `-enditem` — M1 daba VERDE con el invariante roto. Se
+midió, se corrigió (escaneo del cuerpo propio de cada rama) y se
+commiteó aparte (`cebc400`). La regla de proceso D61 se aplica al propio
+invariante: su vacuidad también se demuestra con mutación.
+
+**F2/F3.** `test_secuencia_completa_de_la_batalla_67_limpia_el_item`
+pasaba en la base y queda verde bajo las mutaciones: es caracterización
+del proyector (deja escrita la refutación de la hipótesis del
+`-damage`), no prueba del arreglo; su docstring lo dice ahora.
+`test_el_watermark_es_por_batalla_no_global` se renombró a
+`test_el_inbox_aisla_los_frames_por_batalla`: verifica aislamiento de
+frames por tag (queda verde con watermark compartido, medido por Tasos);
+la cobertura del watermark por tag la da el test de client.
+
+**Verificación (R2).** Suite completa en serie, DSN plano, base
+descartable `ludex_mon16_gate`: 800 passed / 1 skipped / 0 failed (delta
+5 sobre R1: 3 tests de gap + invariante AST + F4). Los 5 nuevos estaban
+rojos antes del arreglo por la razón correcta (los 3 de gap por
+misatribución real, el AST por las ramas violadoras, F4 por `IndexError`
+exacto en client.py:1703). Worktree limpio salvo los 2 artefactos del
+tech lead (no commiteados, fuera de rango). Sin segunda fuente de verdad
+agregada: el canario del invariante es un oráculo de test, no una lista
+que la producción tenga que mantener en sincronía.
+
+---
+
+## D62-R3 — MON-26: los miembros vivos del despacho delegado, el escáner transitivo y el doble descuento de PP (2026-08-16)
+
+**Contexto (adjudicación del tech lead, reproducida con sonda propia).** El
+escáner de R2 miraba el cuerpo propio de cada rama; las ramas que DELEGAN en
+un helper quedaban fuera de su universo. Escáner transitivo sobre el HEAD de
+R2: **33 ramas, 21 helpers**, 8 ramas escriben identidad resolviendo por
+`active()` DENTRO de un helper. Medidas una por una en el escenario de gap
+(narración huérfana + switch de cierre, sonda propia coincidente con la del
+tech lead):
+
+| Rama | Helper | Contamina | ¿Miembro? |
+|---|---|---|---|
+| `move` | `apply_move` | `moves` (movimiento ajeno al reemplazo) | 🔴 sí — **2.817 turnos** del corpus con move+switch del mismo lado (~7%) |
+| `-transform` | `apply_transform` | `ability`, `moves` | 🔴 sí |
+| `-damage` con `[of]` | `apply_damage_or_heal_ownership` | `ability` | 🔴 sí |
+| `-item` transferencia | `apply_item_transfer_ownership` | `item` + memoria D40 | 🔴 sí |
+| `-start` typechange / `-formechange` / `detailschange` / `-heal` con `[of]` / `replace` | `apply_typechange` / `forme_change` / `end_illusion` | — (el switch de cierre descarta la escritura) | no |
+
+**1. Los cuatro miembros por identidad nombrada (QUIÉN, nunca QUÉ).**
+- `apply_move`: `mon = named_target(parts[2])`; el actor nombrado recibe el
+  movimiento, el reemplazo queda limpio.
+- `apply_transform`: el transformer por `named_target(parts[2])` Y la fuente
+  resuelta LOCALMENTE (rival: `named_target`; propia: `own_mon_named`).
+  **`mon_for_ident` NO se generalizó** (adjudicación expresa): sus otros
+  llamadores (typechange y afines) son ramas medidas como no-miembros.
+- `apply_damage_or_heal_ownership` y `apply_item_transfer_ownership`:
+  `_owner_of` resuelve por `named_target` (era el resolver compartido de las
+  rutas `[of]`). Los canarios de `-heal` fijan que la salida final del
+  reemplazo NO cambia: `test_heal_por_item_propio_en_gap_...` y
+  `test_heal_con_of_en_gap_...` (la ruta Hospitality es inalcanzable en
+  singles — hospitality exige aliado —; con la resolución por nombre la
+  escritura va al mon que la línea nombra).
+
+**2. Escáner TRANSITIVO (invariante ejecutable).** La clausura de cada rama
+sigue las llamadas a helpers anidados de `project_observable_state` de forma
+transitiva — la frontera se DERIVA por alcanzabilidad, no se declara.
+`escribe_identidad` ahora incluye `remember_item`, `reveal_ability`,
+`register_move`, lecturas de `persistent_state` Y asignaciones directas de
+campos de identidad sobre `mon` (`species`/`ability`/`item`/`moves`/`types`;
+`hp`/`status`/`boosts` quedan fuera: los reescribe el switch de cierre).
+Reglas:
+- Una rama que escribe identidad no puede contener `active` en su clausura
+  EN ABSOLUTO (fuera del cuerpo de `named_target`, el trust anchor cuyo
+  fallback documentado a `active()` no puede autodenunciar al invariante) —
+  ni siquiera junto a un `named_target` de otro dato: **medido** con
+  M-transform, donde el `named_target` de la fuente tapaba el `active()` del
+  transformer antes de endurecer la regla.
+- Canario POR RAMA, no por tag: cada rama de un miembro tiene `named_target`
+  en su clausura; una rama duplicada del mismo tag no queda tapada por otra
+  que sí resuelve bien, y la allowlist no puede ocultar un miembro (medido:
+  M-allowlist).
+- Allowlist escrita con justificación medida: `-end` (Illusion, adjudicada
+  fuera de R2/R3), `-start`, `-formechange`, `detailschange`, `replace`
+  (sus escrituras las descarta el switch de cierre).
+
+**3. El doble descuento de PP (lo que era MON-27 es ESTA clase).** poke-env
+procesa `|move|` con `mon.moved(..., use=True)` (`abstract_battle.py:740`,
+`Move.use()`): el PP del rival YA está descontado en el snapshot cuando la
+narración drenó antes del request (gap). El proyector re-aplicaba la línea y
+descontaba otra vez: snapshot PRE pp=16 → 15 (correcto), snapshot POST
+pp=15 → **14** — la firma exacta de las 4 violaciones de
+`hidden_information/moves` de `battle-gen6randombattle-120`. FIX:
+`pre_applied` se deriva ÚNICAMENTE del orden de frames (`seq < seq del
+request`, calculado en `client._resolve_state`), nunca del estado del
+snapshot ni de si hay un switch después; `register_move` descuenta iff
+`not pre_applied`. Oráculo de CUATRO celdas, todas → 15:
+(1) PRE16 sin switch, pre=0; (2) POST15 sin switch, pre=1 (battle-120);
+(3) PRE16 con switch, pre=0 → Ludicolo 15 + reemplazo limpio;
+(4) POST15 con switch, pre=1 → Ludicolo 15 + reemplazo limpio. Pin aparte:
+uso repetido sin gap (pp=10, pre=0 → 9) — queda PROHIBIDA por adjudicación
+cualquier regla por-estado (`pp == max_pp` y afines) que lo rompa. Canarios
+de cableado en client: pre=1 con y sin switch cuando el frame de move llega
+ANTES del request; pre=0 cuando llega después.
+
+**R4 (T-01, adjudicación Latwan) — Pressure × gap.** El texto anterior de
+R3 decía que `pre_applied` evita "el único efecto no idempotente": era
+falso. La rama D37 de Pressure (`pp=None` + marca `unknown_pp_moves`)
+también es un efecto no idempotente y quedaba APAGADA por la guarda
+combinada `if not use or pre_applied: return` para líneas de gap: poke-env
+es ciego al costo extra de Pressure TAMBIÉN en el gap, así que el snapshot
+traía el número descontado de a uno y la proyección afirmaba ese número
+stale en vez de `null` (violación de `hidden_information/moves` de signo
+inverso al de battle-120). Corrección mínima: `pre_applied` salta SOLO el
+`pp - 1`; la rama Pressure/D37 corre siempre que `use=True`, con o sin
+bandera; `use=False` sigue sin consumir ni marcar. Canario con el segundo
+snapshot fresco (la marca re-fuerza `None`): RED semántico en la base
+(pp=15 en vez de None), GREEN con el fix. Mutación M-T01 (restaurar la
+guarda combinada): rojo SOLO ese canario; las 4 celdas PP y el pin 10→9
+siguen verdes.
+
+**R4 (T-02, documental).** Los canarios pedidos en R3 NO son ramas nuevas:
+cubren rutas de los helpers ya listados — Magic Bounce es la ruta
+`[from] ability:` de `apply_move` (ability del actor nombrado) y Rocky
+Helmet `[of]` es la ruta de item por `[of]` de
+`apply_damage_or_heal_ownership` (item del dueño nombrado); la tabla de
+arriba las refleja en sus filas `move` y `-damage [of]` respectivamente.
+
+**Mutaciones medidas (R3, in-place, `PYTHONPATH` pineado, restauradas con
+copia byte a byte y sha256 verificado):**
+
+| mutación | rojos |
+|---|---|
+| M-canario-profundidad-2: rama NUEVA `-endmove` → helper → helper que escribe por `active()` | invariante nombra `['-endmove']` (el write vive a profundidad 2) |
+| M-move: `apply_move` → `active()` | invariante `['move']` + gap test de move |
+| M-owner: `_owner_of` → `active()` | invariante + gap de `-damage [of]`, transfer y Rocky Helmet |
+| M-transform: mon → `active()` (con el `named_target` de la fuente intacto) | invariante (tras endurecer la regla) + gap de transform |
+| M-allowlist: `-item` en allowlist + main `-item` → `active()` | invariante POR EL CANARIO por rama (la allowlist no oculta) |
+| M-pp: `pre_applied = 0` en client | los 2 canarios de cableado (celdas 2/4) |
+| M-transitiva: clausura eliminada (solo cuerpo propio) | invariante por el canario por rama |
+
+**Verificación.** Entorno recreado con `uv sync` (el worktree mon-20 y su
+venv dejaron de existir entre R2 y R3; Python 3.12.12, uv 0.9.27). Corrida
+válida: `env -i` + `PYTHONPATH` pineado + SOLO `TEST_DATABASE_URL` (DSN
+plano) + `DATABASE_URL=` vacío (para que el conftest no repueble la base
+compartida desde `.env`) + `--ignore=tests/integration/test_langgraph_
+battle.py`: **723 passed, 94 skipped (motivo explicado), 0 failed, 1
+exclusión documentada** (el langgraph test es un gate live de MON-16 que
+exige DATABASE_URL y el server; NO se le agrega skip). Suite focal showdown:
+280 passed. Desviación registrada: dos corridas anteriores inválidas
+(suite2 cuelgue en test_graph_play por DATABASE_URL repoblado desde `.env`
+con los servicios de juego apagados; suite3 idem — causas confirmadas por el
+tech lead y documentadas aquí como procedimiento, no como defecto).
+
+**Limitaciones que quedan (R3).** (1) La ruta `-heal` con `[of]`
+(Hospitality) es inalcanzable en singles; con `_owner_of` por nombre su
+escritura va al mon nombrado. (2) `mon_for_ident` conserva su rama
+`active()` para idents rivales: sus llamadores restantes (typechange,
+afines) son no-miembros medidos; patrón latente, adjudicado fuera. (3) La
+ability de Mega Evolution (`intimidate` vs `hugepower` de
+mawile/mawilemega) es MON-27 GENUINO, fuera de R3. (4) F5 (retry en gap
+persiste una fila con item viejo) documentado, no arreglado. (5) El
+escáner es estructural: una reescritura del despacho que extraiga los
+handlers del cuerpo del proyector lo dejaría sin clausura que seguir — el
+canario de >= 25 ramas/15 helpers lo denuncia. No se afirma que la clase
+queda cerrada sin la mutación medida que lo respalde: las mutaciones de
+arriba son la evidencia.

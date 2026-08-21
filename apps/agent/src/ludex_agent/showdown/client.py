@@ -789,6 +789,12 @@ class LudexPlayer(RandomPlayer):
         # tras una eleccion rechazada, donde no hay resolucion nueva que
         # esperar.
         self._last_projection: dict[str, dict] = {}
+        # MON-26: watermark de frames entregados a la proyeccion, POR TAG:
+        # seq del ultimo frame de la ventana consumida por la decision
+        # anterior de ESTA batalla. Se inicializa en 0 (nada consumido) y
+        # avanza en `_resolve_state`. Un reintento NO consume frames y por
+        # eso no lo toca.
+        self._projected_until: dict[str, int] = {}
         # Memoria PUBLICA entre decisiones, por tag e identidad canonica:
         # tipos/ability/moves persistentes que un typechange o un Transform
         # tapan temporalmente. `switch_out` (`pokemon.py:600-612`) en
@@ -1351,6 +1357,7 @@ class LudexPlayer(RandomPlayer):
         self._outbound_sequences.pop(tag, None)
         self._last_projection.pop(tag, None)
         self._temporary_state.pop(tag, None)
+        self._projected_until.pop(tag, None)
 
     def trajectory_blocker(self, tag: str) -> tuple[int, str] | None:
         terminal = self._terminal_failures.get(tag)
@@ -1668,9 +1675,18 @@ class LudexPlayer(RandomPlayer):
             }
         budget = max(0.0, deadline - self._clock())
         try:
-            frame = await self.frame_inbox.wait_for_resolution(
+            window = await self.frame_inbox.wait_for_resolution(
                 tag,
-                after_seq=cursor,
+                # MON-26: el watermark es el seq del ULTIMO frame entregado
+                # a la proyeccion anterior de ESTE tag (por batalla, nunca
+                # global: con concurrencia > 1 un cursor compartido haria que
+                # dos batallas se roben frames en silencio). La ventana
+                # devuelve los frames de resolucion entre el watermark y el
+                # frame de cierre -- incluida cualquier narracion que un
+                # request `wait:true` haya interpuesto antes del request
+                # activo (battle-gen6randombattle-67, turno 2).
+                after_seq=self._projected_until.get(tag, 0),
+                until_seq=cursor,
                 timeout=min(self.projection_timeout_seconds, budget),
             )
         except ProjectionTimeoutError:
@@ -1680,10 +1696,39 @@ class LudexPlayer(RandomPlayer):
             self.projection_timeout_count += 1
             self._drop_step(tag, step)
             raise
+        # El watermark avanza al entregar la ventana, ANTES de proyectar: si
+        # la proyeccion falla cerrado (`-swapboost`), los frames ya fueron
+        # consumidos y la decision siguiente no tiene que volver a tropezar
+        # con el mismo frame envenenado.
+        # MON-26 R2 (F4): el contrato del inbox permite ventana VACIA cuando
+        # el cursor de esta decision quedo por DETRAS del watermark (dos
+        # decisiones resolviendo al mismo frame de cierre; medido). Sin
+        # guarda, `window[-1]` lanzaria `IndexError`, que escapa de los dos
+        # `except` de fallo cerrado SIN `_drop_step`. Se convierte en el
+        # mismo fallo cerrado de siempre: ni proveedor con estado ambiguo ni
+        # fila persistida.
+        if not window:
+            self.projection_timeout_count += 1
+            self._drop_step(tag, step)
+            raise ProjectionTimeoutError(
+                f"{tag} entrego una ventana de frames vacia para la decision "
+                f"(watermark={self._projected_until.get(tag, 0)}, "
+                f"request={cursor}): no se puede demostrar cual es la "
+                "narracion de esta decision"
+            )
+        self._projected_until[tag] = window[-1].seq
+        # MON-26 R3: las lineas de frames con seq < cursor (los del gap,
+        # interpuestos por un request `wait:true`) llegan de frames que
+        # poke-env YA proceso antes de capturar el snapshot: sus efectos
+        # (incluido el descuento de PP de `Move.use()`) ya estan aplicados
+        # y el proyector no debe reaplicar el unico efecto NO idempotente.
+        pre_applied = sum(
+            len(frame.lines) for frame in window if frame.seq < cursor
+        )
         try:
             projected = project_observable_state(
                 snapshot,
-                frame.lines,
+                tuple(line for frame in window for line in frame.lines),
                 opponent_side=opponent_side,
                 vocabulary=vocabulary,
                 # Mismo dict, por tag, a traves de TODA la batalla: es lo
@@ -1691,6 +1736,7 @@ class LudexPlayer(RandomPlayer):
                 # ESTA decision seguir siendo correcto varias decisiones
                 # despues, cuando recien ahi llegue su switch-out.
                 persistent_state=self._temporary_state.setdefault(tag, {}),
+                pre_applied=pre_applied,
             )
         except ProjectionAmbiguityError:
             # Mismo fallo CERRADO que el timeout: la alternativa era copiar
