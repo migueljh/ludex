@@ -64,6 +64,7 @@ from .eval_report import (
     BenchmarkRecord,
     append_ledger_row,
     build_benchmark_record,
+    validate_run_id,
     write_run_snapshot,
 )
 from .state.schema import STATE_SCHEMA_VERSION
@@ -1005,14 +1006,22 @@ def benchmark_command(
     model_name = model or settings.llm_model
     if not model_name:
         raise typer.BadParameter("falta --model o LUDEX_MODEL")
+    effective_run_id = run_id or (
+        datetime.now(timezone.utc).strftime("%Y%m%dt%H%M%Sz")
+        + f"-{provider_name}-{model_name}".replace("_", "-").replace(".", "-")
+    )
+    # MON-28: validar ANTES de cualquier efecto live (provider, Showdown,
+    # DB, artifact, ledger) -- incluido `model_route`, que no tiene efectos
+    # live pero tambien debe quedar despues del fail-fast por disciplina de
+    # orden. Antes, este chequeo solo vivia dentro de `build_benchmark_
+    # record`, alcanzado por primera vez desde `report_progress` DESPUES de
+    # que la batalla real ya corrio (medido: `battle-id=3981`, 29 decisiones
+    # persistidas, cero artefacto, `ValueError` enmascarando el resultado).
+    validate_run_id(effective_run_id)
     selected_route = (
         model_route(load_model_routes(), provider_name, model_name)
         if provider_name in {"kimi", "open_code_zen"}
         else None
-    )
-    effective_run_id = run_id or (
-        datetime.now(timezone.utc).strftime("%Y%m%dt%H%M%Sz")
-        + f"-{provider_name}-{model_name}".replace("_", "-").replace(".", "-")
     )
     artifact = DEFAULT_RUNS_PATH / f"{effective_run_id}.json"
     if record and artifact.exists():
