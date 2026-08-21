@@ -2599,6 +2599,67 @@ de la integración MON-11/D44).** Dos correcciones sobre D43:
    veces. Con la autorización real (Zen 11/10/1 y Kimi 6/5.50/0.50) los
    límites efectivos son exactamente 10.00 y 5.50 (no 9.00/5.00).
 
+**R5 (MON-29) — el antecedente de corpus vacío queda histórico; MON-16 midió
+2/82 y el gate `training` sigue exigiendo el mismo contrato.** El párrafo
+"Consecuencia medida, hoy" de arriba describe el estado de MON-11 R3/R4: las
+12 batallas `local` de ESE corpus eran 100% `state_schema_version=1`, así que
+`scope=training` medía **cero** trayectorias elegibles — un hecho legítimo del
+corpus de entonces, no un defecto de la frontera. Ese antecedente se conserva
+tal cual arriba: es historia, no se reescribe.
+
+MON-16 corrió batallas locales adicionales deliberadamente, con el recorder ya
+en `state_schema_version=2` (D31 en adelante). Medido HOY contra la DB
+compartida (`packages/dataset-audit`, `--scope training`, `--scope all`,
+read-only): 16 batallas `source='local'` en total, de las cuales **sólo 2
+trayectorias** son elegibles bajo el contrato de D44/R4 sin cambios (`source
+<> 'test'`, `final_result IS NOT NULL`, `EXISTS` al menos un paso, `NOT
+EXISTS` ningún paso fuera de `state_schema_version=2`) — trayectoria 2722
+(battle 3978) y trayectoria 2725 (battle 3981), ambas terminadas en `win`, **82
+pasos en total**, las 82 en v2, **cero violaciones** en las ocho invariantes
+(`auditor exit 0`). El auditor ya NO imprime el aviso de "corpus de
+entrenamiento VACÍO bajo D44": esa rama de `cli.ts` está condicionada
+explícitamente a `dataset.trajectories.length === 0` (línea existente desde
+R3, sin tocar en esta ronda) y con 2 trayectorias elegibles no dispara.
+
+**Las trayectorias 2723/2724 (battle 3979/3980) se retiraron deliberadamente,
+`battles`/`battle_turns` se conservaron.** Según el checkpoint del tech lead
+en la tarea de Linear de MON-16, esas dos corridas locales adicionales
+quedaron con su `battle`/`battle_turns` intactos (protocolo crudo conservado
+como evidencia, D17) pero sin fila en `trajectories` — confirmado contra la DB
+compartida: `battles.id IN (3979, 3980)` existen (`source='local'`,
+terminadas, con 22 y 28 filas de `battle_turns` respectivamente) y
+`trajectories.id IN (2723, 2724)` no existen. Por eso las 16 batallas
+`source='local'` del dataset no coinciden 1:1 con las 2 trayectorias
+elegibles: `training` cuenta `battles` y `trajectories` con reglas
+independientes (`SCOPE_RULES.training`, `packages/dataset-audit/src/
+scope.ts`), nunca implica que toda batalla no-test tenga trayectoria.
+
+**`all` no cambia de contrato.** Medido en el mismo corte: 731 batallas, 729
+trayectorias, 44949 pasos, **47528 violaciones** totales (47481
+`hidden_information` + 47 `decision_index`), sin ninguna clase nueva de
+violación respecto de las ya documentadas en D62/D63/D64 — la deuda histórica
+v1 (31206 filas, 46341 violaciones) y el residuo v2 (13743 filas, 1187
+violaciones) no se re-persisten ni se re-auditan por esta entrada; D44 no
+autoriza ni pide arreglarlas.
+
+**Los dos canarios TypeScript de D44 que fijaban el corpus vacío se
+actualizaron para reflejar este estado (MON-29, sin tocar lógica de
+producción).** `packages/dataset-audit/test/cli.test.ts` (`"audita el scope
+training..."`) y `test/db.test.ts` (`"el scope training excluye toda fila no
+elegible..."`) afirmaban `0 trayectorias`/`toHaveLength(0)` como el estado
+esperado; con el corpus ya no vacío esa aserción quedó ROJA en la base
+(reproducido antes de tocar nada: `expected 'Dataset: 16 batallas · 2
+trayectorias…' to match /… · 0 trayectorias …/` y `expected [ …(2) ] to have a
+length of +0 but got 2`). Se repinearon a los números exactos medidos (16/2/
+82, exit 0, cero violaciones, sin el aviso de corpus vacío), nunca a `> 0`
+genérico, siguiendo la misma disciplina de canario (relación + valor exacto)
+que ya exige `.claude/verification/SKILL.md`. `test/d44.test.ts` (los 8
+escenarios sintéticos contra una DB descartable) no se tocó: sigue
+verificando la frontera con datos fabricados, independiente del estado real de
+la DB compartida, y sigue `skipIf` sin `TEST_DATABASE_URL` (no se levantó
+ninguna DB descartable en esta ronda: cero DB writes, sólo lectura contra la
+compartida).
+
 ## D45 — el respaldo de Encore rival en `_find_action_line` confirma con la repetición forzada, no con su propio anuncio (MON-21, hallazgo de MON-11 R4)
 
 **Síntoma verificado en vivo** (`battle-gen6randombattle-3349`, capturado

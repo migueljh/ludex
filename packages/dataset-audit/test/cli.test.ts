@@ -36,24 +36,36 @@ describe("dataset-audit CLI", () => {
     expect(result.stdout).toMatch(/pasos auditados: [1-9]\d*/);
   }, 300_000);
 
-  it("audita el scope training: hoy es un corpus VACÍO bajo D44 y lo avisa explícito", () => {
-    // MON-11 R3 (D44): las 12 batallas `local` de este corpus son 100%
-    // schema v1 -- ninguna trayectoria es elegible para `training` todavía.
-    // Este test documenta ESE estado a propósito: si algún día deja de ser
-    // 0, hay que revisar esta aserción, no relajarla. El auditor tiene que
-    // avisarlo, no reportar "PASS" en silencio sobre cero filas.
+  it("audita el scope training: MON-16 dejó un corpus no vacío y sano (D44/MON-29)", () => {
+    // MON-16 corrió 16 batallas locales deliberadamente. De ésas, las
+    // trayectorias de battle 3979/3980 (2723/2724) se retiraron a propósito
+    // (checkpoint Linear de MON-16), conservando `battles`/`battle_turns` de
+    // esas dos -- por eso las 16 batallas siguen contando en el dataset aunque
+    // no todas aporten trayectoria. Sólo battle 3978 (trayectoria 2722) y
+    // battle 3981 (trayectoria 2725) son elegibles para `training` bajo D44:
+    // íntegramente `state_schema_version=2`, terminadas, `source <> 'test'`.
+    // 82 pasos en total, cero violaciones. Este test fija el estado medido de
+    // HOY: si el conteo cambia, hay que repinearlo a conciencia con los
+    // números reales (ver `.claude/verification/SKILL.md`), nunca aflojarlo a
+    // `> 0` ni volver a la aserción de corpus vacío.
     const result = run(["audit", "--scope", "training"]);
-    expect([0, 1]).toContain(result.status);
+    expect(result.status).toBe(0);
     expect(result.stderr).toBe("");
-    expect(result.stdout).toMatch(/Dataset: \d+ batallas · 0 trayectorias · 0 pasos · scope training/);
-    for (const invariant of INVARIANTS) expect(result.stdout).toContain(invariant);
+    expect(result.stdout).toContain(
+      "Dataset: 16 batallas · 2 trayectorias · 82 pasos · scope training",
+    );
+    for (const invariant of INVARIANTS) {
+      expect(result.stdout).toContain(`PASS ${invariant}: 0`);
+    }
     for (const field of OPPONENT_FIELDS) {
-      expect(result.stdout).toContain(`hidden_information/${field}`);
+      expect(result.stdout).toContain(`PASS hidden_information/${field}: 0`);
     }
     expect(result.stdout).toMatch(/Queries: 6 \(esperadas 6\)/);
-    expect(result.stdout).toMatch(/pasos auditados: 0\b/);
-    expect(result.stdout).toContain("corpus de entrenamiento VACÍO bajo D44");
-    expect(result.stdout).toContain("no certifican un corpus limpio");
+    expect(result.stdout).toMatch(/pasos auditados: 82\b/);
+    // El aviso de corpus vacío (D44) es condicional a `trayectorias.length
+    // === 0` en `cli.ts`; con 2 trayectorias elegibles no debe imprimirse.
+    expect(result.stdout).not.toContain("corpus de entrenamiento VACÍO");
+    expect(result.stdout).not.toContain("no certifican un corpus limpio");
   }, 300_000);
 
   it("--gen conserva el mismo contrato filtrado por generación", () => {

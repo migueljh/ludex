@@ -112,23 +112,33 @@ describe("contra PostgreSQL real", () => {
     expect(
       training.steps.every((step) => step.stateSchemaVersion === 2),
     ).toBe(true);
-    // Es un subconjunto -- nunca mayor que `all`. HOY (D44, MON-11 R3) es un
-    // subconjunto VACÍO: las 12 batallas `local` de este corpus son 100%
-    // schema v1, así que ninguna trayectoria de entrenamiento es elegible
-    // todavía. Esto documenta ese estado a propósito -- si algún día deja de
-    // ser 0, hay que revisar esta aserción, no relajarla en silencio. Ver
-    // `test/d44.test.ts` para los 7 escenarios con datos sintéticos.
-    expect(training.steps.length).toBeLessThanOrEqual(all.steps.length);
-    expect(training.trajectories).toHaveLength(0);
+    // Es un subconjunto PROPIO -- nunca mayor ni igual que `all`.
+    expect(training.steps.length).toBeLessThan(all.steps.length);
+    expect(training.trajectories.length).toBeLessThan(all.trajectories.length);
+    // MON-16/MON-29 (D44): el corpus de `training` dejó de estar vacío a
+    // propósito. 16 batallas locales; de ésas, las trayectorias de battle
+    // 3979/3980 (2723/2724) se retiraron deliberadamente según el checkpoint
+    // de Linear MON-16, conservando `battles`/`battle_turns` de esas dos --
+    // por eso siguen contando en las 16 batallas del scope aunque no aporten
+    // trayectoria. Sólo battle 3978 (trayectoria 2722) y battle 3981
+    // (trayectoria 2725) son íntegramente schema v2 y quedan elegibles: 82
+    // pasos en total. Ver `test/d44.test.ts` para los 8 escenarios con datos
+    // sintéticos (incluido R4, `ZERO_STEP_SELECTED_BY_D44`). Estos son los
+    // números medidos de HOY -- si cambian, hay que repinearlos a conciencia,
+    // nunca aflojar a `toBeGreaterThan(0)` ni volver a `toHaveLength(0)`.
+    expect(training.battles).toHaveLength(16);
+    expect(training.trajectories).toHaveLength(2);
+    expect(training.steps).toHaveLength(82);
   }, 120_000);
 
   it("--gen conserva el mismo contrato, filtrado por generación (scope all)", async () => {
-    // MON-11 R3 (D44): antes este test tomaba `gen` de la primera
-    // trayectoria de `training`, pero ese scope es hoy un corpus vacío en
-    // datos reales (ver el test de arriba) -- `scope: "all"` sigue teniendo
-    // datos reales y prueba el mismo mecanismo de `--gen`. La combinación
-    // `training` + `--gen` sobre un corpus no vacío está cubierta con datos
-    // sintéticos en `test/d44.test.ts`.
+    // MON-11 R3 (D44): este test toma `gen` de `scope: "all"` en vez de
+    // `training` a propósito -- el mecanismo de `--gen` no depende de qué
+    // scope se use, y `all` tiene el corpus más grande para probarlo. Desde
+    // MON-16/MON-29, `training` también tiene datos reales (ver el test de
+    // arriba), pero seguir usando `all` acá no es una limitación, es la
+    // elección original: la combinación `training` + `--gen` sobre un corpus
+    // no vacío ya está cubierta con datos sintéticos en `test/d44.test.ts`.
     const all = await loadDataset(pool, { scope: "all" });
     const gen = all.trajectories[0]?.gen;
     expect(gen).toBeDefined();
