@@ -4416,6 +4416,29 @@ cualquier regla por-estado (`pp == max_pp` y afines) que lo rompa. Canarios
 de cableado en client: pre=1 con y sin switch cuando el frame de move llega
 ANTES del request; pre=0 cuando llega después.
 
+**R4 (T-01, adjudicación Latwan) — Pressure × gap.** El texto anterior de
+R3 decía que `pre_applied` evita "el único efecto no idempotente": era
+falso. La rama D37 de Pressure (`pp=None` + marca `unknown_pp_moves`)
+también es un efecto no idempotente y quedaba APAGADA por la guarda
+combinada `if not use or pre_applied: return` para líneas de gap: poke-env
+es ciego al costo extra de Pressure TAMBIÉN en el gap, así que el snapshot
+traía el número descontado de a uno y la proyección afirmaba ese número
+stale en vez de `null` (violación de `hidden_information/moves` de signo
+inverso al de battle-120). Corrección mínima: `pre_applied` salta SOLO el
+`pp - 1`; la rama Pressure/D37 corre siempre que `use=True`, con o sin
+bandera; `use=False` sigue sin consumir ni marcar. Canario con el segundo
+snapshot fresco (la marca re-fuerza `None`): RED semántico en la base
+(pp=15 en vez de None), GREEN con el fix. Mutación M-T01 (restaurar la
+guarda combinada): rojo SOLO ese canario; las 4 celdas PP y el pin 10→9
+siguen verdes.
+
+**R4 (T-02, documental).** Los canarios pedidos en R3 NO son ramas nuevas:
+cubren rutas de los helpers ya listados — Magic Bounce es la ruta
+`[from] ability:` de `apply_move` (ability del actor nombrado) y Rocky
+Helmet `[of]` es la ruta de item por `[of]` de
+`apply_damage_or_heal_ownership` (item del dueño nombrado); la tabla de
+arriba las refleja en sus filas `move` y `-damage [of]` respectivamente.
+
 **Mutaciones medidas (R3, in-place, `PYTHONPATH` pineado, restauradas con
 copia byte a byte y sha256 verificado):**
 

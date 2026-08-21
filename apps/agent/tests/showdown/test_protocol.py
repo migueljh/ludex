@@ -1682,6 +1682,53 @@ def test_pp_desconocido_por_pressure_se_reaplica_con_snapshot_fresco():
     )
 
 
+def test_pressure_propio_con_linea_pre_aplicada_va_en_null_y_marca():
+    """MON-26 R4 (T-01): `pre_applied` salta SOLO el `pp - 1`, nunca la rama
+    D37 de Pressure. En una ventana con gap el snapshot POST-narracion trae
+    el numero de poke-env (ciego a Pressure, por eso existe D37): con
+    Pressure propio, el PP del rival NOMBRADO tiene que quedar `None` y la
+    marca `unknown_pp_moves` persistir -- tambien cuando la linea es
+    pre-aplicada. Y la marca tiene que sobrevivir al snapshot fresco de la
+    decision siguiente (mismo patron que
+    `test_pp_desconocido_por_pressure_se_reaplica_con_snapshot_fresco`)."""
+    memoria: dict[str, dict] = {}
+    snap = _snapshot_con_gap()
+    snap["opponent"]["pokemon"][0]["moves"] = [
+        {"id": "energyball", "pp": 15, "max_pp": 16}
+    ]
+    snap["me"]["pokemon"] = [{
+        "species": "dusknoir", "active": True, "ability": "pressure",
+    }]
+    tras_uso = _proyectar(
+        ["|move|p2a: Ludicolo|Energy Ball|p1a: Dusknoir",
+         "|switch|p2a: Latias|Latias, L77, F|100/100"],
+        snap, persistent_state=memoria, pre_applied=1,
+    )
+    assert _por_especie(tras_uso)["ludicolo"]["moves"] == [
+        {"id": "energyball", "pp": None, "max_pp": 16}
+    ], (
+        "Pressure propio + linea pre-aplicada: el PP NO es derivable y va "
+        "en None, no en el numero de poke-env"
+    )
+    assert memoria.get("ludicolo", {}).get("unknown_pp_moves") == {"energyball"}, (
+        "la marca D37 se siembra tambien en lineas pre-aplicadas"
+    )
+
+    # Snapshot FRESCO de la decision siguiente (poke-env ya recontó sin
+    # saber de Pressure): la marca tiene que forzar None de nuevo.
+    snap2 = _snapshot_con_gap()
+    snap2["opponent"]["pokemon"][0]["moves"] = [
+        {"id": "energyball", "pp": 14, "max_pp": 16}
+    ]
+    tras_segunda = _proyectar([], snap2, persistent_state=memoria)
+    assert _por_especie(tras_segunda)["ludicolo"]["moves"] == [
+        {"id": "energyball", "pp": None, "max_pp": 16}
+    ], (
+        "el snapshot fresco trae pp=14; la marca persistida lo fuerza de "
+        "nuevo a None"
+    )
+
+
 def test_pp_desconocido_sobrevive_un_switch_ordinario():
     """A diferencia de `types`/`moves`/`ability` copiados por Transform, la
     marca de Pressure NO es un evento puntual: tiene que sobrevivir un

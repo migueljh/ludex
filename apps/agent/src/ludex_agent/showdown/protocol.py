@@ -1308,6 +1308,13 @@ def project_observable_state(
         del oraculo dan el PP post-uso exacto (16 sin-gap -> 15; 15
         pre-aplicada -> 15, la firma de battle-120) y los usos repetidos
         del flujo normal siguen descontando uno por uno (10 sin-gap -> 9).
+
+        MON-26 R4 (T-01): `pre_applied` salta SOLO el `pp - 1`, NUNCA la
+        rama D37 de Pressure: poke-env es ciego al costo extra de Pressure
+        TAMBIEN en el gap (su numero ya llega descontado de a uno), asi que
+        la unica salida correcta sigue siendo `None` + marca en
+        `persistent_state`, con o sin bandera. `use=False` (ecos) sigue sin
+        consumir ni marcar.
         """
         move_id = normalize_id(raw_move)
         # Hidden Power: Showdown narra siempre "Hidden Power", nunca el tipo.
@@ -1321,7 +1328,7 @@ def project_observable_state(
             max_pp = vocabulary.move_max_pp(move_id)
             existing = {"id": move_id, "pp": max_pp, "max_pp": max_pp}
             mon["moves"].append(existing)
-        if not use or pre_applied:
+        if not use:
             return
         if pressure_on_us():
             # `Move.use` descuenta 2 con Pressure (`move.py:123-127`) y la regla
@@ -1341,6 +1348,8 @@ def project_observable_state(
                 entry.setdefault("transform_unknown_pp_moves", set()).add(move_id)
             else:
                 entry.setdefault("unknown_pp_moves", set()).add(move_id)
+            return
+        if pre_applied:
             return
         pp = existing.get("pp")
         existing["pp"] = pp - 1 if isinstance(pp, int) and pp > 0 else None
