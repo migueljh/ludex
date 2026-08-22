@@ -17,11 +17,20 @@ import pytest
 from sqlalchemy import UniqueConstraint, text
 from sqlalchemy.dialects import postgresql
 
+from _disposable import verified_engine
 from ludex_agent.config import load_settings
 from ludex_agent.db import models
 from ludex_agent.db.session import make_engine, session_factory
 
-pytestmark = pytest.mark.skipif(
+# T-03 (TASOS REVIEW PACKET R2): este skipif de modulo antes gateaba TAMBIEN
+# los tests D65 nuevos (mas abajo), que ya migraron a la fixture
+# `test_database_url` (TEST_DATABASE_URL, base descartable -- ver
+# conftest.py / _disposable.py). Los tests PRE-EXISTENTES de este archivo
+# (D1/F2-08/F2-09/D36) siguen inspeccionando `load_settings().database_url`
+# via `DATABASE_URL`/`.env`: son fuera del alcance de esta correccion (MON-33
+# T-03 pide migrar los tests NUEVOS de esta rebanada, no reescribir los
+# viejos) y llevan su propio marker explicito mas abajo.
+_necesita_database_url = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"), reason="necesita la base levantada"
 )
 
@@ -59,6 +68,7 @@ def _tipo_esperado(column) -> tuple[str, str]:
     return ("USER-DEFINED", compilado.lower())
 
 
+@_necesita_database_url
 async def test_models_espeja_el_ddl_columna_por_columna():
     engine = make_engine(load_settings().database_url)
     try:
@@ -129,6 +139,7 @@ async def test_models_espeja_el_ddl_columna_por_columna():
         await engine.dispose()
 
 
+@_necesita_database_url
 async def test_models_fk_y_unique_compuesto_espejan_el_ddl():
     """L-02 (MON-14 R2): el ORM de `models` refleja EXACTAMENTE el DDL ya
     aprobado de la migracion F2-09: FK a `providers.id` con `ON DELETE
@@ -170,6 +181,7 @@ async def test_models_fk_y_unique_compuesto_espejan_el_ddl():
     )
 
 
+@_necesita_database_url
 async def test_action_path_es_text_nullable_con_dominio_acotado():
     engine = make_engine(load_settings().database_url)
     try:
@@ -193,6 +205,7 @@ async def test_action_path_es_text_nullable_con_dominio_acotado():
         await engine.dispose()
 
 
+@_necesita_database_url
 async def test_battles_constraints_e_indices_espejan_el_ddl():
     """D36: extiende la paridad esquema<->modelo a UNIQUE constraints e
     indices, no solo columnas/tipos. Sin esto, `battle_tag: Mapped[str] =
@@ -264,6 +277,7 @@ async def test_battles_constraints_e_indices_espejan_el_ddl():
         await engine.dispose()
 
 
+@_necesita_database_url
 async def test_trajectory_steps_metadata_constraints_espejan_el_ddl():
     """F2-08: los CHECK de la migracion de metadata de decision existen, se
     llaman como el codigo espera (los tests de repository matchean por nombre)
@@ -343,8 +357,13 @@ async def test_trajectory_steps_metadata_constraints_espejan_el_ddl():
 
 # --- D65 (MON-31/Fase 3 S2): approval_outcome y pending_decisions ---------
 
-async def test_approval_outcome_es_text_nullable_con_dominio_acotado():
-    engine = make_engine(load_settings().database_url)
+# T-03 (TASOS REVIEW PACKET R2, MON-11): los tests D65 de este archivo usan
+# la fixture `test_database_url` (TEST_DATABASE_URL, base descartable) igual
+# que el resto de la rebanada -- nunca `load_settings().database_url`, que
+# resuelve `DATABASE_URL` via `.env` y podia terminar inspeccionando la base
+# canonica compartida.
+async def test_approval_outcome_es_text_nullable_con_dominio_acotado(test_database_url):
+    engine = await verified_engine(test_database_url)
     try:
         async with session_factory(engine)() as s:
             column = (await s.execute(text("""
@@ -366,10 +385,10 @@ async def test_approval_outcome_es_text_nullable_con_dominio_acotado():
         await engine.dispose()
 
 
-async def test_human_override_metadata_null_check_referencia_las_once_columnas_d38():
+async def test_human_override_metadata_null_check_referencia_las_once_columnas_d38(test_database_url):
     """El CHECK "global D38" (D65): existe y su definicion nombra las once
     columnas de metadata F2-08, no un subconjunto."""
-    engine = make_engine(load_settings().database_url)
+    engine = await verified_engine(test_database_url)
     try:
         async with session_factory(engine)() as s:
             definicion = (await s.execute(text("""
@@ -399,8 +418,8 @@ async def test_pending_decision_pk_compuesta_espeja_el_ddl():
     assert pk_columnas == ["battle_tag", "decision_index", "attempt_index"]
 
 
-async def test_pending_decisions_constraints_espejan_el_ddl():
-    engine = make_engine(load_settings().database_url)
+async def test_pending_decisions_constraints_espejan_el_ddl(test_database_url):
+    engine = await verified_engine(test_database_url)
     try:
         async with session_factory(engine)() as s:
             filas = (await s.execute(text("""

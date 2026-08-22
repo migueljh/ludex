@@ -545,6 +545,7 @@ CREATE TABLE public.trajectory_steps (
     approval_outcome text,
     CONSTRAINT trajectory_steps_action_path_check CHECK ((action_path = ANY (ARRAY['llm'::text, 'llm_retry'::text, 'fallback'::text]))),
     CONSTRAINT trajectory_steps_alternatives_type_check CHECK (((alternatives IS NULL) OR (jsonb_typeof(alternatives) = 'array'::text))),
+    CONSTRAINT trajectory_steps_approval_outcome_action_source_check CHECK ((((approval_outcome IS DISTINCT FROM 'human_override'::text) OR (action_source = 'human'::public.action_source)) AND ((action_source <> 'human'::public.action_source) OR (NOT (approval_outcome IS DISTINCT FROM 'human_override'::text))) AND ((approval_outcome <> ALL (ARRAY['human_approved'::text, 'timeout_auto'::text])) OR (action_source = 'agent'::public.action_source)))),
     CONSTRAINT trajectory_steps_approval_outcome_check CHECK ((approval_outcome = ANY (ARRAY['human_approved'::text, 'human_override'::text, 'timeout_auto'::text]))),
     CONSTRAINT trajectory_steps_cached_input_tokens_check CHECK (((cached_input_tokens IS NULL) OR (cached_input_tokens <= input_tokens))),
     CONSTRAINT trajectory_steps_cached_input_tokens_nonnegative_check CHECK (((cached_input_tokens IS NULL) OR (cached_input_tokens >= 0))),

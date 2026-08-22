@@ -108,10 +108,30 @@ ALTER TABLE trajectory_steps
       AND output_tokens IS NULL AND cached_input_tokens IS NULL
       AND reasoning_tokens IS NULL
     )
+  ),
+  -- T-02 (TASOS REVIEW PACKET R2, MON-33): matriz declarativa
+  -- approval_outcome <-> action_source. `human_override` <=> action_source
+  -- 'human' en las DOS direcciones -- 'human' nunca se escribe fuera de un
+  -- override (repository.save_step), asi que la fila inversa (action_source
+  -- 'human' con approval_outcome NULL o distinto de 'human_override') es
+  -- igual de invalida que la directa. `human_approved`/`timeout_auto` =>
+  -- action_source 'agent' en UNA sola direccion: la inmensa mayoria de las
+  -- filas 'agent' nunca pasan por el gate HITL y quedan con approval_outcome
+  -- NULL, que sigue siendo historico y valido (no se exige la reciproca).
+  ADD CONSTRAINT trajectory_steps_approval_outcome_action_source_check
+  CHECK (
+    (approval_outcome IS DISTINCT FROM 'human_override' OR action_source = 'human')
+    -- `= 'human_override'` sola es NULL (no FALSE) cuando approval_outcome
+    -- es NULL, y un CHECK trata NULL como aprobado: sin `IS NOT DISTINCT
+    -- FROM` una fila action_source='human' con approval_outcome NULL
+    -- pasaba el CHECK (mutacion verificada en la prueba de regresion).
+    AND (action_source != 'human' OR approval_outcome IS NOT DISTINCT FROM 'human_override')
+    AND (approval_outcome NOT IN ('human_approved', 'timeout_auto') OR action_source = 'agent')
   );
 
 -- migrate:down
 ALTER TABLE trajectory_steps
+  DROP CONSTRAINT trajectory_steps_approval_outcome_action_source_check,
   DROP CONSTRAINT trajectory_steps_human_override_metadata_null_check,
   DROP CONSTRAINT trajectory_steps_approval_outcome_check,
   DROP COLUMN approval_outcome;

@@ -875,6 +875,80 @@ async def test_human_override_con_metadata_parcial_viola_check_global(repo):
     assert exc.value.orig.sqlstate == "23514"
 
 
+async def test_human_override_con_action_source_agent_viola_check_de_matriz(repo):
+    """T-02 (TASOS REVIEW PACKET R2): sin el CHECK de matriz, un
+    `human_override` etiquetado `action_source='agent'` (autoria falsa) se
+    insertaba sin que la migracion lo rechazara -- el CHECK global D38 solo
+    mira la metadata, nunca `action_source`."""
+    tid = await _trajectory_test(repo)
+    with pytest.raises(
+        DBAPIError, match="trajectory_steps_approval_outcome_action_source_check"
+    ) as exc:
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO trajectory_steps
+                  (trajectory_id, decision_index, turn_number, state,
+                   state_schema_version, legal_actions, action_source, approval_outcome)
+                VALUES (:t, 0, 1, '{}', 1, '[]', 'agent', 'human_override')
+            """), {"t": tid})
+    assert exc.value.orig.sqlstate == "23514"
+
+
+async def test_action_source_human_con_approval_outcome_null_viola_check_de_matriz(repo):
+    """La otra mitad de la iff: `action_source='human'` solo se escribe via
+    override (`repository.save_step`); una fila 'human' sin
+    `approval_outcome='human_override'` (aca NULL) es igual de invalida."""
+    tid = await _trajectory_test(repo)
+    with pytest.raises(
+        DBAPIError, match="trajectory_steps_approval_outcome_action_source_check"
+    ) as exc:
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO trajectory_steps
+                  (trajectory_id, decision_index, turn_number, state,
+                   state_schema_version, legal_actions, action_source)
+                VALUES (:t, 0, 1, '{}', 1, '[]', 'human')
+            """), {"t": tid})
+    assert exc.value.orig.sqlstate == "23514"
+
+
+async def test_human_approved_con_action_source_human_viola_check_de_matriz(repo):
+    """`human_approved`/`timeout_auto` solo emparejan con `action_source='agent'`
+    -- el humano no "aprueba" su propia accion, aprueba la del modelo."""
+    tid = await _trajectory_test(repo)
+    with pytest.raises(
+        DBAPIError, match="trajectory_steps_approval_outcome_action_source_check"
+    ) as exc:
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO trajectory_steps
+                  (trajectory_id, decision_index, turn_number, state,
+                   state_schema_version, legal_actions, action_source, approval_outcome)
+                VALUES (:t, 0, 1, '{}', 1, '[]', 'human', 'human_approved')
+            """), {"t": tid})
+    assert exc.value.orig.sqlstate == "23514"
+
+
+async def test_action_source_agent_con_approval_outcome_null_sigue_siendo_valido(repo):
+    """NULL sigue siendo historico y valido (T-02): la inmensa mayoria de las
+    filas 'agent' nunca pasan por el gate HITL y no deben empezar a exigir
+    approval_outcome poblado -- el CHECK de matriz no puede romper esto."""
+    tid = await _trajectory_test(repo)
+    async with repo.factory() as s:
+        await s.execute(text("""
+            INSERT INTO trajectory_steps
+              (trajectory_id, decision_index, turn_number, state,
+               state_schema_version, legal_actions, action_source)
+            VALUES (:t, 0, 1, '{}', 1, '[]', 'agent')
+        """), {"t": tid})
+        await s.commit()
+        outcome = (await s.execute(text(
+            "SELECT approval_outcome FROM trajectory_steps "
+            "WHERE trajectory_id=:t AND decision_index=0"
+        ), {"t": tid})).scalar_one()
+    assert outcome is None
+
+
 async def test_ningun_human_override_tiene_metadata_d38_parcial_en_todo_el_corpus(repo):
     """Canario global (AGENTS.md): corre sobre TODA `trajectory_steps` de la
     base descartable, no solo sobre las filas de este test -- exactamente el
