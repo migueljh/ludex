@@ -85,7 +85,8 @@ export const READ_QUERIES = {
                  ORDER BY t.id`,
   steps: `SELECT s.trajectory_id, s.turn_number, s.decision_index, s.state,
                  s.state_schema_version, s.legal_actions, s.action_taken,
-                 s.action_source::text AS action_source, s.action_path, s.reward
+                 s.action_source::text AS action_source, s.action_path,
+                 s.approval_outcome, s.reward
           FROM trajectory_steps s
           JOIN trajectories t ON t.id = s.trajectory_id
           JOIN generations g ON g.id = t.gen_id
@@ -166,6 +167,7 @@ interface StepRow {
   action_taken: Record<string, unknown> | null;
   action_source: string;
   action_path: string | null;
+  approval_outcome: string | null;
   reward: string | null;
 }
 
@@ -253,6 +255,7 @@ export async function loadDataset(
     actionTaken: row.action_taken,
     actionSource: row.action_source,
     actionPath: row.action_path,
+    approvalOutcome: row.approval_outcome,
     reward: row.reward === null ? null : Number(row.reward),
   }));
   const dexPokemon: DexPokemon[] = (dexResult.rows as DexPokemonRow[]).map((row) => ({

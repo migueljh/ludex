@@ -140,6 +140,44 @@ class TrajectoryStep(Base):
     cached_input_tokens: Mapped[int | None] = mapped_column(nullable=True)
     reasoning_tokens: Mapped[int | None] = mapped_column(nullable=True)
     reward: Mapped[float | None] = mapped_column(Numeric, nullable=True)
+    # D65 (MON-31/Fase 3 S2): tercer eje ortogonal, nunca colapsado con
+    # action_source/action_path. `human_override` implica las 11 columnas
+    # D38 de arriba NULL como grupo (CHECK
+    # trajectory_steps_human_override_metadata_null_check en la migracion).
+    approval_outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class PendingDecision(Base):
+    """D65 (MON-31/Fase 3 S2): auditoria durable del gate exact-once.
+
+    PK natural compuesta `(battle_tag, decision_index, attempt_index)`,
+    misma convencion que `TrajectoryStep` (D21/C2): cada intento de decision
+    es su propia fila. La fila `awaiting` se persiste ANTES de publicar la
+    propuesta por WebSocket; el Future del gate (hitl/gate.py) sigue siendo
+    la fuente de verdad de `/choose`, esta tabla es auditoria. `action`,
+    `legal_actions` y `model_envelope` espejan 1:1 los campos de
+    `ApprovalProposal`: `model_envelope` es el envelope D38 completo como UN
+    solo jsonb, no columnas planas.
+    """
+
+    __tablename__ = "pending_decisions"
+    battle_tag: Mapped[str] = mapped_column(Text, primary_key=True)
+    decision_index: Mapped[int] = mapped_column(primary_key=True)
+    attempt_index: Mapped[int] = mapped_column(primary_key=True)
+    status: Mapped[str] = mapped_column(Text, server_default="awaiting")
+    action: Mapped[dict] = mapped_column(JSONB)
+    legal_actions: Mapped[list] = mapped_column(JSONB)
+    model_envelope: Mapped[dict] = mapped_column(JSONB)
+    resolved_action: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    resolved_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approval_wait_ms: Mapped[float | None] = mapped_column(Double, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class Provider(Base):
