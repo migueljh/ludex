@@ -195,11 +195,13 @@ más en 5 batallas, pero con 21,9% de acciones ilegales. La muestra no
 alcanza para decidir por winrate; probablemente haya que decidir por costo
 y confiabilidad, y volver a medir con n más grande.
 
-**c) Fase 3 está bloqueada por dos insumos del usuario**: su cuenta real de
-Showdown y su equipo exportado. El plan general tiene un hueco acá — define
-`player_teams` como "equipos vistos" (los de los rivales) y nunca dice de
-dónde sale el propio. La fase 2 lo esquivó usando `gen6randombattle`, donde
-el server genera los equipos.
+**c) Fase 3 necesita una cuenta de testing de Showdown, no la cuenta real
+del torneo** (D65, `docs/superpowers/specs/2026-08-22-phase-3-design.md`
+§6.3, §11 y §12). Jugar oficial con la cuenta real queda prohibido durante
+Fase 3 — el riesgo de baneo lo paga el torneo. El equipo exportado del
+usuario no es un blocker de Fase 3: pertenece a Fase 5 (equipos de
+torneo). Fase 3 sigue usando `gen6randombattle`, donde el server genera
+los equipos, igual que la fase 2.
 
 **d) El orden acordado era 3 → 4 → 5**, pero nunca se validó contra
 dependencias reales.

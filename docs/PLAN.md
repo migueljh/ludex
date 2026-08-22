@@ -114,6 +114,16 @@ settings(key, value jsonb)                                   -- ej. autonomous_m
 
 ## 6. Agente (apps/agent)
 
+> **Nota Fase 3 (D65, MON-31).** El nodo 5 (`human_approval`) y el uso de
+> `interrupt()`/checkpointer de LangGraph que describe esta sección están
+> superados por `docs/superpowers/specs/2026-08-22-phase-3-design.md`,
+> documento vinculante para Fase 3: el gate HITL vive FUERA del grafo,
+> sincrónico entre `ainvoke` y `execute_action`, y `interrupt()` NO es el
+> mecanismo. El checkpointer queda como rebanada S8, opcional y
+> descartable. Ver `docs/DECISIONS.md` D65 para el detalle completo y el
+> motivo (poke-env no sobrevive un checkpoint: socket, lock y mapa
+> `BattleOrder` se pierden).
+
 ### Modos de conexión
 
 Configurable por `CONNECTION_MODE` y `SHOWDOWN_SERVER_URL`:

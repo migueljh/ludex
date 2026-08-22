@@ -4,13 +4,32 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Literal, Mapping
 from urllib.parse import urlsplit, urlunsplit
+
+# Fase 3 D65 (MON-31): dos ejes ortogonales de runtime, ninguno inferido del
+# otro. `local` siempre saltea el gate humano en produccion; `official` exige
+# `acceptance` (ver guardarraiel de _reject_unsafe_official_database).
+ConnectionMode = Literal["local", "official"]
+DatabaseRole = Literal["canonical", "acceptance"]
+
+_CONNECTION_MODES: tuple[ConnectionMode, ...] = ("local", "official")
+_DATABASE_ROLES: tuple[DatabaseRole, ...] = ("canonical", "acceptance")
+
+# DSN de la base canonica que levanta docker-compose (.env.example,
+# POSTGRES_DB=ludex sobre 127.0.0.1:15432). Ambas grafias de loopback
+# cuentan: AGENTS.md documenta un Postgres nativo que alguna vez ensombrecio
+# este puerto sin fallar.
+_CANONICAL_DB_HOSTS = {"127.0.0.1", "localhost"}
+_CANONICAL_DB_PORT = 15432
+_CANONICAL_DB_NAME = "ludex"
 
 
 @dataclass(frozen=True)
 class Settings:
     database_url: str
+    connection_mode: ConnectionMode
+    database_role: DatabaseRole
     showdown_ws_url: str
     showdown_battle_format: str
     bot_username: str
@@ -22,6 +41,8 @@ class Settings:
     llm_provider_chain: tuple[str, ...]
     llm_request_timeout_seconds: float
     decision_budget_seconds: float
+    approval_timeout_seconds: float
+    send_margin_seconds: float
     showdown_turn_limit_seconds: float
     battle_timeout_seconds: float
 
@@ -65,6 +86,39 @@ def _positive_number(env: Mapping[str, str], name: str, default: float) -> float
     return value
 
 
+def _is_canonical_dsn(raw_dsn: str) -> bool:
+    parts = urlsplit(raw_dsn)
+    return (
+        parts.hostname in _CANONICAL_DB_HOSTS
+        and parts.port == _CANONICAL_DB_PORT
+        and parts.path.lstrip("/") == _CANONICAL_DB_NAME
+    )
+
+
+def _reject_unsafe_official_database(
+    connection_mode: ConnectionMode, database_role: DatabaseRole, raw_dsn: str,
+) -> None:
+    """Guardarraiel D65 (spec S0 5.4): falla antes de abrir red o autenticar.
+
+    `official` exige DATABASE_ROLE=acceptance y prohibe el DSN canonico
+    de Ludex, sin flag de override en Fase 3. Se parsea el DSN ORIGINAL
+    (antes de `_to_asyncpg`), porque asyncpg descarta netloc/path distinto.
+    """
+    if connection_mode != "official":
+        return
+    if database_role != "acceptance":
+        raise RuntimeError(
+            "CONNECTION_MODE=official exige DATABASE_ROLE=acceptance "
+            f"(recibido DATABASE_ROLE={database_role!r})"
+        )
+    if _is_canonical_dsn(raw_dsn):
+        raise RuntimeError(
+            "CONNECTION_MODE=official no puede persistir en la base canónica "
+            f"de Ludex ({_CANONICAL_DB_HOSTS!r}:{_CANONICAL_DB_PORT}/"
+            f"{_CANONICAL_DB_NAME}). Fase 3 no tiene flag de override."
+        )
+
+
 def _optional_http_url(env: Mapping[str, str], name: str | None) -> str | None:
     if name is None:
         return None
@@ -81,6 +135,19 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     raw = env.get("DATABASE_URL")
     if not raw:
         raise RuntimeError("Falta DATABASE_URL. Copiar .env.example a .env.")
+    connection_mode = env.get("CONNECTION_MODE", "local").strip().lower()
+    if connection_mode not in _CONNECTION_MODES:
+        raise RuntimeError(
+            f"CONNECTION_MODE desconocido: {connection_mode!r}; "
+            f"conocidos: {', '.join(_CONNECTION_MODES)}"
+        )
+    database_role = env.get("DATABASE_ROLE", "canonical").strip().lower()
+    if database_role not in _DATABASE_ROLES:
+        raise RuntimeError(
+            f"DATABASE_ROLE desconocido: {database_role!r}; "
+            f"conocidos: {', '.join(_DATABASE_ROLES)}"
+        )
+    _reject_unsafe_official_database(connection_mode, database_role, raw)
     provider = env.get("LUDEX_PROVIDER", "google").strip().lower()
     if provider not in _PROVIDERS:
         raise RuntimeError(
@@ -94,11 +161,17 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     decision_budget = _positive_number(
         env, "LUDEX_DECISION_BUDGET_SECONDS", 240,
     )
+    approval_timeout = _positive_number(
+        env, "LUDEX_APPROVAL_TIMEOUT_SECONDS", 10,
+    )
+    send_margin = _positive_number(
+        env, "LUDEX_SEND_MARGIN_SECONDS", 5,
+    )
     turn_limit = _positive_number(
         env, "LUDEX_SHOWDOWN_TURN_LIMIT_SECONDS", 300,
     )
     battle_timeout = _positive_number(
-        env, "LUDEX_BATTLE_TIMEOUT_SECONDS", 180,
+        env, "LUDEX_BATTLE_TIMEOUT_SECONDS", 300,
     )
     if decision_budget >= turn_limit:
         raise RuntimeError(
@@ -120,6 +193,8 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         model = env.get("OPEN_CODE_ZEN_MODEL", "").strip()
     return Settings(
         database_url=_to_asyncpg(raw),
+        connection_mode=connection_mode,
+        database_role=database_role,
         showdown_ws_url=env.get(
             "SHOWDOWN_WS_URL", "ws://localhost:8100/showdown/websocket"
         ),
@@ -135,6 +210,8 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         llm_provider_chain=chain,
         llm_request_timeout_seconds=request_timeout,
         decision_budget_seconds=decision_budget,
+        approval_timeout_seconds=approval_timeout,
+        send_margin_seconds=send_margin,
         showdown_turn_limit_seconds=turn_limit,
         battle_timeout_seconds=battle_timeout,
     )

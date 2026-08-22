@@ -4787,3 +4787,166 @@ sin ningún artefacto.
 
 **Modelo efectivo:** Sonnet 5 (Neoblex), fijado explícitamente por el
 coordinador. Recomendación: `In Review`.
+
+## D65 — MON-31 S0: contratos de runtime vinculantes de Fase 3 y guardarraíl de la base canónica (2026-08-22)
+
+**Contexto.** `docs/superpowers/specs/2026-08-22-phase-3-design.md`
+(aprobado por el usuario y el tech lead, baseline
+`1ad425aa38f3abd29f14b269d65cc4cbe0b85f96`) es el contrato vigente para
+Fase 3 y reemplaza los detalles incompatibles de `docs/PLAN.md` §6 sobre
+`interrupt()` y checkpointing. El propio documento exige que esa
+desviación quede registrada acá y en una nota puntual del PLAN antes de
+S1. Esta entrada fija la parte de Fase 3 que S0 debe dejar cerrada antes
+de tocar código de runtime: dónde vive el gate, cómo se miden los
+presupuestos y qué le está prohibido a la configuración oficial.
+
+**El gate vive fuera de LangGraph, no en `interrupt()`.** El punto de
+inserción es sincrónico, dentro de `run_graph`, entre
+`decision_graph.ainvoke(...)`, `approval_gate.await_resolution(...)` y
+`execute_action(...)`. El grafo conserva sus cinco nodos, su `compile()`
+actual y la resolución de provider por invocación; no se tocan
+`graph/workflow.py`, `graph/state.py`, `graph/decision.py` ni
+`graph/execute.py` para implementarlo. `interrupt()` NO es el mecanismo
+HITL: un checkpoint no conserva el socket vivo, el lock, la ventana del
+servidor ni el mapa `acción → BattleOrder` de poke-env, así que prometer
+recuperación de la batalla tras un reinicio sería falso. Un checkpointer
+de LangGraph queda como rebanada S8, ortogonal y descartable: si obliga a
+tocar D39 o la semántica del grafo, se elimina de Fase 3 sin negociar.
+
+**Reinicio del proceso: sin límite de reintentos, sin recuperación.** Una
+caída del proceso pierde la batalla viva sin excepción; las filas
+`pending_decisions` que quedaron `awaiting` pasan a
+`aborted/process_restart` mediante un sweep al iniciar. No hay política de
+reintento automático de la batalla — la UI puede reconectarse, la
+conexión a Showdown no.
+
+**Tres ejes ortogonales de metadata, nunca colapsados.**
+`action_source` (`agent`/`human`/`opponent`), `action_path` y
+`trajectory_steps.approval_outcome` (`human_approved` / `human_override` /
+`timeout_auto` / `NULL`, `text` con `CHECK`) son tres columnas
+independientes. `human_override` implica las 11 columnas de metadata D38
+NULL como grupo (rechazado antes que parcialmente pobladas);
+`human_approved` y `timeout_auto` llevan metadata D38 completa.
+`played_by` sigue siendo `bot` siempre: describe el cliente que manda el
+choice, no quién decidió la acción — ni en modo híbrido.
+
+**Regla de reloj D42.** El waiter del gate usa únicamente el `clock()`
+inyectado; `gate_start = clock()`,
+`approval_deadline = min(gate_start + approval_timeout, decision_deadline)`.
+Quedan prohibidos sobre el Future del CAS: `asyncio.wait_for`,
+`asyncio.timeout`, `asyncio.wrap_future` bajo timeout, `cancel()` y
+`shield` como sustituto del reloj — verificado en CPython 3.12 que
+`wait_for(wrap_future(fut))` cancela el Future fuente y hace imposible
+escribir `timeout_auto`. Cada `|inactive|` puede ACORTAR el deadline
+(`deadline = min(deadline, clock() + segundos_anunciados - margen_de_envío)`)
+pero nunca extenderlo, y nunca mezcla `clock()` con `loop.time()` o
+`time.monotonic()`.
+
+**Presupuestos iniciales (S0, sujetos a configuración):** decisión del
+modelo 240 s, aprobación humana 10 s, margen de envío 5 s, timeout de
+batalla 300 s, fallback de turno sin `|inactive|` 300 s, watchdog de login
+15 s. Debe cumplirse `240 + 10 + 5 < 300`. Implementado en
+`apps/agent/src/ludex_agent/config.py`: `Settings` gana
+`approval_timeout_seconds` (default 10, `LUDEX_APPROVAL_TIMEOUT_SECONDS`)
+y `send_margin_seconds` (default 5, `LUDEX_SEND_MARGIN_SECONDS`);
+`battle_timeout_seconds` sube su default de 180 a 300
+(`LUDEX_BATTLE_TIMEOUT_SECONDS`) para que la desigualdad se cumpla con los
+defaults de fábrica. `showdown_turn_limit_seconds` (300,
+`LUDEX_SHOWDOWN_TURN_LIMIT_SECONDS`) no cambia: sigue siendo el fallback
+de turno cuando el servidor no anuncia countdown, un eje distinto del
+timeout de inactividad de batalla.
+
+**Challenges: aceptación siempre explícita, nunca automática.**
+`LudexPlayer` sobrescribe los dos productores de `_challenge_queue` de
+poke-env 0.15.0 (`_update_challenges` desde `|updatechallenges|`,
+`_handle_challenge_request` desde PM `/challenge`); ninguno llama al
+original ni encola por su cuenta. Sólo `POST /challenges/{user}/accept`
+inserta al usuario en la cola que consume `Player.accept_challenges`.
+Usar `PSClient.accept_challenge` directamente queda prohibido porque
+saltea la contabilidad de poke-env. No existe auto-accept por usuario,
+formato ni lista blanca.
+
+**Ladder: máquina independiente, apagada por defecto, con interlock
+quíntuple.** Exige simultáneamente `connection_mode=official`,
+`ladder_enabled=true` en settings, `confirm=true` en la solicitud de
+sesión, `testing_account_confirmed=true` y `DATABASE_ROLE=acceptance`
+sobre una DB no canónica. Si falta una condición, se rechaza antes de
+abrir socket o enviar `/search`; el canario de S6 debe demostrar cero
+llamadas de red cuando falta cualquiera de las cinco. Sólo la cuenta de
+testing puede usarse; la cuenta del torneo queda fuera de Fase 3 por
+completo.
+
+**Costo de un override se cuenta con dos tablas, no una.** La propuesta
+descartada de un `human_override` permanece completa en
+`pending_decisions` (fila `awaiting` persistida ANTES de publicar la
+propuesta por WebSocket, auditoría independiente del `Future`). Por eso
+el costo real de una batalla con overrides es
+`trajectory_steps` (la acción finalmente ejecutada) MÁS `pending_decisions`
+(las propuestas del modelo que el humano pisó): el LLM sí gastó tokens en
+la propuesta descartada y ese costo no puede desaparecer del cómputo sólo
+porque no ganó el CAS.
+
+**Guardarraíl de la base canónica (implementado en este slice).** Fase 3
+prohíbe persistir juego oficial en la base canónica. `Settings` gana dos
+campos ortogonales: `connection_mode: Literal["local", "official"]`
+(env `CONNECTION_MODE`, default `local`) y
+`database_role: Literal["canonical", "acceptance"]` (env `DATABASE_ROLE`,
+default `canonical` — fail-closed: si no se declara explícitamente
+`acceptance`, se asume la base insegura). `load_settings` rechaza ANTES
+de convertir el DSN a `asyncpg` (`_to_asyncpg` descarta netloc/path
+distinto, así que el guardarraíl inspecciona el DSN original) y antes de
+abrir cualquier red o autenticar:
+
+1. `CONNECTION_MODE=official` con `DATABASE_ROLE` distinto de
+   `acceptance` → `RuntimeError` (`"...DATABASE_ROLE=acceptance..."`).
+2. `CONNECTION_MODE=official` con `DATABASE_ROLE=acceptance` pero DSN que
+   resuelve a `{127.0.0.1,localhost}:15432/ludex` (la base canónica de
+   `docker-compose.yml` / `.env.example`) → `RuntimeError`
+   (`"...base canónica..."`).
+
+No existe flag de override en Fase 3. `CONNECTION_MODE=local` nunca
+dispara el guardarraíl — sigue permitiendo la DB canónica de desarrollo,
+que es exactamente su propósito. Habilitar juego oficial sobre el corpus
+canónico queda diferido a una decisión posterior explícita, junto con
+repin deliberado del dataset y pruebas reales de mezcla `agent/human`.
+
+**Verificación (S0, `apps/agent/tests/test_config.py`).** RED antes de
+implementar: `test_official_requires_acceptance_database_role`,
+`test_official_rejects_canonical_ludex_dsn` y
+`test_phase3_budget_defaults_are_coherent` fallan
+(`DID NOT RAISE`/`AttributeError`); el canario de default legado
+(renombrado `test_battle_timeout_default_300`) falla contra el `180`
+viejo. GREEN tras implementar: 18/18 en `test_config.py`, suite
+proporcional offline completa 696 passed, 138 skipped, 0 failed (sin
+Docker ni Postgres; `DATABASE_URL=''`, `PYTHONPATH` pineado al `src` de
+este worktree, `--ignore=tests/integration/test_langgraph_battle.py`, el
+único ignore live ya documentado en D64). Mutación deliberada in-place,
+restaurada y verificada por `sha256` idéntico
+(`1370503c643120e3…fdb914fb32` antes/después): comentar el `if
+database_role != "acceptance"` pone rojo únicamente
+`test_official_requires_acceptance_database_role`; comentar el `if
+_is_canonical_dsn(raw_dsn)` pone rojo únicamente
+`test_official_rejects_canonical_ludex_dsn`. Cada mutación se restauró
+antes de la siguiente.
+
+**Limitaciones conocidas.** (1) Esta entrada documenta y liga la
+totalidad del contrato S0, pero SOLO el guardarraíl de la base canónica y
+los presupuestos de `config.py` quedan implementados y verificados en
+este slice (MON-31 Task 1); el gate exact-once, el CAS, la regla de
+reloj D42 en runtime, `pending_decisions`, los tres ejes en
+`trajectory_steps`, challenges, ladder y la API/WS son S1 en adelante. (2)
+El watchdog de login (15 s) queda documentado acá pero SIN campo nuevo en
+`Settings`: no hay ningún test de S0 que lo ejerza y agregar el campo sin
+consumidor habría sido alcance no pedido; se deja para la rebanada que
+implemente login oficial (S4). (3) El default de `battle_timeout_seconds`
+subió de 180 a 300 sólo en `config.py`; los defaults hardcodeados de 180
+en `eval_report.py:194` (fallback de `build_benchmark_record` cuando no
+se pasa `battle_timeout_seconds`) y el texto de ayuda de `cli.py:981`
+quedan fuera de alcance de este slice — no son parte de los seis archivos
+autorizados — y siguen coherentes porque son rutas de benchmark/matrix
+que reciben el timeout explícito, no leen `Settings.battle_timeout_seconds`
+como default de producción salvo cuando el usuario omite `--battle-timeout`
+(`cli.py:1003`), caso en el que ahora heredan 300 correctamente.
+
+**Modelo efectivo:** Sonnet 5, fijado explícitamente por el coordinador
+(Task 1 de MON-31). Recomendación: `In Review`.
