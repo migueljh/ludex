@@ -149,7 +149,8 @@ class BattleRepository:
                         input_tokens: int | None = None,
                         output_tokens: int | None = None,
                         cached_input_tokens: int | None = None,
-                        reasoning_tokens: int | None = None) -> None:
+                        reasoning_tokens: int | None = None,
+                        approval_outcome: str | None = None) -> None:
         """D21 (C2): la clave es `(trajectory_id, decision_index)`.
 
         `decision_index` cuenta decisiones, no turnos, asi que un cambio
@@ -167,6 +168,15 @@ class BattleRepository:
         incoherente (correccion del TECH LEAD PARTIAL CHECKPOINT VERDICT).
         El diseño sigue siendo de una sola fila por decision canonica; el
         intento rechazado por Showdown no llega nunca a esta tabla (D34).
+
+        D65 (MON-31/Fase 3 S2): `approval_outcome` es un tercer eje
+        ortogonal, nunca colapsado con `action_source`/`action_path`. Un
+        `human_override` se persiste con `approval_outcome="human_override"`
+        y el caller SIN pasar ninguno de los kwargs de metadata D38 (todos
+        quedan en su default `None`): el mismo EXCLUDED puro de arriba deja
+        el grupo completo en NULL, y el CHECK
+        `trajectory_steps_human_override_metadata_null_check` lo rechaza si
+        alguno viniera poblado.
         """
         async with self.factory() as s:
             await s.execute(text("""
@@ -175,12 +185,14 @@ class BattleRepository:
                    state_schema_version, legal_actions, action_taken, action_source,
                    action_path, rationale, target, confidence, alternatives,
                    provider, model, decision_latency_ms, input_tokens,
-                   output_tokens, cached_input_tokens, reasoning_tokens)
+                   output_tokens, cached_input_tokens, reasoning_tokens,
+                   approval_outcome)
                 VALUES (:tj, :di, :t, CAST(:st AS jsonb), :v, CAST(:la AS jsonb),
                         CAST(:at AS jsonb), CAST(:src AS action_source), :path,
                         :rationale, CAST(:target AS jsonb), :confidence,
                         CAST(:alt AS jsonb), :provider, :model, :latency_ms,
-                        :in_tok, :out_tok, :cached_tok, :reasoning_tok)
+                        :in_tok, :out_tok, :cached_tok, :reasoning_tok,
+                        :approval_outcome)
                 -- turn_number, state_schema_version y action_source TAMBIEN se
                 -- actualizan: si un paso se reescribe tras un bump de version,
                 -- dejar la version vieja con el estado nuevo hace que la fila
@@ -205,7 +217,8 @@ class BattleRepository:
                       input_tokens = EXCLUDED.input_tokens,
                       output_tokens = EXCLUDED.output_tokens,
                       cached_input_tokens = EXCLUDED.cached_input_tokens,
-                      reasoning_tokens = EXCLUDED.reasoning_tokens
+                      reasoning_tokens = EXCLUDED.reasoning_tokens,
+                      approval_outcome = EXCLUDED.approval_outcome
             """), {"tj": trajectory_id, "di": decision_index, "t": turn,
                    "st": json.dumps(state), "v": version, "la": json.dumps(legal),
                    "at": json.dumps(action) if action is not None else None,
@@ -218,7 +231,8 @@ class BattleRepository:
                    "latency_ms": decision_latency_ms,
                    "in_tok": input_tokens, "out_tok": output_tokens,
                    "cached_tok": cached_input_tokens,
-                   "reasoning_tok": reasoning_tokens})
+                   "reasoning_tok": reasoning_tokens,
+                   "approval_outcome": approval_outcome})
             await s.commit()
 
     async def finalize(self, trajectory_id: int, *, result: str,

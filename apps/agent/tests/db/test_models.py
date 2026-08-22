@@ -118,10 +118,11 @@ async def test_models_espeja_el_ddl_columna_por_columna():
             # Canario: sin esto, una `Base.metadata` vacia (o un typo que
             # deje `tables` sin nada) pasaria en verde sin haber comparado
             # una sola columna.
-            assert tablas_comparadas == 7, (
-                f"se esperaban 7 tablas mapeadas (battles, battle_turns, "
+            assert tablas_comparadas == 8, (
+                f"se esperaban 8 tablas mapeadas (battles, battle_turns, "
                 f"trajectories, trajectory_steps + providers, models, "
-                f"settings de F2-09), se compararon {tablas_comparadas}"
+                f"settings de F2-09 + pending_decisions de D65), "
+                f"se compararon {tablas_comparadas}"
             )
             assert columnas_comparadas > 0, "no se comparo ninguna columna"
     finally:
@@ -338,3 +339,118 @@ async def test_trajectory_steps_metadata_constraints_espejan_el_ddl():
     assert "input_tokens" not in definiciones[
         "trajectory_steps_output_tokens_nonnegative_check"
     ], "el CHECK de output_tokens referencia input_tokens: typo del borrador"
+
+
+# --- D65 (MON-31/Fase 3 S2): approval_outcome y pending_decisions ---------
+
+async def test_approval_outcome_es_text_nullable_con_dominio_acotado():
+    engine = make_engine(load_settings().database_url)
+    try:
+        async with session_factory(engine)() as s:
+            column = (await s.execute(text("""
+                SELECT is_nullable, data_type
+                FROM information_schema.columns
+                WHERE table_schema='public'
+                  AND table_name='trajectory_steps'
+                  AND column_name='approval_outcome'
+            """))).one()
+            definicion = (await s.execute(text("""
+                SELECT pg_get_constraintdef(oid)
+                FROM pg_constraint
+                WHERE conname='trajectory_steps_approval_outcome_check'
+            """))).scalar_one()
+        assert column == ("YES", "text")
+        for valor in ("human_approved", "human_override", "timeout_auto"):
+            assert valor in definicion
+    finally:
+        await engine.dispose()
+
+
+async def test_human_override_metadata_null_check_referencia_las_once_columnas_d38():
+    """El CHECK "global D38" (D65): existe y su definicion nombra las once
+    columnas de metadata F2-08, no un subconjunto."""
+    engine = make_engine(load_settings().database_url)
+    try:
+        async with session_factory(engine)() as s:
+            definicion = (await s.execute(text("""
+                SELECT pg_get_constraintdef(oid)
+                FROM pg_constraint
+                WHERE conname='trajectory_steps_human_override_metadata_null_check'
+            """))).scalar_one()
+    finally:
+        await engine.dispose()
+
+    assert "human_override" in definicion
+    for columna in (
+        "rationale", "target", "confidence", "alternatives", "provider",
+        "model", "decision_latency_ms", "input_tokens", "output_tokens",
+        "cached_input_tokens", "reasoning_tokens",
+    ):
+        assert f"{columna} IS NULL" in definicion, (
+            f"el CHECK global D38 no menciona {columna!r}: {definicion!r}"
+        )
+
+
+async def test_pending_decision_pk_compuesta_espeja_el_ddl():
+    """PK natural compuesta (battle_tag, decision_index, attempt_index),
+    misma convencion que TrajectoryStep (D21/C2)."""
+    table = models.PendingDecision.__table__
+    pk_columnas = [c.name for c in table.primary_key.columns]
+    assert pk_columnas == ["battle_tag", "decision_index", "attempt_index"]
+
+
+async def test_pending_decisions_constraints_espejan_el_ddl():
+    engine = make_engine(load_settings().database_url)
+    try:
+        async with session_factory(engine)() as s:
+            filas = (await s.execute(text("""
+                SELECT conname, pg_get_constraintdef(oid)
+                FROM pg_constraint
+                WHERE conrelid = 'pending_decisions'::regclass
+                  AND contype = 'c'
+                ORDER BY conname
+            """))).all()
+            indices = (await s.execute(text("""
+                SELECT indexname FROM pg_indexes
+                WHERE schemaname = 'public' AND tablename = 'pending_decisions'
+            """))).all()
+    finally:
+        await engine.dispose()
+    definiciones = dict(filas)
+    nombres_indices = {r[0] for r in indices}
+
+    esperados: dict[str, list[str]] = {
+        "pending_decisions_status_check": [
+            "awaiting", "human_approved", "human_override", "timeout_auto",
+            "superseded", "aborted",
+        ],
+        "pending_decisions_resolved_by_check": ["operator", "timer", "system"],
+        "pending_decisions_awaiting_has_no_resolution_check": [
+            "status = 'awaiting'", "resolved_at IS NULL",
+        ],
+        "pending_decisions_resolution_action_check": [
+            "human_approved", "human_override", "timeout_auto", "resolved_action IS NOT NULL",
+        ],
+        "pending_decisions_approval_wait_ms_check": [
+            "approval_wait_ms IS NULL", "approval_wait_ms >=",
+        ],
+        "pending_decisions_action_type_check": ["jsonb_typeof(action) = 'object'"],
+        "pending_decisions_resolved_action_type_check": [
+            "resolved_action IS NULL", "jsonb_typeof(resolved_action) = 'object'",
+        ],
+        "pending_decisions_legal_actions_type_check": [
+            "jsonb_typeof(legal_actions) = 'array'",
+        ],
+        "pending_decisions_model_envelope_type_check": [
+            "jsonb_typeof(model_envelope) = 'object'",
+        ],
+        "pending_decisions_decision_index_nonnegative_check": ["decision_index >= 0"],
+        "pending_decisions_attempt_index_nonnegative_check": ["attempt_index >= 0"],
+    }
+    for nombre, fragmentos in esperados.items():
+        assert nombre in definiciones, f"falta el CHECK {nombre!r} en pending_decisions"
+        for fragmento in fragmentos:
+            assert fragmento in definiciones[nombre], (
+                f"{nombre}: {definiciones[nombre]!r} no contiene {fragmento!r}"
+            )
+    assert "pending_decisions_status_idx" in nombres_indices

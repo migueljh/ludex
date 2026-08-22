@@ -1,4 +1,4 @@
-import type { Dataset, TrajectoryStepRecord } from "./types.js";
+import type { AuthorshipMix, Dataset, TrajectoryStepRecord } from "./types.js";
 
 function actionLabel(action: TrajectoryStepRecord["actionTaken"]): string {
   if (!action) return "(sin acción)";
@@ -104,5 +104,48 @@ export function renderBattle(dataset: Dataset, selector: string | number): strin
       }
     }
   }
+  return lines.join("\n");
+}
+
+const NO_APPROVAL_OUTCOME_LABEL = "(sin outcome)";
+
+/** D65 (MON-31/Fase 3 S2): mezcla de autoría sobre `dataset.steps` completo.
+ *
+ * `dataset.steps` ya salió de la query global de `loadDataset` (scope +
+ * generación aplicados en el SQL, nunca filtrado por `battle_tag` -- ver
+ * AGENTS.md), así que esta función es en sí misma la consulta "sobre todo
+ * el dataset" que D65 exige: no vuelve a filtrar por lote ni por corrida.
+ */
+export function computeAuthorshipMix(dataset: Dataset): AuthorshipMix {
+  const bySource: Record<string, number> = {};
+  const byApprovalOutcome: Record<string, number> = {};
+  for (const step of dataset.steps) {
+    bySource[step.actionSource] = (bySource[step.actionSource] ?? 0) + 1;
+    const outcomeKey = step.approvalOutcome ?? NO_APPROVAL_OUTCOME_LABEL;
+    byApprovalOutcome[outcomeKey] = (byApprovalOutcome[outcomeKey] ?? 0) + 1;
+  }
+  return { bySource, byApprovalOutcome, total: dataset.steps.length };
+}
+
+function formatCounts(counts: Record<string, number>): string[] {
+  return Object.entries(counts)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, count]) => `  ${key}: ${count}`);
+}
+
+/** Reporte legible de la mezcla `agent`/`human`/`opponent` y de los tres
+ * outcomes de aprobación, sobre TODO el dataset cargado (D65 5.3: "el
+ * auditor reporta mezcla agent/human y los tres outcomes"). */
+export function renderAuthorshipReport(dataset: Dataset): string {
+  const mix = computeAuthorshipMix(dataset);
+  const lines = [
+    `Autoría de ${mix.total} decisiones`,
+    "",
+    "Por action_source:",
+    ...formatCounts(mix.bySource),
+    "",
+    "Por approval_outcome:",
+    ...formatCounts(mix.byApprovalOutcome),
+  ];
   return lines.join("\n");
 }

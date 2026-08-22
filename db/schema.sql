@@ -320,6 +320,38 @@ ALTER SEQUENCE public.moves_id_seq OWNED BY public.moves.id;
 
 
 --
+-- Name: pending_decisions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pending_decisions (
+    battle_tag text NOT NULL,
+    decision_index integer NOT NULL,
+    attempt_index integer NOT NULL,
+    status text DEFAULT 'awaiting'::text NOT NULL,
+    action jsonb NOT NULL,
+    legal_actions jsonb NOT NULL,
+    model_envelope jsonb NOT NULL,
+    resolved_action jsonb,
+    resolved_by text,
+    resolved_reason text,
+    approval_wait_ms double precision,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    resolved_at timestamp with time zone,
+    CONSTRAINT pending_decisions_action_type_check CHECK ((jsonb_typeof(action) = 'object'::text)),
+    CONSTRAINT pending_decisions_approval_wait_ms_check CHECK (((approval_wait_ms IS NULL) OR (approval_wait_ms >= (0)::double precision))),
+    CONSTRAINT pending_decisions_attempt_index_nonnegative_check CHECK ((attempt_index >= 0)),
+    CONSTRAINT pending_decisions_awaiting_has_no_resolution_check CHECK (((status = 'awaiting'::text) = (resolved_at IS NULL))),
+    CONSTRAINT pending_decisions_decision_index_nonnegative_check CHECK ((decision_index >= 0)),
+    CONSTRAINT pending_decisions_legal_actions_type_check CHECK ((jsonb_typeof(legal_actions) = 'array'::text)),
+    CONSTRAINT pending_decisions_model_envelope_type_check CHECK ((jsonb_typeof(model_envelope) = 'object'::text)),
+    CONSTRAINT pending_decisions_resolution_action_check CHECK (((status <> ALL (ARRAY['human_approved'::text, 'human_override'::text, 'timeout_auto'::text])) OR (resolved_action IS NOT NULL))),
+    CONSTRAINT pending_decisions_resolved_action_type_check CHECK (((resolved_action IS NULL) OR (jsonb_typeof(resolved_action) = 'object'::text))),
+    CONSTRAINT pending_decisions_resolved_by_check CHECK (((resolved_by IS NULL) OR (resolved_by = ANY (ARRAY['operator'::text, 'timer'::text, 'system'::text])))),
+    CONSTRAINT pending_decisions_status_check CHECK ((status = ANY (ARRAY['awaiting'::text, 'human_approved'::text, 'human_override'::text, 'timeout_auto'::text, 'superseded'::text, 'aborted'::text])))
+);
+
+
+--
 -- Name: pokemon; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -510,11 +542,14 @@ CREATE TABLE public.trajectory_steps (
     output_tokens integer,
     cached_input_tokens integer,
     reasoning_tokens integer,
+    approval_outcome text,
     CONSTRAINT trajectory_steps_action_path_check CHECK ((action_path = ANY (ARRAY['llm'::text, 'llm_retry'::text, 'fallback'::text]))),
     CONSTRAINT trajectory_steps_alternatives_type_check CHECK (((alternatives IS NULL) OR (jsonb_typeof(alternatives) = 'array'::text))),
+    CONSTRAINT trajectory_steps_approval_outcome_check CHECK ((approval_outcome = ANY (ARRAY['human_approved'::text, 'human_override'::text, 'timeout_auto'::text]))),
     CONSTRAINT trajectory_steps_cached_input_tokens_check CHECK (((cached_input_tokens IS NULL) OR (cached_input_tokens <= input_tokens))),
     CONSTRAINT trajectory_steps_cached_input_tokens_nonnegative_check CHECK (((cached_input_tokens IS NULL) OR (cached_input_tokens >= 0))),
     CONSTRAINT trajectory_steps_confidence_check CHECK (((confidence IS NULL) OR ((confidence >= (0)::double precision) AND (confidence <= (1)::double precision)))),
+    CONSTRAINT trajectory_steps_human_override_metadata_null_check CHECK (((approval_outcome IS DISTINCT FROM 'human_override'::text) OR ((rationale IS NULL) AND (target IS NULL) AND (confidence IS NULL) AND (alternatives IS NULL) AND (provider IS NULL) AND (model IS NULL) AND (decision_latency_ms IS NULL) AND (input_tokens IS NULL) AND (output_tokens IS NULL) AND (cached_input_tokens IS NULL) AND (reasoning_tokens IS NULL)))),
     CONSTRAINT trajectory_steps_input_tokens_nonnegative_check CHECK (((input_tokens IS NULL) OR (input_tokens >= 0))),
     CONSTRAINT trajectory_steps_latency_check CHECK (((decision_latency_ms IS NULL) OR (decision_latency_ms >= (0)::double precision))),
     CONSTRAINT trajectory_steps_output_tokens_nonnegative_check CHECK (((output_tokens IS NULL) OR (output_tokens >= 0))),
@@ -761,6 +796,14 @@ ALTER TABLE ONLY public.moves
 
 
 --
+-- Name: pending_decisions pending_decisions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pending_decisions
+    ADD CONSTRAINT pending_decisions_pkey PRIMARY KEY (battle_tag, decision_index, attempt_index);
+
+
+--
 -- Name: pokemon pokemon_gen_id_showdown_id_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -890,6 +933,13 @@ CREATE INDEX learnsets_move_id_idx ON public.learnsets USING btree (move_id);
 --
 
 CREATE INDEX moves_gen_type_idx ON public.moves USING btree (gen_id, type);
+
+
+--
+-- Name: pending_decisions_status_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pending_decisions_status_idx ON public.pending_decisions USING btree (status);
 
 
 --
@@ -1053,4 +1103,5 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20260727000008'),
     ('20260729000001'),
     ('20260803000001'),
-    ('20260804000001');
+    ('20260804000001'),
+    ('20260822000001');

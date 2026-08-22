@@ -777,3 +777,135 @@ async def test_target_no_object_viola_check(repo):
                 VALUES (:t, 0, 1, '{}', 1, '[]', 'agent', '["slot"]')
             """), {"t": tid})
     assert exc.value.orig.sqlstate == "23514"
+
+
+# --- D65 (MON-31/Fase 3 S2): approval_outcome y grupo NULL de human_override
+
+async def test_save_step_persiste_approval_outcome_human_approved_con_metadata_completa(repo):
+    tid = await _trajectory_test(repo)
+    await repo.save_step(
+        tid, 0, 1, {"schema_version": 1}, 1,
+        [{"kind": "move", "id": "x"}], {"kind": "move", "id": "x"}, "agent",
+        action_path="llm", approval_outcome="human_approved", **_METADATA_COMPLETA,
+    )
+    async with repo.factory() as s:
+        fila = (await s.execute(text(
+            "SELECT approval_outcome, action_source::text, rationale, provider "
+            "FROM trajectory_steps WHERE trajectory_id=:t AND decision_index=0"
+        ), {"t": tid})).one()
+    assert fila[0] == "human_approved"
+    assert fila[1] == "agent"
+    assert fila[2] == _METADATA_COMPLETA["rationale"]
+    assert fila[3] == _METADATA_COMPLETA["provider"]
+
+
+async def test_save_step_persiste_approval_outcome_timeout_auto_con_metadata_completa(repo):
+    tid = await _trajectory_test(repo)
+    await repo.save_step(
+        tid, 0, 1, {"schema_version": 1}, 1,
+        [{"kind": "move", "id": "x"}], {"kind": "move", "id": "x"}, "agent",
+        action_path="llm", approval_outcome="timeout_auto", **_METADATA_COMPLETA,
+    )
+    async with repo.factory() as s:
+        outcome = (await s.execute(text(
+            "SELECT approval_outcome FROM trajectory_steps "
+            "WHERE trajectory_id=:t AND decision_index=0"
+        ), {"t": tid})).scalar_one()
+    assert outcome == "timeout_auto"
+
+
+async def test_save_step_human_override_sin_metadata_persiste_grupo_null(repo):
+    """D65: la fila `human_override` se persiste con `action_source='human'`
+    y SIN pasar ningun kwarg de metadata D38 -- el mismo EXCLUDED puro deja
+    las 11 columnas en NULL como grupo."""
+    tid = await _trajectory_test(repo)
+    accion_humana = {"kind": "switch", "species": "charizard"}
+    await repo.save_step(
+        tid, 0, 1, {"schema_version": 1}, 1, [{"kind": "move", "id": "x"}],
+        accion_humana, "human", action_path=None, approval_outcome="human_override",
+    )
+    async with repo.factory() as s:
+        fila = (await s.execute(text("""
+            SELECT action_source::text, approval_outcome, action_taken, rationale,
+                   target, confidence, alternatives, provider, model,
+                   decision_latency_ms, input_tokens, output_tokens,
+                   cached_input_tokens, reasoning_tokens
+            FROM trajectory_steps WHERE trajectory_id=:t AND decision_index=0
+        """), {"t": tid})).one()
+    assert fila[0] == "human"
+    assert fila[1] == "human_override"
+    assert fila[2] == accion_humana
+    assert fila[3:] == (None,) * 11, (
+        "human_override tiene que dejar las 11 columnas D38 en NULL como grupo"
+    )
+
+
+async def test_approval_outcome_fuera_del_dominio_viola_check(repo):
+    tid = await _trajectory_test(repo)
+    with pytest.raises(
+        DBAPIError, match="trajectory_steps_approval_outcome_check"
+    ) as exc:
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO trajectory_steps
+                  (trajectory_id, decision_index, turn_number, state,
+                   state_schema_version, legal_actions, action_source, approval_outcome)
+                VALUES (:t, 0, 1, '{}', 1, '[]', 'agent', 'inventado')
+            """), {"t": tid})
+    assert exc.value.orig.sqlstate == "23514"
+
+
+async def test_human_override_con_metadata_parcial_viola_check_global(repo):
+    """El CHECK "global D38" (D65): un `human_override` con SIQUIERA UNA de
+    las 11 columnas poblada revienta -- nunca queda parcialmente poblado.
+    `rationale` solo, con el resto NULL, ya alcanza para violarlo."""
+    tid = await _trajectory_test(repo)
+    with pytest.raises(
+        DBAPIError, match="trajectory_steps_human_override_metadata_null_check"
+    ) as exc:
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO trajectory_steps
+                  (trajectory_id, decision_index, turn_number, state,
+                   state_schema_version, legal_actions, action_source,
+                   approval_outcome, rationale)
+                VALUES (:t, 0, 1, '{}', 1, '[]', 'human', 'human_override',
+                        'no deberia poder persistir')
+            """), {"t": tid})
+    assert exc.value.orig.sqlstate == "23514"
+
+
+async def test_ningun_human_override_tiene_metadata_d38_parcial_en_todo_el_corpus(repo):
+    """Canario global (AGENTS.md): corre sobre TODA `trajectory_steps` de la
+    base descartable, no solo sobre las filas de este test -- exactamente el
+    patron de `test_identity_key_es_unica_y_no_nula_en_todo_el_corpus`.
+    `filas_override > 0` prueba que el escaneo ejercio algo real, no que
+    paso por vacuidad."""
+    tid = await _trajectory_test(repo)
+    # Una fila human_override legitima (grupo NULL) y una agent con
+    # metadata completa: si el escaneo global filtrara de mas, cualquiera
+    # de las dos podria esconder una violacion real.
+    await repo.save_step(
+        tid, 0, 1, {}, 1, [], {"kind": "switch", "species": "charizard"}, "human",
+        approval_outcome="human_override",
+    )
+    await repo.save_step(
+        tid, 1, 1, {}, 1, [], {"kind": "move", "id": "x"}, "agent",
+        approval_outcome="human_approved", **_METADATA_COMPLETA,
+    )
+
+    async with repo.factory() as s:
+        filas_override = (await s.execute(text(
+            "SELECT count(*) FROM trajectory_steps WHERE approval_outcome = 'human_override'"
+        ))).scalar_one()
+        violaciones = (await s.execute(text("""
+            SELECT count(*) FROM trajectory_steps
+            WHERE approval_outcome = 'human_override'
+              AND (rationale IS NOT NULL OR target IS NOT NULL OR confidence IS NOT NULL
+                   OR alternatives IS NOT NULL OR provider IS NOT NULL OR model IS NOT NULL
+                   OR decision_latency_ms IS NOT NULL OR input_tokens IS NOT NULL
+                   OR output_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL
+                   OR reasoning_tokens IS NOT NULL)
+        """))).scalar_one()
+    assert filas_override > 0, "rows_checked debe ser > 0: el canario no verifico nada"
+    assert violaciones == 0

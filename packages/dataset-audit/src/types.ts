@@ -103,6 +103,14 @@ export interface TrajectoryStepRecord {
   actionTaken: Record<string, unknown> | null;
   actionSource: string;
   actionPath: string | null;
+  /** D65 (MON-31/Fase 3 S2): tercer eje ortogonal, nunca colapsado con
+   * `actionSource`/`actionPath`. `null`/ausente es el comportamiento
+   * histórico (fila sin gate HITL); los tres valores no nulos son
+   * `human_approved` | `human_override` | `timeout_auto`. Opcional para no
+   * romper los fixtures existentes de otras rebanadas (`test/fixtures.ts`,
+   * fuera del alcance de esta tarea) que construyen `TrajectoryStepRecord`
+   * sin este campo. */
+  approvalOutcome?: string | null;
   reward: number | null;
 }
 
@@ -214,4 +222,16 @@ export interface AuditResult {
   opponentFields: OpponentFieldCheck[];
   violations: Violation[];
   stats: AuditStats;
+}
+
+/** D65 (MON-31/Fase 3 S2): mezcla de autoría del dataset, sobre TODO
+ * `dataset.steps` que ya cargó `loadDataset` (siempre global respecto de la
+ * consulta -- ver `AGENTS.md`, nunca filtrado por `battle_tag`). `bySource`
+ * cuenta por `action_source` (`agent`/`human`/`opponent`); `byApprovalOutcome`
+ * cuenta por los tres outcomes más `"(sin outcome)"` para el comportamiento
+ * histórico (`approvalOutcome === null`). */
+export interface AuthorshipMix {
+  bySource: Record<string, number>;
+  byApprovalOutcome: Record<string, number>;
+  total: number;
 }
