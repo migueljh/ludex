@@ -15,6 +15,7 @@ significa desconocido o no comparable, nunca cero implícito.
 | 2026-08-08 | [20260808-kimi-k26-battle-1](../apps/agent/evals/runs/20260808-kimi-k26-battle-1.json) | kimi/kimi-k2.6 | 0/1 | 0-0-0 |  |  |  | 0/0 | 0.0000 |  |  | 0.0000%/0.0000% | 1 | 0 | 0 |  |  | 2026-07-28-official |
 | 2026-08-08 | [20260808-gemini-25flash-d30](../apps/agent/evals/runs/20260808-gemini-25flash-d30.json) | google/gemini-2.5-flash | 0/1 | 0-0-0 |  |  |  | 439144/24515 |  |  |  | 0.0000%/0.0000% | 0 | 0 | 1 |  |  | 2026-07-28-official |
 | 2026-08-08 | [20260808-opencode-claude-haiku-4-5-screen](../apps/agent/evals/runs/20260808-opencode-claude-haiku-4-5-screen.json) | open_code_zen/claude-haiku-4-5 | 1/1 | 1-0-0 | 100.0000% | 20.6549%–100.0000% | 52.0000 | 156/7975 |  |  |  | 39.3939%/18.1818% | 0 | 0 | 0 | 3007/4304/7253 | 5466/7465/8885 | 2026-07-28-official |
+| 2026-08-16 | [20260816t205613z-open-code-zen-hy3-free](../apps/agent/evals/runs/20260816t205613z-open-code-zen-hy3-free.json) | open_code_zen/hy3-free | 1/1 | 1-0-0 | 100.0000% | 20.6549%–100.0000% | 32.0000 | 1915034/81700 | 0.0000 | 0.0000 | 0.0000 | 3.2258%/0.0000% | 0 | 0 | 0 | 21318/30149/32202 | 21748/31126/42568 | 2026-08-14-zen-moonshot-modelsdev |
 
 ## Controles parciales e incidencias
 
