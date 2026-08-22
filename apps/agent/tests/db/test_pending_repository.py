@@ -16,6 +16,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from _disposable import verified_engine
 from ludex_agent.db.pending_repository import (
+    PendingDecisionAlreadyResolvedError,
     PendingDecisionNotFoundError,
     PendingDecisionRecord,
     PendingDecisionRepository,
@@ -218,6 +219,93 @@ async def test_resolve_sin_insert_previo_revienta(repo):
     with pytest.raises(PendingDecisionNotFoundError) as exc:
         await repo.resolve(key, resolution, approval_wait_ms=100)
     assert exc.value.key == key
+
+
+# --- T-01 (TASOS REVIEW PACKET R2): resolve() no es CAS sin
+# `AND status = 'awaiting'` -- un segundo resolve, o un resolve tras
+# abort_stale, reescribia una fila terminal en silencio. ----------------
+
+async def test_resolve_segunda_vez_sobre_fila_terminal_revienta_y_preserva_la_original(repo, reader):
+    """Repro exacta de T-01: insert_awaiting + resolve(human_approved) +
+    resolve(human_override) -- el segundo resolve NO debe suceder, y la fila
+    tiene que quedar exactamente como la dejo el primer resolve."""
+    key = _key()
+    proposal = _proposal()
+    await repo.insert_awaiting(PendingDecisionRecord(key=key, proposal=proposal))
+
+    primera = ApprovalResolution(
+        outcome="human_approved", action=proposal.action, resolved_by="operator",
+    )
+    await repo.resolve(key, primera, approval_wait_ms=1500)
+
+    async with reader() as s:
+        antes = (await s.execute(text("""
+            SELECT status, resolved_action, resolved_by, resolved_reason, approval_wait_ms
+            FROM pending_decisions
+            WHERE battle_tag=:bt AND decision_index=:di AND attempt_index=:ai
+        """), {"bt": key.battle_tag, "di": key.decision_index, "ai": key.attempt_index})).one()
+
+    segunda = ApprovalResolution(
+        outcome="human_override", action={"kind": "switch", "species": "charizard"},
+        resolved_by="operator", resolved_reason="intento tardio de pisar la resolucion",
+    )
+    with pytest.raises(PendingDecisionAlreadyResolvedError) as exc:
+        await repo.resolve(key, segunda, approval_wait_ms=9999)
+    assert exc.value.key == key
+    assert exc.value.current_status == "human_approved"
+
+    async with reader() as s:
+        despues = (await s.execute(text("""
+            SELECT status, resolved_action, resolved_by, resolved_reason, approval_wait_ms
+            FROM pending_decisions
+            WHERE battle_tag=:bt AND decision_index=:di AND attempt_index=:ai
+        """), {"bt": key.battle_tag, "di": key.decision_index, "ai": key.attempt_index})).one()
+
+    assert tuple(despues) == tuple(antes), (
+        "el segundo resolve() tiene que haber sido un no-op total: la fila "
+        "terminal de auditoria no puede cambiar"
+    )
+    assert despues[0] == "human_approved", "el override tardio no gano el CAS de auditoria"
+
+
+async def test_resolve_tras_abort_stale_revienta_y_preserva_aborted(repo, reader):
+    """Repro exacta de T-01: insert_awaiting + abort_stale() (cuenta=1) +
+    resolve(timeout_auto) -- la fila abortada por el sweep de arranque no
+    puede volver a `timeout_auto` como si nunca se hubiera abortado."""
+    key = _key()
+    proposal = _proposal()
+    await repo.insert_awaiting(PendingDecisionRecord(key=key, proposal=proposal))
+
+    afectadas = await repo.abort_stale()
+    assert afectadas == 1
+
+    async with reader() as s:
+        antes = (await s.execute(text("""
+            SELECT status, resolved_action, resolved_by, resolved_reason, approval_wait_ms
+            FROM pending_decisions
+            WHERE battle_tag=:bt AND decision_index=:di AND attempt_index=:ai
+        """), {"bt": key.battle_tag, "di": key.decision_index, "ai": key.attempt_index})).one()
+    assert antes[0] == "aborted"
+
+    tardio = ApprovalResolution(
+        outcome="timeout_auto", action=proposal.action, resolved_by="timer",
+    )
+    with pytest.raises(PendingDecisionAlreadyResolvedError) as exc:
+        await repo.resolve(key, tardio, approval_wait_ms=30_000)
+    assert exc.value.key == key
+    assert exc.value.current_status == "aborted"
+
+    async with reader() as s:
+        despues = (await s.execute(text("""
+            SELECT status, resolved_action, resolved_by, resolved_reason, approval_wait_ms
+            FROM pending_decisions
+            WHERE battle_tag=:bt AND decision_index=:di AND attempt_index=:ai
+        """), {"bt": key.battle_tag, "di": key.decision_index, "ai": key.attempt_index})).one()
+
+    assert tuple(despues) == tuple(antes), (
+        "resolve() tras abort_stale tiene que haber sido un no-op total: la "
+        "fila 'aborted' de auditoria no puede volver a 'timeout_auto'"
+    )
 
 
 async def test_abort_stale_cambia_solo_awaiting_y_devuelve_el_conteo(repo, reader):

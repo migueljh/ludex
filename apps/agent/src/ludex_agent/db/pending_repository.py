@@ -68,7 +68,21 @@ _RESOLVE_SQL = text("""
     WHERE battle_tag = :battle_tag
       AND decision_index = :decision_index
       AND attempt_index = :attempt_index
+      AND status = 'awaiting'
     RETURNING battle_tag
+""")
+
+# T-01 (TASOS REVIEW PACKET R2): la UPDATE de arriba ya no toca ninguna fila
+# que no este 'awaiting' -- RETURNING vacio ahora es ambiguo entre "la clave
+# no existe" y "la clave existe pero ya es terminal". Esta SELECT solo se usa
+# para distinguir esos dos casos DESPUES de que la UPDATE (que ya corrio y no
+# modifico nada) devolvio vacio; nunca decide sola si la resolucion procede.
+_SELECT_STATUS_SQL = text("""
+    SELECT status
+    FROM pending_decisions
+    WHERE battle_tag = :battle_tag
+      AND decision_index = :decision_index
+      AND attempt_index = :attempt_index
 """)
 
 _ABORT_STALE_SQL = text("""
@@ -98,6 +112,27 @@ class PendingDecisionNotFoundError(LookupError):
             "insert_awaiting() no se llamo antes de resolve()"
         )
         self.key = key
+
+
+class PendingDecisionAlreadyResolvedError(LookupError):
+    """`resolve()` encontro la fila pero ya no esta `awaiting`.
+
+    T-01 (TASOS REVIEW PACKET R2): sin esto, un segundo `resolve()` sobre la
+    misma clave -- o un `resolve()` posterior a `abort_stale()` -- reescribia
+    en silencio una fila terminal de auditoria: la auditoria durable de D65
+    dejaba de ser historica. `resolve()` nunca toca una fila que no este
+    `status='awaiting'`; si lo intenta, esto se lanza SIN modificar la fila
+    existente."""
+
+    def __init__(self, key: ApprovalKey, current_status: str) -> None:
+        super().__init__(
+            f"pending_decisions para battle_tag={key.battle_tag!r} "
+            f"decision_index={key.decision_index} attempt_index={key.attempt_index} "
+            f"ya esta en status={current_status!r} (no 'awaiting'): resolve() no "
+            "reescribe una fila terminal"
+        )
+        self.key = key
+        self.current_status = current_status
 
 
 class PendingDecisionRepository:
@@ -170,8 +205,19 @@ class PendingDecisionRepository:
                 "approval_wait_ms": approval_wait_ms,
             })
             if result.first() is None:
+                # La UPDATE de arriba ya no toco ninguna fila (WHERE incluye
+                # status='awaiting'): esta SELECT solo distingue el mensaje,
+                # nunca decide si la resolucion procede -- eso ya lo decidio
+                # la UPDATE, atomicamente, dentro de esta misma transaccion.
+                existente = (await session.execute(_SELECT_STATUS_SQL, {
+                    "battle_tag": key.battle_tag,
+                    "decision_index": key.decision_index,
+                    "attempt_index": key.attempt_index,
+                })).first()
                 await session.rollback()
-                raise PendingDecisionNotFoundError(key)
+                if existente is None:
+                    raise PendingDecisionNotFoundError(key)
+                raise PendingDecisionAlreadyResolvedError(key, existente[0])
             await session.commit()
 
     async def abort_stale(self, reason: str = "process_restart") -> int:
