@@ -14,6 +14,18 @@
  * `SIGKILL` ni una caída del proceso, ahí ningún `finally` corre y la base
  * queda huérfana (mitigación: el prefijo `ludex_test_` la hace barrible a
  * mano, nunca contra `ludex`).
+ *
+ * R4 (MON-33, flake de Latwan): `pool.end()` de pg-pool resuelve apenas los
+ * clientes se DES-REGISTRAN del pool, no cuando sus sockets terminaron de
+ * cerrarse. El `DROP ... WITH (FORCE)` corría en esa ventana; si el FORCE le
+ * ganaba al cierre, el backend moría SIGTERMeado, le mandaba el ErrorResponse
+ * 57P01 al cliente idle, y sin listener de `'error'` en el pool el
+ * `pool.emit('error')` se volvía un `uncaughtException` (suite entera con
+ * 203 aserciones y exit 1). Dos endurecimientos: (1) `drop()` espera el
+ * drenaje REAL de `pg_stat_activity` antes del FORCE; (2) el pool captura y
+ * EXPONE los errores de conexión asíncronos en `connectionErrors` en vez de
+ * dejar que revienten el proceso -- nunca se tragan, el test los inspecciona.
+ * Canarios en `test/disposable-teardown.test.ts`.
  */
 
 import { randomUUID } from "node:crypto";
@@ -24,6 +36,11 @@ import pg from "pg";
 const SCHEMA_PATH = fileURLToPath(new URL("../../../db/schema.sql", import.meta.url));
 const DISPOSABLE_PREFIX = "ludex_test_";
 const FORBIDDEN_NAMES = new Set(["", "ludex", "postgres", "template0", "template1"]);
+/** Cota de espera del drenaje de `pg_stat_activity` antes de recurrir al
+ * `WITH (FORCE)` (que queda como último recurso para conexiones que el helper
+ * no puede cerrar, p. ej. clientes huérfanos de un bug ajeno). */
+const DRAIN_TIMEOUT_MS = 5_000;
+const DRAIN_POLL_MS = 100;
 
 export class SharedDatabaseGuardError extends Error {}
 
@@ -49,11 +66,25 @@ export function assertDisposable(url: string): void {
   }
 }
 
+/** Pool verificado cuyo evento `'error'` (terminaciones de conexión fuera de
+ * una query: 57P01 de un FORCE, `pg_terminate_backend`, caída del server)
+ * queda CAPTURADO y expuesto en `connectionErrors` en lugar de convertirse en
+ * un `uncaughtException` que tira el proceso entero. No se traga nada: los
+ * errores de las queries siguen viajando por la promesa de la query, y los de
+ * conexión quedan acá, listos para que el test los inspeccione. */
+export interface DisposablePool extends pg.Pool {
+  readonly connectionErrors: unknown[];
+}
+
 /** Confirma `current_database()` sobre la conexión REAL antes de devolver un
  * pool utilizable -- no basta con el chequeo de string de `assertDisposable`
  * (ver el equivalente Python, R2). */
-export async function verifiedPool(url: string): Promise<pg.Pool> {
+export async function verifiedPool(url: string): Promise<DisposablePool> {
   const pool = new pg.Pool({ connectionString: url });
+  const connectionErrors: unknown[] = [];
+  pool.on("error", (error) => {
+    connectionErrors.push(error);
+  });
   try {
     const { rows } = await pool.query<{ current_database: string }>("SELECT current_database()");
     const name = rows[0]?.current_database ?? "";
@@ -63,7 +94,7 @@ export async function verifiedPool(url: string): Promise<pg.Pool> {
         + "mutadora puede correr sobre este pool.",
       );
     }
-    return pool;
+    return Object.assign(pool, { connectionErrors });
   } catch (error) {
     await pool.end();
     throw error;
@@ -72,7 +103,7 @@ export async function verifiedPool(url: string): Promise<pg.Pool> {
 
 export interface DisposableDatabase {
   url: string;
-  pool: pg.Pool;
+  pool: DisposablePool;
   drop(): Promise<void>;
 }
 
@@ -108,6 +139,21 @@ export async function createDisposableDatabase(baseUrl: string): Promise<Disposa
       const cleanup = new pg.Client({ connectionString: maintenanceUrl });
       await cleanup.connect();
       try {
+        // `pool.end()` resolvió, pero los sockets pueden seguir cerrando. El
+        // FORCE mataría cualquier backend que todavía no procesó su cierre y
+        // ese 57P01 termina (a lo sumo) en `pool.connectionErrors` -- mejor:
+        // esperar el drenaje real, y sólo recurrir al FORCE si queda algo que
+        // el helper no controla.
+        const deadline = Date.now() + DRAIN_TIMEOUT_MS;
+        for (;;) {
+          const { rows } = await cleanup.query<{ n: number }>(
+            "SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = $1",
+            [name],
+          );
+          if ((rows[0]?.n ?? 0) === 0) break;
+          if (Date.now() >= deadline) break;
+          await new Promise((resolve) => setTimeout(resolve, DRAIN_POLL_MS));
+        }
         await cleanup.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
       } finally {
         await cleanup.end();
