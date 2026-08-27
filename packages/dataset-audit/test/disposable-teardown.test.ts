@@ -1,31 +1,29 @@
-/** MON-33 R4: el ciclo de vida de las bases descartables cierra TODAS las
- * conexiones del pool antes del `DROP DATABASE ... WITH (FORCE)` y ninguna
- * terminación administradora puede volverse un error no manejado.
+/** MON-33 R5: teardown descartable fail-closed con barrera determinística
+ * de sockets cerrados.
  *
- * Reproducción del gate independiente de Latwan: Node 22,
- * `TEST_DATABASE_URL` apuntando al Postgres de mantenimiento y
- * `DATABASE_URL` a un clon descartable migrado, la suite completa terminó
- * 203 aserciones con exit 1 y tres errores PostgreSQL 57P01 no manejados
- * ("terminating connection due to administrator command"); Postgres logueó
- * el FATAL por backend matado y el contenedor quedó con RestartCount 0.
+ * R4 dejó agujeros (revisión de Tasos, adjudicada):
+ * - T-01: drop() podía devolver éxito después de que el drenaje agotara la
+ *   cota y el FORCE matara sockets: el 57P01 quedaba en
+ *   `pool.connectionErrors` sin que nadie lo mirara.
+ * - T-02: los canarios de R4 no eran load-bearing: sacar sólo el poll de
+ *   `pg_stat_activity` dejaba todo verde (12/12). El drenaje sigue como
+ *   defensa, pero la barrera primaria ahora es determinística: drop()
+ *   espera el evento `'remove'` del pool por CADA conexión (socket cerrado
+ *   del todo) y deja constancia en `db.removedAtDrop`.
+ * - T-03: el doble drop con catch-all escondía fallas de limpieza. drop()
+ *   ahora es idempotente y los finally no tragan errores.
  *
- * Mecanismo (verificado contra pg@8.13.1 / pg-pool): `pool.end()` resuelve
- * apenas los clientes se DES-REGISTRAN del pool (`_clients.length === 0`),
- * no cuando sus sockets terminaron de cerrarse. `drop()` corría el
- * `DROP ... WITH (FORCE)` en esa ventana: si el FORCE le ganaba al cierre,
- * el backend era SIGTERMeado, mandaba el ErrorResponse 57P01 al cliente, y
- * como el pool no tenía listener de `'error'`, el `pool.emit('error')` se
- * volvía un `uncaughtException` que tiraba la suite. Flaky por naturaleza:
- * es una carrera de microsegundos entre el cierre del socket y el FORCE.
- *
- * Canarios de este archivo:
- * 1. `drop()` con un pool de 10 conexiones: cierra TODO, no deja base ni
- *    backends residuales, y no captura ningún error de conexión.
- * 2. Terminación administradora (mismo SIGTERM/57P01 que el FORCE, vía
- *    `pg_terminate_backend`) de conexiones idle: el error llega CAPTURADO y
- *    expuesto en `pool.connectionErrors` — nunca un `uncaughtException` —
- *    y el `drop()` posterior sigue sin dejar nada.
- * 3. El guard de base compartida sigue intacto.
+ * Canarios:
+ * 1. drop() con pool de 10 conexiones: barrera completa (removedAtDrop=10),
+ *    sin errores de conexión, sin backends, sin base.
+ * 2. pg-pool end() resuelve ANTES de que ningún socket termine de cerrarse
+ *    (n>1): es la premisa que hace necesaria la barrera.
+ * 3. drenaje agotado con un backend ajeno vivo: drop() rechaza SIN DROP
+ *    (fail-closed); al cerrar el ajeno, drop() vuelve a funcionar.
+ * 4. terminación administradora de conexiones idle: 57P01 expuesto sin
+ *    filtrar, drop() rechaza el ciclo sucio y la base queda sin residuos.
+ * 5. una limpieza que rechaza en el finally NO se traga.
+ * 6. el guard de base compartida sigue intacto.
  */
 
 import { describe, expect, it } from "vitest";
@@ -33,6 +31,8 @@ import pg from "pg";
 import {
   assertDisposable,
   createDisposableDatabase,
+  DisposableConnectionError,
+  DisposableDrainTimeoutError,
   SharedDatabaseGuardError,
 } from "./_disposable.js";
 
@@ -63,8 +63,21 @@ async function databaseState(baseUrl: string, name: string): Promise<{ exists: b
   }
 }
 
-describe.skipIf(requiresTestDatabase)("ciclo de vida de bases descartables (MON-33 R4)", () => {
-  it("drop con 10 conexiones de pool: 0 errores de conexión, 0 backends residuales, 0 bases huérfanas", async () => {
+/** Espera acotada con aserción final: si la condición nunca se cumple el
+ * test FALLA (no puede pasar sin verificar). */
+async function eventually(condition: () => boolean, label: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (condition()) return;
+    if (Date.now() >= deadline) {
+      throw new Error(`timeout (${timeoutMs} ms) esperando ${label}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+describe.skipIf(requiresTestDatabase)("ciclo de vida de bases descartables (MON-33 R5)", () => {
+  it("drop con 10 conexiones de pool: barrera de removes completa, 0 errores de conexión, 0 backends residuales, 0 bases huérfanas", async () => {
     const base = process.env.TEST_DATABASE_URL!;
     const db = await createDisposableDatabase(base);
     const name = databaseName(db.url);
@@ -77,23 +90,86 @@ describe.skipIf(requiresTestDatabase)("ciclo de vida de bases descartables (MON-
 
       await db.drop();
 
+      // Barrera determinística (T-02): cuando drop() emitió el DROP, las 10
+      // conexiones habían completado el cierre (evento 'remove' del pool).
+      // Sin la espera, esto es 0 con certeza: pool.end() resuelve al
+      // des-registrarse los clientes, el socket cierra después.
+      expect(db.removedAtDrop).toBe(10);
+
       const state = await databaseState(base, name);
       expect(state.exists).toBe(false);
       expect(state.backends).toBe(0);
       expect(db.pool.connectionErrors).toEqual([]);
     } finally {
-      await db.drop().catch(() => {});
+      await db.drop();
     }
   });
 
-  it("terminación administradora de conexiones idle: 57P01 capturado y expuesto, nunca uncaughtException, drop posterior limpio", async () => {
+  it("pg-pool end() resuelve antes de que ningún socket termine de cerrarse (premisa de la barrera, n>1)", async () => {
+    const base = process.env.TEST_DATABASE_URL!;
+    const db = await createDisposableDatabase(base);
+    try {
+      await Promise.all(Array.from({ length: 3 }, () => db.pool.query("SELECT 1")));
+      const n = db.pool.totalCount;
+      expect(n).toBeGreaterThan(1);
+
+      let removed = 0;
+      db.pool.on("remove", () => { removed += 1; });
+
+      await db.pool.end();
+
+      // Determinístico: pool.end() resuelve apenas los clientes se
+      // des-registran; el 'remove' (socket cerrado del todo) es I/O y no
+      // puede haber ocurrido todavía.
+      expect(removed).toBe(0);
+
+      // Y después SÍ completan todos: el canario verifica que el evento
+      // llega (no puede pasar sin ejercerlo).
+      await eventually(() => removed === n, `los ${n} eventos 'remove' del pool`);
+    } finally {
+      await db.drop();
+    }
+  });
+
+  it("drop() rechaza SIN DROP cuando el drenaje agota la cota con un backend ajeno vivo (fail-closed)", async () => {
+    const base = process.env.TEST_DATABASE_URL!;
+    const db = await createDisposableDatabase(base);
+    const name = databaseName(db.url);
+    const foreign = new pg.Client({ connectionString: db.url });
+    const foreignErrors: unknown[] = [];
+    foreign.on("error", (error) => { foreignErrors.push(error); });
+    await foreign.connect();
+    try {
+      // Una conexión AJENA al helper, viva: el drenaje nunca llega a cero.
+      // Fail-closed (T-01): drop() debe rechazar en vez de devolver éxito.
+      await expect(db.drop()).rejects.toThrow(DisposableDrainTimeoutError);
+
+      // El FORCE NO corrió: la base sigue y el backend ajeno sigue vivo
+      // (fail-closed significa no matar lo que el helper no controla).
+      const state = await databaseState(base, name);
+      expect(state.exists).toBe(true);
+      expect(state.backends).toBeGreaterThan(0);
+      expect(foreignErrors).toEqual([]);
+
+      await foreign.end();
+      await db.drop();
+
+      const after = await databaseState(base, name);
+      expect(after.exists).toBe(false);
+      expect(after.backends).toBe(0);
+    } finally {
+      await foreign.end();
+      await db.drop();
+    }
+  });
+
+  it("terminación administradora de conexiones idle: 57P01 expuesto sin filtrar, drop() rechaza el ciclo sucio y no deja residuos", async () => {
     const base = process.env.TEST_DATABASE_URL!;
     const db = await createDisposableDatabase(base);
     const name = databaseName(db.url);
     try {
       // 3 consultas concurrentes -> 3 conexiones (1 de verificación + 2
-      // nuevas), las tres idle al volver al pool: el FORCE del DROP las
-      // habría matado igual que acá las mata pg_terminate_backend.
+      // nuevas), las tres idle al volver al pool.
       await Promise.all(Array.from({ length: 3 }, () => db.pool.query("SELECT 1")));
 
       const killer = new pg.Client({ connectionString: maintenanceUrl(base) });
@@ -109,19 +185,45 @@ describe.skipIf(requiresTestDatabase)("ciclo de vida de bases descartables (MON-
       // El ErrorResponse viaja por el socket: darle tiempo a llegar.
       await new Promise((resolve) => setTimeout(resolve, 500));
 
-      // Sin listener de 'error' en el pool, estos tres 57P01 revientan el
-      // proceso (reproducción de Latwan). Con la captura, quedan expuestos
-      // acá: el error NO se traga, se inspecciona.
       expect(db.pool.connectionErrors).toHaveLength(3);
       expect((db.pool.connectionErrors[0] as { code?: string }).code).toBe("57P01");
 
-      await db.drop();
+      // Fail-closed (T-01): el DROP corre (cero backends: no hay nada que
+      // el FORCE pueda matar) pero drop() rechaza el ciclo sucio en vez de
+      // devolver éxito, y NO filtra ni limpia los 57P01.
+      await expect(db.drop()).rejects.toThrow(DisposableConnectionError);
+      expect(db.pool.connectionErrors).toHaveLength(3);
+
       const state = await databaseState(base, name);
       expect(state.exists).toBe(false);
       expect(state.backends).toBe(0);
     } finally {
-      await db.drop().catch(() => {});
+      await db.drop();
     }
+  });
+
+  it("una limpieza que rechaza en el finally no se traga: el error se relaya (T-03)", async () => {
+    const base = process.env.TEST_DATABASE_URL!;
+    const db = await createDisposableDatabase(base);
+    const foreign = new pg.Client({ connectionString: db.url });
+    await foreign.connect();
+    let relaid: unknown;
+    try {
+      try {
+        await db.pool.query("SELECT 1");
+      } finally {
+        // Sin catch-all: si la limpieza rechaza, el error sale. Acá el
+        // backend ajeno mantiene el drenaje ocupado -> drop() rechaza.
+        await db.drop();
+      }
+    } catch (error) {
+      relaid = error;
+    } finally {
+      await foreign.end();
+      await db.drop();
+    }
+    // El rechazo de la limpieza llegó (no fue tragado por un catch-all).
+    expect(relaid).toBeInstanceOf(DisposableDrainTimeoutError);
   });
 
   it("el guard de base compartida sigue rechazando toda URL no descartable", () => {
