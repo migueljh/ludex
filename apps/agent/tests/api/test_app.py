@@ -1,0 +1,313 @@
+"""`create_app` wiring y `ApiReadRepository` (spec Fase 3 S3.3/S7, D65
+MON-33 Task 4).
+
+Cubre: el ensamblado exacto de `create_app` (registry/event_hub/settings_repo/
+historical_repo_factory en `app.state`, router y rutas WS registradas),
+`GET /health`, que las lecturas historicas pasan por el factory inyectado
+(nunca por `PendingDecisionRepository`, que ni siquiera se importa en este
+paquete), el bind loopback-only de `build_uvicorn_config`, y el canario de
+uso cross-loop tipado de `ApiReadRepository`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+
+import pytest
+from fastapi.testclient import TestClient
+
+from ludex_agent.api import routes as routes_module
+from ludex_agent.api.app import LOOPBACK_HOST, build_uvicorn_config, create_app
+from ludex_agent.db.api_read_repository import (
+    ApiReadRepository,
+    BattleSummary,
+    CrossLoopRepositoryError,
+)
+from ludex_agent.db.model_repository import ProviderModel
+from ludex_agent.hitl.events import EventHub
+from ludex_agent.hitl.registry import ApprovalRegistry
+
+
+class _FakeSettingsRepo:
+    async def active_selection(self):
+        return ProviderModel("google", "gemini-test")
+
+
+class _FakeReadRepository:
+    def __init__(self, battle: BattleSummary | None) -> None:
+        self._battle = battle
+        self.calls = 0
+
+    async def get_battle_by_tag(self, battle_tag: str) -> BattleSummary | None:
+        self.calls += 1
+        return self._battle
+
+
+def _app(*, read_repo=None, settings_repo=None):
+    registry = ApprovalRegistry()
+    event_hub = EventHub()
+    settings_repo = settings_repo or _FakeSettingsRepo()
+    factory = (lambda: read_repo) if read_repo is not None else (lambda: _FakeReadRepository(None))
+    app = create_app(
+        registry=registry, event_hub=event_hub,
+        settings_repo=settings_repo, historical_repo_factory=factory,
+    )
+    return app, registry, event_hub
+
+
+def test_create_app_wires_state_from_injected_dependencies():
+    registry = ApprovalRegistry()
+    event_hub = EventHub()
+    settings_repo = _FakeSettingsRepo()
+    read_repo = _FakeReadRepository(None)
+
+    app = create_app(
+        registry=registry, event_hub=event_hub, settings_repo=settings_repo,
+        historical_repo_factory=lambda: read_repo,
+    )
+
+    assert app.state.registry is registry
+    assert app.state.event_hub is event_hub
+    assert app.state.settings_repo is settings_repo
+    assert app.state.historical_repo_factory() is read_repo
+
+
+def test_create_app_includes_the_rest_router():
+    # OpenAPI es el contrato publico y estable de rutas montadas; los
+    # internals de como FastAPI 0.141 representa un router incluido en
+    # `app.routes` no son API publica y no hay que acoplarse a ellos.
+    app, _, _ = _app()
+    paths = set(app.openapi()["paths"])
+    assert "/health" in paths
+    assert "/battles/{battle_tag}/decisions/{decision_index}/approve" in paths
+    assert "/battles/{battle_tag}/decisions/{decision_index}/override" in paths
+
+
+def test_create_app_registers_websocket_routes():
+    app, _, _ = _app()
+    ws_paths = {
+        route.path for route in app.routes
+        if getattr(route, "path", None) and "/ws/" in route.path
+    }
+    assert "/ws/battle/{battle_tag}" in ws_paths
+    assert "/ws/lobby" in ws_paths
+
+
+def test_health_endpoint_ok():
+    app, _, _ = _app()
+    client = TestClient(app)
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_battle_read_goes_through_the_injected_historical_factory():
+    battle = BattleSummary(
+        battle_tag="battle-42", format="gen6randombattle", p1="A", p2="B",
+        winner=None, played_by="bot", source="test",
+    )
+    read_repo = _FakeReadRepository(battle)
+    app, _, _ = _app(read_repo=read_repo)
+    client = TestClient(app)
+
+    response = client.get("/battles/battle-42")
+
+    assert response.status_code == 200
+    assert response.json()["battle_tag"] == "battle-42"
+    assert read_repo.calls == 1
+
+
+def test_routes_module_never_imports_pending_decision_repository():
+    """Task 4 nunca usa `PendingDecisionRepository` (Task 3): el estado
+    vivo sale del registry, las lecturas historicas de `ApiReadRepository`.
+    Chequeo por simbolo importado (no substring), para no reaccionar a la
+    mencion en la documentacion del propio modulo."""
+    assert not hasattr(routes_module, "PendingDecisionRepository")
+    assert "ludex_agent.db.pending_repository" not in {
+        getattr(value, "__module__", None) for value in vars(routes_module).values()
+    }
+
+
+def test_the_whole_api_surface_never_imports_pending_decision_repository():
+    """El contrato S3.3 aplica a TODA la superficie de la API, no solo al
+    router: ni `app.py`, ni `schemas.py`, ni `websockets.py`, ni
+    `api_read_repository.py` pueden importar el unico escritor de
+    `pending_decisions` (vive exclusivamente dentro de `POKE_LOOP`)."""
+    import ludex_agent.api.app as app_module
+    import ludex_agent.api.schemas as schemas_module
+    import ludex_agent.api.websockets as websockets_module
+    from ludex_agent.db import api_read_repository as read_module
+
+    for module in (
+        app_module, routes_module, schemas_module, websockets_module, read_module,
+    ):
+        assert not hasattr(module, "PendingDecisionRepository"), module.__name__
+        assert "ludex_agent.db.pending_repository" not in {
+            getattr(value, "__module__", None)
+            for value in vars(module).values()
+        }, module.__name__
+
+
+def test_build_uvicorn_config_binds_only_loopback():
+    app, _, _ = _app()
+    config = build_uvicorn_config(app, port=8888)
+    assert config.host == LOOPBACK_HOST == "127.0.0.1"
+    assert config.port == 8888
+
+
+# ---------------------------------------------------------------------------
+# ApiReadRepository: cross-loop typed failure (D65 S3.3)
+# ---------------------------------------------------------------------------
+
+
+def test_cross_loop_repository_use_raises_typed_error():
+    """El engine se bindea al loop del PRIMER uso; un segundo uso desde otro
+    loop de asyncio tiene que fallar con un tipo propio, no con el error
+    generico de asyncio/asyncpg ("Future attached to a different loop")."""
+    repo = ApiReadRepository(
+        "postgresql+asyncpg://ludex:ludex@127.0.0.1:15432/ludex_test_fake"
+    )
+
+    async def bind_to_current_loop() -> None:
+        # create_async_engine es perezoso: no abre conexion real, asi que
+        # este test no necesita una base viva para ejercer el guardia.
+        repo._ensure_factory()
+
+    asyncio.run(bind_to_current_loop())
+
+    with pytest.raises(CrossLoopRepositoryError) as exc_info:
+        asyncio.run(bind_to_current_loop())
+
+    assert exc_info.value.created_loop_id != exc_info.value.used_loop_id
+
+
+async def test_api_read_repository_reads_battles_from_a_real_disposable_db():
+    """Sin fixture compartida: `tests/api/` no tiene conftest propio (Task 4
+    solo puede tocar los 13 paths listados), asi que este test arma su
+    propia base descartable con el mismo helper que usa `tests/db/`
+    (`_disposable`, expuesto globalmente por `tests/conftest.py`)."""
+    base = os.environ.get("TEST_DATABASE_URL")
+    if not base:
+        pytest.skip(
+            "necesita TEST_DATABASE_URL (base descartable; nunca DATABASE_URL)"
+        )
+    import asyncpg
+    from _disposable import disposable_database
+
+    async with disposable_database(base) as url:
+        asyncpg_url = url
+        engine_url = url.replace("postgres://", "postgresql+asyncpg://", 1).replace(
+            "postgresql://", "postgresql+asyncpg://", 1
+        )
+
+        conn = await asyncpg.connect(asyncpg_url)
+        try:
+            await conn.execute(
+                """
+                INSERT INTO battles (battle_tag, identity_key, format, p1, p2,
+                                      winner, played_by, source)
+                VALUES ('battle-read-1', 'ps-open-v1:sha256:read1',
+                        'gen6randombattle', 'A', 'B', 'A', 'bot', 'test')
+                """
+            )
+        finally:
+            await conn.close()
+
+        repo = ApiReadRepository(engine_url)
+        try:
+            battle = await repo.get_battle_by_tag("battle-read-1")
+            assert battle is not None
+            assert battle.winner == "A"
+            assert battle.source == "test"
+
+            missing = await repo.get_battle_by_tag("battle-does-not-exist")
+            assert missing is None
+        finally:
+            await repo.aclose()
+
+
+async def test_settings_model_validation_runs_against_the_real_db():
+    """`PATCH /settings/model` valida contra la DB REAL (F2-09): un model
+    que no existe para el provider es `422 INVALID_MODEL_SELECTION` y no
+    toca `settings`; uno valido se persiste y queda visible en el GET.
+
+    Sin fixture compartida (mismo motivo que el test de arriba): base
+    descartable propia sobre `TEST_DATABASE_URL`."""
+    base = os.environ.get("TEST_DATABASE_URL")
+    if not base:
+        pytest.skip(
+            "necesita TEST_DATABASE_URL (base descartable; nunca DATABASE_URL)"
+        )
+    import asyncpg
+    from _disposable import disposable_database
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from ludex_agent.db.model_repository import ModelRepository
+
+    class _LazySessionFactory:
+        """Crea el engine en el PRIMER uso, dentro del loop que este
+        corriendo en ese momento -- el patron de produccion (D65 S3.3):
+        `TestClient` corre la app en un hilo con su propio loop de asyncio,
+        asi que crear el engine aca (loop del test) cruzaria loops."""
+
+        def __init__(self, database_url: str) -> None:
+            self._url = database_url
+            self._factory = None
+
+        def __call__(self):
+            if self._factory is None:
+                engine = create_async_engine(self._url, poolclass=NullPool)
+                self._factory = async_sessionmaker(
+                    engine, expire_on_commit=False,
+                )
+            return self._factory()
+
+    async with disposable_database(base) as url:
+        asyncpg_url = url
+        engine_url = url.replace("postgres://", "postgresql+asyncpg://", 1).replace(
+            "postgresql://", "postgresql+asyncpg://", 1
+        )
+
+        conn = await asyncpg.connect(asyncpg_url)
+        try:
+            provider_id = await conn.fetchval(
+                "INSERT INTO providers (name, base_url, api_key_env, enabled) "
+                "VALUES ('google', 'https://example.invalid', 'GOOGLE_API_KEY', true) "
+                "RETURNING id"
+            )
+            await conn.execute(
+                "INSERT INTO models (provider_id, model_id, label, is_default, enabled) "
+                "VALUES ($1, 'gemini-test', 'Gemini Test', true, true)",
+                provider_id,
+            )
+        finally:
+            await conn.close()
+
+        settings_repo = ModelRepository(_LazySessionFactory(engine_url))
+        app = create_app(
+            registry=ApprovalRegistry(),
+            event_hub=EventHub(),
+            settings_repo=settings_repo,
+            historical_repo_factory=lambda: _FakeReadRepository(None),
+        )
+        client = TestClient(app)
+
+        invalid = client.patch(
+            "/settings/model",
+            json={"provider": "google", "model": "does-not-exist"},
+        )
+        assert invalid.status_code == 422
+        assert invalid.json()["detail"]["error"] == "INVALID_MODEL_SELECTION"
+
+        valid = client.patch(
+            "/settings/model",
+            json={"provider": "google", "model": "gemini-test"},
+        )
+        assert valid.status_code == 200
+        assert valid.json() == {"provider": "google", "model": "gemini-test"}
+
+        current = client.get("/settings/model")
+        assert current.status_code == 200
+        assert current.json() == {"provider": "google", "model": "gemini-test"}

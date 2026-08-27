@@ -1,0 +1,54 @@
+"""Modelos Pydantic de request/response de la API de control (spec Fase 3
+S7.1, D65 MON-33 Task 4).
+
+Nunca modelan secretos: `ModelRepository` (F2-09) ya excluye valores de API
+key de toda fila que expone, y estos schemas heredan esa restriccion sin
+agregar ningun campo nuevo que pudiera filtrarlos.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class DecisionAttemptRequest(BaseModel):
+    attempt_index: int = Field(ge=0)
+
+
+class OverrideRequest(DecisionAttemptRequest):
+    action: dict[str, object]
+
+
+class ResolutionResponse(BaseModel):
+    outcome: Literal["human_approved", "human_override", "timeout_auto"]
+    action: dict[str, object]
+    resolved_by: Literal["operator", "timer", "system"]
+    resolved_reason: str | None = None
+
+
+class ModelSelectionRequest(BaseModel):
+    provider: str
+    model: str
+
+
+class ModelSelectionResponse(BaseModel):
+    provider: str
+    model: str
+
+
+class BattleSummaryResponse(BaseModel):
+    battle_tag: str
+    format: str
+    p1: str
+    p2: str
+    winner: str | None
+    played_by: str
+    source: str
+
+
+class PendingDecisionResponse(BaseModel):
+    attempt_index: int
+    action: dict[str, object]
+    legal_actions: list[dict[str, object]]
