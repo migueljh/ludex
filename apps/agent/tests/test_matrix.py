@@ -22,7 +22,6 @@ from ludex_agent.matrix import (
     tier_prices_from_pricing_table,
 )
 
-
 def _routes() -> dict[tuple[str, str], ModelRoute]:
     return {
         ("google", "gemini-2.5-flash"): ModelRoute(protocol="google"),
@@ -2736,3 +2735,72 @@ def test_ruteo_sitio1_build_provider_por_la_fuente_unica():
     assert results[0].status == "externally-limited"
     assert results[0].failure_type == "TransientProviderError"
     assert results[0].failure_stage == "smoke"
+
+
+def test_matrix_run_ejecuta_sus_batallas_via_benchmark_command(tmp_path, monkeypatch):
+    """MON-35 (requisito 2): las batallas de `matrix-run` se ejecutan a
+    traves de `cli._benchmark_command`, el UNICO punto que inyecta la
+    politica que nunca gatea: la garantia offline del benchmark se
+    extiende a la matriz por delegacion, no por una politica paralela."""
+    import asyncio
+    import json as _json
+
+    from ludex_agent import cli as cli_module
+    from ludex_agent.benchmark import BenchmarkResult
+    from ludex_agent.cli import app
+    from typer.testing import CliRunner
+
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(_json.dumps({"rows": [{
+        "provider": "open_code_zen", "model": "mimo-v2.5-free",
+        "protocol": "chat_completions", "endpoint": None,
+        "structured_output": "json_schema", "tier": "free",
+        "status": "ready", "battles": 2, "concurrency": 1,
+        "persist": False, "pin": ["open_code_zen", "mimo-v2.5-free"],
+        "estimated_cost_usd": "0", "estimated_smoke_usd": "0",
+        "classification_note": "",
+    }]}))
+    calls: list[dict] = []
+
+    async def fake_benchmark_command(**kwargs):
+        calls.append(dict(kwargs))
+        return (
+            BenchmarkResult(
+                requested=1, completed=1, wins=0, losses=1, ties=0,
+            ),
+            {},
+        )
+
+    async def fake_run_matrix_round(**kwargs):
+        await kwargs["run_battles"](
+            "open_code_zen", "mimo-v2.5-free", n=1,
+            battle_timeout_seconds=60, fmt="gen6randombattle",
+            opponent="simple_heuristics",
+        )
+        return []
+
+    monkeypatch.setattr(cli_module, "_benchmark_command", fake_benchmark_command)
+    monkeypatch.setattr(
+        "ludex_agent.matrix.run_matrix_round", fake_run_matrix_round
+    )
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+asyncpg://x:x@localhost:15432/x"
+    )
+    monkeypatch.setenv("OPEN_CODE_ZEN_API_KEY", "fake-key")
+    monkeypatch.setenv("OPEN_CODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
+    for secret_env in ("GEMINI_API_KEY", "GEMINI_API_KEYS", "GOOGLE_API_KEY",
+                       "GOOGLE_API_KEYS", "KIMI_API_KEY", "KIMI_BASE_URL"):
+        monkeypatch.delenv(secret_env, raising=False)
+
+    result = CliRunner().invoke(
+        app,
+        ["matrix-run", "--manifest", str(manifest), "--tier", "free",
+         "--round", "test-delegation", "--zen-auto-reload-confirmed"],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert len(calls) == 1, (
+        f"las batallas de matrix-run deben pasar por _benchmark_command: {calls}"
+    )
+    assert calls[0]["provider_name"] == "open_code_zen"
+    assert calls[0]["model"] == "mimo-v2.5-free"
+    assert calls[0]["battle_timeout_seconds"] == 60

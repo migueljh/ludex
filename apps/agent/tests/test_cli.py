@@ -40,6 +40,7 @@ from ludex_agent.cli import (
     app,
 )
 from ludex_agent.graph.provider import DecisionMetrics
+from ludex_agent.hitl.policy import NeverGateApprovalPolicy
 from ludex_agent.showdown.client import (
     LudexPlayer,
     PendingChoice,
@@ -742,6 +743,85 @@ async def test_persist_one_separa_action_path_de_action_source():
     assert kwargs["output_tokens"] is None
     assert kwargs["cached_input_tokens"] is None
     assert kwargs["reasoning_tokens"] is None
+    assert kwargs["approval_outcome"] is None
+
+
+_D38_STEP_KEYS = (
+    "rationale", "confidence", "alternatives", "target", "provider", "model",
+    "decision_latency_ms", "input_tokens", "output_tokens", "cached_input_tokens",
+    "reasoning_tokens",
+)
+
+
+async def test_persist_one_aprobado_persiste_source_agent_y_metadata_completa():
+    """MON-35 (requisito 3): `_persist_one` lee `action_source` y
+    `approval_outcome` DEL STEP (nunca hardcodea source='agent'): un
+    `human_approved` viaja con `action_source='agent'` y metadata completa."""
+    player = _player()
+    tag = "battle-axes-approved"
+    player.battles[tag] = SimpleNamespace(
+        battle_tag=tag, player_role="p1", player_username="Bot",
+        opponent_username="Rival", finished=False, won=None, gen=6,
+    )
+    player.steps[tag] = [{
+        "turn": 1, "decision_turn": 1,
+        "state": {"legal_actions": [{"kind": "move", "id": "tackle"}]},
+        "action_taken": {"kind": "move", "id": "tackle"},
+        "action_source": "agent",
+        "action_path": "llm",
+        "approval_outcome": "human_approved",
+        "rationale": "r", "confidence": 0.5, "alternatives": [],
+        "target": None, "provider": "google", "model": "gemini-2.5-flash",
+        "decision_latency_ms": 1.0, "input_tokens": 1, "output_tokens": 1,
+        "cached_input_tokens": 0, "reasoning_tokens": 0,
+    }]
+    _record_valid_opening(player, tag)
+    repo = _FakeRepo()
+
+    await _persist_one(player, repo, tag, "gen6randombattle", "test")
+
+    assert repo.saved_steps[0][-1] == "agent"
+    kwargs = repo.saved_step_kwargs[0]
+    assert kwargs["approval_outcome"] == "human_approved"
+    assert kwargs["provider"] == "google"
+    assert kwargs["input_tokens"] == 1
+
+
+async def test_persist_one_override_persiste_source_human_y_d38_null():
+    """MON-35 (requisito 3): un `human_override` viaja con
+    `action_source='human'`, `approval_outcome='human_override'` y las 11
+    columnas D38 en None (nunca se inventa metadata de un modelo)."""
+    player = _player()
+    tag = "battle-axes-override"
+    player.battles[tag] = SimpleNamespace(
+        battle_tag=tag, player_role="p1", player_username="Bot",
+        opponent_username="Rival", finished=False, won=None, gen=6,
+    )
+    step = {
+        "turn": 1, "decision_turn": 1,
+        "state": {"legal_actions": [{"kind": "move", "id": "surf"}]},
+        "action_taken": {"kind": "move", "id": "surf"},
+        "action_source": "human",
+        "action_path": None,
+        "approval_outcome": "human_override",
+    }
+    for key in _D38_STEP_KEYS:
+        step[key] = None
+    player.steps[tag] = [step]
+    _record_valid_opening(player, tag)
+    repo = _FakeRepo()
+
+    await _persist_one(player, repo, tag, "gen6randombattle", "test")
+
+    assert repo.saved_steps[0][-1] == "human", (
+        "el override debe persistirse con action_source='human'"
+    )
+    kwargs = repo.saved_step_kwargs[0]
+    assert kwargs["approval_outcome"] == "human_override"
+    for key in _D38_STEP_KEYS:
+        assert kwargs[key] is None, (
+            f"un override debe persistir {key!r} NULL (D38 como grupo)"
+        )
 
 
 def _patch_play_dependencies(monkeypatch, agent_type) -> None:
@@ -797,6 +877,42 @@ async def test_play_propaga_el_fallo_background_sin_esperar_timeout(monkeypatch)
         )
 
     assert caught.value is failure
+
+
+async def test_play_pasa_una_politica_que_nunca_gatea_al_jugador(monkeypatch):
+    """MON-35 (requisito 2): `run` nunca debe bloquear ni crear un Future
+    por un setting de HITL. La politica inyectada al jugador nunca gatea,
+    ni siquiera con `approval_mode=hitl` (el modo que un operador podria
+    dejar seteado en la DB): la garantia vive en la politica, no en el modo."""
+    captured: dict[str, object] = {}
+
+    class CapturingAgent:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+            self.battles = {}
+
+        async def battle_against(self, rival, n_battles=1):
+            raise RuntimeError("detener antes de persistir")
+
+        async def wait_for_background_failure(self):
+            await asyncio.Event().wait()
+
+    _patch_play_dependencies(monkeypatch, CapturingAgent)
+
+    with pytest.raises(RuntimeError, match="detener antes de persistir"):
+        await cli_module.play(1, "gen6randombattle", source="test")
+
+    policy = captured["approval_policy"]
+    assert isinstance(policy, NeverGateApprovalPolicy), (
+        f"run debe inyectar NeverGateApprovalPolicy, recibido {type(policy)!r}"
+    )
+    # El modo HITL de la DB (hitl) no puede gatillar nada, ni en official.
+    assert policy.requires_gate(
+        connection_mode="official", approval_mode="hitl"
+    ) is False
+    assert policy.requires_gate(
+        connection_mode="local", approval_mode="hitl"
+    ) is False
 
 
 async def test_battle_helper_cancela_hijas_ante_timeout_externo():
@@ -1081,6 +1197,53 @@ def test_benchmark_command_deadline_clasificado_y_escribe_final(
     assert "test-deadline" in ledger_text
     assert "1/3" in ledger_text
     assert "1-0-0" in ledger_text
+
+
+def test_benchmark_command_pasa_una_politica_que_nunca_gatea(monkeypatch):
+    """MON-35 (requisito 2): `benchmark` (y `matrix-run`, que delega sus
+    batallas en `_benchmark_command`) inyectan una politica que nunca
+    gatea: sin Future, sin bloqueo, aunque el modo HITL este seteado en la
+    DB."""
+    captured: dict[str, object] = {}
+
+    class CapturingAgent:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+            self.n_won_battles = 0
+            self.n_lost_battles = 0
+            self.n_tied_battles = 0
+            self.battles = {}
+
+        async def battle_against(self, rival, n_battles=1):
+            self.battles[f"b-{len(self.battles)}"] = SimpleNamespace()
+            self.n_won_battles += 1
+
+        async def wait_for_background_failure(self):
+            await asyncio.Event().wait()
+
+        async def drain_inflight_decisions(self):
+            pass
+
+    _patch_benchmark_command_dependencies(monkeypatch, CapturingAgent)
+
+    result, _ = asyncio.run(cli_module._benchmark_command(
+        n=1, opponent="random", concurrency=1, persist=False,
+        provider_name="fake", model="fake-model",
+        fmt="gen6randombattle", battle_timeout_seconds=30,
+    ))
+
+    assert result.completed == 1
+    policy = captured["approval_policy"]
+    assert isinstance(policy, NeverGateApprovalPolicy), (
+        f"benchmark/matrix deben inyectar NeverGateApprovalPolicy, "
+        f"recibido {type(policy)!r}"
+    )
+    assert policy.requires_gate(
+        connection_mode="official", approval_mode="hitl"
+    ) is False
+    assert policy.requires_gate(
+        connection_mode="local", approval_mode="hitl"
+    ) is False
 
 
 def test_benchmark_command_transient_con_causa_persiste_tipos_en_json(
