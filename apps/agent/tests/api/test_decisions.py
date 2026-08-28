@@ -12,6 +12,7 @@ embebido y esa lectura falle.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -35,10 +36,66 @@ class _FakeClock:
         return self.now
 
 
+class _FakeRows:
+    def __init__(self, rows: list[tuple]) -> None:
+        self._rows = rows
+
+    def all(self) -> list[tuple]:
+        return self._rows
+
+    def first(self) -> tuple | None:
+        return self._rows[0] if self._rows else None
+
+
+class _FakeSession:
+    """Sesion SQLAlchemy falsa sobre dicts en memoria: solo los statements
+    de `settings` (approval_mode) y de `providers` que usan las rutas de
+    Task 4. Cualquier statement desconocido falla el test (fail-loud)."""
+
+    def __init__(self, store: dict, providers: list[tuple]) -> None:
+        self._store = store
+        self._providers = providers
+
+    async def __aenter__(self) -> "_FakeSession":
+        return self
+
+    async def __aexit__(self, *exc_info) -> bool:
+        return False
+
+    async def execute(self, statement, params=None):
+        sql = str(statement).strip()
+        if sql.startswith("INSERT INTO settings"):
+            assert params is not None
+            self._store["approval_mode"] = json.loads(params["value"])
+            return _FakeRows([])
+        if "FROM settings WHERE key" in sql:
+            value = self._store.get("approval_mode")
+            return _FakeRows([(value,)] if value is not None else [])
+        if "FROM providers" in sql:
+            return _FakeRows(self._providers)
+        raise AssertionError(f"fake session no conoce este statement: {sql[:80]!r}")
+
+    async def commit(self) -> None:
+        return None
+
+
 class _FakeSettingsRepo:
-    def __init__(self, *, valid: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        valid: bool = True,
+        settings: dict | None = None,
+        providers: list[tuple] | None = None,
+        models: list[ProviderModel] | None = None,
+    ) -> None:
         self._valid = valid
         self.active = None
+        self._settings_store = settings if settings is not None else {}
+        self._providers = providers if providers is not None else [("google", True)]
+        self._models = models if models is not None else []
+
+    def factory(self) -> _FakeSession:
+        return _FakeSession(self._settings_store, self._providers)
 
     async def active_selection(self):
         return self.active
@@ -50,6 +107,11 @@ class _FakeSettingsRepo:
 
     async def set_active(self, provider: str, model: str) -> None:
         self.active = ProviderModel(provider, model)
+
+    async def list_models(self, provider_name: str | None = None) -> list[ProviderModel]:
+        if provider_name is None:
+            return list(self._models)
+        return [m for m in self._models if m.provider_name == provider_name]
 
 
 class _EmptyReadRepository:
@@ -282,6 +344,86 @@ def test_patch_settings_model_with_an_invalid_selection_returns_422():
     )
     assert response.status_code == 422
     assert response.json()["detail"]["error"] == "INVALID_MODEL_SELECTION"
+
+
+# ---------------------------------------------------------------------------
+# Superficie S7.1 restante: GET /settings, PATCH /settings/hitl,
+# GET /providers, GET /models (T-02)
+# ---------------------------------------------------------------------------
+
+
+def test_get_settings_returns_active_model_and_approval_mode():
+    repo = _FakeSettingsRepo(settings={"approval_mode": "hitl"})
+    repo.active = ProviderModel("google", "gemini-test")
+    client, _, _ = _client(settings_repo=repo)
+
+    response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["active_model"] == {"provider": "google", "model": "gemini-test"}
+    assert body["approval_mode"] == "hitl"
+
+
+def test_get_settings_returns_nulls_when_nothing_is_configured():
+    client, _, _ = _client()
+    response = client.get("/settings")
+    assert response.status_code == 200
+    assert response.json() == {"active_model": None, "approval_mode": None}
+
+
+def test_patch_settings_hitl_stores_the_mode_and_get_settings_returns_it():
+    repo = _FakeSettingsRepo()
+    client, _, _ = _client(settings_repo=repo)
+
+    patch = client.patch("/settings/hitl", json={"approval_mode": "hitl"})
+    assert patch.status_code == 200
+    assert patch.json()["approval_mode"] == "hitl"
+
+    follow_up = client.get("/settings")
+    assert follow_up.status_code == 200
+    assert follow_up.json()["approval_mode"] == "hitl"
+
+
+def test_patch_settings_hitl_rejects_an_unknown_mode_with_422():
+    client, _, _ = _client()
+    response = client.patch(
+        "/settings/hitl", json={"approval_mode": "not-a-real-mode"},
+    )
+    assert response.status_code == 422
+
+
+def test_get_models_lists_models_and_honors_the_provider_filter():
+    repo = _FakeSettingsRepo(models=[
+        ProviderModel("google", "gemini-test"),
+        ProviderModel("google", "gemini-other"),
+        ProviderModel("kimi", "k2"),
+    ])
+    client, _, _ = _client(settings_repo=repo)
+
+    all_models = client.get("/models")
+    assert all_models.status_code == 200
+    assert len(all_models.json()) == 3
+
+    filtered = client.get("/models", params={"provider": "google"})
+    assert [m["model"] for m in filtered.json()] == ["gemini-test", "gemini-other"]
+
+
+def test_get_providers_returns_only_name_and_enabled_never_credentials():
+    """D65 S6.3: `providers.base_url` puede embeder credenciales y
+    `api_key_env` es el NOMBRE de la variable del secreto; ninguno de los
+    dos puede aparecer en una respuesta. La igualdad exacta del payload es
+    el canario: cualquier key de mas (base_url/api_key_env) la rompe."""
+    repo = _FakeSettingsRepo(providers=[("google", True), ("kimi", False)])
+    client, _, _ = _client(settings_repo=repo)
+
+    response = client.get("/providers")
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {"name": "google", "enabled": True},
+        {"name": "kimi", "enabled": False},
+    ]
 
 
 # ---------------------------------------------------------------------------

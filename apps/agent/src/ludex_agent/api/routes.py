@@ -1,11 +1,13 @@
-"""Router REST de la API de control (spec Fase 3 S7.1, D65 MON-33 Task 4).
+"""Router REST de la API de control (spec Fase 3 S7.1, D65/D66 MON-33
+Task 4).
 
-Superficie minima que ejerce Task 4: `/health`, seleccion de modelo
-(`ModelRepository`, F2-09: nunca expone valores de API key), la decision
-pendiente y su resolucion (`ApprovalRegistry`/gate exact-once, Task 2) y una
-lectura historica minima (`ApiReadRepository`). El resto de la superficie de
-`spec S7.1` (challenges, ladder, conexion oficial, sesiones) pertenece a
-S5/S6 y no se declara aca.
+Superficie de Task 4 (S3): `/health`, la seleccion de modelo y los settings
+durables (`ModelRepository`, F2-09: nunca expone valores de API key),
+providers y modelos, la decision pendiente y su resolucion
+(`ApprovalRegistry`/gate exact-once, Task 2) y las lecturas historicas
+(`ApiReadRepository` via el provider memoizado de `app.state`, D66 T-03).
+El resto de la superficie de `spec S7.1` (connection, sessions) pertenece a
+S4/Task 6 y challenges a S5/Task 7 (asignacion vinculante D66).
 
 El estado de una decision pendiente sale EXCLUSIVAMENTE del
 `ApprovalRegistry` inyectado (`request.app.state.registry`); esta capa nunca
@@ -15,23 +17,34 @@ exclusiva de `POKE_LOOP`.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import asdict
 
 from fastapi import APIRouter, HTTPException, Request
+from sqlalchemy import text
 
 from ..db.model_repository import ModelSelectionError
 from ..hitl.gate import AlreadyResolved, ApprovalResolution, IllegalOverrideError
 from ..hitl.registry import ApprovalRegistry, StaleAttemptError, UnknownDecisionError
 from .schemas import (
+    ApprovalModeRequest,
     BattleSummaryResponse,
     DecisionAttemptRequest,
     ModelSelectionRequest,
     ModelSelectionResponse,
     OverrideRequest,
     PendingDecisionResponse,
+    ProviderSummaryResponse,
     ResolutionResponse,
+    SettingsResponse,
 )
+
+# D66: `approval_mode` se persiste en la tabla `settings` con esta key,
+# como JSON string (`"hitl"` | `"autonomous"`) -- mismo store que
+# `active_model` (F2-09). El consumidor en el camino vivo (Task 5) tiene
+# que leer esta key al construir la politica inyectable.
+_APPROVAL_MODE_KEY = "approval_mode"
 
 
 def _resolution_response(resolution: ApprovalResolution) -> ResolutionResponse:
@@ -112,6 +125,70 @@ def create_router() -> APIRouter:
         await repo.set_active(payload.provider, payload.model)
         return ModelSelectionResponse(provider=payload.provider, model=payload.model)
 
+    async def _settings_response(repo) -> SettingsResponse:
+        selection = await repo.active_selection()
+        async with repo.factory() as s:
+            row = (await s.execute(text(
+                "SELECT value FROM settings WHERE key = :key"
+            ), {"key": _APPROVAL_MODE_KEY})).first()
+        mode = row[0] if row is not None else None
+        return SettingsResponse(
+            active_model=(
+                ModelSelectionResponse(
+                    provider=selection.provider_name, model=selection.model_id,
+                ) if selection is not None else None
+            ),
+            approval_mode=mode,
+        )
+
+    @router.get("/settings")
+    async def get_settings(request: Request) -> SettingsResponse:
+        return await _settings_response(request.app.state.settings_repo)
+
+    @router.patch("/settings/hitl")
+    async def set_settings_hitl(
+        payload: ApprovalModeRequest, request: Request,
+    ) -> SettingsResponse:
+        repo = request.app.state.settings_repo
+        async with repo.factory() as s:
+            await s.execute(text("""
+                INSERT INTO settings (key, value)
+                VALUES (:key, CAST(:value AS jsonb))
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """), {
+                "key": _APPROVAL_MODE_KEY,
+                "value": json.dumps(payload.approval_mode),
+            })
+            await s.commit()
+        return await _settings_response(repo)
+
+    @router.get("/providers")
+    async def list_providers(request: Request) -> list[ProviderSummaryResponse]:
+        repo = request.app.state.settings_repo
+        async with repo.factory() as s:
+            rows = (await s.execute(text(
+                "SELECT name, enabled FROM providers ORDER BY name"
+            ))).all()
+        return [ProviderSummaryResponse(name=row[0], enabled=row[1]) for row in rows]
+
+    @router.get("/models")
+    async def list_models(
+        request: Request, provider: str | None = None,
+    ) -> list[ModelSelectionResponse]:
+        rows = await request.app.state.settings_repo.list_models(provider)
+        return [
+            ModelSelectionResponse(provider=row.provider_name, model=row.model_id)
+            for row in rows
+        ]
+
+    @router.get("/battles")
+    async def list_battles(
+        request: Request, limit: int = 50,
+    ) -> list[BattleSummaryResponse]:
+        repo = request.app.state.historical_repo_provider.get_repo()
+        battles = await repo.list_recent_battles(limit=limit)
+        return [BattleSummaryResponse(**asdict(battle)) for battle in battles]
+
     @router.get("/battles/{battle_tag}/pending")
     async def get_pending(
         battle_tag: str, decision_index: int, request: Request,
@@ -128,7 +205,7 @@ def create_router() -> APIRouter:
 
     @router.get("/battles/{battle_tag}")
     async def get_battle(battle_tag: str, request: Request) -> BattleSummaryResponse:
-        repo = request.app.state.historical_repo_factory()
+        repo = request.app.state.historical_repo_provider.get_repo()
         battle = await repo.get_battle_by_tag(battle_tag)
         if battle is None:
             raise HTTPException(status_code=404, detail={"error": "BATTLE_NOT_FOUND"})

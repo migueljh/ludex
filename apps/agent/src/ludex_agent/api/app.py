@@ -1,19 +1,24 @@
 """`create_app`: ensamblado de la API de control de Fase 3 (spec S3.3, S7,
-D65 MON-33 Task 4).
+D65 MON-33 Task 4, D66 R2).
 
 Bindea SOLO loopback (D65 S6.3): `LOOPBACK_HOST` es la unica constante que
 `build_uvicorn_config` acepta como host, sin parametro para otro valor. El
 estado vivo de una decision pendiente sale del `ApprovalRegistry` inyectado,
 nunca de una consulta a `pending_decisions` (auditoria exclusiva de
 `POKE_LOOP`, Task 3): esta API nunca importa `PendingDecisionRepository`.
-Las lecturas historicas usan `historical_repo_factory`, que construye un
-`ApiReadRepository` con un engine propio del loop de FastAPI (D65 S3.3).
+
+Lecturas historicas (D65 S3.3, D66 T-03): `_LazyHistoricalRepoProvider`
+memoiza UNA `ApiReadRepository` por app, creada perezosamente en el PRIMER
+uso (asi el engine bindea al loop de FastAPI, no al loop de quien llamo
+`create_app`) y el lifespan de la app la cierra con `aclose` al apagar.
+Nunca se crea un repo/engine por request.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, Request
@@ -34,6 +39,28 @@ DEFAULT_PORT = 8420
 _logger = logging.getLogger(__name__)
 
 
+class _LazyHistoricalRepoProvider:
+    """Dueno de la unica `ApiReadRepository` de la app (D66 T-03).
+
+    La factory corre una sola vez, en el primer `get_repo()` -- dentro del
+    loop de FastAPI, que es donde vive el engine (D65 S3.3). `aclose()`
+    cierra la instancia si alguna vez se creo; lo invoca el lifespan."""
+
+    def __init__(self, factory: "Callable[[], ApiReadRepository]") -> None:
+        self._factory = factory
+        self._repo: "ApiReadRepository | None" = None
+
+    def get_repo(self) -> "ApiReadRepository":
+        if self._repo is None:
+            self._repo = self._factory()
+        return self._repo
+
+    async def aclose(self) -> None:
+        repo, self._repo = self._repo, None
+        if repo is not None:
+            await repo.aclose()
+
+
 def create_app(
     *,
     registry: ApprovalRegistry,
@@ -41,11 +68,19 @@ def create_app(
     settings_repo: ModelRepository,
     historical_repo_factory: "Callable[[], ApiReadRepository]",
 ) -> FastAPI:
-    app = FastAPI()
+    historical_repo_provider = _LazyHistoricalRepoProvider(historical_repo_factory)
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        yield
+        await historical_repo_provider.aclose()
+
+    app = FastAPI(lifespan=_lifespan)
     app.state.registry = registry
     app.state.event_hub = event_hub
     app.state.settings_repo = settings_repo
     app.state.historical_repo_factory = historical_repo_factory
+    app.state.historical_repo_provider = historical_repo_provider
 
     @app.middleware("http")
     async def _enforce_loopback_origin(request: Request, call_next):
