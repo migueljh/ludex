@@ -71,6 +71,10 @@ def test_create_app_wires_state_from_injected_dependencies():
     assert app.state.event_hub is event_hub
     assert app.state.settings_repo is settings_repo
     assert app.state.historical_repo_factory() is read_repo
+    # D65 S3.3 (T-03): UNA instancia por app/loop, memoizada y cerrada por
+    # el lifespan de la app, no una factory corrida por request.
+    assert app.state.historical_repo_provider.get_repo() is read_repo
+    assert app.state.historical_repo_provider.get_repo() is read_repo
 
 
 def test_create_app_includes_the_rest_router():
@@ -116,6 +120,62 @@ def test_battle_read_goes_through_the_injected_historical_factory():
     assert response.status_code == 200
     assert response.json()["battle_tag"] == "battle-42"
     assert read_repo.calls == 1
+
+
+def test_historical_repository_is_memoized_per_app_and_closed_on_shutdown():
+    """T-03: la factory se invoca UNA vez por app (en el primer GET, dentro
+    del loop de FastAPI) y el lifespan de la app cierra esa instancia con
+    `aclose`. Dos GET usan la misma instancia; shutdown cierra una sola."""
+    state = {"factory_calls": 0, "closed": 0}
+
+    class _ClosingReadRepository(_FakeReadRepository):
+        async def aclose(self) -> None:
+            state["closed"] += 1
+
+    def factory():
+        state["factory_calls"] += 1
+        return _ClosingReadRepository(None)
+
+    app = create_app(
+        registry=ApprovalRegistry(), event_hub=EventHub(),
+        settings_repo=_FakeSettingsRepo(), historical_repo_factory=factory,
+    )
+
+    with TestClient(app) as client:
+        first = client.get("/battles/battle-1")
+        second = client.get("/battles/battle-2")
+        assert first.status_code == 404
+        assert second.status_code == 404
+        assert state["factory_calls"] == 1
+        assert state["closed"] == 0
+
+    assert state["closed"] == 1
+
+
+def test_get_battles_lists_recent_battles_from_the_injected_repository():
+    battle_2 = BattleSummary(
+        battle_tag="battle-2", format="gen6randombattle", p1="C", p2="D",
+        winner=None, played_by="bot", source="test",
+    )
+    battle_1 = BattleSummary(
+        battle_tag="battle-1", format="gen6randombattle", p1="A", p2="B",
+        winner="A", played_by="bot", source="test",
+    )
+
+    class _ListReadRepository(_FakeReadRepository):
+        async def list_recent_battles(self, limit: int = 50):
+            return [battle_2, battle_1]
+
+    read_repo = _ListReadRepository(None)
+    app, _, _ = _app(read_repo=read_repo)
+    client = TestClient(app)
+
+    response = client.get("/battles")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [b["battle_tag"] for b in body] == ["battle-2", "battle-1"]
+    assert body[1]["winner"] == "A"
 
 
 def test_routes_module_never_imports_pending_decision_repository():
@@ -178,6 +238,41 @@ def test_cross_loop_repository_use_raises_typed_error():
 
     with pytest.raises(CrossLoopRepositoryError) as exc_info:
         asyncio.run(bind_to_current_loop())
+
+    assert exc_info.value.created_loop_id != exc_info.value.used_loop_id
+
+
+def test_repository_pins_the_binding_loop_by_strong_reference(monkeypatch):
+    """D66 R2: la guardia cross-loop es inmune al reciclado de direcciones
+    de CPython. `asyncio.run` reusa el mismo address para loops sucesivos
+    (verificado en este worktree: ids identicos en varias corridas), asi
+    que una guardia que compare SOLO por `id()` trata como "el mismo loop"
+    a un loop nuevo creado donde murio el anterior y deja pasar el uso
+    cross-loop en silencio.
+
+    Este canario es DETERMINISTA y pinea el mecanismo: el repo tiene que
+    guardar una REFERENCIA FUERTE al loop de creacion (`repo._loop is
+    loop_a`, que impide que su address se recicle mientras el repo vive) y
+    el segundo uso desde otro loop tiene que fallar tipado aunque ambos
+    objetos reportaran el mismo `id()`."""
+    repo = ApiReadRepository(
+        "postgresql+asyncpg://ludex:ludex@127.0.0.1:15432/ludex_test_fake"
+    )
+
+    class _FakeLoop:
+        pass
+
+    loop_a = _FakeLoop()
+    loop_b = _FakeLoop()
+    loops = iter([loop_a, loop_b])
+    monkeypatch.setattr(asyncio, "get_running_loop", lambda: next(loops))
+
+    # create_async_engine es perezoso: no abre conexion real.
+    repo._ensure_factory()  # bindea loop_a
+    assert repo._loop is loop_a
+
+    with pytest.raises(CrossLoopRepositoryError) as exc_info:
+        repo._ensure_factory()  # loop_b: OTRO objeto, no el loop de creacion
 
     assert exc_info.value.created_loop_id != exc_info.value.used_loop_id
 
@@ -311,3 +406,99 @@ async def test_settings_model_validation_runs_against_the_real_db():
         current = client.get("/settings/model")
         assert current.status_code == 200
         assert current.json() == {"provider": "google", "model": "gemini-test"}
+
+
+async def test_settings_hitl_providers_models_and_battles_routes_against_the_real_db():
+    """T-02 sobre la DB real: `GET /providers` (solo name+enabled),
+    `GET /models`, `PATCH /settings/hitl` persistiendo en la tabla
+    `settings` (mismo store que `active_model`, F2-09), `GET /settings` y
+    `GET /battles` via el `ApiReadRepository` real, todo dentro del
+    lifespan de la app (que hace `aclose` al salir)."""
+    base = os.environ.get("TEST_DATABASE_URL")
+    if not base:
+        pytest.skip(
+            "necesita TEST_DATABASE_URL (base descartable; nunca DATABASE_URL)"
+        )
+    import asyncpg
+    from _disposable import disposable_database
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from ludex_agent.db.model_repository import ModelRepository
+
+    class _LazySessionFactory:
+        def __init__(self, database_url: str) -> None:
+            self._url = database_url
+            self._factory = None
+
+        def __call__(self):
+            if self._factory is None:
+                engine = create_async_engine(self._url, poolclass=NullPool)
+                self._factory = async_sessionmaker(
+                    engine, expire_on_commit=False,
+                )
+            return self._factory()
+
+    async with disposable_database(base) as url:
+        asyncpg_url = url
+        engine_url = url.replace("postgres://", "postgresql+asyncpg://", 1).replace(
+            "postgresql://", "postgresql+asyncpg://", 1
+        )
+
+        conn = await asyncpg.connect(asyncpg_url)
+        try:
+            provider_id = await conn.fetchval(
+                "INSERT INTO providers (name, base_url, api_key_env, enabled) "
+                "VALUES ('google', 'https://example.invalid', 'GOOGLE_API_KEY', true) "
+                "RETURNING id"
+            )
+            await conn.execute(
+                "INSERT INTO models (provider_id, model_id, label, is_default, enabled) "
+                "VALUES ($1, 'gemini-test', 'Gemini Test', true, true)",
+                provider_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO battles (battle_tag, identity_key, format, p1, p2,
+                                      winner, played_by, source)
+                VALUES ('battle-list-1', 'ps-open-v1:sha256:list1',
+                        'gen6randombattle', 'A', 'B', 'A', 'bot', 'test')
+                """
+            )
+        finally:
+            await conn.close()
+
+        settings_repo = ModelRepository(_LazySessionFactory(engine_url))
+        read_repo = ApiReadRepository(engine_url)
+        app = create_app(
+            registry=ApprovalRegistry(),
+            event_hub=EventHub(),
+            settings_repo=settings_repo,
+            historical_repo_factory=lambda: read_repo,
+        )
+        with TestClient(app) as client:
+            providers = client.get("/providers")
+            assert providers.status_code == 200
+            assert providers.json() == [{"name": "google", "enabled": True}]
+
+            models = client.get("/models")
+            assert models.status_code == 200
+            assert models.json() == [{"provider": "google", "model": "gemini-test"}]
+
+            patch = client.patch(
+                "/settings/hitl", json={"approval_mode": "autonomous"},
+            )
+            assert patch.status_code == 200
+            assert patch.json()["approval_mode"] == "autonomous"
+
+            settings = client.get("/settings")
+            assert settings.status_code == 200
+            assert settings.json()["approval_mode"] == "autonomous"
+            assert settings.json()["active_model"] == {
+                "provider": "google", "model": "gemini-test",
+            }
+
+            battles = client.get("/battles")
+            assert battles.status_code == 200
+            tags = [b["battle_tag"] for b in battles.json()]
+            assert "battle-list-1" in tags

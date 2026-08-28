@@ -38,6 +38,23 @@ class ModelSelectionResponse(BaseModel):
     model: str
 
 
+class ApprovalModeRequest(BaseModel):
+    approval_mode: Literal["hitl", "autonomous"]
+
+
+class SettingsResponse(BaseModel):
+    active_model: ModelSelectionResponse | None
+    approval_mode: Literal["hitl", "autonomous"] | None
+
+
+class ProviderSummaryResponse(BaseModel):
+    """Solo `name` y `enabled`: nunca `base_url` (puede embeder
+    credenciales) ni `api_key_env` (nombra la variable del secreto)."""
+
+    name: str
+    enabled: bool
+
+
 class BattleSummaryResponse(BaseModel):
     battle_tag: str
     format: str

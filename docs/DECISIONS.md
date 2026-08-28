@@ -4950,3 +4950,114 @@ como default de producción salvo cuando el usuario omite `--battle-timeout`
 
 **Modelo efectivo:** Sonnet 5, fijado explícitamente por el coordinador
 (Task 1 de MON-31). Recomendación: `In Review`.
+
+## D66 — MON-34 R2: fan-out live del WebSocket, cierre de la superficie S7.1 y memoización del repo histórico (2026-08-27)
+
+**Contexto.** La revisión formal de Task 4 (TASOS REVIEW PACKET R1, Grok
+4.6 high) devolvió `CHANGES_REQUESTED` con cuatro findings: T-01 CRITICAL
+(los streams WS no publican live; `_serve_stream` solo emite en respuesta
+a `resume`, y ninguna rebanada posterior del plan posee
+`websockets.py`/`events.py`), T-02 IMPORTANT (endpoints de spec §7.1 sin
+dueño: `GET /settings`, `PATCH /settings/hitl`, `GET /providers`,
+`GET /models`, `GET /battles`), T-03 IMPORTANT (factory histórica por
+request = un `AsyncEngine` por GET, sin `aclose`) y T-04 MINOR (el canario
+de `REPLAY_GAP` colgaba `receive_json` si el handler tragaba el error).
+Esta entrada fija las decisiones del R2.
+
+**Fan-out live server-side (T-01).** `_serve_stream` corre DOS loops
+concurrentes por conexión en un `asyncio.TaskGroup` (Python 3.12): un
+loop de fan-out que sondea server-side `event_hub.resume(stream_id,
+cursor)` cada 50 ms (`_FAN_OUT_TICK_SECONDS`) y reenvía al socket cada
+evento nuevo, y un loop de receive que atiende `resume`/`REPLAY_GAP` en
+paralelo. El cliente NUNCA tiene que poll-ear; `resume` queda como canal
+exclusivo de reconexión. Ambos loops comparten cursor y un
+`asyncio.Lock` para no duplicar eventos entre el canal live y el replay.
+`EventHub` (Task 2, ya aceptada) NO se modifica: agregarle un waiter/cola
+requería autorización de Latwan (así lo exigió la propia revisión) y el
+poll server-side fue el mecanismo mínimo sancionado por ella. El cursor
+de fan-out arranca en el seq vigente al momento de `accept()`, leído del
+atributo privado `EventHub._next_seq` (mismo repo; única vía de conocer
+el seq sin tocar Task 2): un connect fresco no recibe backlog — el
+backlog se sirve SOLO vía `resume`.
+
+**Superficie REST S7.1 (T-02).** Las cinco rutas huérfanas se implementan
+en este slice (`api/routes.py` + `api/schemas.py`), sin perfiles ni
+tablas nuevas:
+- `GET /settings` → `{active_model, approval_mode}` (fuentes: selección
+  activa de `ModelRepository` y key `approval_mode` de la tabla
+  `settings`).
+- `PATCH /settings/hitl` → persiste `approval_mode` (`Literal["hitl",
+  "autonomous"]`, el tipo real de `hitl/policy.py`) en la tabla
+  `settings` con key `approval_mode`, valor JSON string — el MISMO store
+  que ya usa `active_model` (F2-09/MON-14); no hay tabla ni columna
+  nueva. El consumidor en el camino vivo (Task 5) tiene que leer esta
+  key al construir la política inyectable; hasta entonces el valor es
+  leído por `GET /settings` y no por el gate.
+- `GET /providers` → SOLO `name` y `enabled`. Nunca `base_url` (puede
+  embeder credenciales) ni `api_key_env` (nombra la variable del
+  secreto): D65 S6.3, verificado por canario de igualdad exacta.
+- `GET /models` → `list_models` de `ModelRepository` (ya existente), con
+  filtro opcional `?provider=`.
+- `GET /battles` → `list_recent_battles` de `ApiReadRepository` (ya
+  existente; estaba muerto, sin ruta).
+
+**Asignación vinculante connection/sessions (T-02).** Los endpoints
+`GET /connection`, `POST /connection/connect`, `POST /connection/disconnect`,
+`POST /sessions` y `DELETE /sessions/{id}` de spec §7.1 pertenecen a la
+Task 6 del plan ("Add official connection management and sequential
+sessions", dominio de conexión oficial/sesiones), cuya lista de archivos
+DEBE agregar `apps/agent/src/ludex_agent/api/routes.py` (hoy no lo
+incluye). Challenges (`accept`/`reject`/`outgoing`) ya están cubiertos:
+Task 7 incluye `api/routes.py` en su file list. El plan no se edita desde
+este worktree (riesgo de conflicto con agentes paralelos); esta entrada
+es la asignación vinculante.
+
+**Memoización y shutdown del repo histórico (T-03).** `create_app`
+mantiene las EXACTAS dependencias inyectadas del plan; adicionalmente
+arma `_LazyHistoricalRepoProvider`, que memoiza UNA `ApiReadRepository`
+por app, creada perezosamente en el PRIMER uso — dentro del loop de
+FastAPI, para que el engine bindee a ese loop (D65 S3.3) — y registra un
+lifespan de FastAPI que la cierra con `await repo.aclose()` al apagar.
+`app.state.historical_repo_factory` se conserva por compatibilidad con el
+contrato inyectado; las rutas leen `app.state.historical_repo_provider`.
+Nunca se crea repo/engine por request.
+
+**Guardia cross-loop por identidad, no por `id()` (T-03, defecto real de
+suite).** La verificación de R2 reveló que el canario cross-loop falló
+dentro de la suite focal (81/82) y pasó aislado. Causa raíz verificada:
+la guardia comparaba `id(asyncio.get_running_loop())` entre usos y
+CPython RECICLA la misma dirección de memoria para loops sucesivos
+(probe: `asyncio.run` devolvió el mismo id 3/3; la reutilización depende
+del patrón de alocación del contexto, por eso era intermitente). Si el
+loop de creación muere y se crea otro en su address, la comparación por
+`id()` lo trata como el mismo loop y el uso cross-loop pasa en silencio.
+Arreglo: el repo guarda una REFERENCIA FUERTE al loop de creación
+(`self._loop = loop`), que impide que su address se recicle mientras el
+repo vive, y compara por identidad de objeto (`loop is not self._loop`).
+Canario load-bearing DETERMINISTA
+(`test_repository_pins_the_binding_loop_by_strong_reference`): con loops
+fake inyectados vía monkeypatch de `asyncio.get_running_loop`, pineaa que
+`repo._loop is loop_a` (referencia fuerte presente) y que un segundo uso
+desde otro objeto loop levanta `CrossLoopRepositoryError`. Mutación real
+verificada (quitar `self._loop = loop` + comparar solo `id()`) → el
+canario FALLA siempre (RED 3/3); restaurado byte a byte → GREEN 10/10 en
+aislamiento y 3/3 suites focales completas. Limitación honesta: el
+escenario de colisión de direcciones NO puede canariarse de caja negra
+de forma determinista (si ambos loops están vivos, `id()` difiere y
+cualquier guardia correcta se comporta igual); por eso el canario pineaa
+el MECANISMO (referencia fuerte), no el síntoma.
+
+**Canarios acotados (T-04).** Los canarios de `REPLAY_GAP` y de fan-out
+live corren el `receive_json` en un hilo worker y esperan el frame en una
+`queue` con timeout (2 s): si el mecanismo bajo prueba deja de enviar,
+el test FALLA acotado en vez de colgar la suite. Sin dependencia nueva
+(`pytest-timeout` no se agrega). Mutaciones verificadas: tragar
+`ReplayGapError` sin enviar → RED acotado (~2.4 s); quitar el fan-out →
+RED acotado (~2.3 s).
+
+**Alcance.** Todo lo anterior vive en los 13 paths de Task 4 más esta
+entrada de DECISIONS.md. Fuera de alcance intacto: sin challenges,
+ladder, sesiones, login ni cliente vivo.
+
+**Modelo efectivo:** DeepSeek V4 Pro (coordinador, MON-34 R2). Sin
+recomendación propia: Latwan adjudica.

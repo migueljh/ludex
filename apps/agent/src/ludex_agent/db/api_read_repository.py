@@ -59,11 +59,21 @@ class ApiReadRepository:
         self._database_url = database_url
         self._engine = None
         self._factory = None
+        self._loop = None
         self._loop_id: int | None = None
 
     def _ensure_factory(self):
-        loop_id = id(asyncio.get_running_loop())
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
         if self._factory is None:
+            # Referencia FUERTE al loop de creacion (D66 R2): comparar solo
+            # por `id()` es fragil -- `asyncio.run` recicla la misma
+            # direccion de memoria para loops sucesivos (verificado:
+            # ids identicos en 3/3 corridas), asi que un loop nuevo creado
+            # donde murio el anterior pasaria el guardia en silencio. La
+            # referencia fuerte impide que el address se recicle mientras
+            # el repo vive, y la comparacion es por identidad de objeto.
+            self._loop = loop
             self._loop_id = loop_id
             self._engine = create_async_engine(
                 self._database_url, poolclass=NullPool,
@@ -71,7 +81,7 @@ class ApiReadRepository:
             self._factory = async_sessionmaker(
                 self._engine, expire_on_commit=False,
             )
-        elif loop_id != self._loop_id:
+        elif loop is not self._loop:
             raise CrossLoopRepositoryError(
                 created_loop_id=self._loop_id, used_loop_id=loop_id,
             )
@@ -102,6 +112,7 @@ class ApiReadRepository:
         engine = self._engine
         self._engine = None
         self._factory = None
+        self._loop = None
         self._loop_id = None
         if engine is not None:
             await engine.dispose()
