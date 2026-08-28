@@ -5061,3 +5061,132 @@ ladder, sesiones, login ni cliente vivo.
 
 **Modelo efectivo:** DeepSeek V4 Pro (coordinador, MON-34 R2). Sin
 recomendación propia: Latwan adjudica.
+
+## D67 — MON-35 (Fase 3 Task 5): gate HITL integrado en el camino vivo de decisión (2026-08-28)
+
+**Contexto.** Con Tasks 2–4 aceptadas (dominio exact-once, auditoría
+durable, API/WS con `EventHub` integrado), esta rebanada inserta el gate
+de aprobación humana en el camino vivo de decisión, exactamente entre
+`decision_graph.ainvoke` y `execute_action` (D65 S3.1), y deja coherentes
+los tres ejes de metadata (`action_source`/`action_path`/
+`approval_outcome`, D65 S5.2) sin tocar el grafo, `PendingChoice`, el
+recorder ni el inbox crudo.
+
+**Orquestación del gate (`LudexPlayer._apply_approval_gate`).** El gate
+vive fuera del grafo, en `run_graph`, entre `ainvoke` y
+`execute_action`. La política es inyectable por constructor; si la
+política no exige gate, `create_gate` devuelve `None` y NO se construye
+ningún `PendingApproval` ni ningún `Future`. Si exige gate, el orden es
+el exigido por D65 S5.1 (canario 19) y verificado por un canario de
+orden con probes sobre el repositorio y el hub:
+
+1. `PendingDecisionRepository.insert_awaiting` — la fila `awaiting` es
+   durable ANTES del evento WS;
+2. `ApprovalRegistry.open` — el attempt vigente queda resoluble por la
+   API (un attempt nuevo reemplaza al rechazado: superseded, D65 S4.3);
+3. `EventHub.publish("battle:{tag}", decision_proposed)` — por el
+   `EventHub` integrado de Task 4, sin segundo hub;
+4. `PendingApproval.await_resolution` — con el reloj D42 inyectado
+   (`self._clock`), sin `wait_for`/`timeout`/`cancel` sobre el Future;
+5. `PendingDecisionRepository.resolve` — el outcome queda durable y
+   `approval_wait_ms` se mide con el mismo reloj inyectado
+   (`round((clock()-gate_start)*1000)`);
+6. `execute_action` corre EXACTAMENTE una vez, con la acción que ganó el
+   CAS (propuesta, override legal validado contra la MISMA máscara
+   capturada, o timeout).
+
+`decision_resolved` se publica desde dos rutas, sin duplicar: el CAS que
+gana un operador vía API lo publica `routes.py` (Task 4); el POKE_LOOP
+publica únicamente las resoluciones con `resolved_by != "operator"`
+(timer por vencimiento; system para el toggle autónomo futuro). El
+canario de orden pineaa la secuencia exacta
+`persist_awaiting → decision_proposed → persist_outcome → (decision_resolved)`.
+
+**Tres ejes coherentes, sin hardcodear `source="agent"`.** `run_graph`
+escribe `step["action_source"]` (`agent`/`human`) y
+`step["approval_outcome"]`; `_persist_one` los lee del step
+(`step.get("action_source", "agent")` — el default cubre solo la ruta
+random, que es decisión del agente). `human_override` deja las 11
+columnas D38 NULL COMO GRUPO (y `action_path`/`reasoning` en None); la
+propuesta descartada permanece completa en `pending_decisions`. El CHECK
+`trajectory_steps_approval_outcome_action_source_check` (Task 3) es el
+rechazo durable de cualquier combinación inválida.
+
+**Rechazo de Showdown → intento nuevo.** El retry existente
+(`_reject_pending_choice` + `_reserve_step` con `attempt_index+1`) abre
+un gate NUEVO con el `attempt_index` incrementado; `ApprovalRegistry.open`
+reemplaza al anterior (superseded) y una aprobación tardía con el attempt
+viejo recibe `StaleAttemptError` (409). Los dos intentos quedan auditados
+como filas distintas de `pending_decisions`; el slot canónico sigue
+siendo uno.
+
+**Shutdown resuelve `aborted` sin step.** `drain_inflight_decisions`
+cancela la decisión que espera el gate: el gate se descarta del registry
+(deja de ser alcanzable vía API), `execute_action` nunca corre y el slot
+queda sin `action_taken` (la trayectoria no se persiste). La fila
+`awaiting` huérfana la barre `abort_stale` en el próximo arranque
+(D65 S4.3). El sweep de arranque pertenece al runner oficial (Task 6):
+los tres comandos offline de este slice nunca crean gates, así que no
+tienen huérfanos que barrer.
+
+**Offline nunca bloquea (requisito 2 del brief).** `play()` (run) y
+`_benchmark_command` (benchmark y matrix-run, que delega sus batallas
+ahí) inyectan `NeverGateApprovalPolicy`: sin Future y sin bloqueo aunque
+un operador deje `approval_mode=hitl` en la tabla `settings`, y sin
+importar `CONNECTION_MODE`. El default del jugador es
+`ProductionApprovalPolicy` + `connection_mode="local"`: una construcción
+desnuda nunca gatea; la política local de producción sigue siendo
+no-bloqueante. **Desviación documentada de D66:** los tres comandos
+offline NO leen la key `approval_mode` de la tabla `settings` — leerla
+no puede cambiar su política (nunca gatean por diseño, D65 S1.1) y
+acoplaría el camino offline a una lectura de DB; la superficie
+inyectable `approval_mode` del jugador es el consumidor que D66 asigna a
+"el camino vivo", y quien la cablea desde la key de DB es el runner
+oficial (Task 6), el único camino donde el modo HITL tiene efecto.
+
+**Fallos cerrados.** Si la política exige gate pero no hay
+`PendingDecisionRepository` inyectado, la decisión falla ruidosamente
+(la auditoría no puede desaparecer en silencio). Un fallo de proyección
+ocurre ANTES de `ainvoke`: nunca se crea gate, Future, fila ni evento
+(canario sobre `PendingApproval.open`). La etapa observable nueva
+`approval_gate` en `decision_snapshot()` hace visible una decisión
+detenida en el gate (canario en `test_decision_observability.py`).
+
+**Limitaciones conocidas.** (1) El evento WS `decision_invalidated`
+(spec §7.2) no tiene productor todavía: su punto natural es el handler
+de rechazo (`_reject_pending_choice`), fuera del rango de archivos de
+esta rebanada; el rechazo es observable hoy por `decision_proposed` del
+attempt nuevo y por el 409 STALE_ATTEMPT. (2) Si la batalla termina
+(deinit) con un gate abierto, la decisión sigue esperando su timeout
+(10 s por defecto) y falla cerrada al intentar enviar: acotado, sin
+step. (3) `_benchmark_command` está fuera del rango de líneas del plan
+para `cli.py` (191-348), pero tocarla era obligatorio para el requisito
+2 (benchmark/matrix nunca bloquean); el cambio es de una línea. (4)
+`test_diagnostic_monitor.py` no requirió cambios: `_benchmark_command`
+no agregó lecturas nuevas de `Settings`, así que sus fakes siguen
+válidos.
+
+**Verificación (Task 5).** RED antes de implementar: los 15 canarios
+nuevos (gate placement/override/approve/timeout/proyección/rechazo/
+drenaje/política local/etapa observable/delegación de matriz/ejes en
+`_persist_one`/integración offline) fallan contra el código integrado
+(`TypeError: unexpected keyword argument 'approval_policy'`,
+`KeyError: 'approval_policy'`, `KeyError: 'approval_outcome'`). GREEN:
+suite focal del plan (hitl+showdown+test_play+test_cli+test_benchmark+
+test_matrix) 492 passed, 12 skipped, 0 failed; suite offline completa
+791 passed, 174 skipped (skips: TEST_DATABASE_URL/DB/Showdown, los
+documentados), 0 failed, con `DATABASE_URL=''` y `PYTHONPATH` pineado al
+src del worktree. Mutaciones deliberadas in-place (cada una RED en su
+canario y restaurada byte a byte, `sha256` verificado antes/después):
+gate movido DESPUÉS de `execute_action` (RED: "execute no puede correr
+con el gate abierto"); doble `execute_action` (RED: "debe correr
+EXACTAMENTE una vez"); `source="agent"` hardcodeado (RED: override debe
+persistir `action_source='human'`); una columna D38 sin nullear en el
+override (RED: grupo D38 incompleto); `NeverGate` reemplazado por
+`Production` en play y en `_benchmark_command` (RED: run/benchmark deben
+inyectar NeverGate); `discard` del registry removido en shutdown (RED:
+gate abortado alcanzable); `run_battles` de matrix sin delegar a
+`_benchmark_command` (RED: delegación rota).
+
+**Modelo efectivo:** DeepSeek V4 Pro (OpenCode, MON-35 Task 5). Sin
+recomendación propia: Latwan adjudica.

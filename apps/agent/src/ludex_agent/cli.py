@@ -38,6 +38,7 @@ from .db.context_repository import PostgresContextRepository
 from .db.model_repository import ModelRepository, ModelSelectionError
 from .db.repository import BattleRepository
 from .db.session import make_engine, session_factory
+from .hitl import NeverGateApprovalPolicy
 from .showdown.client import LudexPlayer, local_server_configuration
 from .showdown.protocol import compute_opening_identity
 from .graph.calc import CalcClient
@@ -207,6 +208,10 @@ async def play(n: int, fmt: str, *, source: str = "local") -> list[str]:
     agent = LudexPlayer(
         account_configuration=AccountConfiguration(f"{settings.bot_username}{suffix}", None),
         server_configuration=server, battle_format=fmt, log_level=40,
+        # MON-35 (D65 S1.1): `run` local NUNCA puede bloquear ni crear un
+        # Future por un setting de HITL: politica que nunca gatea, sin
+        # importar el approval_mode que un operador deje seteado en la DB.
+        approval_policy=NeverGateApprovalPolicy(),
     )
     rival = RandomPlayer(
         account_configuration=AccountConfiguration(f"Rival{suffix}", None),
@@ -323,11 +328,18 @@ async def _persist_one(
         assert step is not None and step["state"] is not None
         await repo.save_step(
             traj, decision_index, step["turn"], step["state"], STATE_SCHEMA_VERSION,
-            step["state"]["legal_actions"], step["action_taken"], "agent",
+            step["state"]["legal_actions"], step["action_taken"],
+            # MON-35 (D65 S5.2): la autoria sale DEL STEP, nunca de un
+            # literal: el gate escribe `action_source` ('agent'/'human') y
+            # `approval_outcome` en el camino del grafo; la ruta random no
+            # setea la clave y conserva el comportamiento historico 'agent'.
+            step.get("action_source", "agent"),
             action_path=step.get("action_path"),
             # F2-08 (D38): la metadata de la decision canónica viaja del step
             # a la fila. La ruta random no setea estas claves: `get` devuelve
-            # None y la fila queda NULL, coherente con la historia.
+            # None y la fila queda NULL, coherente con la historia. Un
+            # human_override las trae en None COMO GRUPO (escritas por el
+            # gate), y el CHECK de la migracion las exige NULL.
             rationale=step.get("rationale"),
             target=step.get("target"),
             confidence=step.get("confidence"),
@@ -339,6 +351,9 @@ async def _persist_one(
             output_tokens=step.get("output_tokens"),
             cached_input_tokens=step.get("cached_input_tokens"),
             reasoning_tokens=step.get("reasoning_tokens"),
+            # D65 S5.2: tercer eje ortogonal, nunca colapsado con
+            # action_source/action_path. NULL = historico/sin gate.
+            approval_outcome=step.get("approval_outcome"),
         )
     if battle.finished:
         await repo.finalize(traj, result=result, reward=reward)
@@ -846,6 +861,10 @@ async def _benchmark_command(
             account_configuration=AccountConfiguration(f"Bench{suffix}", None),
             decision_graph=None,
             decision_budget_seconds=settings.decision_budget_seconds,
+            # MON-35 (requisito 2): benchmark y matrix-run (que delega aca)
+            # nunca bloquean por un setting de HITL: politica que nunca
+            # gatea, sin importar approval_mode ni connection_mode.
+            approval_policy=NeverGateApprovalPolicy(),
             **common,
         )
         graph = build_decision_graph(

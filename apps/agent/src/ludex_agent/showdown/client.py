@@ -29,6 +29,18 @@ from poke_env.player import RandomPlayer
 from ..state.actions import action_from_order, legal_actions
 from ..state.serializer import serialize_battle
 from ..graph.execute import execute_action
+from ..db.pending_repository import PendingDecisionRecord
+from ..hitl import (
+    ApprovalKey,
+    ApprovalMode,
+    ApprovalPolicy,
+    ApprovalProposal,
+    ConnectionMode,
+    EventHub,
+    ProductionApprovalPolicy,
+    create_gate,
+)
+from ..hitl.registry import ApprovalRegistry
 from .protocol import (
     CURRENT_FRAME_SEQ,
     ProjectionTimeoutError,
@@ -255,6 +267,16 @@ class PokeEnvVocabulary:
 # en cadenas largas de decisiones excusadas; ninguna decision real necesito
 # jamas buscar mas de unos pocos turnos de margen.
 ACTION_SEARCH_MARGIN_TURNS = 3
+
+# D65 (MON-33 Task 3): las once columnas de metadata D38 (F2-08) que un
+# `human_override` deja NULL como grupo y que `human_approved`/
+# `timeout_auto` conservan completas. El envelope de la propuesta en
+# `pending_decisions` se arma con estas mismas claves.
+_D38_METADATA_KEYS = (
+    "rationale", "confidence", "alternatives", "target", "provider", "model",
+    "decision_latency_ms", "input_tokens", "output_tokens", "cached_input_tokens",
+    "reasoning_tokens",
+)
 
 
 def _ident_matches(field: str, actor_species: str | None) -> bool:
@@ -766,6 +788,20 @@ class LudexPlayer(RandomPlayer):
         decision_budget_seconds: float = 240,
         projection_timeout_seconds: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
+        # MON-35 (Fase 3 Task 5): gate HITL integrado entre `ainvoke` y
+        # `execute_action` (D65 S3.1). Todo lo que sigue es inyectable y
+        # tiene defaults no-bloqueantes: la politica de produccion saltea
+        # SIEMPRE `local`, asi que una construccion desnuda nunca gatea.
+        # `run`/`benchmark`/`matrix-run` pasan `NeverGateApprovalPolicy`
+        # explicitamente (cli.py); los tests inyectan una politica que
+        # gatea para ejercer HITL contra un Showdown local.
+        approval_policy: ApprovalPolicy | None = None,
+        connection_mode: ConnectionMode = "local",
+        approval_mode: ApprovalMode = "hitl",
+        approval_timeout_seconds: float = 10.0,
+        pending_repository: Any | None = None,
+        approval_registry: ApprovalRegistry | None = None,
+        event_hub: EventHub | None = None,
         **kwargs: Any,
     ) -> None:
         # El listener se arranca DESPUES de instalar el observador pre-lock:
@@ -890,6 +926,26 @@ class LudexPlayer(RandomPlayer):
         # atado a ningun loop, así que un segundo llamador (de cualquier
         # loop) puede esperar el MISMO drenaje en vez de disparar otro.
         self._drain_future: concurrent.futures.Future[None] | None = None
+        # MON-35: componentes del gate HITL. La politica decide si el gate
+        # existe; en modo skip no se construye ningun PendingApproval y por
+        # lo tanto ningun Future. `_pending_repository` es el UNICO escritor
+        # de `pending_decisions` y solo corre en POKE_LOOP (D65 S3.3): si la
+        # politica exige gate y no hay repositorio inyectado, la decision
+        # falla CERRADA (la auditoria no puede desaparecer en silencio).
+        # Registry/hub por defecto: instancias frescas en memoria (puros,
+        # sin loop); el runner oficial inyecta los compartidos con la API.
+        if approval_policy is None:
+            approval_policy = ProductionApprovalPolicy()
+        self._approval_policy = approval_policy
+        self._connection_mode = connection_mode
+        self._approval_mode = approval_mode
+        self._approval_timeout_seconds = approval_timeout_seconds
+        self._pending_repository = pending_repository
+        self._approval_registry = (
+            approval_registry if approval_registry is not None
+            else ApprovalRegistry()
+        )
+        self._event_hub = event_hub if event_hub is not None else EventHub()
 
     async def wait_for_background_failure(self) -> Exception:
         return await asyncio.shield(
@@ -1574,6 +1630,10 @@ class LudexPlayer(RandomPlayer):
             request_rqid=request_rqid,
             request_frame_seq=cursor,
         )
+        # MON-35: el attempt VIGENTE se captura sincronicamente, junto con la
+        # reserva: es la clave (tag, decision, attempt) del gate de este
+        # intento (D65 S4). Un retry lo tiene incrementado por `_reserve_step`.
+        attempt_index = self._pending_choices[tag].attempt_index
 
         async def run_graph() -> Any:
             # D46/MON-23: primera linea sincronica, antes de tocar
@@ -1601,8 +1661,26 @@ class LudexPlayer(RandomPlayer):
                 # `ainvoke` que no es de ningun nodo.
                 self._set_decision_stage(task, "graph")
                 result = await self.decision_graph.ainvoke(graph_input)
-                self._set_decision_stage(task, "execute")
+                # MON-35 (D65 S3.1): el gate vive FUERA del grafo,
+                # exactamente entre `ainvoke` y `execute_action`. Un override
+                # se valida contra la MISMA mascara capturada con la que se
+                # construyo `action_orders`; la accion final es la que gano
+                # el CAS y `execute_action` corre EXACTAMENTE una vez.
+                self._set_decision_stage(task, "approval_gate")
                 action = result["action"]
+                model_envelope = {
+                    key: result.get(key) for key in _D38_METADATA_KEYS
+                }
+                action, approval_outcome = await self._apply_approval_gate(
+                    tag=tag,
+                    decision_index=index,
+                    attempt_index=attempt_index,
+                    action=action,
+                    legal_actions=captured_legal,
+                    model_envelope=model_envelope,
+                    deadline=deadline,
+                )
+                self._set_decision_stage(task, "execute")
                 # F2-09 (D39): adapter explícito del resultado del grafo a la
                 # ejecución de poke-env. NO es un nodo LangGraph: el mapa
                 # accion->BattleOrder se captura SÍNCRONO antes del primer await
@@ -1614,27 +1692,125 @@ class LudexPlayer(RandomPlayer):
                         f"decision graph returned action outside captured mask: {action!r}"
                     )
                 step["action_taken"] = action
-                step["action_path"] = result["action_path"]
-                step["reasoning"] = result.get("reasoning")
-                # F2-08 (D38): metadata de la decision canónica, desde el resultado
-                # del grafo (que sale del envelope de la llamada LLM aceptada,
-                # nunca de estado compartido) hasta el step que persiste
-                # `_persist_one`. La ruta random no pasa por aca y queda NULL.
-                # El resultado del grafo SIEMPRE trae estas claves (decide las
-                # emite en ambos caminos, llm y fallback); `get` con default None
-                # protege a un grafo fake que no las conozca.
-                for key in (
-                    "rationale", "confidence", "alternatives", "target",
-                    "provider", "model", "decision_latency_ms",
-                    "input_tokens", "output_tokens", "cached_input_tokens",
-                    "reasoning_tokens",
-                ):
-                    step[key] = result.get(key)
+                if approval_outcome == "human_override":
+                    # D65 S5.2: override -> action_source 'human', las 11
+                    # columnas D38 NULL COMO GRUPO y la propuesta descartada
+                    # permanece completa en `pending_decisions`. El CHECK
+                    # `trajectory_steps_approval_outcome_action_source_check`
+                    # rechaza cualquier otra combinacion.
+                    step["action_source"] = "human"
+                    step["action_path"] = None
+                    step["reasoning"] = None
+                    for key in _D38_METADATA_KEYS:
+                        step[key] = None
+                else:
+                    # F2-08 (D38): metadata de la decision canónica, desde el
+                    # resultado del grafo (que sale del envelope de la llamada
+                    # LLM aceptada, nunca de estado compartido) hasta el step
+                    # que persiste `_persist_one`. La ruta random no pasa por
+                    # aca y queda NULL. `get` con default None protege a un
+                    # grafo fake que no conozca estas claves.
+                    step["action_source"] = "agent"
+                    step["action_path"] = result["action_path"]
+                    step["reasoning"] = result.get("reasoning")
+                    for key in _D38_METADATA_KEYS:
+                        step[key] = result.get(key)
+                # Tercer eje ortogonal (D65 S5.2): NULL en el camino sin gate
+                # (comportamiento historico).
+                step["approval_outcome"] = approval_outcome
                 return order
             finally:
                 self._release_decision(task)
 
         return run_graph()
+
+    async def _apply_approval_gate(
+        self,
+        *,
+        tag: str,
+        decision_index: int,
+        attempt_index: int,
+        action: dict[str, object],
+        legal_actions: list[dict[str, object]],
+        model_envelope: dict[str, object],
+        deadline: float,
+    ) -> tuple[dict[str, object], str | None]:
+        """Gate exact-once entre `ainvoke` y `execute_action` (D65 S3.1).
+
+        La politica decide si el gate existe: en modo skip no se construye
+        ningun `PendingApproval` y por lo tanto ningun `Future` (run/
+        benchmark/matrix-run). Si la politica exige gate:
+        1. persiste la fila `awaiting` ANTES de publicar (D65 S5.1, canario
+           19: la fila durable existe antes del evento WS);
+        2. abre el attempt vigente en el `ApprovalRegistry` (un intento
+           nuevo reemplaza al rechazado: superseded, D65 S4.3);
+        3. publica `decision_proposed` por el `EventHub` integrado;
+        4. espera la resolucion con el reloj D42 inyectado;
+        5. persiste el outcome y, si el CAS no lo gano un operador via API
+           (esa ruta publica su propio `decision_resolved`), lo publica aca;
+        6. devuelve la accion final para `execute_action` EXACTAMENTE una
+           vez.
+
+        Shutdown: si la task se cancela con el gate abierto, el gate se
+        descarta del registry (deja de ser alcanzable via API) y no se crea
+        ningun step; la fila `awaiting` huerfana la barre `abort_stale` en
+        el proximo arranque (D65 S4.3: `aborted`, sin step).
+        """
+        gate = create_gate(
+            self._approval_policy,
+            connection_mode=self._connection_mode,
+            approval_mode=self._approval_mode,
+            key=ApprovalKey(
+                battle_tag=tag,
+                decision_index=decision_index,
+                attempt_index=attempt_index,
+            ),
+            proposal=ApprovalProposal(
+                action=action,
+                legal_actions=legal_actions,
+                model_envelope=model_envelope,
+            ),
+            approval_timeout_seconds=self._approval_timeout_seconds,
+            decision_deadline=deadline,
+            clock=self._clock,
+            tick=None,
+        )
+        if gate is None:
+            return action, None
+        repository = self._pending_repository
+        if repository is None:
+            raise RuntimeError(
+                f"{tag}: la politica exige gate de aprobacion para la "
+                f"decision {decision_index} pero no hay "
+                "PendingDecisionRepository inyectado"
+            )
+        await repository.insert_awaiting(
+            PendingDecisionRecord(key=gate.key, proposal=gate.proposal)
+        )
+        self._approval_registry.open(gate)
+        self._event_hub.publish(f"battle:{tag}", {
+            "type": "decision_proposed",
+            "decision_index": decision_index,
+            "attempt_index": attempt_index,
+            "action": dict(action),
+            "legal_actions": [dict(entry) for entry in legal_actions],
+        })
+        try:
+            gate_start = self._clock()
+            resolution = await gate.await_resolution()
+            approval_wait_ms = int(round((self._clock() - gate_start) * 1000))
+        except BaseException:
+            self._approval_registry.discard(tag, decision_index)
+            raise
+        await repository.resolve(gate.key, resolution, approval_wait_ms)
+        if resolution.resolved_by != "operator":
+            self._event_hub.publish(f"battle:{tag}", {
+                "type": "decision_resolved",
+                "decision_index": decision_index,
+                "outcome": resolution.outcome,
+                "resolved_by": resolution.resolved_by,
+            })
+        return resolution.action, resolution.outcome
 
     async def _resolve_state(
         self,
