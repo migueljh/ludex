@@ -380,6 +380,7 @@ Commit `Integrate human approval into battle decisions` with explicit paths and 
 - Create: `apps/agent/src/ludex_agent/runner/session.py`
 - Modify: `apps/agent/src/ludex_agent/showdown/client.py`
 - Modify: `apps/agent/src/ludex_agent/cli.py:117-242`
+- Modify: `apps/agent/src/ludex_agent/api/routes.py` (connection/session endpoints; D66)
 - Create: `apps/agent/tests/showdown/test_connection.py`
 - Create: `apps/agent/tests/showdown/test_lobby.py`
 - Create: `apps/agent/tests/runner/test_session.py`
