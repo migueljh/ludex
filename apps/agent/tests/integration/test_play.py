@@ -512,6 +512,29 @@ async def test_persiste_batallas_turnos_y_pasos(jugadas):
         await engine.dispose()
 
 
+async def test_offline_play_persiste_ejes_coherentes_sin_ningun_gate(jugadas):
+    """MON-35 (requisito 3): `play` offline corre con una politica que nunca
+    gatea y persiste los tres ejes coherentes con la historia: TODOS los
+    pasos de la base descartable (el dataset completo de esta corrida,
+    nunca un subconjunto por tag) quedan con `action_source='agent'` y
+    `approval_outcome=NULL` (D65 S5.2)."""
+    assert jugadas, "la fixture debe haber jugado batallas"
+    engine = make_engine(load_settings().database_url)
+    try:
+        async with session_factory(engine)() as s:
+            rows = (await s.execute(text("""
+                SELECT ts.action_source::text, ts.approval_outcome
+                FROM trajectory_steps ts
+                ORDER BY ts.trajectory_id, ts.decision_index
+            """))).all()
+    finally:
+        await engine.dispose()
+    assert rows, "las batallas jugadas deben tener pasos persistidos"
+    for source, outcome in rows:
+        assert source == "agent"
+        assert outcome is None
+
+
 async def test_el_reward_esta_propagado(jugadas):
     engine = make_engine(load_settings().database_url)
     try:

@@ -19,6 +19,13 @@ from ludex_agent.graph.provider import (
     TransientProviderError,
 )
 from ludex_agent.graph.workflow import build_decision_graph
+from ludex_agent.hitl.events import EventHub
+from ludex_agent.hitl.gate import PendingApproval
+from ludex_agent.hitl.policy import (
+    AlwaysGateApprovalPolicy,
+    ProductionApprovalPolicy,
+)
+from ludex_agent.hitl.registry import ApprovalRegistry, StaleAttemptError
 from ludex_agent.showdown import client as client_module
 from ludex_agent.showdown.client import (
     LudexPlayer,
@@ -3059,3 +3066,579 @@ async def test_drenaje_conjunto_vacio_es_idempotente_y_bloquea_admision_tardia()
     # 3. Idempotencia.
     await player.drain_inflight_decisions()
     await player.drain_inflight_decisions()
+
+
+# --- MON-35 (Fase 3 Task 5): gate HITL integrado entre ainvoke y execute ---
+#
+# El gate vive FUERA del grafo, exactamente entre `decision_graph.ainvoke`
+# y `execute_action` (D65 S3.1). La politica es inyectable: estos canarios
+# usan `AlwaysGateApprovalPolicy` para gatear contra un Showdown local
+# simulado; la politica de produccion (local) nunca gatea, y `run`/
+# `benchmark`/`matrix-run` pasan una politica que nunca gatea (test_cli.py).
+
+_D38_METADATA_KEYS = (
+    "rationale", "confidence", "alternatives", "target", "provider", "model",
+    "decision_latency_ms", "input_tokens", "output_tokens", "cached_input_tokens",
+    "reasoning_tokens",
+)
+
+
+def _gated_result(action: dict, **overrides: object) -> dict:
+    """Resultado de grafo con metadata D38 completa y coherente."""
+    result: dict[str, object] = {
+        "action": action,
+        "action_path": "llm",
+        "reasoning": "rationale del modelo",
+        "rationale": "rationale del modelo",
+        "confidence": 0.8,
+        "alternatives": [{"kind": "move", "id": "surf"}],
+        "target": {"side": "p2", "species": "eevee"},
+        "provider": "google",
+        "model": "gemini-2.5-flash",
+        "decision_latency_ms": 125.0,
+        "input_tokens": 10,
+        "output_tokens": 3,
+        "cached_input_tokens": 1,
+        "reasoning_tokens": 2,
+    }
+    result.update(overrides)
+    return result
+
+
+class _StubGraph:
+    """Grafo fake que devuelve un resultado fijo; cuenta invocaciones."""
+
+    def __init__(self, result: dict) -> None:
+        self.result = dict(result)
+        self.ainvoke_calls = 0
+
+    async def ainvoke(self, graph_input):
+        self.ainvoke_calls += 1
+        return dict(self.result)
+
+
+class _SequenceGraph:
+    """Grafo fake que devuelve un resultado por invocacion (retries)."""
+
+    def __init__(self, results: list[dict]) -> None:
+        self.results = [dict(result) for result in results]
+
+    async def ainvoke(self, graph_input):
+        return self.results.pop(0)
+
+
+class _FakePendingRepo:
+    """Doble de `PendingDecisionRepository` con probe de orden.
+
+    `events` registra la secuencia exacta persistir/resolver contra la que
+    se compara el orden de los eventos WS (D65 S5.1: la fila durable existe
+    ANTES del evento `decision_proposed`)."""
+
+    def __init__(self, events: list | None = None) -> None:
+        self.inserts: list = []
+        self.resolutions: list = []
+        self.aborts: list = []
+        self.events: list = events if events is not None else []
+
+    async def insert_awaiting(self, record) -> None:
+        self.inserts.append(record)
+        self.events.append(("persist_awaiting", record.key))
+
+    async def resolve(self, key, resolution, approval_wait_ms) -> None:
+        self.resolutions.append((key, resolution, approval_wait_ms))
+        self.events.append(("persist_outcome", key, resolution.outcome))
+
+    async def abort_stale(self, reason: str = "process_restart") -> int:
+        self.aborts.append(reason)
+        return 0
+
+
+class _RaisingPendingRepo:
+    """Cualquier acceso revienta: prueba que el camino sin gate jamas lo usa."""
+
+    async def insert_awaiting(self, record) -> None:
+        raise AssertionError("insert_awaiting no debe llamarse sin gate")
+
+    async def resolve(self, key, resolution, approval_wait_ms) -> None:
+        raise AssertionError("resolve no debe llamarse sin gate")
+
+    async def abort_stale(self, reason: str = "process_restart") -> int:
+        raise AssertionError("abort_stale no debe llamarse sin gate")
+
+
+class _ProbeHub(EventHub):
+    """EventHub que registra (orden, stream, tipo) para los canarios."""
+
+    def __init__(self, events: list) -> None:
+        super().__init__()
+        self._events = events
+
+    def publish(self, stream_id, payload):
+        self._events.append(("event", stream_id, payload["type"]))
+        return super().publish(stream_id, payload)
+
+
+async def _await_gate(
+    player, tag: str, index: int, *, attempt: int, timeout: float = 2.0
+):
+    """Espera a que el registry tenga el gate del attempt pedido."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        current = player._approval_registry.get(tag, index)
+        if current is not None and current.key.attempt_index == attempt:
+            return current
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        f"el gate (attempt {attempt}) de {tag}/{index} nunca se abrio"
+    )
+
+
+async def _arrancar_decision(player, tag: str, battle) -> asyncio.Task:
+    """Schedulea la coroutine de `choose_move` como task hermana en el loop
+    del test y le publica la narracion previa, de modo que la decision corra
+    mientras el test espera el gate en el registry."""
+    task = asyncio.create_task(player.choose_move(battle))
+    await player.frame_inbox.publish(tag, ("|upkeep",))
+    return task
+
+
+def _serialize_graph_stub(battle):
+    return {
+        "turn": battle.turn, "opponent": {"pokemon": []},
+        "field": {"weather": {}, "field_effects": {},
+                  "my_side": {}, "opponent_side": {}},
+        "legal_actions": [
+            {"kind": "move", "id": m.id} for m in battle.available_moves
+        ],
+    }
+
+
+async def test_gate_vive_entre_ainvoke_y_execute_y_ejecuta_exactamente_una_vez():
+    """MON-35 canario 1: el gate esta ENTRE `ainvoke` y `execute_action`.
+
+    Mientras el gate espera, `execute_action` NO corrio aunque `ainvoke` ya
+    volvio (la propuesta existe en el registry). Un override legal cambia el
+    BattleOrder ejecutado, y execute corre EXACTAMENTE una vez.
+    """
+    tag = "battle-gate-placement"
+    moves = [SimpleNamespace(id="tackle"), SimpleNamespace(id="surf")]
+    battle = _fake_battle(battle_tag=tag, available_moves=moves)
+    repo = _FakePendingRepo()
+    registry = ApprovalRegistry()
+    graph = _StubGraph(_gated_result({"kind": "move", "id": "tackle"}))
+    player = _player(
+        decision_graph=graph,
+        approval_policy=AlwaysGateApprovalPolicy(),
+        approval_timeout_seconds=10.0,
+        pending_repository=repo,
+        approval_registry=registry,
+        event_hub=EventHub(),
+    )
+    executed: list[dict] = []
+    real_execute = client_module.execute_action
+
+    def spy_execute(action, action_orders):
+        executed.append(dict(action))
+        return real_execute(action, action_orders)
+
+    with patch.object(client_module, "serialize_battle", _serialize_graph_stub), \
+            patch.object(client_module, "execute_action", spy_execute):
+        task = await _arrancar_decision(player, tag, battle)
+        gate = await _await_gate(player, tag, 0, attempt=0)
+        # ainvoke ya volvio (la propuesta vive en el registry) pero execute
+        # NO corrio: el gate esta exactamente entre ambos.
+        assert graph.ainvoke_calls == 1
+        assert gate.proposal.action == {"kind": "move", "id": "tackle"}
+        assert executed == [], "execute no puede correr con el gate abierto"
+        resolution = registry.resolve_override(
+            tag, 0, 0, {"kind": "move", "id": "surf"}
+        )
+        assert resolution.outcome == "human_override"
+        order = await task
+
+    assert order.order.id == "surf", (
+        "el override legal debe reemplazar la propuesta del modelo"
+    )
+    assert executed == [{"kind": "move", "id": "surf"}], (
+        "execute_action debe correr EXACTAMENTE una vez, con la accion final"
+    )
+    step = player.steps[tag][0]
+    assert step["action_taken"] == {"kind": "move", "id": "surf"}
+
+
+async def test_gate_override_nullea_las_once_columnas_d38_y_conserva_la_propuesta():
+    """MON-35 canario 2: `human_override` persiste los tres ejes coherentes.
+
+    `action_source='human'`, `approval_outcome='human_override'` y las 11
+    columnas D38 NULL COMO GRUPO; la propuesta descartada permanece COMPLETA
+    en `pending_decisions` (action, legal_actions y envelope D38 enteros).
+    """
+    tag = "battle-gate-override-d38"
+    moves = [SimpleNamespace(id="tackle"), SimpleNamespace(id="surf")]
+    battle = _fake_battle(battle_tag=tag, available_moves=moves)
+    ordered: list = []
+    repo = _FakePendingRepo(ordered)
+    registry = ApprovalRegistry()
+    hub = _ProbeHub(ordered)
+    player = _player(
+        decision_graph=_StubGraph(_gated_result({"kind": "move", "id": "tackle"})),
+        approval_policy=AlwaysGateApprovalPolicy(),
+        approval_timeout_seconds=10.0,
+        pending_repository=repo,
+        approval_registry=registry,
+        event_hub=hub,
+    )
+
+    with patch.object(client_module, "serialize_battle", _serialize_graph_stub):
+        task = await _arrancar_decision(player, tag, battle)
+        await _await_gate(player, tag, 0, attempt=0)
+        registry.resolve_override(tag, 0, 0, {"kind": "move", "id": "surf"})
+        order = await task
+
+    assert order.order.id == "surf"
+    step = player.steps[tag][0]
+    assert step["action_taken"] == {"kind": "move", "id": "surf"}
+    assert step["action_source"] == "human"
+    assert step["approval_outcome"] == "human_override"
+    assert step["action_path"] is None
+    for key in _D38_METADATA_KEYS:
+        assert step[key] is None, (
+            f"un override debe dejar {key!r} en None (D38 NULL como grupo)"
+        )
+    # La propuesta descartada queda completa en la auditoria durable.
+    record = repo.inserts[0]
+    assert record.key.battle_tag == tag
+    assert record.key.attempt_index == 0
+    assert record.proposal.action == {"kind": "move", "id": "tackle"}
+    assert record.proposal.legal_actions == [
+        {"kind": "move", "id": "tackle"}, {"kind": "move", "id": "surf"}
+    ]
+    envelope = record.proposal.model_envelope
+    assert envelope["provider"] == "google"
+    assert envelope["input_tokens"] == 10
+    assert repo.resolutions[0][1].action == {"kind": "move", "id": "surf"}
+    # D65 S5.1 (canario 19): fila durable ANTES del evento WS.
+    assert ordered == [
+        ("persist_awaiting", repo.inserts[0].key),
+        ("event", f"battle:{tag}", "decision_proposed"),
+        ("persist_outcome", repo.inserts[0].key, "human_override"),
+    ]
+
+
+async def test_gate_human_approved_conserva_metadata_completa_y_mide_la_espera():
+    """MON-35 canario 3: `human_approved` conserva la metadata D38 completa,
+    `action_source='agent'` y `approval_wait_ms` sale del reloj D42."""
+    tag = "battle-gate-approve"
+    battle = _fake_battle(
+        battle_tag=tag, available_moves=[SimpleNamespace(id="tackle")]
+    )
+    ordered: list = []
+    repo = _FakePendingRepo(ordered)
+    registry = ApprovalRegistry()
+    hub = _ProbeHub(ordered)
+    clock = {"now": 0.0}
+    player = _player(
+        decision_graph=_StubGraph(_gated_result({"kind": "move", "id": "tackle"})),
+        approval_policy=AlwaysGateApprovalPolicy(),
+        approval_timeout_seconds=10.0,
+        decision_budget_seconds=60,
+        clock=lambda: clock["now"],
+        pending_repository=repo,
+        approval_registry=registry,
+        event_hub=hub,
+    )
+
+    with patch.object(client_module, "serialize_battle", _serialize_graph_stub):
+        task = await _arrancar_decision(player, tag, battle)
+        gate = await _await_gate(player, tag, 0, attempt=0)
+        clock["now"] = 3.5
+        resolution = registry.resolve_approved(tag, 0, 0)
+        assert resolution.outcome == "human_approved"
+        order = await task
+
+    assert order.order.id == "tackle"
+    step = player.steps[tag][0]
+    assert step["action_source"] == "agent"
+    assert step["approval_outcome"] == "human_approved"
+    for key in _D38_METADATA_KEYS:
+        assert step[key] is not None, (
+            f"human_approved debe conservar {key!r} (metadata completa)"
+        )
+    assert step["provider"] == "google"
+    # approval_wait_ms con el reloj inyectado: (3.5 - 0.0) * 1000.
+    _, resolution, wait_ms = repo.resolutions[0]
+    assert resolution.outcome == "human_approved"
+    assert resolution.resolved_by == "operator"
+    assert wait_ms == 3500
+    # El CAS del operador lo publica la API (routes.py); el POKE_LOOP no
+    # duplica `decision_resolved`.
+    assert ordered == [
+        ("persist_awaiting", repo.inserts[0].key),
+        ("event", f"battle:{tag}", "decision_proposed"),
+        ("persist_outcome", repo.inserts[0].key, "human_approved"),
+    ]
+
+
+async def test_gate_timeout_auto_con_reloj_falso_estuvo_pending_y_ejecuta_una_vez():
+    """MON-35 canario 4: `timeout_auto` con el reloj D42 inyectado.
+
+    El Future estuvo `pending` antes de resolver (was_pending), el outcome
+    es `timeout_auto/resolved_by=timer`, la metadata D38 se conserva y
+    `decision_resolved` lo publica el POKE_LOOP (ningun operador gano el CAS).
+    """
+    tag = "battle-gate-timeout"
+    battle = _fake_battle(
+        battle_tag=tag, available_moves=[SimpleNamespace(id="tackle")]
+    )
+    ordered: list = []
+    repo = _FakePendingRepo(ordered)
+    registry = ApprovalRegistry()
+    hub = _ProbeHub(ordered)
+    clock = {"now": 0.0}
+    player = _player(
+        decision_graph=_StubGraph(_gated_result({"kind": "move", "id": "tackle"})),
+        approval_policy=AlwaysGateApprovalPolicy(),
+        approval_timeout_seconds=10.0,
+        decision_budget_seconds=60,
+        clock=lambda: clock["now"],
+        pending_repository=repo,
+        approval_registry=registry,
+        event_hub=hub,
+    )
+    executed: list[dict] = []
+    real_execute = client_module.execute_action
+
+    def spy_execute(action, action_orders):
+        executed.append(dict(action))
+        return real_execute(action, action_orders)
+
+    with patch.object(client_module, "serialize_battle", _serialize_graph_stub), \
+            patch.object(client_module, "execute_action", spy_execute):
+        task = await _arrancar_decision(player, tag, battle)
+        gate = await _await_gate(player, tag, 0, attempt=0)
+        # El reloj esta congelado en 0: la decision queda PENDIENTE de
+        # verdad (un tick completo del waiter) antes de avanzar el reloj.
+        await asyncio.sleep(0.06)
+        assert gate.was_pending is True, (
+            "el test de timeout debe demostrar que el Future estuvo pending"
+        )
+        clock["now"] = 20.0
+        order = await task
+
+    assert order.order.id == "tackle"
+    assert executed == [{"kind": "move", "id": "tackle"}]
+    step = player.steps[tag][0]
+    assert step["action_source"] == "agent"
+    assert step["approval_outcome"] == "timeout_auto"
+    assert step["provider"] == "google", (
+        "timeout_auto conserva la metadata D38 completa"
+    )
+    _, resolution, _ = repo.resolutions[0]
+    assert resolution.outcome == "timeout_auto"
+    assert resolution.resolved_by == "timer"
+    assert ordered == [
+        ("persist_awaiting", repo.inserts[0].key),
+        ("event", f"battle:{tag}", "decision_proposed"),
+        ("persist_outcome", repo.inserts[0].key, "timeout_auto"),
+        ("event", f"battle:{tag}", "decision_resolved"),
+    ]
+
+
+async def test_sin_gate_tras_fallo_de_proyeccion():
+    """MON-35 canario 5: un fallo de proyeccion ocurre ANTES de `ainvoke`,
+    asi que no se crea ningun gate: cero Futures, cero filas, cero eventos."""
+    tag = "battle-gate-projection-failure"
+    battle = _fake_battle(
+        battle_tag=tag, available_moves=[SimpleNamespace(id="tackle")]
+    )
+    repo = _FakePendingRepo()
+    registry = ApprovalRegistry()
+    player = _player(
+        decision_graph=_StubGraph(_gated_result({"kind": "move", "id": "tackle"})),
+        approval_policy=AlwaysGateApprovalPolicy(),
+        projection_timeout_seconds=0.01,
+        pending_repository=repo,
+        approval_registry=registry,
+        event_hub=EventHub(),
+    )
+    with patch.object(
+        PendingApproval, "open", wraps=PendingApproval.open
+    ) as open_spy, patch.object(
+        client_module, "serialize_battle", _serialize_graph_stub
+    ):
+        pending = player.choose_move(battle)
+        with pytest.raises(client_module.ProjectionTimeoutError):
+            await pending
+
+    assert open_spy.call_count == 0, (
+        "un fallo de proyeccion no puede crear ningun Future de gate"
+    )
+    assert repo.inserts == []
+    assert repo.resolutions == []
+    assert registry.get(tag, 0) is None
+    assert player._event_hub.resume(f"battle:{tag}", 0) == []
+
+
+async def test_rechazo_de_showdown_abre_un_intento_nuevo_con_gate_propio():
+    """MON-35 canario 6: un rechazo crea un intento NUEVO (D65 S4.3).
+
+    El retry abre su propio gate con `attempt_index+1`; el registry lo
+    reemplaza (superseded) y una aprobacion con el attempt viejo recibe
+    `StaleAttemptError`. Los dos intentos quedan auditados como filas
+    distintas y el slot canonico sigue siendo UNO."""
+    tag = "battle-gate-rejection"
+    websocket = _RecordingWebsocket()
+    repo = _FakePendingRepo()
+    registry = ApprovalRegistry()
+    player = _player(
+        decision_graph=_SequenceGraph([
+            _gated_result({"kind": "move", "id": "tackle"}),
+            _gated_result({"kind": "move", "id": "surf"}),
+        ]),
+        approval_policy=AlwaysGateApprovalPolicy(),
+        approval_timeout_seconds=10.0,
+        pending_repository=repo,
+        approval_registry=registry,
+        event_hub=EventHub(),
+    )
+    player.ps_client.websocket = websocket
+
+    battle = _fake_battle(
+        battle_tag=tag, last_request={"rqid": 4},
+        available_moves=[SimpleNamespace(id="tackle")],
+    )
+    with patch.object(client_module, "serialize_battle", _serialize_graph_stub):
+        task = await _arrancar_decision(player, tag, battle)
+        await _await_gate(player, tag, 0, attempt=0)
+        registry.resolve_approved(tag, 0, 0)
+        order = await task
+    assert order.order.id == "tackle"
+    await _enviar(player, tag, "/choose move tackle")
+
+    with patch.object(client_module.RandomPlayer, "_handle_battle_message", _sin_super):
+        await player._handle_battle_message([
+            _split(f">{tag}"),
+            _split("|error|[Unavailable choice] Move disabled"),
+        ])
+    assert player.rejected_choice_count == 1
+
+    retry_battle = _fake_battle(
+        battle_tag=tag, turn=5, last_request={"rqid": 6},
+        available_moves=[SimpleNamespace(id="surf")],
+    )
+    with patch.object(client_module, "serialize_battle", _serialize_graph_stub):
+        retry_task = asyncio.create_task(player.choose_move(retry_battle))
+        gate1 = await _await_gate(player, tag, 0, attempt=1)
+        assert gate1.key.attempt_index == 1
+        # El attempt viejo ya no es alcanzable: superseded (D65 S4.3).
+        with pytest.raises(StaleAttemptError):
+            registry.resolve_approved(tag, 0, 0)
+        registry.resolve_approved(tag, 0, 1)
+        retry_order = await retry_task
+    assert retry_order.order.id == "surf"
+
+    assert [r.key.attempt_index for r in repo.inserts] == [0, 1]
+    assert [r[1].outcome for r in repo.resolutions] == [
+        "human_approved", "human_approved",
+    ]
+    assert len(player.steps[tag]) == 1, (
+        "dos intentos de la MISMA decision comparten un unico slot canonico"
+    )
+    assert player.steps[tag][0]["action_taken"] == {"kind": "move", "id": "surf"}
+    pending_choice = player._pending_choices[tag]
+    assert pending_choice.attempt_index == 1
+    assert websocket.sent == [f"{tag}|/choose move tackle"]
+
+
+async def test_drenaje_con_gate_abierto_no_ejecuta_ni_deja_paso_persistible():
+    """MON-35 canario 7: shutdown con el gate abierto resuelve `aborted`.
+
+    `drain_inflight_decisions` cancela la decision que espera el gate:
+    `execute_action` nunca corre, el gate deja de ser alcanzable via el
+    registry y el slot canonico queda sin `action_taken` -- la fila
+    `awaiting` huerfana la barre `abort_stale` en el proximo arranque.
+    """
+    tag = "battle-gate-drain"
+    battle = _fake_battle(
+        battle_tag=tag, available_moves=[SimpleNamespace(id="tackle")]
+    )
+    repo = _FakePendingRepo()
+    registry = ApprovalRegistry()
+    player = _player(
+        decision_graph=_StubGraph(_gated_result({"kind": "move", "id": "tackle"})),
+        approval_policy=AlwaysGateApprovalPolicy(),
+        approval_timeout_seconds=30.0,
+        decision_budget_seconds=60,
+        pending_repository=repo,
+        approval_registry=registry,
+        event_hub=EventHub(),
+    )
+    executed: list[dict] = []
+    real_execute = client_module.execute_action
+
+    def spy_execute(action, action_orders):
+        executed.append(dict(action))
+        return real_execute(action, action_orders)
+
+    with patch.object(client_module, "serialize_battle", _serialize_graph_stub), \
+            patch.object(client_module, "execute_action", spy_execute):
+        pending = player.choose_move(battle)
+        decision_future = _run_on_pokeloop(pending)
+        await _await_on_pokeloop(player.frame_inbox.publish(tag, ("|upkeep",)))
+        await _await_gate(player, tag, 0, attempt=0)
+        await player.drain_inflight_decisions()
+        assert decision_future.done(), (
+            "el drenaje debe esperar a que la decision cancelada termine"
+        )
+
+    assert executed == [], "una decision abortada nunca ejecuta"
+    assert registry.get(tag, 0) is None, (
+        "el gate abortado deja de ser alcanzable via el registry"
+    )
+    assert player.steps[tag][0]["action_taken"] is None
+    assert player.trajectory_blocker(tag) == (0, "reserved"), (
+        "sin accion final no hay paso persistible: la trayectoria queda bloqueada"
+    )
+    assert repo.resolutions == [], (
+        "nadie persiste un outcome: la fila 'awaiting' la barre el sweep"
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wrap_future(decision_future)
+
+
+async def test_politica_local_de_produccion_nunca_crea_gate_ni_future():
+    """MON-35 canario 8 (requisito 2): la politica de produccion es
+    no-bloqueante en local aunque el modo de la DB sea `hitl` (D65 S1.1):
+    cero gates, cero Futures, cero persistencia, cero eventos."""
+    tag = "battle-prod-local"
+    battle = _fake_battle(
+        battle_tag=tag, available_moves=[SimpleNamespace(id="tackle")]
+    )
+    player = _player(
+        decision_graph=_StubGraph(_gated_result({"kind": "move", "id": "tackle"})),
+        connection_mode="local",
+        approval_mode="hitl",
+        pending_repository=_RaisingPendingRepo(),
+    )
+    with patch.object(
+        PendingApproval, "open", wraps=PendingApproval.open
+    ) as open_spy, patch.object(
+        client_module, "serialize_battle", _serialize_graph_stub
+    ):
+        pending = player.choose_move(battle)
+        await player.frame_inbox.publish(tag, ("|upkeep",))
+        order = await pending
+
+    assert order.order.id == "tackle"
+    assert open_spy.call_count == 0, (
+        "la politica local de produccion no puede construir ningun Future"
+    )
+    assert isinstance(player._approval_policy, ProductionApprovalPolicy), (
+        "el default del jugador es la politica de produccion, nunca una que gatee"
+    )
+    assert player._approval_registry.get(tag, 0) is None
+    assert player._event_hub.resume(f"battle:{tag}", 0) == []
+    step = player.steps[tag][0]
+    assert step["action_source"] == "agent"
+    assert step.get("approval_outcome") is None
+    assert step["provider"] == "google"

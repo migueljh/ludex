@@ -31,6 +31,7 @@ from poke_env.concurrency import POKE_LOOP
 from ludex_agent.graph.decision import DecisionMetrics
 from ludex_agent.graph.provider import PinnedResolver
 from ludex_agent.graph.workflow import build_decision_graph
+from ludex_agent.hitl.policy import AlwaysGateApprovalPolicy
 from ludex_agent.showdown import client as client_module
 from ludex_agent.showdown.client import LudexPlayer, local_server_configuration
 
@@ -186,6 +187,96 @@ async def test_snapshot_identifica_etapa_y_linea_de_una_decision_atascada():
             assert awaited, (
                 "el snapshot debe incluir el frame de load_battle_context "
                 "(la linea exacta que la decision esta esperando); frames: "
+                + ", ".join(
+                    f"{frame['function']}:{frame['line']}"
+                    for entry in snapshot
+                    for frame in entry["frames"]
+                )
+            )
+    finally:
+        await player.drain_inflight_decisions()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wrap_future(decision_future)
+
+
+class _OkGraph:
+    """Grafo que decide al instante: la decision se queda esperando el GATE."""
+
+    async def ainvoke(self, graph_input):
+        return {
+            "action": {"kind": "move", "id": "tackle"},
+            "action_path": "llm",
+            "rationale": "r", "confidence": 0.5, "alternatives": [],
+            "target": None, "provider": "fake", "model": "fake-model",
+            "decision_latency_ms": 1.0, "input_tokens": 1,
+            "output_tokens": 1, "cached_input_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+
+
+class _FakePendingRepo:
+    """El gate persiste antes de publicar: el repo debe existir y ser rapido."""
+
+    async def insert_awaiting(self, record) -> None:
+        pass
+
+    async def resolve(self, key, resolution, approval_wait_ms) -> None:
+        pass
+
+    async def abort_stale(self, reason: str = "process_restart") -> int:
+        return 0
+
+
+async def test_snapshot_identifica_la_etapa_approval_gate_mientras_espera():
+    """MON-35: una decision detenida en el gate de aprobacion debe ser
+    observable con `stage="approval_gate"` y la linea exacta que espera
+    (`await_resolution`): igual que `retrieve_context`, un await sin
+    deadline en el gate seria invisible sin esta superficie."""
+    tag = "battle-stage-gate-1"
+    move = SimpleNamespace(id="tackle")
+    battle = _fake_battle(battle_tag=tag, available_moves=[move])
+    player = _player(
+        decision_graph=None,
+        decision_budget_seconds=60,
+        approval_policy=AlwaysGateApprovalPolicy(),
+        approval_timeout_seconds=30.0,
+        pending_repository=_FakePendingRepo(),
+    )
+    player.decision_graph = _OkGraph()
+
+    try:
+        with patch.object(client_module, "serialize_battle", _stub_serialize):
+            pending = player.choose_move(battle)
+            decision_future = _run_on_pokeloop(pending)
+            await _await_on_pokeloop(player.frame_inbox.publish(tag, ("|upkeep",)))
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if player._approval_registry.get(tag, 0) is not None:
+                    break
+                await asyncio.sleep(0.01)
+            assert player._approval_registry.get(tag, 0) is not None, (
+                "el gate nunca se abrio: la decision no llego a esperarlo"
+            )
+
+            snapshot = await player.decision_snapshot()
+            assert snapshot, "decision_snapshot() debe listar la decision en vuelo"
+            stage_entries = [
+                e for e in snapshot if e["stage"] == "approval_gate"
+            ]
+            assert stage_entries, (
+                "el snapshot debe incluir una entrada con etapa "
+                "approval_gate; vistas: "
+                + ", ".join(f"{e['stage']!r}" for e in snapshot)
+            )
+            awaited = [
+                frame
+                for entry in stage_entries
+                for frame in entry["frames"]
+                if frame["function"] == "await_resolution"
+            ]
+            assert awaited, (
+                "el snapshot debe incluir el frame de await_resolution "
+                "(la linea exacta que el gate espera); frames: "
                 + ", ".join(
                     f"{frame['function']}:{frame['line']}"
                     for entry in snapshot
