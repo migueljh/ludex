@@ -558,3 +558,88 @@ def test_session_delete_frees_active_for_a_new_session(monkeypatch):
 
         reopened = client.post("/sessions", json={"n_battles": 1})
         assert reopened.status_code == 200
+
+
+# --- Task 7 (MON-37/F3-07, D65 S5/S7.1): challenges -------------------------
+
+
+def test_list_challenges_reflects_the_injected_gateway():
+    from ludex_agent.showdown.challenge_gateway import InMemoryChallengeGateway
+
+    gateway = InMemoryChallengeGateway()
+    gateway.seed_incoming("rival1", "gen6ou")
+    app, _, _ = _app()
+    app.state.challenge_gateway = gateway
+
+    with TestClient(app) as client:
+        response = client.get("/challenges")
+        assert response.status_code == 200
+        assert response.json() == [{"user": "rival1", "format": "gen6ou"}]
+
+
+def test_accept_unknown_challenge_returns_404():
+    app, _, _ = _app()
+
+    with TestClient(app) as client:
+        response = client.post("/challenges/ghost/accept")
+        assert response.status_code == 404
+        assert response.json()["detail"]["error"] == "UNKNOWN_CHALLENGE"
+
+
+def test_accept_known_challenge_removes_it_from_the_list():
+    from ludex_agent.showdown.challenge_gateway import InMemoryChallengeGateway
+
+    gateway = InMemoryChallengeGateway()
+    gateway.seed_incoming("rival1", "gen6ou")
+    app, _, _ = _app()
+    app.state.challenge_gateway = gateway
+
+    with TestClient(app) as client:
+        accepted = client.post("/challenges/rival1/accept")
+        assert accepted.status_code == 200
+        assert accepted.json() == {"user": "rival1", "action": "accept"}
+
+        remaining = client.get("/challenges")
+        assert remaining.json() == []
+
+
+def test_reject_unknown_challenge_returns_404():
+    app, _, _ = _app()
+
+    with TestClient(app) as client:
+        response = client.post("/challenges/ghost/reject")
+        assert response.status_code == 404
+        assert response.json()["detail"]["error"] == "UNKNOWN_CHALLENGE"
+
+
+def test_reject_known_challenge_removes_it_from_the_list():
+    from ludex_agent.showdown.challenge_gateway import InMemoryChallengeGateway
+
+    gateway = InMemoryChallengeGateway()
+    gateway.seed_incoming("rival1", "gen6ou")
+    app, _, _ = _app()
+    app.state.challenge_gateway = gateway
+
+    with TestClient(app) as client:
+        rejected = client.post("/challenges/rival1/reject")
+        assert rejected.status_code == 200
+        assert rejected.json() == {"user": "rival1", "action": "reject"}
+        assert client.get("/challenges").json() == []
+
+
+def test_send_outgoing_challenge_echoes_the_request():
+    app, _, _ = _app()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/challenges/outgoing", json={"user": "rival1", "format": "gen6ou"},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"user": "rival1", "action": "outgoing"}
+
+
+def test_create_app_defaults_to_an_in_memory_challenge_gateway():
+    from ludex_agent.showdown.challenge_gateway import InMemoryChallengeGateway
+
+    app, _, _ = _app()
+    assert isinstance(app.state.challenge_gateway, InMemoryChallengeGateway)

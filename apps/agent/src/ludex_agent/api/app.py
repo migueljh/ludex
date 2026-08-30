@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse
 from ..db.model_repository import ModelRepository
 from ..hitl.events import EventHub
 from ..hitl.registry import ApprovalRegistry
+from ..showdown.challenge_gateway import ChallengeGateway, InMemoryChallengeGateway
 from .routes import create_router
 from .websockets import is_allowed_origin, register_websocket_routes
 
@@ -67,6 +68,7 @@ def create_app(
     event_hub: EventHub,
     settings_repo: ModelRepository,
     historical_repo_factory: "Callable[[], ApiReadRepository]",
+    challenge_gateway: ChallengeGateway | None = None,
 ) -> FastAPI:
     historical_repo_provider = _LazyHistoricalRepoProvider(historical_repo_factory)
 
@@ -81,6 +83,9 @@ def create_app(
     app.state.settings_repo = settings_repo
     app.state.historical_repo_factory = historical_repo_factory
     app.state.historical_repo_provider = historical_repo_provider
+    app.state.challenge_gateway = (
+        challenge_gateway if challenge_gateway is not None else InMemoryChallengeGateway()
+    )
 
     @app.middleware("http")
     async def _enforce_loopback_origin(request: Request, call_next):

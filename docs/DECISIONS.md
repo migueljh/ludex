@@ -5374,3 +5374,89 @@ en `test_app.py`).
 
 **Modelo efectivo:** Claude Sonnet 5 (MON-36 R2, corrección de revisión
 independiente). Sin recomendación propia: Latwan adjudica.
+
+## D69 — MON-37 (Fase 3 Task 7, F3-07): aceptación explícita de challenges (2026-08-29)
+
+**Contexto.** S5 de la spec de Fase 3 (D65 sección 6.1): poke-env 0.15.0
+auto-encola cualquier challenge entrante cuyo formato matchea
+`self._format`, vía dos productores de `_challenge_queue`
+(`Player._update_challenges` desde `|updatechallenges|`,
+`Player._handle_challenge_request` desde PM `/challenge`). D65 prohíbe ese
+auto-accept: la aceptación tiene que ser siempre explícita.
+
+**Inspección de la librería real (0.15.0, `.venv`).** Confirmado leyendo
+`poke_env/player/player.py`: los dos métodos llaman
+`self._challenge_queue.put(user)` directo si `format_ == self._format`, sin
+publicar nada observable antes de encolar. `PSClient._update_challenges`/
+`_handle_challenge_request` son wrappers finos que delegan a
+`_on_update_challenges`/`_on_challenge_request` (callbacks inyectables en
+`PSClient.__init__`, pero `Player` los apunta a sus propios métodos —
+sobrescribirlos en `LudexPlayer` es el punto de intercepción correcto, ya
+usado por el resto de la clase). `accept_challenges`/`_accept_challenges`
+consumen la cola con un loop `while True` que DESCARTA cualquier item que
+no matchee el filtro `opponent` — confirma que un consumidor con
+`opponent` fijo por accept individual sería una carrera (dos accepts
+casi simultáneos de usuarios distintos podrían descartarse entre sí); ese
+consumidor real (S9a, "aceptación live de challenge en DB descartable")
+queda fuera de esta rebanada.
+
+**Implementación (`showdown/client.py`).** `LudexPlayer` gana
+`lobby_inbox: LobbyInbox` (mismo `LobbyInbox` de Task 6, sin usar hasta
+ahora) e `incoming_challenges: dict[str, str]`. Las dos sobrescrituras
+(`_update_challenges`, `_handle_challenge_request`) NUNCA llaman al
+original ni tocan `_challenge_queue`: solo publican al lobby y actualizan
+`incoming_challenges`, sin filtrar por `self._format` (canario 12 — un
+challenge de otro formato sigue visible). `_update_challenges` trata el
+mapa `challengesFrom` como snapshot completo: un usuario ausente en el
+mapa nuevo publica `challenge_withdrawn` (comportamiento real de
+`|updatechallenges|` que la librería original no expone).
+`accept_incoming_challenge(username)`/`reject_incoming_challenge(username)`
+normalizan el username (`normalize_id`, mismo criterio que `to_id_str` de
+poke-env) y fallan cerrado con `UnknownChallengeError` si no hay challenge
+entrante conocido — no existe accept "a ciegas". Solo `accept_incoming_
+challenge` inserta en `_challenge_queue`; nunca se llama
+`PSClient.accept_challenge` directo (D65: saltearía la contabilidad de
+poke-env).
+
+**Superficie REST (`api/routes.py`, `showdown/challenge_gateway.py`,
+`api/app.py`).** `GET /challenges`, `POST /challenges/{user}/accept`,
+`POST /challenges/{user}/reject`, `POST /challenges/outgoing` (spec
+S7.1). Igual que `/connection/*` y `/sessions` (Task 6, D66 T-02): stub
+sin socket real todavía. `ChallengeGateway` es un Protocol
+(`list_incoming`/`accept`/`reject`) que desacopla la ruta del productor
+real; `InMemoryChallengeGateway` es el default inyectado por `create_app`
+(parámetro nuevo `challenge_gateway`, opcional, no rompe callers
+existentes). Un accept/reject sobre un usuario desconocido devuelve 404
+`UNKNOWN_CHALLENGE`. Wirear el gateway a un `LudexPlayer` vivo (para que
+`GET /challenges` refleje challenges reales de Showdown) es S9a.
+
+**Tests.** `tests/showdown/test_challenges.py` (10 casos: los dos
+productores publican sin encolar, formatos ajenos visibles, snapshot
+publica retiro, accept/reject fallan cerrado sobre usuario desconocido,
+accept encola y normaliza username, lobby inyectable). `tests/api/
+test_app.py` (7 casos nuevos: listar, accept/reject conocido y
+desconocido, outgoing, default del gateway). Suite offline completa
+(`--ignore=tests/integration/test_langgraph_battle.py`, sin Docker ni
+Postgres, `DATABASE_URL=''`): 826 passed, 174 skipped, 0 failed.
+
+**Mutación deliberada, restaurada y verificada por `sha256` idéntico**
+antes/después (`client.py`, `challenge_gateway.py`, `routes.py`): (1)
+hacer que `_update_challenges` vuelva a encolar automáticamente (como el
+original de poke-env) pone rojo 4/10 tests de `test_challenges.py`
+(publica-sin-encolar, accept encola/normaliza, reject no encola); (2)
+quitar el chequeo `UnknownChallengeError` de `InMemoryChallengeGateway.
+accept` pone rojo `test_accept_unknown_challenge_returns_404` (200 en vez
+de 404). Cada mutación se restauró antes de la siguiente.
+
+**Limitaciones conocidas.** (1) `ChallengeAcceptor`/el consumidor real de
+`_challenge_queue` vía `Player.accept_challenges` (S9a) no existe todavía:
+esta rebanada cierra el lado de "nada auto-encola" y "el accept explícito
+sí encola", no el lado de "un socket real acepta la batalla". (2) La
+superficie REST sigue sin `LudexPlayer` vivo detrás (mismo alcance que
+Task 6): `GET /challenges` solo refleja lo que un test siembra a mano en
+`InMemoryChallengeGateway.seed_incoming`, no hay ruta que popule
+challenges entrantes reales todavía. (3) `POST /challenges/outgoing` es
+un stub que devuelve eco; `send_challenges` real contra poke-env queda
+para la rebanada que integre el gateway con `LudexPlayer`.
+
+**Modelo efectivo:** Sonnet 5. Recomendación: `In Review`.

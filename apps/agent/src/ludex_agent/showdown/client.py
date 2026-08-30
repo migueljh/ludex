@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import orjson
 from poke_env import ServerConfiguration
 from poke_env.battle.field import Field
 from poke_env.battle.pokemon_type import PokemonType
@@ -41,6 +42,7 @@ from ..hitl import (
     create_gate,
 )
 from ..hitl.registry import ApprovalRegistry
+from .lobby import LobbyInbox
 from .protocol import (
     CURRENT_FRAME_SEQ,
     ProjectionTimeoutError,
@@ -65,6 +67,11 @@ class DecisionsClosedError(RuntimeError):
     D46: la barrera es terminal para la instancia. Cualquier `choose_move`
     cuya coroutine arranca despues de que la barrera cerro la admision falla
     ruidosamente ACA, antes de tocar proyeccion, grafo o calc."""
+
+
+class UnknownChallengeError(KeyError):
+    """`accept_incoming_challenge`/`reject_incoming_challenge` sobre un
+    usuario sin challenge entrante conocido (Fase 3 Task 7, D65 S5)."""
 
 
 @dataclass
@@ -802,6 +809,9 @@ class LudexPlayer(RandomPlayer):
         pending_repository: Any | None = None,
         approval_registry: ApprovalRegistry | None = None,
         event_hub: EventHub | None = None,
+        # Fase 3 Task 7 (D65 S5): canal pre-lock de challenges/conexion/
+        # sesion. Default no compartido, mismo patron que `event_hub`.
+        lobby_inbox: LobbyInbox | None = None,
         **kwargs: Any,
     ) -> None:
         # El listener se arranca DESPUES de instalar el observador pre-lock:
@@ -946,10 +956,104 @@ class LudexPlayer(RandomPlayer):
             else ApprovalRegistry()
         )
         self._event_hub = event_hub if event_hub is not None else EventHub()
+        # Fase 3 Task 7 (D65 S5). `incoming_challenges` es la unica fuente
+        # de verdad de "hay un challenge entrante real de este usuario":
+        # `accept_incoming_challenge`/`reject_incoming_challenge` fallan
+        # cerrado (`UnknownChallengeError`) si el usuario no esta aca. Nunca
+        # se llena desde otro lado que `_update_challenges`/
+        # `_handle_challenge_request`.
+        self.lobby_inbox = lobby_inbox if lobby_inbox is not None else LobbyInbox()
+        self.incoming_challenges: dict[str, str] = {}
 
     async def wait_for_background_failure(self) -> Exception:
         return await asyncio.shield(
             asyncio.wrap_future(self._background_failure)
+        )
+
+    # -- Fase 3 Task 7 (D65 S5): challenges, aceptacion siempre explicita --
+    #
+    # poke-env 0.15.0 tiene dos productores de `_challenge_queue`:
+    # `_update_challenges` (desde `|updatechallenges|`, snapshot completo de
+    # challenges vigentes) y `_handle_challenge_request` (desde PM
+    # `/challenge`, uno a la vez). Los dos, en la version original, encolan
+    # directo si el formato coincide con `self._format` -- eso es
+    # exactamente el auto-accept que D65 prohibe. Las dos sobrescrituras de
+    # aca NUNCA llaman al metodo original ni tocan `_challenge_queue`: solo
+    # publican al `lobby_inbox` y actualizan `incoming_challenges`, sin
+    # filtrar por formato (canario 12 -- un challenge de otro formato sigue
+    # visible). Solo `accept_incoming_challenge` inserta en la cola que
+    # consume `Player.accept_challenges` (S9a, fuera de esta rebanada).
+
+    async def _update_challenges(self, split_message: list[str]) -> None:
+        challenges = orjson.loads(split_message[2]).get("challengesFrom", {})
+        # `|updatechallenges|` manda el mapa COMPLETO vigente: un usuario
+        # que estaba y ya no esta retiro su challenge. Publicar esa baja es
+        # lo que evita que el lobby muestre un challenge fantasma.
+        withdrawn = set(self.incoming_challenges) - set(challenges)
+        self.incoming_challenges = dict(challenges)
+        for user in withdrawn:
+            self.lobby_inbox.publish(
+                {"type": "challenge_withdrawn", "direction": "incoming", "user": user}
+            )
+        for user, format_ in challenges.items():
+            self.lobby_inbox.publish(
+                {
+                    "type": "challenge",
+                    "direction": "incoming",
+                    "user": user,
+                    "format": format_,
+                }
+            )
+
+    async def _handle_challenge_request(self, split_message: list[str]) -> None:
+        challenging_player = split_message[2].strip()
+        if challenging_player == self.username:
+            return
+        if len(split_message) < 6:
+            return
+        format_ = split_message[5]
+        self.incoming_challenges[challenging_player] = format_
+        self.lobby_inbox.publish(
+            {
+                "type": "challenge",
+                "direction": "incoming",
+                "user": challenging_player,
+                "format": format_,
+            }
+        )
+
+    async def accept_incoming_challenge(self, username: str) -> None:
+        """Unico camino que encola un usuario en `_challenge_queue`.
+
+        Falla cerrado (`UnknownChallengeError`) si `username` no tiene un
+        challenge entrante conocido: no existe accept "a ciegas". Nunca
+        llama `PSClient.accept_challenge` directamente (D65: saltearia la
+        contabilidad de poke-env, prohibido)."""
+        key = normalize_id(username)
+        matched = next(
+            (user for user in self.incoming_challenges if normalize_id(user) == key),
+            None,
+        )
+        if matched is None:
+            raise UnknownChallengeError(username)
+        del self.incoming_challenges[matched]
+        await self._challenge_queue.put(matched)
+        self.lobby_inbox.publish(
+            {"type": "challenge_accepted", "direction": "incoming", "user": matched}
+        )
+
+    async def reject_incoming_challenge(self, username: str) -> None:
+        """Descarta un challenge entrante sin tocar `_challenge_queue`."""
+        key = normalize_id(username)
+        matched = next(
+            (user for user in self.incoming_challenges if normalize_id(user) == key),
+            None,
+        )
+        if matched is None:
+            raise UnknownChallengeError(username)
+        del self.incoming_challenges[matched]
+        self.lobby_inbox.publish(
+            {"type": "challenge_rejected", "direction": "incoming", "user": matched}
         )
 
     def _admit_decision(self) -> asyncio.Task[Any]:

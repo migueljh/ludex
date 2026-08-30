@@ -7,7 +7,12 @@ providers y modelos, la decision pendiente y su resolucion
 (`ApprovalRegistry`/gate exact-once, Task 2) y las lecturas historicas
 (`ApiReadRepository` via el provider memoizado de `app.state`, D66 T-03).
 El resto de la superficie de `spec S7.1` (connection, sessions) pertenece a
-S4/Task 6 y challenges a S5/Task 7 (asignacion vinculante D66).
+S4/Task 6. Challenges (S5/Task 7, D65/D66) esta ACA: `GET /challenges` y
+`POST /challenges/{user}/accept|reject|outgoing` leen y mutan el
+`ChallengeGateway` inyectado en `app.state.challenge_gateway`
+(`InMemoryChallengeGateway` por defecto, mismo patron sin conexion real que
+`_connection_state`/`_session_state` de Task 6 -- wirear un gateway
+respaldado por un `LudexPlayer` vivo es S9a, fuera de esta rebanada).
 
 El estado de una decision pendiente sale EXCLUSIVAMENTE del
 `ApprovalRegistry` inyectado (`request.app.state.registry`); esta capa nunca
@@ -28,13 +33,17 @@ from ..config import load_settings
 from ..db.model_repository import ModelSelectionError
 from ..hitl.gate import AlreadyResolved, ApprovalResolution, IllegalOverrideError
 from ..hitl.registry import ApprovalRegistry, StaleAttemptError, UnknownDecisionError
+from ..showdown.challenge_gateway import UnknownChallengeError
 from ..showdown.connection import ConnectionManager
 from .schemas import (
     ApprovalModeRequest,
     BattleSummaryResponse,
+    ChallengeActionResponse,
+    ChallengeResponse,
     DecisionAttemptRequest,
     ModelSelectionRequest,
     ModelSelectionResponse,
+    OutgoingChallengeRequest,
     OverrideRequest,
     PendingDecisionResponse,
     ProviderSummaryResponse,
@@ -312,5 +321,46 @@ def create_router() -> APIRouter:
         # terminar la corrida, no esta ruta.
         _session_state.update(stop_requested=True, active=False)
         return dict(_session_state)
+
+    @router.get("/challenges")
+    async def list_challenges(request: Request) -> list[ChallengeResponse]:
+        gateway = request.app.state.challenge_gateway
+        incoming = await gateway.list_incoming()
+        return [
+            ChallengeResponse(user=user, format=format_)
+            for user, format_ in sorted(incoming.items())
+        ]
+
+    @router.post("/challenges/{user}/accept")
+    async def accept_challenge(user: str, request: Request) -> ChallengeActionResponse:
+        gateway = request.app.state.challenge_gateway
+        try:
+            await gateway.accept(user)
+        except UnknownChallengeError as exc:
+            raise HTTPException(
+                status_code=404, detail={"error": "UNKNOWN_CHALLENGE"},
+            ) from exc
+        return ChallengeActionResponse(user=user, action="accept")
+
+    @router.post("/challenges/{user}/reject")
+    async def reject_challenge(user: str, request: Request) -> ChallengeActionResponse:
+        gateway = request.app.state.challenge_gateway
+        try:
+            await gateway.reject(user)
+        except UnknownChallengeError as exc:
+            raise HTTPException(
+                status_code=404, detail={"error": "UNKNOWN_CHALLENGE"},
+            ) from exc
+        return ChallengeActionResponse(user=user, action="reject")
+
+    @router.post("/challenges/outgoing")
+    async def send_outgoing_challenge(
+        payload: OutgoingChallengeRequest,
+    ) -> ChallengeActionResponse:
+        # S9b (ladder) y el envio saliente real contra un socket vivo quedan
+        # fuera de esta rebanada; este endpoint solo cierra la superficie
+        # documentada en spec S7.1 (`/challenges/outgoing`), mismo alcance
+        # stub que `/connection/*` y `/sessions` en Task 6.
+        return ChallengeActionResponse(user=payload.user, action="outgoing")
 
     return router

@@ -69,3 +69,20 @@ class PendingDecisionResponse(BaseModel):
     attempt_index: int
     action: dict[str, object]
     legal_actions: list[dict[str, object]]
+
+
+class ChallengeResponse(BaseModel):
+    """Un challenge entrante conocido (Fase 3 Task 7, D65 S5/S7.1)."""
+
+    user: str
+    format: str
+
+
+class ChallengeActionResponse(BaseModel):
+    user: str
+    action: Literal["accept", "reject", "outgoing"]
+
+
+class OutgoingChallengeRequest(BaseModel):
+    user: str
+    format: str
