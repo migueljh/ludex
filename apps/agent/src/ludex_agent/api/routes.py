@@ -22,7 +22,9 @@ exclusiva de `POKE_LOOP`.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from collections.abc import Callable
 from dataclasses import asdict
 
@@ -33,6 +35,13 @@ from ..config import load_settings
 from ..db.model_repository import ModelSelectionError
 from ..hitl.gate import AlreadyResolved, ApprovalResolution, IllegalOverrideError
 from ..hitl.registry import ApprovalRegistry, StaleAttemptError, UnknownDecisionError
+from ..runner.session import (
+    LadderGates,
+    LadderInterlockError,
+    SessionKind,
+    SessionRunner,
+    check_ladder_interlocks,
+)
 from ..showdown.challenge_gateway import UnknownChallengeError
 from ..showdown.connection import ConnectionManager
 from .schemas import (
@@ -48,6 +57,7 @@ from .schemas import (
     PendingDecisionResponse,
     ProviderSummaryResponse,
     ResolutionResponse,
+    SessionRequest,
     SettingsResponse,
 )
 
@@ -56,6 +66,19 @@ from .schemas import (
 # `active_model` (F2-09). El consumidor en el camino vivo (Task 5) tiene
 # que leer esta key al construir la politica inyectable.
 _APPROVAL_MODE_KEY = "approval_mode"
+
+# Task 8 (D65 S6.2): los interlocks durables del ladder viven en la MISMA
+# tabla `settings` (store F2-09) que `active_model`/`approval_mode`. Su
+# ausencia se lee como `False` (fail-closed): sin fila no hay permiso.
+_LADDER_ENABLED_KEY = "ladder_enabled"
+_TESTING_ACCOUNT_CONFIRMED_KEY = "testing_account_confirmed"
+
+# El formato de aceptacion es un parametro de configuracion (generacion como
+# parametro, nunca un literal en produccion). Sin esta variable el interlock
+# de formato falla cerrado (required_format="" nunca matchea).
+_LADDER_ACCEPTANCE_FORMAT_ENV = "LADDER_ACCEPTANCE_FORMAT"
+
+_SESSION_RESPONSE_KEYS = ("id", "n_battles", "active", "stop_requested", "source")
 
 
 def _resolution_response(resolution: ApprovalResolution) -> ResolutionResponse:
@@ -115,8 +138,18 @@ def create_router() -> APIRouter:
     # mode-aware (D65 S5.4) antes de abrir cualquier socket.
     _connection_state: dict[str, object] = {"connected": False, "mode": None}
     _session_state: dict[str, object | None] = {
-        "id": None, "n_battles": None, "active": False, "stop_requested": False,
+        "id": None,
+        "n_battles": None,
+        "active": False,
+        "stop_requested": False,
+        "source": None,
     }
+    # Task 8: el runner/task vivos detras de la sesion de ladder. No se
+    # exponen en las respuestas (`_session_response` filtra las keys).
+    _session_live: dict[str, object | None] = {"runner": None, "task": None}
+
+    def _session_response() -> dict[str, object]:
+        return {key: _session_state[key] for key in _SESSION_RESPONSE_KEYS}
 
     @router.get("/health")
     async def health() -> dict[str, str]:
@@ -291,36 +324,110 @@ def create_router() -> APIRouter:
         _connection_state["mode"] = None
         return dict(_connection_state)
 
+    async def _read_durable_flag(request: Request, key: str) -> bool:
+        """Lee un flag booleano durable de `settings`; ausente = `False`.
+
+        Fail-closed: la relectura ocurre por request (nunca se cachea), asi
+        que deshabilitar ladder en `settings` bloquea la solicitud SIGUIENTE.
+        """
+        repo = request.app.state.settings_repo
+        async with repo.factory() as s:
+            row = (await s.execute(
+                text("SELECT value FROM settings WHERE key = :key"),
+                {"key": key},
+            )).first()
+        if row is None:
+            return False
+        return row[0] is True
+
+    async def _run_ladder_session(runner: SessionRunner, n_battles: int) -> None:
+        try:
+            await runner.start(n_battles)
+        finally:
+            _session_state.update(active=False, id=None, stop_requested=False)
+            _session_live.update(runner=None, task=None)
+
     @router.post("/sessions")
-    async def create_session(payload: dict[str, int]) -> dict[str, object]:
+    async def create_session(
+        payload: SessionRequest, request: Request,
+    ) -> dict[str, object]:
+        # T-08: la solicitud es una sesion de ladder. El slot de matchmaking
+        # se protege ANTES de cualquier evaluacion: una corrida activa (o en
+        # stop-after-current) rechaza una segunda con 409.
         if _session_state["active"]:
             raise HTTPException(
                 status_code=409, detail={"error": "ACTIVE_MATCHMAKING"},
             )
-        n_battles = payload.get("n_battles", 1)
-        _session_state.update(
-            id="session-1", n_battles=n_battles, active=True, stop_requested=False,
+        # Interlock de configuracion (D65 S5.4): `official` exige
+        # DATABASE_ROLE=acceptance y DSN no canonico. `load_settings()` lo
+        # rechaza como `RuntimeError` ANTES de abrir red; el resto de los
+        # interlocks los evalua `check_ladder_interlocks`.
+        try:
+            settings = load_settings()
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=422, detail={"error": "UNSAFE_OFFICIAL_DATABASE"},
+            ) from exc
+        required_format = os.environ.get(_LADDER_ACCEPTANCE_FORMAT_ENV, "")
+        gates = LadderGates(
+            connection_mode=settings.connection_mode,
+            battle_format=settings.showdown_battle_format,
+            required_format=required_format,
+            database_role=settings.database_role,
+            database_url=settings.database_url,
+            ladder_enabled=await _read_durable_flag(request, _LADDER_ENABLED_KEY),
+            confirm=payload.confirm,
+            testing_account_confirmed=await _read_durable_flag(
+                request, _TESTING_ACCOUNT_CONFIRMED_KEY,
+            ),
         )
-        return dict(_session_state)
+        try:
+            check_ladder_interlocks(gates)
+        except LadderInterlockError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "LADDER_INTERLOCK",
+                    "missing": list(gates.missing_interlocks()),
+                    "reason": str(exc),
+                },
+            ) from exc
+        player = getattr(request.app.state, "ladder_player", None)
+        if player is None:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "LADDER_INTERLOCK", "missing": ["player"]},
+            )
+        runner = SessionRunner(player=player, kind=SessionKind.LADDER, gates=gates)
+        _session_state.update(
+            id="session-1",
+            n_battles=payload.n_battles,
+            active=True,
+            stop_requested=False,
+            source=runner.source,
+        )
+        _session_live["runner"] = runner
+        _session_live["task"] = asyncio.create_task(
+            _run_ladder_session(runner, payload.n_battles)
+        )
+        return _session_response()
 
     @router.delete("/sessions/{session_id}")
     async def delete_session(session_id: str) -> dict[str, object]:
         if _session_state["id"] != session_id:
             raise HTTPException(status_code=404, detail={"error": "UNKNOWN_SESSION"})
-        # T-04 (MON-36 R2): esta superficie es un stub sin `SessionRunner`
-        # ni `LudexPlayer` vivo detras (D68, limitacion conocida) -- no hay
-        # una batalla real en curso que proteger todavia. Dejar solo
-        # `stop_requested=True` con `active` sin tocar dejaba el slot de
-        # matchmaking BLOQUEADO PARA SIEMPRE (409 `ACTIVE_MATCHMAKING` en
-        # cualquier `POST /sessions` posterior), porque nada en este stub
-        # limpia `active` cuando "termina". `stop-after-current` real
-        # (jamas cancelar una batalla viva) es responsabilidad de
-        # `SessionRunner.stop()`, ya implementado y probado en
-        # `runner/session.py`/`test_session.py`; cuando esta ruta lo
-        # invoque de verdad, sera ESE metodo el que libere `active` al
-        # terminar la corrida, no esta ruta.
-        _session_state.update(stop_requested=True, active=False)
-        return dict(_session_state)
+        # T-08: stop-after-current REAL. `SessionRunner.stop()` marca
+        # stop_requested y JAMAS cancela la batalla en curso; el slot de
+        # matchmaking (`active`) lo libera el runner cuando TERMINA la corrida,
+        # no esta ruta. Sin runner vivo (limite D68, surface sin player) no hay
+        # batalla que proteger: se libera el slot de inmediato.
+        runner = _session_live.get("runner")
+        if runner is not None:
+            await runner.stop()
+        else:
+            _session_state.update(stop_requested=True, active=False, id=None)
+        _session_state["stop_requested"] = True
+        return _session_response()
 
     @router.get("/challenges")
     async def list_challenges(request: Request) -> list[ChallengeResponse]:

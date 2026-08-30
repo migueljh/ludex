@@ -86,3 +86,16 @@ class ChallengeActionResponse(BaseModel):
 class OutgoingChallengeRequest(BaseModel):
     user: str
     format: str
+
+
+class SessionRequest(BaseModel):
+    """Solicitud de sesion (Fase 3 Task 8, D65 S6.2/S7.1).
+
+    `confirm` es el interlock por llamada: sin `confirm=true` el ladder se
+    rechaza antes de abrir socket o enviar `/search`, por mas que el resto
+    de los interlocks esten abiertos. Fail-closed: nunca hay un default que
+    lo habilite.
+    """
+
+    n_battles: int = Field(default=1, ge=1)
+    confirm: bool = False

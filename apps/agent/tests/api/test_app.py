@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 from ludex_agent.api import routes as routes_module
 from ludex_agent.api.app import LOOPBACK_HOST, build_uvicorn_config, create_app
+from ludex_agent.config import Settings
 from ludex_agent.db.api_read_repository import (
     ApiReadRepository,
     BattleSummary,
@@ -30,8 +32,96 @@ from ludex_agent.hitl.registry import ApprovalRegistry
 
 
 class _FakeSettingsRepo:
+    def __init__(self, flags: dict[str, bool] | None = None) -> None:
+        self.flags = flags or {}
+
     async def active_selection(self):
         return ProviderModel("google", "gemini-test")
+
+    def factory(self):
+        return _FakeSettingsSession(self.flags)
+
+
+class _FakeSettingsResult:
+    def __init__(self, row) -> None:
+        self._row = row
+
+    def first(self):
+        return self._row
+
+
+class _FakeSettingsSession:
+    def __init__(self, flags: dict[str, bool]) -> None:
+        self._flags = flags
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args) -> bool:
+        return False
+
+    async def execute(self, stmt, params):
+        key = params["key"]
+        row = (self._flags[key],) if key in self._flags else None
+        return _FakeSettingsResult(row)
+
+    async def commit(self) -> None:
+        pass
+
+
+class _RecordingLadderPlayer:
+    """Cuenta la actividad de red de `ladder` (llamada, socket, `/search`).
+    Con `hold=True` queda retenida en la batalla en curso hasta
+    `finish_current_battle`; con `hold=False` retorna de inmediato, para que
+    una mutacion de un interlock falle en rojo sin colgarse."""
+
+    def __init__(self, hold: bool = True) -> None:
+        self.hold = hold
+        self.ladder_calls: list[int] = []
+        self.socket_opens = 0
+        self.search_sends: list[str] = []
+        self._battle_done = asyncio.Event()
+
+    async def ladder(self, n_battles: int) -> None:
+        self.ladder_calls.append(n_battles)
+        self.socket_opens += 1
+        self.search_sends.append("/search")
+        if self.hold:
+            await self._battle_done.wait()
+
+    def finish_current_battle(self) -> None:
+        self._battle_done.set()
+
+
+_ACCEPTANCE_DSN = "postgresql+asyncpg://ludex:ludex@127.0.0.1:9999/acceptance"
+_CANONICAL_DSN = "postgresql+asyncpg://ludex:ludex@127.0.0.1:15432/ludex"
+_LADDER_ACCEPTANCE_FORMAT_ENV = "LADDER_ACCEPTANCE_FORMAT"
+_OPEN_FLAGS = {"ladder_enabled": True, "testing_account_confirmed": True}
+
+
+def _open_settings(**overrides) -> Settings:
+    base = dict(
+        database_url=_ACCEPTANCE_DSN,
+        connection_mode="official",
+        database_role="acceptance",
+        showdown_ws_url="ws://localhost:8100/showdown/websocket",
+        showdown_battle_format="gen6randombattle",
+        bot_username="LudexBot",
+        llm_provider="google",
+        llm_model="gemini-test",
+        llm_api_key_env="GEMINI_API_KEY",
+        llm_api_keys_env=None,
+        llm_base_url=None,
+        llm_provider_chain=(),
+        llm_request_timeout_seconds=30,
+        decision_budget_seconds=240,
+        approval_timeout_seconds=10,
+        send_margin_seconds=5,
+        showdown_turn_limit_seconds=300,
+        battle_timeout_seconds=300,
+    )
+    base.update(overrides)
+    return Settings(**base)
 
 
 class _FakeReadRepository:
@@ -44,10 +134,10 @@ class _FakeReadRepository:
         return self._battle
 
 
-def _app(*, read_repo=None, settings_repo=None):
+def _app(*, read_repo=None, settings_repo=None, settings_flags=None):
     registry = ApprovalRegistry()
     event_hub = EventHub()
-    settings_repo = settings_repo or _FakeSettingsRepo()
+    settings_repo = settings_repo or _FakeSettingsRepo(settings_flags)
     factory = (lambda: read_repo) if read_repo is not None else (lambda: _FakeReadRepository(None))
     app = create_app(
         registry=registry, event_hub=event_hub,
@@ -537,26 +627,39 @@ def test_connect_with_unsafe_official_database_returns_422_not_500(monkeypatch):
         assert response.json()["detail"]["error"] == "UNSAFE_OFFICIAL_DATABASE"
 
 
-def test_session_delete_frees_active_for_a_new_session(monkeypatch):
-    """T-04: antes de este fix, `DELETE /sessions/{id}` marcaba
-    `stop_requested=True` pero dejaba `active=True` para siempre, asi que
-    un `POST /sessions` posterior devolvia 409 `ACTIVE_MATCHMAKING` sin
-    limite (stop-after-current nunca liberaba el slot)."""
-    app, _, _ = _app()
+async def test_session_delete_frees_active_for_a_new_session(monkeypatch):
+    """T-04 (adaptado a Task 8): `DELETE /sessions/{id}` hace stop-after-current
+    real (nunca cancela la batalla en curso); el slot de matchmaking se libera
+    cuando TERMINA la batalla en curso, no en el momento del DELETE. Antes del
+    fix de T-04, `active` quedaba bloqueado para siempre y el POST posterior
+    devolvia 409 `ACTIVE_MATCHMAKING` sin limite."""
+    player = _RecordingLadderPlayer()
+    app, _, _ = _app(settings_flags=dict(_OPEN_FLAGS))
+    app.state.ladder_player = player
+    monkeypatch.setattr(routes_module, "load_settings", lambda: _open_settings())
+    monkeypatch.setenv(_LADDER_ACCEPTANCE_FORMAT_ENV, "gen6randombattle")
 
     with TestClient(app) as client:
-        created = client.post("/sessions", json={"n_battles": 3})
+        created = client.post("/sessions", json={"n_battles": 1, "confirm": True})
         assert created.status_code == 200
         session_id = created.json()["id"]
 
-        second_attempt = client.post("/sessions", json={"n_battles": 1})
+        second_attempt = client.post("/sessions", json={"n_battles": 1, "confirm": True})
         assert second_attempt.status_code == 409
 
         deleted = client.delete(f"/sessions/{session_id}")
         assert deleted.status_code == 200
-        assert deleted.json()["active"] is False
+        # stop-after-current: la batalla en curso sigue viva -> active True.
+        assert deleted.json()["stop_requested"] is True
+        assert deleted.json()["active"] is True
 
-        reopened = client.post("/sessions", json={"n_battles": 1})
+        player.finish_current_battle()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            reopened = client.post("/sessions", json={"n_battles": 1, "confirm": True})
+            if reopened.status_code == 200:
+                break
+            await asyncio.sleep(0.01)
         assert reopened.status_code == 200
 
 
@@ -643,3 +746,167 @@ def test_create_app_defaults_to_an_in_memory_challenge_gateway():
 
     app, _, _ = _app()
     assert isinstance(app.state.challenge_gateway, InMemoryChallengeGateway)
+
+
+# --- Task 8 (MON-38/F3-08, D65 S6.2): ladder sessions fail-closed -----------
+
+
+def _ladder_app(monkeypatch, *, flags, settings_overrides=None, player=True, hold=True):
+    player_ = _RecordingLadderPlayer(hold=hold) if player else None
+    app, _, _ = _app(settings_flags=flags)
+    if player_ is not None:
+        app.state.ladder_player = player_
+    monkeypatch.setattr(
+        routes_module, "load_settings",
+        lambda: _open_settings(**(settings_overrides or {})),
+    )
+    monkeypatch.setenv(_LADDER_ACCEPTANCE_FORMAT_ENV, "gen6randombattle")
+    return app, player_
+
+
+@pytest.mark.parametrize(
+    "flags,settings_overrides,payload",
+    [
+        (dict(_OPEN_FLAGS), {"connection_mode": "local"}, {"n_battles": 1, "confirm": True}),
+        ({"ladder_enabled": False, "testing_account_confirmed": True}, None, {"n_battles": 1, "confirm": True}),
+        (dict(_OPEN_FLAGS), None, {"n_battles": 1}),
+        ({"ladder_enabled": True, "testing_account_confirmed": False}, None, {"n_battles": 1, "confirm": True}),
+        (dict(_OPEN_FLAGS), {"database_url": _CANONICAL_DSN}, {"n_battles": 1, "confirm": True}),
+        (dict(_OPEN_FLAGS), {"showdown_battle_format": "gen6ou"}, {"n_battles": 1, "confirm": True}),
+    ],
+    ids=[
+        "local-mode",
+        "disabled-ladder",
+        "missing-call-confirmation",
+        "unconfirmed-testing-account",
+        "canonical-db",
+        "wrong-format",
+    ],
+)
+def test_ladder_session_interlock_fails_closed_with_zero_network_calls(
+    monkeypatch, flags, settings_overrides, payload,
+):
+    """D65 canario 30 a nivel de ruta: al faltar un interlock, `POST
+    /sessions` responde 422 `LADDER_INTERLOCK` y el player nunca abre socket
+    ni envia `/search`."""
+    app, player = _ladder_app(
+        monkeypatch, flags=flags, settings_overrides=settings_overrides,
+        hold=False,
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/sessions", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == "LADDER_INTERLOCK"
+    assert player.ladder_calls == []
+    assert player.socket_opens == 0
+    assert player.search_sends == []
+
+
+def test_ladder_session_without_a_wired_player_fails_closed(monkeypatch):
+    """Sin `app.state.ladder_player` no existe camino de red: fail-closed."""
+    app, player = _ladder_app(
+        monkeypatch, flags=dict(_OPEN_FLAGS), player=False,
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/sessions", json={"n_battles": 1, "confirm": True})
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == "LADDER_INTERLOCK"
+
+
+def test_ladder_session_with_unsafe_official_database_returns_422_not_500(monkeypatch):
+    """`load_settings()` rechaza official+canonical como `RuntimeError`; la ruta
+    lo mapea a 422 (nunca 500) igual que `/connection/connect` (T-03)."""
+    app, player = _ladder_app(
+        monkeypatch, flags=dict(_OPEN_FLAGS), hold=False,
+    )
+
+    def _unsafe_settings():
+        raise RuntimeError(
+            "CONNECTION_MODE=official no puede persistir en la base canónica de Ludex"
+        )
+
+    monkeypatch.setattr(routes_module, "load_settings", _unsafe_settings)
+
+    with TestClient(app) as client:
+        response = client.post("/sessions", json={"n_battles": 1, "confirm": True})
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == "UNSAFE_OFFICIAL_DATABASE"
+    assert player.ladder_calls == []
+
+
+async def test_open_ladder_interlocks_start_a_ladder_session(monkeypatch):
+    """Step 2: con los seis interlocks abiertos, la sesion dispara
+    `Player.ladder(1)` y queda marcada `source="ladder"`."""
+    player = _RecordingLadderPlayer()
+    app, _, _ = _app(settings_flags=dict(_OPEN_FLAGS))
+    app.state.ladder_player = player
+    monkeypatch.setattr(routes_module, "load_settings", lambda: _open_settings())
+    monkeypatch.setenv(_LADDER_ACCEPTANCE_FORMAT_ENV, "gen6randombattle")
+
+    with TestClient(app) as client:
+        response = client.post("/sessions", json={"n_battles": 1, "confirm": True})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["source"] == "ladder"
+        assert body["active"] is True
+
+        deadline = time.monotonic() + 2
+        while not player.ladder_calls and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert player.ladder_calls == [1]
+
+        player.finish_current_battle()
+        deadline = time.monotonic() + 2
+        while _session_slot_busy(client) and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+
+    assert player.ladder_calls == [1]
+    assert player.socket_opens == 1
+    assert player.search_sends == ["/search"]
+
+
+async def test_ladder_disabled_after_a_session_blocks_subsequent_requests(monkeypatch):
+    """Step 3 (off-after-session): al deshabilitar ladder, una solicitud nueva
+    sin re-habilitar falla antes de red y no produce una segunda llamada."""
+    flags = dict(_OPEN_FLAGS)
+    player = _RecordingLadderPlayer()
+    app, _, _ = _app(settings_flags=flags)
+    app.state.ladder_player = player
+    monkeypatch.setattr(routes_module, "load_settings", lambda: _open_settings())
+    monkeypatch.setenv(_LADDER_ACCEPTANCE_FORMAT_ENV, "gen6randombattle")
+
+    with TestClient(app) as client:
+        first = client.post("/sessions", json={"n_battles": 1, "confirm": True})
+        assert first.status_code == 200
+
+        deadline = time.monotonic() + 2
+        while not player.ladder_calls and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert player.ladder_calls == [1]
+
+        player.finish_current_battle()
+        deadline = time.monotonic() + 2
+        while _session_slot_busy(client) and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+
+        flags["ladder_enabled"] = False
+        second = client.post("/sessions", json={"n_battles": 1, "confirm": True})
+
+    assert second.status_code == 422
+    assert second.json()["detail"]["error"] == "LADDER_INTERLOCK"
+    assert player.ladder_calls == [1]
+    assert player.socket_opens == 1
+    assert player.search_sends == ["/search"]
+
+
+def _session_slot_busy(client) -> bool:
+    """Sondea el slot de matchmaking SIN efectos: un POST con `confirm`
+    ausente falla por interlock (422) si el slot esta libre y devuelve 409 si
+    sigue ocupado -- nunca dispara una sesion nueva."""
+    probe = client.post("/sessions", json={"n_battles": 1})
+    return probe.status_code == 409
