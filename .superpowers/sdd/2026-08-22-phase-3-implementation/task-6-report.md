@@ -2,12 +2,37 @@
 
 **Issue:** MON-36 — "Add official connection management and sequential sessions"
 (`docs/superpowers/plans/2026-08-22-phase-3-implementation.md`, Task 6).
-**Decisión asociada:** `docs/DECISIONS.md` D68.
+**Decisión asociada:** `docs/DECISIONS.md` D68 (original) + D68 (corrección R2).
 **Worktree:** `phase3-s6-connection-ws`, branch `migueljh/phase3-s6-connection-ws`.
 **Base SHA:** `a5c7de8bc2d8e64d7430dbcaf3732c4ff53c4ca4`
-**Head SHA:** `8c0c276`
-**Estado:** listo para `In Review`. **No marcar `Completed`** — el veredicto es
-exclusivo del tech lead.
+**Head SHA (packet original):** `daa5a8240a884d5222eff38897678bd72dd9808c`
+**Head SHA (corregido, este documento):** `d45ec42`
+**Revisión independiente:** Grok 4.6 (Tasos), read-only, `CHANGES_REQUESTED`
+sobre `a5c7de8..daa5a82` — T-01 a T-05, ver sección "Correcciones R2" abajo.
+**Estado:** correcciones aplicadas, listo para re-revisión → `In Review`.
+**No marcar `Completed`** — el veredicto es exclusivo del tech lead.
+
+---
+
+## Correcciones R2 (cierre de T-01..T-05 de la revisión independiente)
+
+| Finding | Severidad | Causa raíz | Corrección | Commit |
+|---|---|---|---|---|
+| T-01 | IMPORTANT | `LoginWatchdog` leía `.exception()` de una task que `LudexPlayer._publish_background_failure` resuelve con `set_result(exc)` (nunca `raise`), produciendo `LoginFailedError('None')` | `published = failure_task.exception() or failure_task.result()`; test fake corregido a `set_result` con `match` del mensaje exacto | `d45ec42` |
+| T-02 | IMPORTANT | El canario de config oficial solo aserteaba `is not None`; una regresión a `local_server_configuration` en la rama `official` pasaba GREEN | Assert de la URL exacta `wss://sim3.psim.us/showdown/websocket` | `d45ec42` |
+| T-03 | IMPORTANT | `load_settings()` levanta `RuntimeError` (Task 1) ANTES de que exista `Settings`; el `try/except` solo envolvía `build_server_configuration()`, dejando el 422 documentado inalcanzable (500 real) | `try` envuelve `load_settings()` + `ConnectionManager(...)` + `build_server_configuration()`; captura `RuntimeError`. Canario HTTP nuevo (scope narrow documentado) | `d45ec42` |
+| T-04 | IMPORTANT | `DELETE /sessions/{id}` marcaba `stop_requested=True` sin liberar `active`; `POST /sessions` quedaba en 409 para siempre | `DELETE` limpia `active=False` (stub sin batalla real que proteger, D68); `SessionRunner.stop()` real queda para cuando la ruta invoque un runner vivo | `d45ec42` |
+| T-05 | MINOR | El guardarraíl de socket solo chequeaba `database_role`, más débil que el guardarraíl de DSN canónico de `load_settings()` | Reusa `config._reject_unsafe_official_database` dentro de `build_server_configuration`, envuelto como `UnsafeOfficialDatabaseError` | `d45ec42` |
+
+T-06 (drift de `local_server_configuration` duplicado, primitivos aún no
+cableados a `LudexPlayer`/`/ws/lobby`) queda como observación aceptada: es
+la misma limitación ya documentada en D68 sobre `cli.py`/`client.py` fuera
+de alcance autorizado, no un defecto nuevo de esta corrección.
+
+Cada corrección se verificó **RED antes → restaurado byte a byte (sha256)
+→ GREEN después**, reproduciendo el defecto EXACTO que reportó la
+revisión independiente (ver detalle completo en `docs/DECISIONS.md`,
+entrada "D68 (corrección) — MON-36 R2").
 
 ---
 
@@ -116,9 +141,11 @@ DATABASE_URL='' TEST_DATABASE_URL='' PYTHONPATH=$PWD/src .venv/bin/python -m pyt
 Resultado:
 
 ```
-806 passed, 174 skipped, 1 deselected, 3 warnings in 15.19s
+809 passed, 174 skipped, 1 deselected, 3 warnings in 14.58s
 ```
 
+- 806 → 809: +3 tests nuevos de la corrección R2 (1 canario de DSN canónico
+  en `test_connection.py`, 2 canarios HTTP en `test_app.py`).
 - Los 174 `skipped` son los skips documentados por falta de `TEST_DATABASE_URL`/DB/Showdown reales.
 - El único test deselected (`test_langgraph_battle.py`) es preexistente, llama
   `load_settings()` sin condición de skip y exige una `DATABASE_URL` real
@@ -166,18 +193,30 @@ daemon").
    `app.py`/`schemas.py` están fuera de alcance explícito del brief. Las
    respuestas son `dict` planos, no `ResponseModel` de Pydantic. No hay
    wiring real a un `LudexPlayer` vivo desde las rutas: eso requiere la
-   integración diferida en (1)/(2).
+   integración diferida en (1)/(2). `DELETE /sessions/{id}` ahora limpia
+   `active=False` de inmediato (corrección T-04): es el comportamiento
+   correcto para ESTE stub sin batalla real que proteger; cuando la ruta
+   invoque un `SessionRunner`/`LudexPlayer` vivos, el `stop-after-current`
+   real (nunca cancelar una batalla en curso) lo dará `SessionRunner.stop()`,
+   ya implementado y sin cambios en esta corrección.
+4. **`tests/api/test_app.py` recibió 2 canarios HTTP** en la corrección R2
+   (T-03/T-04), fuera de la lista de archivos original de Task 6. Es la
+   única extensión de scope de este ciclo de corrección, pedida
+   explícitamente porque solo `TestClient` puede ejercer un código de
+   estado HTTP; está documentada con una nota de scope inline en el propio
+   archivo.
 
-Ambas limitaciones están documentadas también en `docs/DECISIONS.md` D68 y
-quedan como trabajo pendiente para una rebanada posterior que incluya
-`cli.py`, `showdown/client.py` y sus tests en su alcance autorizado.
+Todas las limitaciones están documentadas también en `docs/DECISIONS.md`
+(D68 original y D68 corrección R2) y quedan como trabajo pendiente para
+una rebanada posterior que incluya `cli.py`, `showdown/client.py` y sus
+tests en su alcance autorizado.
 
 ---
 
 ## Comando de revisión sugerido para Tasos / tech lead
 
 ```
-git diff a5c7de8bc2d8e64d7430dbcaf3732c4ff53c4ca4..8c0c276 -- \
+git diff a5c7de8bc2d8e64d7430dbcaf3732c4ff53c4ca4..d45ec42 -- \
   apps/agent/src/ludex_agent/showdown/connection.py \
   apps/agent/src/ludex_agent/showdown/lobby.py \
   apps/agent/src/ludex_agent/runner/ \
@@ -185,8 +224,15 @@ git diff a5c7de8bc2d8e64d7430dbcaf3732c4ff53c4ca4..8c0c276 -- \
   apps/agent/tests/showdown/test_connection.py \
   apps/agent/tests/showdown/test_lobby.py \
   apps/agent/tests/runner/test_session.py \
+  apps/agent/tests/api/test_app.py \
   docs/DECISIONS.md
 ```
 
-**Modelo efectivo:** Claude Sonnet 5 (MON-36 Task 6). Sin recomendación
-propia: Latwan adjudica.
+Para revisar SOLO la corrección R2 (T-01..T-05) sobre lo ya revisado en R1:
+
+```
+git diff daa5a8240a884d5222eff38897678bd72dd9808c..d45ec42
+```
+
+**Modelo efectivo:** Claude Sonnet 5 (MON-36 Task 6, R1 + corrección R2).
+Sin recomendación propia: Latwan adjudica.
