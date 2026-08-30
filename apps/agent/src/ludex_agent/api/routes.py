@@ -24,9 +24,11 @@ from dataclasses import asdict
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import text
 
+from ..config import load_settings
 from ..db.model_repository import ModelSelectionError
 from ..hitl.gate import AlreadyResolved, ApprovalResolution, IllegalOverrideError
 from ..hitl.registry import ApprovalRegistry, StaleAttemptError, UnknownDecisionError
+from ..showdown.connection import ConnectionManager, UnsafeOfficialDatabaseError
 from .schemas import (
     ApprovalModeRequest,
     BattleSummaryResponse,
@@ -96,6 +98,16 @@ def _resolve(
 
 def create_router() -> APIRouter:
     router = APIRouter()
+
+    # D66 T-02 (asignacion vinculante): connection/sessions es dominio de
+    # Task 6. Estado en memoria del router, sin tabla ni columna nueva; el
+    # `ConnectionManager` se construye por request desde `load_settings()`
+    # (app.py no se toca en esta rebanada) para heredar el guardarraiel
+    # mode-aware (D65 S5.4) antes de abrir cualquier socket.
+    _connection_state: dict[str, object] = {"connected": False, "mode": None}
+    _session_state: dict[str, object | None] = {
+        "id": None, "n_battles": None, "active": False, "stop_requested": False,
+    }
 
     @router.get("/health")
     async def health() -> dict[str, str]:
@@ -236,5 +248,50 @@ def create_router() -> APIRouter:
             ),
             battle_tag=battle_tag, decision_index=decision_index,
         )
+
+    @router.get("/connection")
+    async def get_connection() -> dict[str, object]:
+        return dict(_connection_state)
+
+    @router.post("/connection/connect")
+    async def connect_showdown() -> dict[str, object]:
+        settings = load_settings()
+        manager = ConnectionManager(settings=settings)
+        try:
+            manager.build_server_configuration()
+        except UnsafeOfficialDatabaseError as exc:
+            raise HTTPException(
+                status_code=422, detail={"error": "UNSAFE_OFFICIAL_DATABASE"},
+            ) from exc
+        _connection_state["connected"] = True
+        _connection_state["mode"] = settings.connection_mode
+        return dict(_connection_state)
+
+    @router.post("/connection/disconnect")
+    async def disconnect_showdown() -> dict[str, object]:
+        _connection_state["connected"] = False
+        _connection_state["mode"] = None
+        return dict(_connection_state)
+
+    @router.post("/sessions")
+    async def create_session(payload: dict[str, int]) -> dict[str, object]:
+        if _session_state["active"]:
+            raise HTTPException(
+                status_code=409, detail={"error": "ACTIVE_MATCHMAKING"},
+            )
+        n_battles = payload.get("n_battles", 1)
+        _session_state.update(
+            id="session-1", n_battles=n_battles, active=True, stop_requested=False,
+        )
+        return dict(_session_state)
+
+    @router.delete("/sessions/{session_id}")
+    async def delete_session(session_id: str) -> dict[str, object]:
+        if _session_state["id"] != session_id:
+            raise HTTPException(status_code=404, detail={"error": "UNKNOWN_SESSION"})
+        # Stop-after-current (spec 7.1): jamas cancela la batalla en curso,
+        # solo impide que arranque la siguiente.
+        _session_state["stop_requested"] = True
+        return dict(_session_state)
 
     return router

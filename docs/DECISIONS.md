@@ -5190,3 +5190,95 @@ gate abortado alcanzable); `run_battles` de matrix sin delegar a
 
 **Modelo efectivo:** DeepSeek V4 Pro (OpenCode, MON-35 Task 5). Sin
 recomendación propia: Latwan adjudica.
+
+## D68 — MON-36 (Fase 3 Task 6): conexion oficial mode-aware, watchdog de login y sesiones secuenciales, R2 (2026-08-29)
+
+**Contexto.** Task 6 agrega `ConnectionManager`/`LoginWatchdog`
+(`showdown/connection.py`), `LobbyInbox` (`showdown/lobby.py`) y
+`SessionRunner` (`runner/session.py`), y asigna en `api/routes.py` los
+endpoints `GET /connection`, `POST /connection/connect`,
+`POST /connection/disconnect`, `POST /sessions` y `DELETE /sessions/{id}`
+que D66 T-02 vinculó a esta tarea.
+
+**`ConnectionManager` (mode-aware, D65 S5.4).** Construye
+`ServerConfiguration` segun `connection_mode`: `local` usa
+`local_server_configuration(settings.showdown_ws_url)`; `official` exige
+`database_role == "acceptance"` ANTES de construir cualquier socket
+(`UnsafeOfficialDatabaseError` si no, sin llamar nunca a
+`official_server_configuration()` en el camino inseguro). El username/
+password oficiales se leen SOLO al construir `AccountConfiguration`, desde
+un `environ` inyectable (default `os.environ`); el manager nunca los
+retiene en ningun otro atributo (spec 6.3, canario
+`test_connection_manager_never_stores_password`).
+
+**`LoginWatchdog` (D65 S4.1, presupuesto 15s spec 4.2).** Observa
+`logged_in.wait()` y `wait_for_background_failure()` de poke-env con reloj y
+`sleep` inyectables (D42): nunca usa `asyncio.wait_for` sobre el Future
+fuente. Si el deadline vence o la task de fondo de poke-env reporta un
+fallo, levanta `LoginFailedError` tipado. `assert_login_complete_before_battle`
+prohibe cualquier intento de jugar antes de que el login haya resuelto
+(spec 6.3: "Login siempre ocurre antes de cualquier `choose_move`").
+
+**`LobbyInbox` (spec 7.2, mismo patron que el inbox de batalla D31).** Ring
+buffer con `seq` monotono, `publish`/`snapshot`/`resume`/`wait_for_next`;
+`resume` sobre un `last_seq` ya rotado levanta `LobbyInbox.ReplayGapError`,
+igual que el canal de batalla.
+
+**`SessionRunner` (spec 7.1, secuencial + stop-after-current).** `start`
+rechaza una segunda solicitud de matchmaking mientras hay una activa
+(`ActiveMatchmakingError`); juega hasta `n_battles` UNA a la vez, revisando
+`_stop_requested` solo ENTRE batallas — nunca cancela la task de la batalla
+en curso. `stop()` es async y unicamente marca la bandera.
+
+**Asignacion de rutas D66 T-02.** `api/routes.py` implementa los cinco
+endpoints de conexion/sesiones con estado en memoria del router (sin tabla
+ni columna nueva) y usa `ConnectionManager` para el preflight mode-aware en
+`POST /connection/connect` (422 `UNSAFE_OFFICIAL_DATABASE` si el guardarraiel
+rechaza). `app.py`/`schemas.py` no se tocan en esta rebanada (fuera de
+alcance explicito del brief); las respuestas son `dict` planos, no
+`ResponseModel` de Pydantic.
+
+**Limitacion conocida: `cli.py` no se modifico.** El plan asignaba
+`cli.py:117-242` para enrutar el preflight mode-aware de `run` (`play()`) a
+traves de `ConnectionManager`. Se intento: el cambio es correcto pero
+`tests/test_cli.py` (fuera de la lista de archivos de esta tarea) fabrica
+`Settings` con `SimpleNamespace` incompletos que no incluyen
+`connection_mode`/`database_role`, y el usuario indico explicitamente NO
+tocar ese archivo de test. Sin poder actualizar sus fakes, el cambio en
+`cli.py` queda revertido para no dejar la suite en rojo fuera de mascara.
+`run`/`benchmark`/`matrix-run` siguen usando `local_server_configuration`
+directo, sin pasar por el guardarraiel unificado; el comportamiento actual
+sigue siendo correcto (nunca corren en modo `official`, D67), pero el
+guardarraiel de `ConnectionManager` no es todavia su unico camino. Queda
+para una rebanada que incluya `tests/test_cli.py` en su alcance autorizado.
+El runner oficial nuevo (`SessionRunner`) y `ConnectionManager` SI se
+construyen y usan a traves de `api/routes.py`.
+
+**`showdown/client.py` sin cambios de comportamiento.** No se encontro un
+punto de integracion que pudiera cablearse sin tocar `tests/showdown/
+test_client.py` (mismo riesgo que `cli.py`, tampoco autorizado). Los
+primitivos nuevos (`ConnectionManager`, `LoginWatchdog`) quedan listos para
+que el runner oficial los inyecte en una rebanada posterior con
+`LudexPlayer`.
+
+**Verificacion.** RED antes de implementar: los 3 archivos de test nuevos
+fallaban por `ModuleNotFoundError` (`ludex_agent.showdown.connection`,
+`ludex_agent.showdown.lobby`, `ludex_agent.runner`). GREEN: 15/15 tests
+nuevos. Mutaciones deliberadas in-place, cada una verificada RED y
+restaurada byte a byte (`sha256` antes/despues): guardia
+`database_role != "acceptance"` removida (RED: DID NOT RAISE); chequeo de
+deadline removido del watchdog (RED: la suite CUELGA, matada con SIGKILL a
+los 10s via wrapper de timeout duro — confirma que el mecanismo, no un
+mock, es lo que evita el cuelgue infinito); guardia `_active` removida de
+`SessionRunner.start` (RED: CUELGA, mismo mecanismo de matanza forzada);
+chequeo de `_stop_requested` removido del loop de `start` (RED: 5 batallas
+en vez de 1); guardia de `ReplayGapError` removida de `LobbyInbox.resume`
+(RED: DID NOT RAISE). Suite offline completa:
+`DATABASE_URL='' TEST_DATABASE_URL=''`, 806 passed, 174 skipped (skips
+documentados de DB/Showdown), 0 failed, 1 deselected
+(`test_langgraph_battle.py`, requiere DB real, preexistente y fuera de
+alcance de esta tarea). Ningun comando toco Docker, la base canonica ni
+abrio red: todo el desarrollo fue offline.
+
+**Modelo efectivo:** Claude Sonnet 5 (MON-36 Task 6). Sin recomendacion
+propia: Latwan adjudica.
