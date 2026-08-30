@@ -20,7 +20,7 @@ from typing import Awaitable, Callable, Mapping, Protocol
 from poke_env import ServerConfiguration
 from poke_env.ps_client.account_configuration import AccountConfiguration
 
-from ludex_agent.config import Settings
+from ludex_agent.config import Settings, _reject_unsafe_official_database
 
 _OFFICIAL_AUTH_URL = "https://play.pokemonshowdown.com/action.php?"
 _OFFICIAL_WS_URL = "wss://sim3.psim.us/showdown/websocket"
@@ -51,11 +51,20 @@ class ConnectionManager:
 
     def build_server_configuration(self) -> ServerConfiguration:
         if self.settings.connection_mode == "official":
-            if self.settings.database_role != "acceptance":
-                raise UnsafeOfficialDatabaseError(
-                    "CONNECTION_MODE=official exige DATABASE_ROLE=acceptance "
-                    f"(recibido {self.settings.database_role!r})"
+            # T-05 (MON-36 R2): reusa el MISMO guardarraiel de Task 1
+            # (`_reject_unsafe_official_database`, D65 S5.4) en vez de
+            # reimplementar solo el chequeo de `database_role`. Sin esto,
+            # este segundo preflight de socket era MAS DEBIL que el de
+            # `load_settings`: dejaba pasar el DSN canonico si
+            # `database_role=acceptance` mentia sobre la DB real.
+            try:
+                _reject_unsafe_official_database(
+                    self.settings.connection_mode,
+                    self.settings.database_role,
+                    self.settings.database_url,
                 )
+            except RuntimeError as exc:
+                raise UnsafeOfficialDatabaseError(str(exc)) from exc
             return official_server_configuration()
         return local_server_configuration(self.settings.showdown_ws_url)
 
@@ -107,7 +116,14 @@ class LoginWatchdog:
                     self._login_complete = True
                     return
                 if failure_task.done():
-                    raise LoginFailedError(str(failure_task.exception()))
+                    # `LudexPlayer.wait_for_background_failure` PUBLICA el
+                    # error como VALOR (`_background_failure.set_result(exc)`,
+                    # client.py:1113), nunca lo levanta: la task de este
+                    # watchdog termina normal con `exception()=None`. Leer
+                    # `.exception()` aca siempre daria `LoginFailedError('None')`
+                    # (T-01, MON-36 R2). El valor real esta en `.result()`.
+                    published = failure_task.exception() or failure_task.result()
+                    raise LoginFailedError(str(published))
                 if self.clock() >= deadline:
                     raise LoginFailedError(
                         f"Login no completo dentro de {self.timeout_seconds}s"

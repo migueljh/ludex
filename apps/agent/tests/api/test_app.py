@@ -502,3 +502,59 @@ async def test_settings_hitl_providers_models_and_battles_routes_against_the_rea
             assert battles.status_code == 200
             tags = [b["battle_tag"] for b in battles.json()]
             assert "battle-list-1" in tags
+
+
+# --- Correccion puntual MON-36 R2 (T-03/T-04) ------------------------------
+#
+# Alcance NARROW: estos dos canarios HTTP son la unica adicion a este
+# archivo en el ciclo de correccion de MON-36. Task 6 (connection/sessions,
+# D66 T-02) no incluia `tests/api/test_app.py` en su lista de archivos
+# autorizada y el brief original de la tarea prohibia agregar tests de API;
+# el ciclo de correccion R2 pidio explicitamente estos dos canarios HTTP
+# como la unica forma de probar T-03 (`POST /connection/connect` debe
+# responder 422 `UNSAFE_OFFICIAL_DATABASE`, no 500) y T-04 (`DELETE
+# /sessions/{id}` debe liberar `active` para que una sesion nueva pueda
+# arrancar). No se toco ninguna otra parte de este archivo.
+
+
+def test_connect_with_unsafe_official_database_returns_422_not_500(monkeypatch):
+    """T-03: antes de este fix, `load_settings()` levantaba un
+    `RuntimeError` sin capturar (official sin `DATABASE_ROLE=acceptance`) y
+    FastAPI lo devolvia como 500 `INTERNAL_ERROR`, dejando el 422
+    documentado (D68) inalcanzable."""
+    app, _, _ = _app()
+
+    def _unsafe_settings():
+        raise RuntimeError(
+            "CONNECTION_MODE=official exige DATABASE_ROLE=acceptance"
+        )
+
+    monkeypatch.setattr(routes_module, "load_settings", _unsafe_settings)
+
+    with TestClient(app) as client:
+        response = client.post("/connection/connect")
+        assert response.status_code == 422
+        assert response.json()["detail"]["error"] == "UNSAFE_OFFICIAL_DATABASE"
+
+
+def test_session_delete_frees_active_for_a_new_session(monkeypatch):
+    """T-04: antes de este fix, `DELETE /sessions/{id}` marcaba
+    `stop_requested=True` pero dejaba `active=True` para siempre, asi que
+    un `POST /sessions` posterior devolvia 409 `ACTIVE_MATCHMAKING` sin
+    limite (stop-after-current nunca liberaba el slot)."""
+    app, _, _ = _app()
+
+    with TestClient(app) as client:
+        created = client.post("/sessions", json={"n_battles": 3})
+        assert created.status_code == 200
+        session_id = created.json()["id"]
+
+        second_attempt = client.post("/sessions", json={"n_battles": 1})
+        assert second_attempt.status_code == 409
+
+        deleted = client.delete(f"/sessions/{session_id}")
+        assert deleted.status_code == 200
+        assert deleted.json()["active"] is False
+
+        reopened = client.post("/sessions", json={"n_battles": 1})
+        assert reopened.status_code == 200

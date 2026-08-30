@@ -75,6 +75,12 @@ def test_official_mode_rejects_canonical_database_before_socket() -> None:
 
 
 def test_official_mode_accepts_acceptance_database() -> None:
+    """T-02 (MON-36 R2): asertar la URL oficial EXACTA, no solo `is not None`.
+
+    Una mutacion que devuelva `local_server_configuration(...)` en la rama
+    official pasaba en silencio con la asercion anterior (2/2 GREEN con el
+    bug inyectado). La URL exacta es el unico canario que la detecta.
+    """
     settings = _settings(
         connection_mode="official",
         database_role="acceptance",
@@ -82,7 +88,24 @@ def test_official_mode_accepts_acceptance_database() -> None:
     )
     manager = ConnectionManager(settings=settings)
     config = manager.build_server_configuration()
-    assert config is not None
+    assert config.websocket_url == "wss://sim3.psim.us/showdown/websocket"
+
+
+def test_official_mode_rejects_canonical_dsn_even_with_acceptance_role() -> None:
+    """T-05 (MON-36 R2): el guardarraiel de socket reusa el MISMO chequeo
+    de DSN canonico que `load_settings` (D65 S5.4), no solo `database_role`.
+
+    Un `database_role=acceptance` mal configurado sobre el DSN canonico real
+    de Ludex (127.0.0.1:15432/ludex) no puede colar un socket oficial.
+    """
+    settings = _settings(
+        connection_mode="official",
+        database_role="acceptance",
+        database_url="postgresql+asyncpg://u:p@127.0.0.1:15432/ludex",
+    )
+    manager = ConnectionManager(settings=settings)
+    with pytest.raises(UnsafeOfficialDatabaseError):
+        manager.build_server_configuration()
 
 
 @pytest.mark.asyncio
@@ -125,15 +148,27 @@ async def test_watchdog_reports_typed_failure_on_invalid_login() -> None:
 @pytest.mark.asyncio
 async def test_watchdog_propagates_background_login_failure() -> None:
     """Si poke-env pierde el error de login en su task fire-and-forget,
-    el watchdog tiene que republicarlo como fallo tipado, no perderlo."""
+    el watchdog tiene que republicarlo como fallo tipado, no perderlo.
+
+    T-01 (MON-36 R2): `LudexPlayer._publish_background_failure`
+    (client.py:1111-1113) PUBLICA el error como VALOR
+    (`self._background_failure.set_result(exc)`), nunca lo levanta con
+    `set_exception`. El fake tiene que reflejar EXACTAMENTE ese contrato
+    real, o el canario no prueba nada: con `set_exception`, la task del
+    watchdog terminaria en excepcion en vez de resultado, y un
+    `failure_task.exception()` roto (que siempre da `None` contra la forma
+    real de poke-env) pasaba igual porque el fake no coincidia con la
+    produccion. Se asertea ademas el mensaje EXACTO preservado.
+    """
     clock = _FakeClock()
+    published = RuntimeError("bad password")
 
     class _FakePokeClient:
         logged_in = asyncio.Event()
 
         def __init__(self) -> None:
             self._background_failure: asyncio.Future[Exception] = asyncio.get_event_loop().create_future()
-            self._background_failure.set_exception(RuntimeError("bad password"))
+            self._background_failure.set_result(published)
 
         async def wait_for_background_failure(self) -> Exception:
             return await asyncio.shield(self._background_failure)
@@ -143,7 +178,7 @@ async def test_watchdog_propagates_background_login_failure() -> None:
         clock=clock,
         sleep=lambda _seconds: asyncio.sleep(0),
     )
-    with pytest.raises(LoginFailedError):
+    with pytest.raises(LoginFailedError, match="bad password"):
         await watchdog.wait_for_login(_FakePokeClient())
 
 
@@ -166,7 +201,11 @@ def test_connection_manager_never_stores_password() -> None:
     logs, eventos o artefactos (spec 6.3): ConnectionManager la lee del
     entorno solo al construir AccountConfiguration y no la retiene."""
     manager = ConnectionManager(
-        settings=_settings(connection_mode="official", database_role="acceptance"),
+        settings=_settings(
+            connection_mode="official",
+            database_role="acceptance",
+            database_url="postgresql+asyncpg://u:p@127.0.0.1:5555/acceptance",
+        ),
         environ={
             "SHOWDOWN_OFFICIAL_USERNAME": "ludex-testing",
             "SHOWDOWN_OFFICIAL_PASSWORD": "s3cr3t",
