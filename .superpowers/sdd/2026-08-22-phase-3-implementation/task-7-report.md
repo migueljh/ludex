@@ -10,9 +10,7 @@ sección 6.1 (challenges) y §7.1 (superficie REST); canarios 10-13.
 (`origin/integration/phase-3-accepted`).
 **Head SHA (packet original):** `356438571756626cef8e3ff801949242acdc770f` (`3564385`).
 **Head SHA (packet R1, evidencia versionada):** `900d302`.
-**Head SHA (corregido, este documento, R2):** `PENDING` — completado en
-un segundo commit inmediato de esta misma corrección (ver nota al pie del
-documento).
+**Head SHA (corregido, este documento, R2):** `1115f8b`.
 **Revisión independiente:** Tasos, read-only, `CHANGES_REQUESTED` sobre
 `dce0cfd..3564385` — T-01 (cobertura del seam de challenges), T-02, T-03.
 Esta corrección cierra **únicamente T-01**; T-02/T-03 y S9a quedan fuera de
