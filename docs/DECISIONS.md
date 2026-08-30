@@ -5282,3 +5282,95 @@ abrio red: todo el desarrollo fue offline.
 
 **Modelo efectivo:** Claude Sonnet 5 (MON-36 Task 6). Sin recomendacion
 propia: Latwan adjudica.
+
+## D68 (correccion) — MON-36 R2: cierre de T-01..T-05 de la revision independiente (2026-08-29)
+
+**Contexto.** Grok 4.6 (Tasos, read-only) revisó `a5c7de8..daa5a82` y devolvió
+`CHANGES_REQUESTED` con T-01..T-04 IMPORTANT y T-05 MINOR. Esta entrada
+documenta las correcciones aplicadas en el mismo worktree/branch.
+
+**T-01 — el watchdog leía `.exception()` de una task que termina normal.**
+`LudexPlayer._publish_background_failure` (`client.py:1111-1113`) publica el
+fallo como VALOR (`self._background_failure.set_result(exc)`), nunca lo
+levanta. `LoginWatchdog.wait_for_login` leía `failure_task.exception()`,
+que da `None` sobre una task resuelta con `set_result`, produciendo
+`LoginFailedError('None')` en vez de propagar el mensaje real. Arreglo:
+`published = failure_task.exception() or failure_task.result()`. El fake de
+`test_watchdog_propagates_background_login_failure` usaba `set_exception`
+en vez de `set_result`, por lo que el canario no reflejaba el contrato real
+de poke-env; se corrigió a `set_result` y se agregó `match="bad password"`
+sobre el mensaje exacto.
+
+**T-02 — el canario de configuración oficial no distinguía `official` de
+`local`.** `test_official_mode_accepts_acceptance_database` solo aserteaba
+`config is not None`; una mutación que devolviera
+`local_server_configuration(...)` en la rama `official` pasaba 2/2 GREEN.
+Arreglo: assert de la URL exacta
+`config.websocket_url == "wss://sim3.psim.us/showdown/websocket"`.
+
+**T-03 — `POST /connection/connect` devolvía 500, no el 422 documentado.**
+`load_settings()` levanta `RuntimeError` (Task 1,
+`_reject_unsafe_official_database`) ANTES de que exista un `Settings` con
+el que construir `ConnectionManager`; el `try/except` solo envolvía
+`build_server_configuration()`, así que el caso más común (`official` sin
+`DATABASE_ROLE=acceptance`) caía sin capturar y FastAPI lo devolvía como
+500 `INTERNAL_ERROR`. Arreglo: el `try` envuelve `load_settings()` +
+`ConnectionManager(...)` + `build_server_configuration()`, capturando
+`RuntimeError` (superclase de `UnsafeOfficialDatabaseError`). Canario HTTP
+nuevo en `tests/api/test_app.py` (alcance narrow, ver nota de scope en el
+archivo): `test_connect_with_unsafe_official_database_returns_422_not_500`.
+
+**T-04 — `DELETE /sessions/{id}` dejaba `active=True` para siempre.** El
+stub de sesiones en `routes.py` no tiene todavía un `SessionRunner`/
+`LudexPlayer` vivo detrás (limitación ya documentada en D68 original);
+marcar solo `stop_requested=True` sin liberar `active` bloqueaba
+CUALQUIER `POST /sessions` posterior con 409 `ACTIVE_MATCHMAKING`
+indefinidamente, porque nada en el stub "termina" la sesión para limpiar
+el flag. Arreglo: `DELETE` limpia `active=False` además de marcar
+`stop_requested=True` — correcto para el contrato HTTP de ESTE stub sin
+batalla real en curso; cuando la ruta invoque `SessionRunner` de verdad,
+será `SessionRunner.stop()` (ya implementado, sin cambios) quien libere el
+slot al terminar la corrida real, no esta ruta. Canario HTTP nuevo:
+`test_session_delete_frees_active_for_a_new_session`.
+
+**T-05 — el guardarraíl de socket era más débil que el de `load_settings`.**
+`ConnectionManager.build_server_configuration` solo chequeaba
+`database_role != "acceptance"`, sin repetir el rechazo del DSN canónico
+(D65 S5.4). Arreglo: reusa `_reject_unsafe_official_database` (Task 1,
+`config.py`) dentro de `build_server_configuration`, envolviendo su
+`RuntimeError` en `UnsafeOfficialDatabaseError` para no romper el tipo que
+ya consumían `routes.py` y los tests. Nuevo canario:
+`test_official_mode_rejects_canonical_dsn_even_with_acceptance_role`.
+
+**Alcance de la corrección.** `tests/api/test_app.py` recibió 2 canarios
+HTTP nuevos — la única extensión de su lista de archivos autorizada,
+pedida explícitamente por el ciclo de corrección R2 para poder probar
+T-03/T-04 (no hay forma de ejercer un código de estado HTTP sin
+`TestClient`). Documentado con una nota de scope inline en el archivo.
+`cli.py`/`showdown/client.py` siguen sin tocarse.
+
+**Verificación.** Las 5 correcciones se probaron RED→restaurado→GREEN
+in-place (`sha256` antes/después de cada revert):
+- T-01: revertir a `str(failure_task.exception())` → RED
+  (`LoginFailedError('None')` no matchea `"bad password"`).
+- T-02: `official` devolviendo `local_server_configuration(...)` → RED
+  (URL exacta no coincide).
+- T-03: volver a envolver solo `build_server_configuration()` → RED (500
+  `RuntimeError` sin capturar, log `unhandled RuntimeError in
+  /connection/connect`).
+- T-04: quitar `active=False` del `update` de `DELETE` → RED (`assert True
+  is False`, el 409 persiste tras el DELETE).
+- T-05: volver al chequeo manual de `database_role` sin reusar el
+  guardarraíl → RED (`DID NOT RAISE UnsafeOfficialDatabaseError` sobre DSN
+  canónico con `database_role=acceptance`).
+
+Suite focal (`test_connection.py` + `test_lobby.py` + `test_session.py` +
+`test_app.py` + `test_cli.py` + `test_client.py`): 200 passed, 3 skipped, 0
+failed. Suite offline completa
+(`DATABASE_URL='' TEST_DATABASE_URL=''`, deselect del test preexistente
+que exige DB real): **809 passed, 174 skipped, 0 failed** (806 + 3 tests
+nuevos: 1 canario de DSN canónico en `test_connection.py`, 2 canarios HTTP
+en `test_app.py`).
+
+**Modelo efectivo:** Claude Sonnet 5 (MON-36 R2, corrección de revisión
+independiente). Sin recomendación propia: Latwan adjudica.

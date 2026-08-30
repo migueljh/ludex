@@ -28,7 +28,7 @@ from ..config import load_settings
 from ..db.model_repository import ModelSelectionError
 from ..hitl.gate import AlreadyResolved, ApprovalResolution, IllegalOverrideError
 from ..hitl.registry import ApprovalRegistry, StaleAttemptError, UnknownDecisionError
-from ..showdown.connection import ConnectionManager, UnsafeOfficialDatabaseError
+from ..showdown.connection import ConnectionManager
 from .schemas import (
     ApprovalModeRequest,
     BattleSummaryResponse,
@@ -255,11 +255,20 @@ def create_router() -> APIRouter:
 
     @router.post("/connection/connect")
     async def connect_showdown() -> dict[str, object]:
-        settings = load_settings()
-        manager = ConnectionManager(settings=settings)
+        # T-03 (MON-36 R2): `load_settings()` YA levanta el guardarraiel de
+        # DB insegura como `RuntimeError` plano (Task 1,
+        # `_reject_unsafe_official_database`), ANTES de que exista un
+        # `Settings` con el que construir `ConnectionManager`. Envolver solo
+        # `build_server_configuration()` dejaba ese caso (el mas comun:
+        # `CONNECTION_MODE=official` sin `DATABASE_ROLE=acceptance`) caer
+        # sin capturar y responder 500 `INTERNAL_ERROR` en vez del 422
+        # documentado. `UnsafeOfficialDatabaseError` es subclase de
+        # `RuntimeError`, asi que un unico `except` cubre ambos origenes.
         try:
+            settings = load_settings()
+            manager = ConnectionManager(settings=settings)
             manager.build_server_configuration()
-        except UnsafeOfficialDatabaseError as exc:
+        except RuntimeError as exc:
             raise HTTPException(
                 status_code=422, detail={"error": "UNSAFE_OFFICIAL_DATABASE"},
             ) from exc
@@ -289,9 +298,19 @@ def create_router() -> APIRouter:
     async def delete_session(session_id: str) -> dict[str, object]:
         if _session_state["id"] != session_id:
             raise HTTPException(status_code=404, detail={"error": "UNKNOWN_SESSION"})
-        # Stop-after-current (spec 7.1): jamas cancela la batalla en curso,
-        # solo impide que arranque la siguiente.
-        _session_state["stop_requested"] = True
+        # T-04 (MON-36 R2): esta superficie es un stub sin `SessionRunner`
+        # ni `LudexPlayer` vivo detras (D68, limitacion conocida) -- no hay
+        # una batalla real en curso que proteger todavia. Dejar solo
+        # `stop_requested=True` con `active` sin tocar dejaba el slot de
+        # matchmaking BLOQUEADO PARA SIEMPRE (409 `ACTIVE_MATCHMAKING` en
+        # cualquier `POST /sessions` posterior), porque nada en este stub
+        # limpia `active` cuando "termina". `stop-after-current` real
+        # (jamas cancelar una batalla viva) es responsabilidad de
+        # `SessionRunner.stop()`, ya implementado y probado en
+        # `runner/session.py`/`test_session.py`; cuando esta ruta lo
+        # invoque de verdad, sera ESE metodo el que libere `active` al
+        # terminar la corrida, no esta ruta.
+        _session_state.update(stop_requested=True, active=False)
         return dict(_session_state)
 
     return router
