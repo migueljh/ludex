@@ -1,17 +1,132 @@
-# REVIEW PACKET — MON-37, Fase 3 Task 7 / F3-07 (aceptación explícita de challenges)
+# REVIEW PACKET R2 — MON-37, Fase 3 Task 7 / F3-07 (aceptación explícita de challenges)
 
 **Issue:** MON-37 / F3-07 — "Implement explicit challenge acceptance"
 (`docs/superpowers/plans/2026-08-22-phase-3-implementation.md`, Task 7).
-**Decisión asociada:** `docs/DECISIONS.md` D69.
+**Decisión asociada:** `docs/DECISIONS.md` D69 (original) + D69 (corrección R2).
 **Spec vinculante:** `docs/superpowers/specs/2026-08-22-phase-3-design.md`,
 sección 6.1 (challenges) y §7.1 (superficie REST); canarios 10-13.
 **Worktree:** `phase3-s7-challenge-ws`, branch `migueljh/phase3-s7-challenge-ws`.
 **Base SHA:** `dce0cfd40ae15ac7108ecfd5e641e1c44ed35cde`
 (`origin/integration/phase-3-accepted`).
-**Head SHA:** `356438571756626cef8e3ff801949242acdc770f` (`3564385`).
-**Estado:** implementación y verificación completas, worktree limpio,
-listo para revisión independiente → `In Review`.
+**Head SHA (packet original):** `356438571756626cef8e3ff801949242acdc770f` (`3564385`).
+**Head SHA (packet R1, evidencia versionada):** `900d302`.
+**Head SHA (corregido, este documento, R2):** `PENDING` — completado en
+un segundo commit inmediato de esta misma corrección (ver nota al pie del
+documento).
+**Revisión independiente:** Tasos, read-only, `CHANGES_REQUESTED` sobre
+`dce0cfd..3564385` — T-01 (cobertura del seam de challenges), T-02, T-03.
+Esta corrección cierra **únicamente T-01**; T-02/T-03 y S9a quedan fuera de
+alcance de este ciclo (ver sección "Corrección R2").
+**Estado:** T-01 cerrado, worktree limpio, listo para re-revisión → `In Review`.
 **No marcar `Completed`** — el veredicto es exclusivo del tech lead.
+
+---
+
+## Corrección R2 (cierre de T-01)
+
+**Finding T-01.** `tests/showdown/test_challenges.py` prueba el CUERPO de
+`_update_challenges`/`_handle_challenge_request` llamándolos directo sobre
+la instancia (`await player._update_challenges(...)`), pero nunca ejerce
+el camino productivo real (`PSClient._handle_message`, el dispatcher que
+usa el socket) ni asevera que los callbacks bindeados en `PSClient`
+(`_on_update_challenges`, `_on_challenge_request`) apunten efectivamente a
+las sobrescrituras de `LudexPlayer` y no a las de `Player` — D65 canario
+10 sin cubrir. Un futuro cambio que rompiera esa atadura (p.ej. un rename
+accidental de las sobrescrituras) pasaría la suite existente en verde
+mientras un challenge real se auto-aceptaría en producción.
+
+**Causa raíz.** Hueco de cobertura, no defecto de comportamiento:
+`Player.__init__` (poke-env, `player.py:156-157`) pasa
+`on_update_challenges=self._update_challenges` y
+`on_challenge_request=self._handle_challenge_request` al construir
+`PSClient`; como `type(self)` ya es `LudexPlayer` durante toda la
+construcción, la resolución MRO real siempre encuentra las sobrescrituras
+de `LudexPlayer` — pero nada en la suite lo comprobaba ejerciendo el seam
+real, así que una regresión futura ahí sería invisible hasta producción.
+
+**Corrección aplicada.** `tests/showdown/test_pokeenv_contract.py` (el
+archivo ya dedicado a contratos con seams privados de poke-env, ver su
+docstring) gana tres tests:
+
+1. `test_los_callbacks_de_challenge_de_psclient_apuntan_a_ludexplayer` —
+   `player.ps_client._on_update_challenges.__func__ is
+   LudexPlayer._update_challenges` (mismo para `_on_challenge_request`).
+2. `test_updatechallenges_productivo_nunca_auto_encola` — llama
+   `player.ps_client._handle_message("|updatechallenges|...")` (el
+   dispatcher real) y asevera `_challenge_queue.empty()`.
+3. `test_pm_challenge_productivo_nunca_auto_encola` — mismo canario para
+   el PM `/challenge` real (`split_message[5]` es el formato, ver
+   `player.py:356-363` y `showdown/client.py::_handle_challenge_request`).
+
+**No se tocó ningún archivo de producción** — T-01 era exclusivamente un
+hueco de cobertura de test. `showdown/client.py`, `challenge_gateway.py`,
+`api/routes.py`, `api/schemas.py` y `api/app.py` quedan byte a byte iguales
+al head `3564385`.
+
+### Mutación deliberada ("seam rebind"), restaurada y verificada por `sha256`
+
+Se renombraron temporalmente (`sed`, líneas 987 y 1008 de
+`showdown/client.py`) `LudexPlayer._update_challenges`/
+`_handle_challenge_request` a `..._MUTATED_seam_rebind`, simulando
+exactamente la regresión que T-01 señaló como no cubierta: sin esas
+sobrescrituras, `Player.__init__` bindea los callbacks de `PSClient` a las
+implementaciones ORIGINALES de `Player`, que auto-encolan si el formato
+matchea.
+
+```
+$ sha256sum src/ludex_agent/showdown/client.py   # antes de mutar
+305a7b0d8971f957ecfed46b4a0ea8846b5b6222df0c0eeade387db9962201d4
+
+$ PYTHONPATH=src DATABASE_URL='' .venv/bin/python -m pytest \
+  tests/showdown/test_pokeenv_contract.py -q -k "callback or productivo"
+.FF
+2 failed, 1 passed, 7 deselected in 0.22s
+```
+
+- `test_updatechallenges_productivo_nunca_auto_encola` → RED:
+  `_challenge_queue` terminó `['rival1']` en vez de vacía.
+- `test_pm_challenge_productivo_nunca_auto_encola` → RED:
+  `_challenge_queue` terminó `['rival2']` en vez de vacía.
+- `test_los_callbacks_de_challenge_de_psclient_apuntan_a_ludexplayer` →
+  **sigue en verde con esta mutación puntual**: es tautológico respecto a
+  "lo que sea que `LudexPlayer._update_challenges` resuelva hoy" — tras el
+  rename, ambos lados de la comparación (`player.ps_client.
+  _on_update_challenges.__func__` y `LudexPlayer._update_challenges`)
+  resuelven al mismo `Player._update_challenges` base. Documentado como
+  limitación conocida de ESE test puntual (no invalida la corrección: los
+  dos canarios productivos SÍ cierran T-01, que exigía ejercer el
+  dispatcher real).
+
+```
+$ sed -i '' -e '987s/_MUTATED_seam_rebind//' ... # restaurado
+$ sha256sum src/ludex_agent/showdown/client.py   # después de restaurar
+305a7b0d8971f957ecfed46b4a0ea8846b5b6222df0c0eeade387db9962201d4
+```
+
+Idéntico al hash pre-mutación. `git diff` contra HEAD tras restaurar:
+vacío para `showdown/client.py`.
+
+### Verificación
+
+```
+$ PYTHONPATH=src DATABASE_URL='' .venv/bin/python -m pytest \
+  tests/showdown/test_pokeenv_contract.py tests/showdown/test_challenges.py -q
+20 passed in 0.26s
+
+$ PYTHONPATH=src DATABASE_URL='' .venv/bin/python -m pytest -q \
+  --ignore=tests/integration/test_langgraph_battle.py
+829 passed, 174 skipped, 3 warnings in 15.38s
+```
+
+0 failed. 826 → 829 (+3 tests nuevos de esta corrección). 0 archivos de
+producción modificados.
+
+### Alcance de la corrección
+
+**Solo T-01.** T-02/T-03 (otros findings de la revisión independiente) y
+S9a (consumidor real de `_challenge_queue`, wiring de la superficie REST a
+un `LudexPlayer` vivo) quedan **explícitamente fuera** de este ciclo de
+corrección, sin tocar.
 
 ---
 

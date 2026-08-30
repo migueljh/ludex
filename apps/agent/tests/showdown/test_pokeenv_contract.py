@@ -145,3 +145,74 @@ async def test_los_frames_que_no_son_de_batalla_pasan_intactos():
     player = _player()
     await player.ps_client._handle_message("|popup|algo")  # no debe reventar
     assert player.frame_inbox.last_seq("") == 0
+
+
+# --- Canario 10 (MON-37 R2, T-01): el seam de challenges esta atado a las
+# sobrescrituras de `LudexPlayer`, no a las de `Player` ----------------------
+#
+# `Player.__init__` pasa `on_update_challenges=self._update_challenges` y
+# `on_challenge_request=self._handle_challenge_request` al construir
+# `PSClient` (ver `player.py:156-157`). Esos dos atributos de instancia son
+# la resolucion REAL que usa el camino productivo
+# (`PSClient._handle_message` -> `PSClient._update_challenges`/
+# `_handle_challenge_request` -> `self._on_update_challenges`/
+# `_on_challenge_request`). `tests/showdown/test_challenges.py` llama
+# `player._update_challenges(...)` directo, que prueba el CUERPO de la
+# sobrescritura pero no prueba que el seam de `PSClient` este atado a ELLA
+# en vez de a `Player._update_challenges`/`_handle_challenge_request`
+# (D65 canario 10). Estos tests cierran esa brecha: aseveran la identidad
+# del callback bindeado y ejercen `PSClient._handle_message` -- el punto de
+# entrada real, nunca los metodos de `LudexPlayer` a mano.
+
+
+def test_los_callbacks_de_challenge_de_psclient_apuntan_a_ludexplayer():
+    player = _player()
+    assert player.ps_client._on_update_challenges.__func__ is (
+        LudexPlayer._update_challenges
+    ), (
+        f"PSClient._on_update_challenges no esta bindeado a la "
+        f"sobrescritura de LudexPlayer -- un challenge real auto-encolaria "
+        f"via Player._update_challenges. {PISTA}"
+    )
+    assert player.ps_client._on_challenge_request.__func__ is (
+        LudexPlayer._handle_challenge_request
+    ), (
+        f"PSClient._on_challenge_request no esta bindeado a la "
+        f"sobrescritura de LudexPlayer -- un challenge real auto-encolaria "
+        f"via Player._handle_challenge_request. {PISTA}"
+    )
+
+
+async def test_updatechallenges_productivo_nunca_auto_encola():
+    """Ejerce `PSClient._handle_message`, el dispatcher real que usa el
+    socket, en vez de llamar `_update_challenges` a mano (D65 canario 10)."""
+    import orjson
+
+    player = _player()
+    payload = orjson.dumps({"challengesFrom": {"rival1": "gen6randombattle"}}).decode()
+
+    await player.ps_client._handle_message(f"|updatechallenges|{payload}")
+
+    assert player._challenge_queue.empty(), (
+        f"un challenge entrante via el dispatcher productivo se auto-encolo "
+        f"sin accept explicito. {PISTA}"
+    )
+    assert player.incoming_challenges == {"rival1": "gen6randombattle"}
+    assert [e["type"] for e in player.lobby_inbox.snapshot()] == ["challenge"]
+
+
+async def test_pm_challenge_productivo_nunca_auto_encola():
+    """Mismo canario para el segundo productor: PM `/challenge` (D65
+    seccion 6.1, split_message[5] es el formato -- ver `player.py:356-363`
+    y `showdown/client.py::_handle_challenge_request`)."""
+    player = _player()
+    mensaje = f"|pm|rival2|{player.username}|/challenge|gen6randombattle|packedteam"
+
+    await player.ps_client._handle_message(mensaje)
+
+    assert player._challenge_queue.empty(), (
+        f"un PM /challenge via el dispatcher productivo se auto-encolo sin "
+        f"accept explicito. {PISTA}"
+    )
+    assert player.incoming_challenges == {"rival2": "gen6randombattle"}
+    assert [e["type"] for e in player.lobby_inbox.snapshot()] == ["challenge"]

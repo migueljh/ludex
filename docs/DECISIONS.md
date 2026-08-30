@@ -5460,3 +5460,62 @@ un stub que devuelve eco; `send_challenges` real contra poke-env queda
 para la rebanada que integre el gateway con `LudexPlayer`.
 
 **Modelo efectivo:** Sonnet 5. Recomendación: `In Review`.
+
+## D69 (corrección R2) — MON-37 R2: cierre de T-01 de la revisión independiente (2026-08-30)
+
+**Contexto.** Revisión independiente (Tasos) sobre `dce0cfd..3564385`
+devolvió T-01: `tests/showdown/test_challenges.py` prueba el CUERPO de
+`_update_challenges`/`_handle_challenge_request` llamándolos directo sobre
+la instancia, pero nunca ejerce el camino productivo real
+(`PSClient._handle_message`) ni asevera que los callbacks que `PSClient`
+tiene bindeados (`_on_update_challenges`, `_on_challenge_request`)
+apunten efectivamente a las sobrescrituras de `LudexPlayer` y no a las de
+`Player` (D65 canario 10). Un futuro cambio que rompiera esa atadura —
+p.ej. renombrar las sobrescrituras sin querer — pasaría la suite existente
+en verde mientras un challenge real se auto-aceptaría en producción.
+
+**Corrección.** `tests/showdown/test_pokeenv_contract.py` (el archivo ya
+dedicado a contratos con seams privados de poke-env) gana tres tests
+nuevos: (1) identidad de los callbacks bindeados en `PSClient`
+(`player.ps_client._on_update_challenges.__func__ is
+LudexPlayer._update_challenges`, mismo para `_on_challenge_request`); (2)
+`test_updatechallenges_productivo_nunca_auto_encola`, que llama
+`player.ps_client._handle_message("|updatechallenges|...")` (el
+dispatcher real que usa el socket) y asevera `_challenge_queue.empty()`;
+(3) `test_pm_challenge_productivo_nunca_auto_encola`, mismo canario para
+el PM `/challenge` (`split_message[5]` es el formato, ver
+`player.py:356-363`). No se tocó ningún archivo de producción: T-01 era un
+hueco de cobertura, no un defecto de comportamiento.
+
+**Mutación deliberada ("seam rebind"), restaurada y verificada por
+`sha256` idéntico.** Se renombraron temporalmente `LudexPlayer.
+_update_challenges`/`_handle_challenge_request` (a
+`..._MUTATED_seam_rebind`) para que `Player.__init__` bindee los
+callbacks de `PSClient` a las implementaciones ORIGINALES de `Player`
+(que sí auto-encolan si el formato matchea) — exactamente la clase de
+regresión que T-01 señaló como no cubierta. Resultado: 2/3 tests nuevos en
+rojo (`test_updatechallenges_productivo_nunca_auto_encola`,
+`test_pm_challenge_productivo_nunca_auto_encola`; `_challenge_queue`
+terminó con `['rival1']`/`['rival2']` en vez de vacía). El test de
+identidad NO cae con esta mutación específica (es tautológico respecto a
+"lo que sea que `LudexPlayer._update_challenges` resuelva hoy", y tras el
+rename ambos lados de la comparación resuelven a `Player._update_
+challenges`) — se documenta como limitación conocida de ESE test
+puntual; los dos canarios productivos son los que realmente cierran T-01.
+Restaurado con `sed` sobre las mismas dos líneas; `sha256sum
+src/ludex_agent/showdown/client.py` idéntico antes/después
+(`305a7b0d8971f957ecfed46b4a0ea8846b5b6222df0c0eeade387db9962201d4`).
+
+**Verificación.** `tests/showdown/test_pokeenv_contract.py` +
+`tests/showdown/test_challenges.py`: 20/20. Suite offline completa
+(`--ignore=tests/integration/test_langgraph_battle.py`, sin Docker ni
+Postgres, `DATABASE_URL=''`): 829 passed, 174 skipped, 0 failed (826→829,
++3 tests nuevos de esta corrección).
+
+**Alcance de la corrección.** Solo T-01. T-02/T-03 y S9a (consumidor real
+de `_challenge_queue`, wiring de la superficie REST a un `LudexPlayer`
+vivo) quedan explícitamente fuera de esta corrección — sin cambios de
+comportamiento de producción en ningún archivo.
+
+**Modelo efectivo:** Sonnet 5, corrección de revisión independiente (R2).
+Sin recomendación propia: Tasos/tech lead adjudica.
