@@ -1,9 +1,9 @@
 # MON-39 — aceptación offline completa de Fase 3
 
-Fecha: 2026-08-31  
-Issue: MON-39  
-Base de fase: `5868c087aee0bee0ec14c004fe06ed5cbdbd697b`  
-Head de código verificado: `e945512514613a799f3b976fdfea360c9f56a9d4`  
+Fecha: 2026-08-31
+Issue: MON-39
+Base de fase: `5868c087aee0bee0ec14c004fe06ed5cbdbd697b`
+Head de código verificado: `e945512514613a799f3b976fdfea360c9f56a9d4`
 Rama: `migueljh/phase3-integration`
 
 Linear no estaba conectado durante esta aceptación (`linear_not_connected`).
@@ -13,9 +13,9 @@ vuelva la conexión.
 
 ## REVIEW PACKET
 
-**Issue:** MON-39  
+**Issue:** MON-39
 **Commit(s):** rango completo de fase desde la Base indicada; el packet se
-versiona en el commit que contiene este archivo.  
+versiona en el commit que contiene este archivo.
 **Archivos modificados por MON-39:**
 
 - `apps/agent/tests/hitl/test_gate.py`: cierre test-only del menor T-02
