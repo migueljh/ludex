@@ -591,6 +591,74 @@ async def test_persist_one_graba_el_empate_sin_ganador_ni_reward_negativo():
     assert kwargs.get("reward") == 0.0
 
 
+# --- MON-40 R3 (T-03, TASOS REVIEW PACKET): `_persist_one` end-to-end -----
+#
+# Los focales de `test_protocol.py` prueban `extract_replay_url`/
+# `elo_bucket_from_rating` aislados; ninguno atraviesa el adapter publico
+# `_persist_one` que de verdad arma los kwargs de `save_battle`/
+# `save_trajectory`. Un borrado accidental de `replay_url=`/`elo_bucket=`
+# en `cli.py` dejaba estos focales en verde sin que nadie se enterara.
+
+async def test_persist_one_persiste_replay_url_y_elo_bucket_de_ladder():
+    """Composicion real: una linea `|raw|` de replay y un `opponent_rating`
+    publico (ladder) tienen que llegar, sin transformacion, a los kwargs de
+    `save_battle`/`save_trajectory`."""
+    player = _player()
+    tag = "battle-ladder-provenance-1"
+    battle = SimpleNamespace(
+        battle_tag=tag, player_role="p1",
+        player_username="Bot", opponent_username="Rival",
+        finished=True, won=True, gen=6, opponent_rating=1503,
+    )
+    player.battles[tag] = battle
+    player.steps[tag] = []
+    _record_valid_opening(player, tag)
+    player.recorders[tag].record([
+        line.split("|") for line in [
+            '|raw|<a href="https://replay.pokemonshowdown.com/'
+            'gen6randombattle-777">View replay</a>',
+        ]
+    ])
+
+    repo = _FakeRepo()
+    await _persist_one(player, repo, tag, "gen6randombattle", "ladder")
+
+    assert (
+        repo.saved_battle_kwargs["replay_url"]
+        == "https://replay.pokemonshowdown.com/gen6randombattle-777"
+    )
+    _, traj_kwargs = repo.saved_trajectories[0]
+    assert traj_kwargs["elo_bucket"] == "1503"
+
+
+async def test_persist_one_challenge_fuerza_elo_bucket_none_aunque_haya_opponent_rating():
+    """TASOS REVIEW PACKET T-01 (IMPORTANT): `source='challenge'` tiene que
+    persistir `elo_bucket=None` SIEMPRE, incluso si `battle.opponent_rating`
+    viene poblado (poke-env lo llena desde cualquier `|raw|` de rating que
+    aparezca, y un challenge rateado no esta descartado por el protocolo).
+    D70/el plan exigen NULL en challenge sin excepcion -- el dato no se
+    vuelve confiable solo porque el evento aparecio en un challenge."""
+    player = _player()
+    tag = "battle-challenge-con-rating-1"
+    battle = SimpleNamespace(
+        battle_tag=tag, player_role="p1",
+        player_username="Bot", opponent_username="Rival",
+        finished=True, won=True, gen=6, opponent_rating=1503,
+    )
+    player.battles[tag] = battle
+    player.steps[tag] = []
+    _record_valid_opening(player, tag)
+
+    repo = _FakeRepo()
+    await _persist_one(player, repo, tag, "gen6randombattle", "challenge")
+
+    _, traj_kwargs = repo.saved_trajectories[0]
+    assert traj_kwargs["elo_bucket"] is None, (
+        "challenge tiene que forzar NULL aunque opponent_rating este "
+        "poblado -- el source, no la mera presencia del dato, es el gate"
+    )
+
+
 # --- I3: un paso perdido tiene que dejar rastro, no perderse en silencio ---
 
 

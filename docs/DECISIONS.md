@@ -5538,8 +5538,11 @@ implementación de los ganchos estrechos de `battles.replay_url` y
   Nunca el rating propio del agente. Se persiste como `str` decimal
   canónico (`str(opponent_rating)`), nunca un rango, un label ni un
   redondeo — "bucket" es el nombre heredado de la columna, no una categoría
-  a inventar. Ausente (`None`, típico de `challenge` sin `|raw|` de rating
-  de ladder) implica `NULL`, sin rama especial.
+  a inventar. Ausente (`None`) implica `NULL`. **`source == "challenge"`
+  fuerza `NULL` explícitamente** (corrección R3, ver abajo): poke-env puebla
+  `opponent_rating` desde CUALQUIER `|raw|` de rating que aparezca en la
+  sala, y un challenge rateado no está excluido del protocolo, así que la
+  ausencia del dato NO alcanzaba como gate por sí sola.
 
 **Motivo.** poke-env no expone ningún hook activo de replay en el paquete
 vendorizado (`Battle.save_replay()` solo escribe HTML local, no produce URL
@@ -5560,13 +5563,18 @@ rival por `player_side` en el reporte de autoría.
 
 **Verificación de las dos reglas centrales (mutación, restaurada por
 `sha256`).** (1) Selección de rol: en `render.ts`, invertir
-`opponentUsername` (`p1`→`battle.p1` en vez de `battle.p2`) tira en rojo 4
-tests nombrados de `test/authorship.test.ts`
-(`opponentUsername`/`renderAuthorshipReport`); restaurado, `sha256sum`
-idéntico
+`opponentUsername` (`p1`→`battle.p1` en vez de `battle.p2`) tira en rojo
+**3** tests nombrados de `test/authorship.test.ts` (los tres de
+`describe("opponentUsername")` que ejercen `p1`/`p2`, MÁS
+`renderAuthorshipReport > una trayectoria de p2 muestra a p1 como rival`;
+el cuarto test de `describe("opponentUsername")`, el de `p3` que verifica
+el fail-closed ante un `playerSide` desconocido, sigue en verde con esta
+mutación — invertir `p1`/`p2` no toca la rama `throw`, es un contrato
+distinto). Corrección de conteo (R3, hallazgo del reviewer independiente
+T-04: la versión anterior de esta entrada decía "4 tests", contados sin
+volver a correr la mutación). Restaurado, `sha256sum` idéntico
 (`d5c7f6e1f6aa497d6f199a20a1f2bbf84daeaa33a82fc20696930f1a8d86bb3e`) y los 9
-tests aplicables vuelven a verde (4 se saltan sin `DATABASE_URL`, esperado
-offline). (2) NULL-rating: en `protocol.py`, cambiar
+tests aplicables vuelven a verde. (2) NULL-rating: en `protocol.py`, cambiar
 `elo_bucket_from_rating(None)` para devolver `"unrated"` en vez de `None`
 tira en rojo `test_elo_bucket_from_rating_none_da_none`; restaurado,
 `sha256sum` idéntico
@@ -5586,13 +5594,102 @@ no relacionado con este cambio) → 796 passed, 174 skipped. TS:
 local de poke-env, fuera del alcance de esta tarea y de la restricción
 offline.
 
-**Límite conocido.** `apps/agent/tests/db/test_repository.py` (incluidos los
-tres tests nuevos de `replay_url`/`elo_bucket`) requiere `TEST_DATABASE_URL`
-(MON-11/R2) y quedó en `skipped` por la restricción offline de esta sesión;
-no se ejecutó contra Postgres real. Es la capa de integración de
-`.claude/verification/SKILL.md`; falta correrla antes de cerrar la
-rebanada con DB disponible.
+**Verificación real contra Postgres (R2/R3, corrige el límite "skipped" de
+la versión original de esta entrada — hallazgo T-04 del reviewer
+independiente).** `apps/agent/tests/db/test_repository.py` corrió
+íntegramente contra `ludex-postgres-1` vía `TEST_DATABASE_URL` + helpers
+descartables `ludex_test_*` (nunca `DATABASE_URL` ni la base `ludex`): R2
+cerró el bind faltante de `replay_url` en los tests de conflicto
+concurrente (C-01) → 41/41 GREEN; R3 agregó dos tests de "no reescribir un
+no-NULL ya establecido" (uno por columna) y un test de preservación NULL
+para `elo_bucket` → 44/44 GREEN. `pnpm --filter @ludex/dataset-audit test`
+con `DATABASE_URL` apuntando a un clon descartable restaurado del backup
+canónico (nunca la base `ludex`) dio 214/214 en R2; R3 agregó un test de
+`renderAuthorshipReport` contra una base descartable real que ejercita
+`p1` **y** `p2` sobre el dataset completo cargado → 14/14 en
+`authorship.test.ts`.
 
-**Modelo efectivo:** Sonnet 5 (Neoblex), continuación de MON-40 Task 9 tras
-agotamiento de contexto de la sesión anterior, sobre la base aceptada
-`7abda93a2b7b9db4d7cd85a8877674479efbbf20`.
+---
+
+## D70 (corrección R3) — MON-40 R3: TASOS REVIEW PACKET T-01/T-02/T-03/T-04
+y hallazgo adicional del tech lead sobre `|raw|` (2026-08-31)
+
+**Revisión independiente:** Tasos / Grok 4.6, read-only, rango
+`7abda93..d4ac3d5`, recomendación `FAIL` (`CHANGES_REQUESTED` en
+`AGENT_GOVERNANCE.md`). Cuatro hallazgos (T-01/T-02 IMPORTANT, T-03/T-04
+MINOR) más un quinto hallazgo del tech lead sobre `extract_replay_url`, ya
+aceptados y cerrados en esta corrección.
+
+**T-01 (IMPORTANT) — `challenge` no forzaba `elo_bucket` NULL si
+`opponent_rating` venía poblado.** `cli.py:_persist_one` ahora fuerza
+`elo_bucket = None` cuando `source == "challenge"`, ANTES de llamar
+`elo_bucket_from_rating`, sin importar si `battle.opponent_rating` trae un
+valor. RED: `test_persist_one_challenge_fuerza_elo_bucket_none_aunque_haya_
+opponent_rating` (`tests/test_cli.py`) — sin el gate, persistía `"1503"` en
+vez de `None`. GREEN tras el fix. Mutación de regresión: quitar el `if
+source == "challenge"` reproduce el mismo RED; restaurado, `sha256sum`
+idéntico.
+
+**T-02 (IMPORTANT) — `COALESCE(EXCLUDED.x, tabla.x)` protegía contra un
+incoming NULL pero reescribía un no-NULL establecido con otro no-NULL
+distinto; `elo_bucket` no tenía test que lo demostrara.** El orden se
+invirtió a `COALESCE(tabla.x, EXCLUDED.x)` para **ambas** columnas
+(`battles.replay_url`, `trajectories.elo_bucket`) en `db/repository.py`:
+el valor YA ESTABLECIDO gana siempre que exista; el nuevo valor solo
+completa un `NULL` previo. Cuatro tests nuevos en `test_repository.py`:
+`test_replay_url_ya_establecido_no_se_reescribe_con_otro_distinto`,
+`test_elo_bucket_ya_establecido_no_se_reescribe_con_otro_distinto` (RED con
+el orden viejo: `"1600"` pisaba `"1503"` / `...-2` pisaba `...-1`; GREEN
+con el orden nuevo), y
+`test_elo_bucket_de_una_repersistencia_posterior_no_pisa_el_ya_conocido_con_null`
+(paridad con el test ya existente de `replay_url`). Mutación de regresión:
+revertir cualquiera de los dos COALESCE reproduce el RED correspondiente
+sin afectar al otro; restaurado, `sha256sum` idéntico.
+
+**T-03 (MINOR) — el cableado real de `_persist_one` y el mapeo p1/p2 del
+reporte de autoría no se ejercían end-to-end.** Dos tests nuevos:
+`test_persist_one_persiste_replay_url_y_elo_bucket_de_ladder`
+(`tests/test_cli.py`, composición real vía el adapter público, no solo las
+funciones puras aisladas) y un test de `renderAuthorshipReport` contra una
+base descartable real con DOS trayectorias de la MISMA batalla (una
+`player_side='p1'`, otra `'p2'`) en `packages/dataset-audit/test/
+authorship.test.ts` — el primero que ejercita `opponentUsername` con filas
+que de verdad pasaron por `loadDataset`, no un `Dataset` fabricado en
+memoria.
+
+**T-04 (MINOR) — D70/el packet quedaron stale tras R2.** Esta misma entrada
+corrige: el límite "`test_repository.py` skipped, no corrido contra
+Postgres" (falso desde R2, ver arriba), el conteo de la mutación de rol
+(3 tests, no 4 — el test de `p3`/fail-closed no cae con esa mutación
+específica), y la frase "sin rama especial" para `elo_bucket`, que ahora
+refleja el gate explícito por `source` de T-01.
+
+**Hallazgo adicional del tech lead (fuera del packet de Tasos): `|raw|`
+como tipo de línea obligatorio.** `extract_replay_url` matcheaba el regex
+de host/slug sobre CUALQUIER línea del protocolo, no solo sobre las de tipo
+`|raw|` — un jugador podía escribir la misma URL en un mensaje de chat
+(`|c|...`) y el extractor la habría aceptado igual, sin que Showdown haya
+anunciado ningún replay real. Corrección en `protocol.py`: la línea tiene
+que empezar con `"|raw|"` ANTES de aplicarle el regex. RED:
+`test_extract_replay_url_ignora_una_url_identica_fuera_de_una_linea_raw`
+(`tests/showdown/test_protocol.py`) — sin el guard, una URL idéntica dentro
+de una línea `|c|` se aceptaba igual. GREEN tras el fix. Mutación de
+regresión: quitar el `if not line.startswith("|raw|"): continue` reproduce
+el mismo RED; restaurado, `sha256sum` idéntico.
+
+**Suites ejecutadas (R3, contra Postgres real vía `TEST_DATABASE_URL` +
+helpers descartables, nunca `DATABASE_URL` ni la base `ludex`).**
+`tests/db/test_repository.py`: 44 passed (41 de R2 + 3 nuevos de T-02).
+`tests/test_cli.py` focal (`-k persist_one`): incluye los 2 tests nuevos de
+T-01/T-03, verde. `tests/showdown/test_protocol.py` focal (`-k
+"extract_replay_url or elo_bucket"`): 9 passed (8 previos + 1 del guard
+`|raw|`). `packages/dataset-audit/test/authorship.test.ts`: 14 passed (13
+previos + 1 DB de T-03).
+
+**Modelo efectivo:** Sonnet 5 (Neoblex), corrección R3 de MON-40 sobre el
+`TASOS REVIEW PACKET` (Grok 4.6, read-only) y un hallazgo adicional del
+tech lead. Sin recomendación propia de estado: tech lead adjudica.
+
+**Modelo efectivo (entrada original D70):** Sonnet 5 (Neoblex),
+continuación de MON-40 Task 9 tras agotamiento de contexto de la sesión
+anterior, sobre la base aceptada `7abda93a2b7b9db4d7cd85a8877674479efbbf20`.

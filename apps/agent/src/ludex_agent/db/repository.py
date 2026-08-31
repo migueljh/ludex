@@ -42,13 +42,21 @@ _SAVE_BATTLE_SQL = text("""
             CAST(:src AS battle_source), :replay_url)
     ON CONFLICT (source, identity_key) DO UPDATE
       SET winner = COALESCE(EXCLUDED.winner, battles.winner),
-          -- MON-40/Fase 3 S9: gancho estrecho, no columna de identidad. La
-          -- primera persistencia puede correr ANTES de que Showdown emita
-          -- el link (el `|raw|` de replay llega recien al cierre real de la
-          -- sala); COALESCE deja que una re-persistencia posterior de la
-          -- MISMA batalla complete el dato sin pisar uno ya conocido con
-          -- NULL.
-          replay_url = COALESCE(EXCLUDED.replay_url, battles.replay_url)
+          -- MON-40/Fase 3 S9 + R3 (TASOS REVIEW PACKET T-02, IMPORTANT):
+          -- gancho estrecho, no columna de identidad. La primera
+          -- persistencia puede correr ANTES de que Showdown emita el link
+          -- (el `|raw|` de replay llega recien al cierre real de la sala);
+          -- COALESCE deja que una re-persistencia posterior de la MISMA
+          -- batalla complete el dato sin pisar uno ya conocido con NULL.
+          -- El orden es `COALESCE(tabla.x, EXCLUDED.x)` A PROPOSITO, no
+          -- `COALESCE(EXCLUDED.x, tabla.x)`: el valor YA ESTABLECIDO gana
+          -- siempre que exista, el nuevo solo completa un NULL previo.
+          -- `EXCLUDED` primero (el orden original) tambien protegia contra
+          -- un incoming NULL, pero dejaba que un segundo valor no-NULL
+          -- DISTINTO reescribiera el primero -- exactamente lo que el
+          -- brief de esta ronda prohibe ("first established non-NULL
+          -- provenance wins").
+          replay_url = COALESCE(battles.replay_url, EXCLUDED.replay_url)
       WHERE battles.p1 = EXCLUDED.p1
         AND battles.p2 = EXCLUDED.p2
         AND battles.format = EXCLUDED.format
@@ -153,10 +161,12 @@ class BattleRepository:
                       -- `format`; re-persistir con otra generacion dejaba
                       -- `gen_id` viejo con el `format` nuevo.
                       gen_id = EXCLUDED.gen_id,
-                      -- mismo criterio que replay_url: gancho opcional, no
-                      -- pisar un valor ya conocido con NULL de una
-                      -- re-persistencia que no lo trae.
-                      elo_bucket = COALESCE(EXCLUDED.elo_bucket, trajectories.elo_bucket)
+                      -- mismo criterio que replay_url (R3/T-02): el valor
+                      -- YA ESTABLECIDO gana, el nuevo solo completa un NULL
+                      -- previo. `tabla.x` primero en el COALESCE, no
+                      -- `EXCLUDED.x` -- ver el comentario extenso en
+                      -- `_SAVE_BATTLE_SQL`.
+                      elo_bucket = COALESCE(trajectories.elo_bucket, EXCLUDED.elo_bucket)
                 RETURNING id
             """), {"b": battle_id, "gen": gen_number, "fmt": fmt, "ps": player_side,
                    "elo": elo_bucket})

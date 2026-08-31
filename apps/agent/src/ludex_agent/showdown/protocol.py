@@ -348,7 +348,12 @@ _REPLAY_URL_RE = re.compile(
 def extract_replay_url(lines: Sequence[str]) -> str | None:
     """Primer link de replay saneado que aparece en `lines`, o `None`.
 
-    Saneado significa: el host tiene que ser EXACTAMENTE
+    Saneado significa DOS cosas, no una: (1) el TIPO de linea tiene que ser
+    `|raw|` -- la unica linea que Showdown usa para anunciar un replay ya
+    subido (D70, hallazgo del tech lead: cualquier otro tipo de linea que
+    por casualidad contenga el mismo texto NO es evidencia de que Showdown
+    publico un replay, es contenido de chat/narracion que un jugador puede
+    escribir literalmente); y (2) el host tiene que ser EXACTAMENTE
     `replay.pokemonshowdown.com` bajo `https`, nunca un prefijo/typosquat
     (`replay.pokemonshowdown.com.evil.example`) ni `http`. El regex ancla el
     host entre `://` y la primera `/` implicita del atributo `href="..."`, y
@@ -356,6 +361,8 @@ def extract_replay_url(lines: Sequence[str]) -> str | None:
     host esperado porque el primer `"` cierra el atributo.
     """
     for line in lines:
+        if not line.startswith("|raw|"):
+            continue
         match = _REPLAY_URL_RE.search(line)
         if match is not None:
             return match.group(1)

@@ -301,10 +301,7 @@ async def _persist_one(
     # MON-40/Fase 3 S9: ganchos estrechos y pasivos, nunca inventados.
     # `replay_url` sale de lo que Showdown ya emitio en el protocolo crudo
     # (D17: omitir, no construir desde `battle_tag`). `elo_bucket` es el
-    # rating PUBLICO del RIVAL (`opponent_rating`, nunca el propio): solo
-    # `|raw|` de ladder lo puebla, asi que en `challenge` queda NULL sin
-    # ninguna rama especial -- la ausencia del dato en el protocolo ES la
-    # senal, no un caso a codificar aparte.
+    # rating PUBLICO del RIVAL (`opponent_rating`), nunca el propio.
     replay_url = agent.replay_url(tag)
     # `getattr` con default: `battle` en tests unitarios es un doble sin
     # `opponent_rating` (poke_env.Battle real siempre lo tiene, default
@@ -313,7 +310,17 @@ async def _persist_one(
     # sin definirlo representa el mismo estado que un `battle.opponent_
     # rating` real sin narracion `|raw|` de rating -- no encubre nada.
     opponent_rating = getattr(battle, "opponent_rating", None)
-    elo_bucket = elo_bucket_from_rating(opponent_rating)
+    # MON-40 R3 (TASOS REVIEW PACKET T-01, IMPORTANT): `challenge` fuerza
+    # `elo_bucket=None` SIEMPRE, sin importar si `opponent_rating` vino
+    # poblado. poke-env llena ese atributo desde CUALQUIER `|raw|` de rating
+    # que aparezca en la sala -- un challenge rateado no esta excluido del
+    # protocolo -- asi que la ausencia previa de rama especial no era un
+    # gate, era una esperanza sobre Showdown que el brief de esta ronda
+    # rechaza explicitamente ("challenge rating stays NULL"). El gate es el
+    # `source`, no la mera presencia del dato.
+    elo_bucket = (
+        None if source == "challenge" else elo_bucket_from_rating(opponent_rating)
+    )
 
     battle_id = await repo.save_battle(
         battle_tag=tag, identity_key=identity_key, fmt=fmt, p1=p1, p2=p2,

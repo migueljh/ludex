@@ -4168,6 +4168,21 @@ def test_extract_replay_url_toma_el_primero_cuando_hay_varias_lineas_raw():
     )
 
 
+def test_extract_replay_url_ignora_una_url_identica_fuera_de_una_linea_raw():
+    """Hallazgo del tech lead (MON-40 R3, D70): el UNICO tipo de linea que
+    Showdown usa para anunciar un replay ya subido es `|raw|`. Un jugador
+    puede escribir el mismo texto (URL valida, host exacto, https) en un
+    mensaje de chat (`|c|`) o en cualquier otro tipo de linea sin que eso
+    signifique que el replay existe -- coincidir el regex no alcanza, el
+    TIPO de linea tambien tiene que ser el correcto."""
+    lines = [
+        '|c|☆LudexBot3682|mira este link '
+        '<a href="https://replay.pokemonshowdown.com/gen6randombattle-386">'
+        "View replay</a>",
+    ]
+    assert extract_replay_url(lines) is None
+
+
 # --- MON-40/Fase 3 S9: elo_bucket, sin bucketing por rangos ---------------
 
 def test_elo_bucket_from_rating_none_da_none():

@@ -188,6 +188,96 @@ async def test_replay_url_de_una_repersistencia_posterior_no_pisa_el_ya_conocido
         assert replay_url == "https://replay.pokemonshowdown.com/gen6randombattle-1"
 
 
+async def test_elo_bucket_de_una_repersistencia_posterior_no_pisa_el_ya_conocido_con_null(repo):
+    """Mismo criterio que `replay_url`: una re-persistencia sin dato de
+    rating (p.ej. una reconexion que no vio el `|raw|` de nuevo) no puede
+    borrar un `elo_bucket` ya conocido de la MISMA trayectoria."""
+    tag = "battle-test-elo-tardio"
+    key = _identity(tag)
+    bid = await repo.save_battle(
+        battle_tag=tag, identity_key=key, fmt="gen6randombattle",
+        p1="A", p2="B", winner=None, source=SOURCE, played_by="bot",
+    )
+    tid = await repo.save_trajectory(
+        bid, gen_number=6, fmt="gen6randombattle", player_side="p1",
+        elo_bucket="1503",
+    )
+    otra_vez = await repo.save_trajectory(
+        bid, gen_number=6, fmt="gen6randombattle", player_side="p1",
+        elo_bucket=None,
+    )
+    assert otra_vez == tid
+
+    async with repo.factory() as s:
+        elo_bucket = (await s.execute(text(
+            "SELECT elo_bucket FROM trajectories WHERE id=:t"
+        ), {"t": tid})).scalar_one()
+        assert elo_bucket == "1503"
+
+
+# --- MON-40 R3 (TASOS REVIEW PACKET T-02, IMPORTANT) ----------------------
+#
+# `COALESCE(EXCLUDED.x, tabla.x)` (orden original) protege contra que un
+# INCOMING NULL borre un valor ya conocido, pero NO protege contra que un
+# segundo valor no-NULL DISTINTO reescriba el primero: para ese caso el
+# `EXCLUDED` (nuevo) sigue ganando. El brief de esta ronda exige lo
+# contrario -- "first established non-NULL provenance wins" -- asi que el
+# orden correcto es `COALESCE(tabla.x, EXCLUDED.x)`: el valor ya establecido
+# gana, el nuevo solo completa un NULL previo.
+
+async def test_replay_url_ya_establecido_no_se_reescribe_con_otro_distinto(repo):
+    tag = "battle-test-replay-doble-distinto"
+    key = _identity(tag)
+    bid = await repo.save_battle(
+        battle_tag=tag, identity_key=key, fmt="gen6randombattle",
+        p1="A", p2="B", winner=None, source=SOURCE, played_by="bot",
+        replay_url="https://replay.pokemonshowdown.com/gen6randombattle-1",
+    )
+    otra_vez = await repo.save_battle(
+        battle_tag=tag, identity_key=key, fmt="gen6randombattle",
+        p1="A", p2="B", winner=None, source=SOURCE, played_by="bot",
+        replay_url="https://replay.pokemonshowdown.com/gen6randombattle-2",
+    )
+    assert otra_vez == bid
+
+    async with repo.factory() as s:
+        replay_url = (await s.execute(text(
+            "SELECT replay_url FROM battles WHERE id=:b"
+        ), {"b": bid})).scalar_one()
+        assert replay_url == "https://replay.pokemonshowdown.com/gen6randombattle-1", (
+            "la primera URL establecida tiene que ganar; un segundo valor "
+            "no-NULL distinto no puede reescribir la provenance ya conocida"
+        )
+
+
+async def test_elo_bucket_ya_establecido_no_se_reescribe_con_otro_distinto(repo):
+    tag = "battle-test-elo-doble-distinto"
+    key = _identity(tag)
+    bid = await repo.save_battle(
+        battle_tag=tag, identity_key=key, fmt="gen6randombattle",
+        p1="A", p2="B", winner=None, source=SOURCE, played_by="bot",
+    )
+    tid = await repo.save_trajectory(
+        bid, gen_number=6, fmt="gen6randombattle", player_side="p1",
+        elo_bucket="1503",
+    )
+    otra_vez = await repo.save_trajectory(
+        bid, gen_number=6, fmt="gen6randombattle", player_side="p1",
+        elo_bucket="1600",
+    )
+    assert otra_vez == tid
+
+    async with repo.factory() as s:
+        elo_bucket = (await s.execute(text(
+            "SELECT elo_bucket FROM trajectories WHERE id=:t"
+        ), {"t": tid})).scalar_one()
+        assert elo_bucket == "1503", (
+            "el primer elo_bucket establecido tiene que ganar; un segundo "
+            "valor no-NULL distinto no puede reescribir la provenance ya "
+            "conocida"
+        )
+
+
 async def test_action_path_nullable_y_restringido(repo):
     tag = "battle-test-action-path"
     bid = await repo.save_battle(

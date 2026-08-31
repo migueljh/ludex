@@ -299,3 +299,70 @@ describe.skipIf(requiresTestDatabase)("filas humanas: elegibilidad de training y
     }
   });
 });
+
+// --- MON-40 R3 (TASOS REVIEW PACKET T-03, MINOR): identidad del rival -----
+// contra una base descartable real, ejercitando p1 Y p2, sobre el dataset
+// COMPLETO cargado por `loadDataset` (no un fixture en memoria: el mapeo
+// `opponentUsername` dentro de `renderAuthorshipReport` nunca se ejercia
+// contra un `Dataset` que de verdad vino de Postgres).
+
+describe.skipIf(requiresTestDatabase)(
+  "identidad del rival contra una base descartable real (p1 y p2)",
+  () => {
+    it("el reporte de autoría resuelve el rival de una trayectoria p1 Y de una p2, sobre el dataset completo cargado", async () => {
+      const db = await createDisposableDatabase(process.env.TEST_DATABASE_URL!);
+      try {
+        await db.pool.query(
+          "INSERT INTO generations (id, gen_number, label) VALUES (1, 6, 'XY/ORAS')",
+        );
+        // Una batalla, DOS trayectorias -- una por lado, cada una con su
+        // propio player_side. `p1`/`p2` de `battles` no dicen por si solos
+        // quien es el rival de CADA trayectoria: `opponentUsername` tiene
+        // que resolverlo por rol, y este test lo ejercita con datos que
+        // realmente pasaron por `loadDataset`, no un `Dataset` armado a
+        // mano en memoria.
+        await db.pool.query(
+          `INSERT INTO battles (id, battle_tag, format, p1, p2, winner, played_by, source, identity_key)
+           VALUES (1, 'battle-authorship-rival-p1p2', 'gen6randombattle',
+                   'LudexBotReal', 'RivalReal', 'LudexBotReal', 'bot', 'local',
+                   'fixture-identity-rival-p1p2')`,
+        );
+        await db.pool.query(
+          `INSERT INTO trajectories (id, battle_id, gen_id, format, player_side, final_result)
+           VALUES (10, 1, 1, 'gen6randombattle', 'p1', 'win')`,
+        );
+        await db.pool.query(
+          `INSERT INTO trajectories (id, battle_id, gen_id, format, player_side, final_result)
+           VALUES (20, 1, 1, 'gen6randombattle', 'p2', 'loss')`,
+        );
+        await db.pool.query(
+          `INSERT INTO trajectory_steps
+             (trajectory_id, turn_number, decision_index, state, state_schema_version,
+              legal_actions, action_taken, action_source)
+           VALUES (10, 0, 0, '{}'::jsonb, 2, '[]'::jsonb, '{"kind":"move","id":"x"}'::jsonb, 'agent')`,
+        );
+        await db.pool.query(
+          `INSERT INTO trajectory_steps
+             (trajectory_id, turn_number, decision_index, state, state_schema_version,
+              legal_actions, action_taken, action_source)
+           VALUES (20, 0, 0, '{}'::jsonb, 2, '[]'::jsonb, '{"kind":"move","id":"y"}'::jsonb, 'opponent')`,
+        );
+
+        const dataset = await loadDataset(db.pool, { scope: "all" });
+        expect(dataset.trajectories.map((t) => t.id).sort()).toEqual([10, 20]);
+
+        const output = renderAuthorshipReport(dataset);
+        expect(output).toContain("Rival de la trayectoria 10 (p1): RivalReal");
+        expect(output).toContain("Rival de la trayectoria 20 (p2): LudexBotReal");
+
+        // opponentUsername directo sobre las filas REALES devueltas por
+        // loadDataset, no un BattleRecord fabricado a mano.
+        const battle = dataset.battles.find((b) => b.id === 1)!;
+        expect(opponentUsername(battle, "p1")).toBe("RivalReal");
+        expect(opponentUsername(battle, "p2")).toBe("LudexBotReal");
+      } finally {
+        await db.drop();
+      }
+    });
+  },
+);
