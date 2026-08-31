@@ -5556,10 +5556,13 @@ tapa exactamente la señal que la ausencia representa (rating privado o
 `extract_replay_url`/`elo_bucket_from_rating`
 (`apps/agent/src/ludex_agent/showdown/protocol.py`), gancho pasivo
 `LudexPlayer.replay_url` (`showdown/client.py`), persistencia con
-`COALESCE(EXCLUDED.x, tabla.x)` para que una re-persistencia sin el dato no
-pise uno ya conocido con `NULL` (`db/repository.py`), y `opponentUsername`
-en `packages/dataset-audit/src/render.ts` para resolver la identidad del
-rival por `player_side` en el reporte de autoría.
+`COALESCE(tabla.x, EXCLUDED.x)` para que el valor YA ESTABLECIDO gane
+siempre que exista y una re-persistencia posterior solo complete un `NULL`
+previo, nunca reescriba un no-NULL ya conocido con otro distinto
+(`db/repository.py`; orden corregido en R3, ver `## D70 (corrección R3)`
+abajo), y `opponentUsername` en `packages/dataset-audit/src/render.ts` para
+resolver la identidad del rival por `player_side` en el reporte de
+autoría.
 
 **Verificación de las dos reglas centrales (mutación, restaurada por
 `sha256`).** (1) Selección de rol: en `render.ts`, invertir

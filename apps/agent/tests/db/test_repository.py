@@ -278,6 +278,71 @@ async def test_elo_bucket_ya_establecido_no_se_reescribe_con_otro_distinto(repo)
         )
 
 
+# --- MON-40 R4 (TASOS REVIEW PACKET R3, T-06, MINOR) -----------------------
+#
+# Los tests anteriores cubren "NULL no borra un valor" y "un segundo no-NULL
+# distinto no reescribe", pero ninguno cubre la otra mitad del contrato que
+# el propio comentario de `repository.py` reclama: una PRIMERA persistencia
+# NULL seguida de una SEGUNDA con valor tiene que COMPLETAR el dato (el
+# `|raw|` de replay llega recien al cerrar la sala real). Un
+# `col = tabla.col` (nunca aceptar `EXCLUDED`) pasaria los tests de
+# inmutabilidad de arriba sin completar nada -- este es el canario que lo
+# cazaria.
+
+async def test_replay_url_null_luego_valor_completa_el_dato(repo):
+    tag = "battle-test-replay-fill"
+    key = _identity(tag)
+    bid = await repo.save_battle(
+        battle_tag=tag, identity_key=key, fmt="gen6randombattle",
+        p1="A", p2="B", winner=None, source=SOURCE, played_by="bot",
+        replay_url=None,
+    )
+    otra_vez = await repo.save_battle(
+        battle_tag=tag, identity_key=key, fmt="gen6randombattle",
+        p1="A", p2="B", winner=None, source=SOURCE, played_by="bot",
+        replay_url="https://replay.pokemonshowdown.com/gen6randombattle-fill",
+    )
+    assert otra_vez == bid
+
+    async with repo.factory() as s:
+        replay_url = (await s.execute(text(
+            "SELECT replay_url FROM battles WHERE id=:b"
+        ), {"b": bid})).scalar_one()
+        assert replay_url == "https://replay.pokemonshowdown.com/gen6randombattle-fill", (
+            "una segunda persistencia CON valor tiene que completar un "
+            "replay_url que la primera dejo NULL -- COALESCE(tabla.x, "
+            "EXCLUDED.x) resuelve a EXCLUDED.x cuando tabla.x es NULL"
+        )
+
+
+async def test_elo_bucket_null_luego_valor_completa_el_dato(repo):
+    tag = "battle-test-elo-fill"
+    key = _identity(tag)
+    bid = await repo.save_battle(
+        battle_tag=tag, identity_key=key, fmt="gen6randombattle",
+        p1="A", p2="B", winner=None, source=SOURCE, played_by="bot",
+    )
+    tid = await repo.save_trajectory(
+        bid, gen_number=6, fmt="gen6randombattle", player_side="p1",
+        elo_bucket=None,
+    )
+    otra_vez = await repo.save_trajectory(
+        bid, gen_number=6, fmt="gen6randombattle", player_side="p1",
+        elo_bucket="1503",
+    )
+    assert otra_vez == tid
+
+    async with repo.factory() as s:
+        elo_bucket = (await s.execute(text(
+            "SELECT elo_bucket FROM trajectories WHERE id=:t"
+        ), {"t": tid})).scalar_one()
+        assert elo_bucket == "1503", (
+            "una segunda persistencia CON valor tiene que completar un "
+            "elo_bucket que la primera dejo NULL -- COALESCE(tabla.x, "
+            "EXCLUDED.x) resuelve a EXCLUDED.x cuando tabla.x es NULL"
+        )
+
+
 async def test_action_path_nullable_y_restringido(repo):
     tag = "battle-test-action-path"
     bid = await repo.save_battle(

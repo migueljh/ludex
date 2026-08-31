@@ -21,6 +21,13 @@ completa y lo cierra.
 un hallazgo adicional del tech lead sobre `|raw|`. T-01/T-02 IMPORTANT
 (BLOCKING, aceptados), T-03/T-04 MINOR — los cuatro cerrados en esta ronda.
 Ver sección "Corrección R3" abajo.
+**R4:** corrección sobre la re-revisión de Tasos
+(`/tmp/ludex-coordination/tasos-mon40-review-r3.md`, recomendación
+`PASS_WITH_MINOR`). T-05/T-06 MINOR, ambos cerrados; alcance
+test/documentación únicamente, sin tocar producción. El tech lead omite una
+cuarta ronda de Tasos para esta corrección (ver justificación en la
+sección "Corrección R4" abajo). Ver esa sección para RED/GREEN/mutación de
+T-06 y el detalle de T-05.
 **Estado:** implementado, worktree limpio tras commit + push → `In Review`.
 **No marcar `Completed`** — el veredicto es exclusivo del tech lead.
 
@@ -337,6 +344,140 @@ preexistentes.
 
 ---
 
+## Corrección R4 (pre-review) — TASOS REVIEW PACKET R3, T-05/T-06 (MINOR,
+test/documentación únicamente)
+
+**Contexto R4.** Re-revisión independiente de Tasos (Grok 4.6, read-only)
+sobre el rango `d4ac3d5..2ef7573`: `/tmp/ludex-coordination/tasos-mon40-review-r3.md`,
+recomendación `PASS_WITH_MINOR`. T-01/T-02 (inmutabilidad)/T-03/T-04 y el
+hallazgo `|raw|` quedaron `CLOSED`, sin nada `CRITICAL` ni `IMPORTANT`
+nuevo. Dos `MINOR` abiertos, ninguno bloqueante: T-05 (docs stale) y T-06
+(cobertura de test incompleta). Esta corrección cierra ambos sin tocar
+ningún archivo de producción — alcance: `apps/agent/tests/db/test_repository.py`,
+`docs/DECISIONS.md`, este packet.
+
+### T-05 (MINOR) — párrafos "presente" de D70/packet aún nombraban
+`COALESCE(EXCLUDED.x, tabla.x)`
+
+**Hallazgo.** T-04 (R3) reescribió el CUERPO de D70 (el ruling y las
+secciones de verificación) para reflejar el gate de challenge, el conteo
+de mutación correcto y los GREEN reales, pero el párrafo **"Implementación
+(Task 9 / F3-09)"** — adyacente pero no tocado — seguía afirmando el orden
+`EXCLUDED`-primero. El packet copiaba la misma frase en "Solución
+aplicada". Código y la entrada `## D70 (corrección R3)` ya decían lo
+correcto; solo estos dos párrafos "presente" quedaron desalineados.
+
+**Corrección.** `docs/DECISIONS.md`, párrafo "Implementación (Task 9 /
+F3-09)": `COALESCE(EXCLUDED.x, tabla.x)` → `COALESCE(tabla.x, EXCLUDED.x)`,
+con la explicación de que el valor ya establecido gana y remite a
+`## D70 (corrección R3)`. Este packet, "Solución aplicada" (párrafo de
+`db/repository.py`): mismo cambio, mismo criterio.
+
+**No aplica RED/GREEN de test** — es un cambio puramente documental, sin
+comportamiento que ejercer.
+
+### T-06 (MINOR) — fill NULL→valor sin test de regresión
+
+**Hallazgo.** Los tests de T-02 (R3) cubren "NULL no borra un valor
+conocido" y "un segundo no-NULL distinto no reescribe", pero ninguno cubre
+la otra mitad del contrato que el propio comentario de `repository.py`
+reclama: una PRIMERA persistencia `NULL` seguida de una SEGUNDA con valor
+tiene que COMPLETAR el dato (el `|raw|` de replay real llega recién al
+cerrar la sala). Un `col = tabla.col` (nunca aceptar `EXCLUDED`) habría
+pasado los tests de inmutabilidad existentes sin completar nada — el
+reviewer lo confirmó de forma independiente con un probe descartable, pero
+ningún test del repo lo pineaba.
+
+**Tests nuevos (`apps/agent/tests/db/test_repository.py`):**
+`test_replay_url_null_luego_valor_completa_el_dato` y
+`test_elo_bucket_null_luego_valor_completa_el_dato` — cada uno persiste
+`NULL` primero, después un valor real, y assert que el valor completó el
+dato.
+
+**GREEN (contra el código real del worktree, sin mutar nada, Postgres
+real):**
+```
+$ TEST_DATABASE_URL=postgresql://ludex:ludex@127.0.0.1:15432/postgres \
+  pytest -q tests/db/test_repository.py -k null_luego_valor
+2 passed, 44 deselected in 0.62s
+```
+
+**RED por mutación — scratch vía `git archive`, worktree NUNCA tocado**
+(coherente con la restricción "no production code" de esta ronda: la
+mutación corre sobre una copia en `/private/tmp/.../scratchpad/mon40-r4-mut`,
+nunca sobre el árbol real). SHA-256 pre-mutación de
+`db/repository.py` (idéntico al del worktree, verificado antes de mutar):
+`672475af77c106981fd7e2d70cfd1e6c682f41d3813e9e53433fd91de4a51aaf`.
+
+(a) Mutar SOLO `replay_url = COALESCE(battles.replay_url,
+EXCLUDED.replay_url)` → `replay_url = battles.replay_url` (nunca acepta
+`EXCLUDED`):
+```
+FAILED test_replay_url_null_luego_valor_completa_el_dato
+assert None == 'https://replay.pokemonshowdown.com/gen6randombattle-fill'
+1 failed, 1 passed, 44 deselected
+```
+El de `elo_bucket` no se entera (mutaciones independientes). Restaurado con
+`sed` puntual sobre la misma línea; SHA-256 post-restauración idéntico.
+
+(b) Mutar SOLO `elo_bucket = COALESCE(trajectories.elo_bucket,
+EXCLUDED.elo_bucket)` → `elo_bucket = trajectories.elo_bucket`:
+```
+FAILED test_elo_bucket_null_luego_valor_completa_el_dato
+assert None == '1503'
+1 failed, 1 passed, 44 deselected
+```
+El de `replay_url` no se entera. Restaurado; SHA-256 post-restauración
+idéntico.
+
+Verificado además que `apps/agent/src/ludex_agent/db/repository.py` del
+WORKTREE (no el scratch) tiene `git diff --stat` vacío durante todo el
+proceso — ningún archivo de producción se tocó en ningún momento de R4,
+ni siquiera temporalmente.
+
+### Suite completa tras R4 (Postgres real, `TEST_DATABASE_URL` +
+helpers `ludex_test_*`, nunca `DATABASE_URL` ni la base `ludex`)
+
+```
+$ TEST_DATABASE_URL=postgresql://ludex:ludex@127.0.0.1:15432/postgres \
+  pytest -q tests/db/test_repository.py
+46 passed in 11.70s
+```
+(44 de R3 + 2 nuevos de T-06 — el conteo exacto de 46 esperado por el
+brief de esta ronda, confirmando que no se coló ningún test extra ni se
+perdió ninguno.)
+
+**`git diff --check` (rango R4, los 3 archivos autorizados):** limpio
+(exit 0). **Scan de secretos y `gen6`** sobre el diff de R4: sin
+coincidencias fuera de fixtures preexistentes (`gen6randombattle` en
+`battle_tag`/`format`, ya presente en todo el archivo). **Huérfanos
+`ludex_test%` al cierre:** ninguno. **Base `ludex`:** no escrita en ningún
+momento — solo se usó `TEST_DATABASE_URL` con los helpers descartables del
+fixture `repo` (que crea/dropea su propia `ludex_test_<uuid>` por test) y
+el probe de mutación corrió contra esa misma base descartable, nunca contra
+un clon ni contra `ludex`.
+
+### Por qué esta corrección no pasa por otra ronda de Tasos
+
+El tech lead decide omitir una cuarta revisión independiente porque: (1)
+el alcance de R4 es exclusivamente tests y documentación — ningún archivo
+de producción cambió, ni siquiera temporalmente (verificado arriba por
+`git diff --stat` vacío durante todo el proceso); (2) el propio reviewer de
+R3 ya probó el comportamiento de "fill" en producción de forma
+independiente con un probe descartable (`/tmp/tasos-mon40-r3-fill-probe.py`,
+`current_database=ludex_test_5d11bb425328466d`: `fill_replay=...-fill`,
+`fill_elo=1503`, `FILL_PROBE_OK`) — el código que T-06 pide cubrir con test
+ya fue verificado por una fuente independiente, distinta de este agente,
+antes de que existiera el test; (3) T-05/T-06 son ambos `MINOR` y
+`PASS_WITH_MINOR` en R3 explícitamente no exigía otra ronda ("no bloquea",
+"Latwan decide si T-05 se limpia ahora o queda como nit documental"); y
+(4) las dos correcciones aquí son mecánicas y verificables por inspección
+directa del diff (dos frases de documentación, dos tests con su propia
+mutación RED/GREEN documentada arriba) sin la ambigüedad que amerita una
+segunda lectura read-only.
+
+---
+
 ## Causa raíz / alcance
 
 No hay bug que corregir: es una feature nueva (ganchos S9). El "problema" que
@@ -367,9 +508,11 @@ extracción + persistencia + reporte.
 - **`apps/agent/src/ludex_agent/db/repository.py`**: `save_battle`/
   `save_trajectory` aceptan los dos campos opcionales (default `None`, no
   rompen callers existentes) y el `ON CONFLICT` usa
-  `COALESCE(EXCLUDED.x, tabla.x)` — una re-persistencia sin el dato (p.ej.
-  antes de que Showdown emita el `|raw|` de replay al cerrar la sala) no pisa
-  un valor ya conocido con `NULL`.
+  `COALESCE(tabla.x, EXCLUDED.x)` (orden corregido en R3, T-02) — el valor
+  YA ESTABLECIDO gana siempre que exista, así que una re-persistencia
+  posterior nunca reescribe un no-NULL ya conocido con otro distinto, y solo
+  completa un `NULL` previo (p.ej. antes de que Showdown emita el `|raw|` de
+  replay al cerrar la sala).
 - **`packages/dataset-audit/src/render.ts`**: `opponentUsername(battle, playerSide)`
   resuelve el rival por rol (`p1`→`battle.p2`, `p2`→`battle.p1`), falla
   cerrado (`throw`) ante cualquier otro valor de `playerSide`, y
@@ -418,6 +561,14 @@ uno):**
 Todos verificados en R2/R3 contra Postgres real (`TEST_DATABASE_URL` +
 helpers `ludex_test_*`, nunca `DATABASE_URL` ni la base `ludex`) — GREEN:
 `test_repository.py` 44/44, `authorship.test.ts` 14/14.
+
+**R4 (ver sección "Corrección R4" arriba para RED/GREEN/mutación):**
+- `apps/agent/tests/db/test_repository.py`: 2 tests nuevos —
+  `test_replay_url_null_luego_valor_completa_el_dato`,
+  `test_elo_bucket_null_luego_valor_completa_el_dato` (T-06).
+
+Verificado contra Postgres real: `test_repository.py` 46/46 (44 de R3 + 2
+de T-06).
 
 ## Comando de verificación y resultado completo
 
@@ -584,6 +735,8 @@ Ver `git log` del branch `migueljh/phase3-s9-provenance-ws`:
   `apps/agent/tests/showdown/test_protocol.py` (hallazgo `|raw|`),
   `packages/dataset-audit/test/authorship.test.ts` (T-03),
   `docs/DECISIONS.md` (T-04) y este packet.
+- Commit R4: `apps/agent/tests/db/test_repository.py` (T-06),
+  `docs/DECISIONS.md` (T-05) y este packet. Sin cambios de producción.
 
 **Modelo efectivo:** Sonnet 5 (Neoblex), Task 9 + correcciones pre-review
-R2/R3 de MON-40. Sin recomendación propia de estado: tech lead adjudica.
+R2/R3/R4 de MON-40. Sin recomendación propia de estado: tech lead adjudica.
