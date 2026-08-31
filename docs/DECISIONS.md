@@ -5587,7 +5587,7 @@ tests de `replay_url`/`elo_bucket` en `test_protocol.py` vuelven a verde.
 **Suites completas ejecutadas (offline, sin DB/Docker).** Python:
 `pytest --ignore=tests/integration/test_langgraph_battle.py --ignore=tests/api`
 (la exclusión de `tests/api` es preexistente al venv compartido de
-`/Users/miguelhernandez/Documents/ludex`, que no tiene `fastapi` instalado —
+`<REPO_ROOT>`, cuyo entorno compartido no tenía `fastapi` instalado —
 no relacionado con este cambio) → 796 passed, 174 skipped. TS:
 `vitest run test/authorship.test.ts` → 9 passed, 4 skipped (los 4
 `skipped` necesitan `DATABASE_URL`/Postgres). `pnpm --filter
@@ -5696,3 +5696,37 @@ tech lead. Sin recomendación propia de estado: tech lead adjudica.
 **Modelo efectivo (entrada original D70):** Sonnet 5 (Neoblex),
 continuación de MON-40 Task 9 tras agotamiento de contexto de la sesión
 anterior, sobre la base aceptada `7abda93a2b7b9db4d7cd85a8877674479efbbf20`.
+
+## D71 — MON-39: el gate offline final audita el corpus completo y cierra el canario diferido de MON-32 (2026-08-31)
+
+**Scope doble y no vacuo.** La aceptación offline de Fase 3 corre el auditor
+sobre un clon no vacío del corpus canónico en dos scopes. `training` es el
+gate de elegibilidad y debe terminar en cero violaciones con filas reales;
+`all` conserva y reporta las violaciones históricas conocidas en vez de
+ocultarlas mediante un filtro. En esta corrida `training` ejercitó 16 batallas,
+2 trayectorias y 82 pasos, todos `v2`, con cero violaciones. `all` ejercitó 731
+batallas, 729 trayectorias y 44.949 pasos y reprodujo 47.528 violaciones
+históricas (47.481 de información oculta y 47 de `decision_index`), con cero
+violaciones de máscara, turno de acción, estado rederivable, reward, schema u
+orfandad. Este resultado no repinea ni sanea retroactivamente el corpus.
+
+**Canario semántico de D42/D65.** El menor T-02 de la revisión de MON-32 se
+cerró en el gate final: buscar substrings en `gate.py` no distinguía llamadas
+de texto documental y podía quedar ciego ante alias o `getattr`. El test ahora
+parsea el AST, resuelve llamadas calificadas, aliases de import y `getattr`
+literal para `asyncio.wait_for`, `asyncio.timeout` y `asyncio.wrap_future`, y
+acota `.cancel()` al Future de aprobación o a un alias local directo. Un
+canario de no-vacuidad exige referencias reales a `_future`. Tres mutaciones
+independientes — alias de `wait_for`, `getattr(asyncio, "wait_for")` y
+`self._future.cancel()` — produjeron RED nombrado; `gate.py` se restauró al
+SHA-256 original después de cada una y `tests/hitl` terminó 38/38.
+
+**Frontera de datos.** El DDL aceptado de Fase 3 se aplicó a la base canónica
+solo después de un backup nuevo y se verificó que no cambió los conteos
+731/729/44.949. Toda prueba que escribió datos usó bases descartables; las
+consultas D38/D44 y el auditor usaron el clon restaurado. No se ejecutó juego
+oficial, challenge ni ladder durante MON-39.
+
+**Evidencia vinculante:** `docs/evidence/phase3/mon-39-offline-acceptance.md`.
+**Modelo efectivo de la corrección T-02:** Sonnet 5 (Neoblex). La revisión
+final del rango completo corresponde a Tasos / Grok 4.6, read-only.

@@ -123,7 +123,7 @@ restaurar un **clon descartable, no la base canónica**, para que
    ```
    $ DATABASE_URL=postgresql://ludex:ludex@127.0.0.1:15432/ludex_test_mon40_audit_20260831 \
      TEST_DATABASE_URL=postgresql://ludex:ludex@127.0.0.1:15432/postgres \
-     LUDEX_SHOWDOWN_DEX_DIR=/Users/miguelhernandez/Documents/ludex/apps/agent/.venv/lib/python3.12/site-packages/poke_env/data/static/pokedex \
+     LUDEX_SHOWDOWN_DEX_DIR=<POKE_ENV_DEX_DIR> \
      pnpm --filter @ludex/dataset-audit test
    Test Files  13 passed (13)
         Tests  214 passed (214)
@@ -404,7 +404,7 @@ $ TEST_DATABASE_URL=postgresql://ludex:ludex@127.0.0.1:15432/postgres \
 
 **RED por mutación — scratch vía `git archive`, worktree NUNCA tocado**
 (coherente con la restricción "no production code" de esta ronda: la
-mutación corre sobre una copia en `/private/tmp/.../scratchpad/mon40-r4-mut`,
+mutación corre sobre una copia en `<SCRATCH_DIR>/mon40-r4-mut`,
 nunca sobre el árbol real). SHA-256 pre-mutación de
 `db/repository.py` (idéntico al del worktree, verificado antes de mutar):
 `672475af77c106981fd7e2d70cfd1e6c682f41d3813e9e53433fd91de4a51aaf`.
@@ -573,14 +573,14 @@ de T-06).
 ## Comando de verificación y resultado completo
 
 **Pin de venv verificado** (evita el falso verde de MON-20 R8 — el venv de
-`/Users/miguelhernandez/Documents/ludex/apps/agent/.venv` es un install
+`<REPO_ROOT>/apps/agent/.venv` es un install
 editable):
 
 ```
 $ env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin PYTHONPATH=$PWD/src \
-    /Users/miguelhernandez/Documents/ludex/apps/agent/.venv/bin/python \
+    <REPO_ROOT>/apps/agent/.venv/bin/python \
     -c "import ludex_agent.showdown.protocol as p; print(p.__file__)"
-/Users/miguelhernandez/orca/workspaces/ludex/phase3-s9-provenance-ws/apps/agent/src/ludex_agent/showdown/protocol.py
+<TASK9_WORKTREE>/apps/agent/src/ludex_agent/showdown/protocol.py
 ```
 
 **Focal, protocol:**
