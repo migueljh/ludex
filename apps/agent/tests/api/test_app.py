@@ -124,6 +124,44 @@ def _open_settings(**overrides) -> Settings:
     return Settings(**base)
 
 
+class _SlowFlagSettingsResult(_FakeSettingsResult):
+    pass
+
+
+class _SlowFlagSettingsSession:
+    """Igual que `_FakeSettingsSession` pero `execute` hace un `await`
+    deliberado (ventana de interleaving) para hacer determinista la carrera
+    TOCTOU de T-01 entre dos `POST /sessions` concurrentes."""
+
+    def __init__(self, flags: dict[str, bool], delay: float) -> None:
+        self._flags = flags
+        self._delay = delay
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args) -> bool:
+        return False
+
+    async def execute(self, stmt, params):
+        await asyncio.sleep(self._delay)
+        key = params["key"]
+        row = (self._flags[key],) if key in self._flags else None
+        return _SlowFlagSettingsResult(row)
+
+    async def commit(self) -> None:
+        pass
+
+
+class _SlowFlagSettingsRepo(_FakeSettingsRepo):
+    def __init__(self, flags: dict[str, bool], delay: float = 0.05) -> None:
+        super().__init__(flags)
+        self._delay = delay
+
+    def factory(self):
+        return _SlowFlagSettingsSession(self.flags, self._delay)
+
+
 class _FakeReadRepository:
     def __init__(self, battle: BattleSummary | None) -> None:
         self._battle = battle
@@ -910,3 +948,46 @@ def _session_slot_busy(client) -> bool:
     sigue ocupado -- nunca dispara una sesion nueva."""
     probe = client.post("/sessions", json={"n_battles": 1})
     return probe.status_code == 409
+
+
+# --- MON-38 R2 (T-01): reserva atomica del slot bajo concurrencia ------------
+
+
+async def test_two_concurrent_session_requests_reserve_the_slot_atomically(monkeypatch):
+    """T-01: dos `POST /sessions` concurrentes con gates abiertos y una
+    ventana de `await` en la lectura de flags -> exactamente un 200, un 409,
+    un `ladder(1)`, un socket y un `/search`.
+
+    `httpx.ASGITransport` corre la app en el MISMO loop del test, y
+    `_SlowFlagSettingsSession.execute` abre una ventana de interleaving
+    deterministico entre el check de `active` y la reserva: sin reserva
+    atomica, ambos requests observan `active=False` y disparan dos
+    `Player.ladder(1)` (el bug que `TestClient` serial no ve)."""
+    import httpx
+
+    player = _RecordingLadderPlayer()  # hold=True: la primera batalla queda viva
+    settings_repo = _SlowFlagSettingsRepo(dict(_OPEN_FLAGS), delay=0.05)
+    app, _, _ = _app(settings_repo=settings_repo)
+    app.state.ladder_player = player
+    monkeypatch.setattr(routes_module, "load_settings", lambda: _open_settings())
+    monkeypatch.setenv(_LADDER_ACCEPTANCE_FORMAT_ENV, "gen6randombattle")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        responses = await asyncio.gather(
+            client.post("/sessions", json={"n_battles": 1, "confirm": True}),
+            client.post("/sessions", json={"n_battles": 1, "confirm": True}),
+        )
+
+    statuses = sorted(response.status_code for response in responses)
+    assert statuses == [200, 409]
+
+    deadline = time.monotonic() + 2
+    while not player.ladder_calls and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert player.ladder_calls == [1]
+    assert player.socket_opens == 1
+    assert player.search_sends == ["/search"]
+
+    player.finish_current_battle()
+    await asyncio.sleep(0.05)

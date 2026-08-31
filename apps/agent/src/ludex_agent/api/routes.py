@@ -358,59 +358,69 @@ def create_router() -> APIRouter:
             raise HTTPException(
                 status_code=409, detail={"error": "ACTIVE_MATCHMAKING"},
             )
-        # Interlock de configuracion (D65 S5.4): `official` exige
-        # DATABASE_ROLE=acceptance y DSN no canonico. `load_settings()` lo
-        # rechaza como `RuntimeError` ANTES de abrir red; el resto de los
-        # interlocks los evalua `check_ladder_interlocks`.
+        # T-01 (MON-38 R2): reservar el slot ATOMICAMENTE -- el check y el set
+        # no tienen `await` entre si, asi que dos `POST /sessions` concurrentes
+        # no pueden atravesar el 409 (antes habia dos `await _read_durable_flag`
+        # en el medio y ambos veian `active=False`). Si cualquier paso posterior
+        # (load_settings, flag durable, interlock o player) falla, se revierte
+        # la reserva SIN abrir socket ni enviar `/search`.
+        _session_state["active"] = True
         try:
-            settings = load_settings()
-        except RuntimeError as exc:
-            raise HTTPException(
-                status_code=422, detail={"error": "UNSAFE_OFFICIAL_DATABASE"},
-            ) from exc
-        required_format = os.environ.get(_LADDER_ACCEPTANCE_FORMAT_ENV, "")
-        gates = LadderGates(
-            connection_mode=settings.connection_mode,
-            battle_format=settings.showdown_battle_format,
-            required_format=required_format,
-            database_role=settings.database_role,
-            database_url=settings.database_url,
-            ladder_enabled=await _read_durable_flag(request, _LADDER_ENABLED_KEY),
-            confirm=payload.confirm,
-            testing_account_confirmed=await _read_durable_flag(
-                request, _TESTING_ACCOUNT_CONFIRMED_KEY,
-            ),
-        )
-        try:
-            check_ladder_interlocks(gates)
-        except LadderInterlockError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "LADDER_INTERLOCK",
-                    "missing": list(gates.missing_interlocks()),
-                    "reason": str(exc),
-                },
-            ) from exc
-        player = getattr(request.app.state, "ladder_player", None)
-        if player is None:
-            raise HTTPException(
-                status_code=422,
-                detail={"error": "LADDER_INTERLOCK", "missing": ["player"]},
+            # Interlock de configuracion (D65 S5.4): `official` exige
+            # DATABASE_ROLE=acceptance y DSN no canonico. `load_settings()` lo
+            # rechaza como `RuntimeError` ANTES de abrir red; el resto de los
+            # interlocks los evalua `check_ladder_interlocks`.
+            try:
+                settings = load_settings()
+            except RuntimeError as exc:
+                raise HTTPException(
+                    status_code=422, detail={"error": "UNSAFE_OFFICIAL_DATABASE"},
+                ) from exc
+            required_format = os.environ.get(_LADDER_ACCEPTANCE_FORMAT_ENV, "")
+            gates = LadderGates(
+                connection_mode=settings.connection_mode,
+                battle_format=settings.showdown_battle_format,
+                required_format=required_format,
+                database_role=settings.database_role,
+                database_url=settings.database_url,
+                ladder_enabled=await _read_durable_flag(request, _LADDER_ENABLED_KEY),
+                confirm=payload.confirm,
+                testing_account_confirmed=await _read_durable_flag(
+                    request, _TESTING_ACCOUNT_CONFIRMED_KEY,
+                ),
             )
-        runner = SessionRunner(player=player, kind=SessionKind.LADDER, gates=gates)
-        _session_state.update(
-            id="session-1",
-            n_battles=payload.n_battles,
-            active=True,
-            stop_requested=False,
-            source=runner.source,
-        )
-        _session_live["runner"] = runner
-        _session_live["task"] = asyncio.create_task(
-            _run_ladder_session(runner, payload.n_battles)
-        )
-        return _session_response()
+            try:
+                check_ladder_interlocks(gates)
+            except LadderInterlockError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "LADDER_INTERLOCK",
+                        "missing": list(gates.missing_interlocks()),
+                        "reason": str(exc),
+                    },
+                ) from exc
+            player = getattr(request.app.state, "ladder_player", None)
+            if player is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"error": "LADDER_INTERLOCK", "missing": ["player"]},
+                )
+            runner = SessionRunner(player=player, kind=SessionKind.LADDER, gates=gates)
+            _session_state.update(
+                id="session-1",
+                n_battles=payload.n_battles,
+                stop_requested=False,
+                source=runner.source,
+            )
+            _session_live["runner"] = runner
+            _session_live["task"] = asyncio.create_task(
+                _run_ladder_session(runner, payload.n_battles)
+            )
+            return _session_response()
+        except BaseException:
+            _session_state.update(active=False, id=None, stop_requested=False)
+            raise
 
     @router.delete("/sessions/{session_id}")
     async def delete_session(session_id: str) -> dict[str, object]:
