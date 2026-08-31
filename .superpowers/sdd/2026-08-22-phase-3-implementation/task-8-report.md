@@ -17,6 +17,107 @@ que la decisión nueva queda documentada en este packet y en el código (ver
 
 ---
 
+## Corrección R2 (cierre de T-01) — MON-38 R2
+
+**Revisión independiente:** Tasos / Grok 4.6, read-only, `CHANGES_REQUESTED`
+sobre `6958bea..a6c9411`. Findings: **T-01 IMPORTANT** (TOCTOU en
+`POST /sessions`), **T-02 MINOR** (deferido, ver abajo). Esta corrección
+cierra **únicamente T-01**. Rango de R2: `a6c9411..<head-R2>`.
+
+**Finding T-01.** `apps/agent/src/ludex_agent/api/routes.py`: entre el check
+`if _session_state["active"]` y el `_session_state.update(active=True)` había
+dos `await _read_durable_flag(...)`. Dos `POST /sessions` concurrentes
+observaban `active=False`, ambos pasaban interlocks y ambos hacían
+`asyncio.create_task(_run_ladder_session(...))` → dos `Player.ladder(1)` y dos
+`/search` simultáneos sobre la cuenta de testing. `SessionRunner` no podía
+salvarlo: cada request construye su propio runner (el `_active` es por
+instancia). Los canarios seriales de T-04 (`TestClient`) no ejercen el
+interleaving.
+
+**Corrección aplicada.** `routes.py` reserva el slot **atómicamente**: el check
+de ocupación y el `_session_state["active"] = True` quedan sin `await` entre
+sí (exclusión mutua en un único paso del event loop). Todo el cuerpo posterior
+(load_settings, lectura de flags, interlock, player) queda dentro de un `try`
+cuyo `except BaseException` revierte la reserva
+(`active=False, id=None, stop_requested=False`) y re-lanza, de modo que un
+fallo de configuración/flag/interlock/player (o una cancelación) libera el
+slot SIN abrir socket ni enviar `/search`. `source`/`stop-after-current`/
+off-after-session quedan intactos.
+
+### RED antes de la corrección (canario concurrente nuevo)
+
+Se agregó `test_two_concurrent_session_requests_reserve_the_slot_atomically`
+(`tests/api/test_app.py`): `httpx.ASGITransport` (la app corre en el MISMO
+loop del test) + `asyncio.gather` de dos `POST /sessions` con gates abiertos y
+`_SlowFlagSettingsSession.execute` que hace un `await asyncio.sleep(0.05)`
+(ventana de interleaving determinística). Contra el head `a6c9411`:
+
+```
+$ ... -m pytest tests/api/test_app.py -q -k concurrent_session
+FAILED ... assert [200, 200] == [200, 409]   # el bug exacto de T-01
+1 failed, 34 deselected in 1.26s
+```
+
+### GREEN después de la corrección
+
+```
+$ ... -m pytest tests/api/test_app.py -q -k concurrent_session
+1 passed in 1.46s
+```
+
+El canario asevera: `statuses == [200, 409]`, `ladder_calls == [1]`,
+`socket_opens == 1`, `search_sends == ["/search"]` — exactamente un 200, un
+409, un `ladder(1)`, un socket y un `/search`.
+
+### Mutación deliberada (reserva movida de vuelta detrás del await)
+
+Se revirtió la reserva atómica al patrón original (borrar
+`_session_state["active"] = True` y devolver `active=True` al
+`_session_state.update(...)` final), dejando el `await _read_durable_flag` entre
+el check y la reserva:
+
+```
+$ ... -m pytest tests/api/test_app.py -q -k concurrent_session
+FAILED ... assert [200, 200] == [200, 409]   # RED
+1 failed in 1.19s
+```
+
+Restaurado byte a byte; `shasum -a 256 apps/agent/src/ludex_agent/api/routes.py`
+== `1bb86418dd2110bf367121ad81235641a599bf6edfd3425b2cb7828599296f1b`
+(idéntico al hash pre-mutación). `git diff` de `routes.py` tras restaurar: solo
+el cambio T-01.
+
+### Suites tras la corrección
+
+```
+$ ... -m pytest tests/runner/test_session.py tests/api/test_app.py -q
+46 passed, 3 skipped, 1 warning   # 45 → 46 (+1 canario concurrente)
+
+$ ... -m pytest -q --ignore=tests/integration/test_langgraph_battle.py
+850 passed, 174 skipped, 0 failed  # 849 → 850
+```
+
+0 failed en ambas.
+
+### T-02 (MINOR, deferido)
+
+`canonical-db` responde `LADDER_INTERLOCK` con `missing: []` (la tupla de
+`missing_interlocks` no incluye el DSN canónico, que lo rechaza
+`_reject_unsafe_official_database`). El rechazo existe y no abre red. Queda
+**explícitamente fuera** de este ciclo de corrección, registrado como minor
+para la triage final de rama, sin tocar.
+
+### Alcance de la corrección R2
+
+Solo `apps/agent/src/ludex_agent/api/routes.py` y
+`apps/agent/tests/api/test_app.py` (+ este packet versionado). NO se tocaron
+`runner/session.py` ni `schemas.py`. Sin scope creep. Sin red, DB, Docker,
+providers ni Linear.
+
+---
+
+## Archivos modificados (`git diff --stat 6958bea..0dac353`)
+
 ## Archivos modificados (`git diff --stat 6958bea..0dac353`)
 
 ```
