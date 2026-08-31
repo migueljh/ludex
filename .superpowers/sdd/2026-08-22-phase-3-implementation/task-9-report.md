@@ -19,6 +19,128 @@ completa y lo cierra.
 
 ---
 
+## Corrección R2 (pre-review) — C-01 IMPORTANT
+
+**Contexto R2.** El tech lead levantó Postgres Ludex (`ludex-postgres-1`) sin
+detener nada ajeno, tomó backup canónico
+`/tmp/backup-phase3-mon40-20260831.dump` (dentro del contenedor) y corrió
+`tests/db/test_repository.py` completo SOLO vía `TEST_DATABASE_URL` +
+helpers `ludex_test_*` (nunca `DATABASE_URL` ni la base `ludex`): **39
+passed / 2 failed**. `docs/AGENT_GOVERNANCE.md` documenta esto como un
+`REVIEW PACKET` normal que vuelve a `Changes Requested`, no `Rejected`.
+
+**Hallazgo C-01 (IMPORTANT).**
+`test_dos_conexiones_reales_se_serializan_por_metadata_incompatible` y
+`test_dos_conexiones_reales_se_serializan_por_winner_incompatible`
+(`apps/agent/tests/db/test_repository.py:392` y `:417`) ejecutan
+`_SAVE_BATTLE_SQL` **directamente**, con `dict`s de parámetros armados a
+mano ANTES de que Task 9 agregara el bind `:replay_url` a esa sentencia
+(`db/repository.py`). Los dos `dict`s (`datos1`/`datos2` en cada test) no
+incluían `"replay_url"`, así que SQLAlchemy revienta
+`InvalidRequestError: A value is required for bind parameter 'replay_url'`
+**antes** de que la sentencia llegue a Postgres — ninguna de las dos
+pruebas llegaba a ejercer la serialización que dicen probar.
+
+**Búsqueda de otros contratos viejos.** `grep -rn "_SAVE_BATTLE_SQL"
+apps/agent/` confirma que estos son los ÚNICOS dos callers de test que
+arman el `dict` a mano contra la sentencia real (el resto del árbol usa
+`repo.save_battle(...)`, que ya tenía `replay_url: str | None = None` desde
+el commit `fc78282`). No quedó ningún otro contrato viejo por corregir.
+
+**Corrección aplicada.** Se agregó `"replay_url": None` a los 4 `dict`s
+(`datos1`/`datos2` de ambos tests) — el mismo valor default que
+`save_battle` ya usa para cualquier caller que no pase el gancho. Sin
+cambios de producción: `db/repository.py`, `cli.py`, `client.py`,
+`protocol.py` y `render.ts` quedan intactos, tal como pedía el alcance R2.
+
+**RED exacto (antes de la corrección, contra Postgres real).**
+```
+$ TEST_DATABASE_URL=postgresql://ludex:ludex@127.0.0.1:15432/postgres \
+  pytest -q tests/db/test_repository.py
+FAILED tests/db/test_repository.py::test_dos_conexiones_reales_se_serializan_por_metadata_incompatible
+FAILED tests/db/test_repository.py::test_dos_conexiones_reales_se_serializan_por_winner_incompatible
+2 failed, 39 passed in 9.83s
+```
+Reproducido byte a byte contra el archivo revertido a HEAD (`git show
+HEAD:...| sha256sum` idéntico al del worktree revertido:
+`3d1b22351548e7df9874c971d5e29ee6885b664fe9f78687d6b097141926e042`) antes de
+volver a aplicar la corrección — el mismo procedimiento de mutación
+in-place + SHA-256 de la Task 9 original, esta vez para reproducir un RED
+que ya existía en vez de inducirlo.
+
+**GREEN exacto (después de la corrección, contra Postgres real, mismos 41
+tests, 0 skips).**
+```
+$ TEST_DATABASE_URL=postgresql://ludex:ludex@127.0.0.1:15432/postgres \
+  pytest -q tests/db/test_repository.py
+41 passed in 9.99s
+```
+
+**`pnpm --filter @ludex/dataset-audit test` con DB (0 failed, incluidos los
+scopes DB).** `db.ts` conecta el CLI real vía `process.env.DATABASE_URL`
+(no `TEST_DATABASE_URL`), y `test/cli.test.ts` fija conteos reales del
+dataset (16 batallas/2 trayectorias/82 pasos en `scope training`) — una DB
+vacía o `TEST_DATABASE_URL` no alcanzan para esos tests. Sin editar
+`db.ts`/`cli.test.ts` (fuera de alcance R2), el tech lead autorizó vía `ask`
+restaurar un **clon descartable, no la base canónica**, para que
+`DATABASE_URL` apunte SOLO a él:
+
+1. Verificado que `ludex_test_mon40_audit_20260831` NO existía
+   (`psql -tAc "SELECT 1 FROM pg_database WHERE datname=...'"` → vacío).
+2. `CREATE DATABASE ludex_test_mon40_audit_20260831 OWNER ludex` +
+   `pg_restore -U ludex -d ludex_test_mon40_audit_20260831 --no-owner
+   --no-privileges /tmp/backup-phase3-mon40-20260831.dump` (dentro de
+   `ludex-postgres-1`) — 0 errores.
+3. Verificado `SELECT current_database()` = el nombre del clon y conteos no
+   vacíos: 731 `battles`, 729 `trajectories`, 44949 `trajectory_steps`.
+4. El backup canónico no tenía aplicada la migración
+   `db/migrations/20260822000001_phase3_hitl.sql` (`trajectory_steps.
+   approval_outcome` no existía — `pg_stat_activity`/`schema_migrations`
+   confirmaron el gap: última versión aplicada `20260804000001`). Se aplicó
+   el bloque `migrate:up` de esa migración **solo en el clon** (`CREATE
+   TABLE pending_decisions`, `ALTER TABLE trajectory_steps ADD COLUMN
+   approval_outcome` + sus 3 constraints) vía `psql -v ON_ERROR_STOP=1` y se
+   registró en `schema_migrations` del clon. Es DDL sobre una base
+   descartable propia, no sobre `ludex` — no toca la base canónica ni su
+   esquema.
+5. Corrida completa con `DATABASE_URL` apuntando SOLO al clon y
+   `TEST_DATABASE_URL` apuntando al host de mantenimiento (para que
+   `createDisposableDatabase` siga creando sus propios `ludex_test_<uuid>`):
+   ```
+   $ DATABASE_URL=postgresql://ludex:ludex@127.0.0.1:15432/ludex_test_mon40_audit_20260831 \
+     TEST_DATABASE_URL=postgresql://ludex:ludex@127.0.0.1:15432/postgres \
+     LUDEX_SHOWDOWN_DEX_DIR=/Users/miguelhernandez/Documents/ludex/apps/agent/.venv/lib/python3.12/site-packages/poke_env/data/static/pokedex \
+     pnpm --filter @ludex/dataset-audit test
+   Test Files  13 passed (13)
+        Tests  214 passed (214)
+   ```
+   0 failed, incluidos `test/cli.test.ts` (6/6, con los conteos reales
+   16/2/82 de `scope training`) y `test/db.test.ts` (9/9, contra el clon
+   real con el esquema al día).
+6. **Cleanup.** `SELECT pid FROM pg_stat_activity WHERE datname=...` → 0
+   filas (sin conexiones colgadas) antes de dropear. `DROP DATABASE
+   ludex_test_mon40_audit_20260831` y reverificado `SELECT 1 FROM
+   pg_database WHERE datname=...` → vacío (no existe). `SELECT datname FROM
+   pg_database WHERE datname LIKE 'ludex_test%'` → vacío: tampoco quedó
+   ningún `ludex_test_<uuid>` huérfano de los helpers descartables. La base
+   `ludex` y cualquier otro nombre no se tocaron en ningún momento de este
+   procedimiento.
+
+**Focal protocol (sin cambios, re-confirmado tras R2):**
+```
+$ pytest --noconftest -q tests/showdown/test_protocol.py -k "replay_url or elo_bucket"
+8 passed, 185 deselected
+```
+
+**`git diff --check` (rango R2):** limpio (exit 0). **Scan de secretos**
+sobre `test_repository.py`: sin coincidencias.
+
+**No se repitieron las mutaciones de Task 9** (role selection en `render.ts`,
+NULL-rating en `protocol.py`): ninguno de esos dos archivos fue tocado en
+R2, y el brief de R2 exime repetirlas salvo que se toquen sus archivos.
+
+---
+
 ## Causa raíz / alcance
 
 No hay bug que corregir: es una feature nueva (ganchos S9). El "problema" que
@@ -69,7 +191,8 @@ extracción + persistencia + reporte.
 - `apps/agent/tests/db/test_repository.py`: 3 tests nuevos — persistencia
   redonda (`replay_url`/`elo_bucket` presentes), NULL sin dato público
   (`challenge`), y COALESCE en re-persistencia sin pisar un valor conocido.
-  Requieren `TEST_DATABASE_URL` (MON-11/R2) — ver "Limitaciones conocidas".
+  Requieren `TEST_DATABASE_URL` (MON-11/R2); verificados en R2 contra
+  Postgres real (ver "Corrección R2" arriba) — GREEN, 41/41.
 - `packages/dataset-audit/test/authorship.test.ts`: `opponentUsername`
   (p1→rival p2, p2→rival p1, `player_side` desconocido falla cerrado) +
   `renderAuthorshipReport` (lista rival por trayectoria normalizado,
@@ -94,7 +217,9 @@ $ pytest --noconftest -q tests/showdown/test_protocol.py -k "replay_url or elo_b
 8 passed, 185 deselected
 ```
 
-**Focal, repository (offline → skip por diseño, MON-11/R2):**
+**Focal, repository (offline en la sesión original → skip por diseño,
+MON-11/R2; verificado GREEN contra Postgres real en R2, ver "Corrección R2"
+arriba):**
 ```
 $ pytest --noconftest -q tests/db/test_repository.py -k "replay_url or elo_bucket"
 3 skipped, 38 deselected
@@ -125,7 +250,9 @@ Postgres/dex local — confirmado que existen **idénticas contra la base sin
 este diff** (stash temporal de los 8 archivos, mismas 4 fallas, mismo
 mensaje; restaurado con `git stash apply <sha>` + `git stash drop` del
 mismo entry, sin tocar el stash compartido de otros agentes). No relacionado
-con esta tarea ni con la restricción offline de este turno.
+con esta tarea ni con la restricción offline de ese turno. **Resuelto en R2**
+con Postgres real disponible (ver "Corrección R2" arriba): la suite completa
+da 214/214, 0 failed.
 
 ## Prueba de regresión (mutación, restaurada por SHA-256)
 
@@ -163,11 +290,16 @@ checkout` sobre un archivo con cambios no commiteados de la propia tarea.
 
 ## Integraciones ejecutadas
 
-Ninguna contra DB/Docker/red real — restricción explícita de esta tarea
-("totalmente offline; no DB, Docker, providers, live"). La capa de
-integración con Postgres (`tests/db/test_repository.py` completo) queda
-pendiente para una sesión con `TEST_DATABASE_URL` disponible; ver
-limitaciones.
+**Task 9 (sesión original):** ninguna contra DB/Docker/red real —
+restricción explícita offline de ese turno.
+**R2 (esta corrección):** capa de integración completa contra Postgres real
+ejecutada por el tech lead (`ludex-postgres-1`, `tests/db/test_repository.py`
+vía `TEST_DATABASE_URL` + helpers `ludex_test_*`, RED 2 failed/39 passed) y
+por este agente (GREEN 41/41 tras el fix, más `pnpm --filter
+@ludex/dataset-audit test` con `DATABASE_URL` apuntando a un clon
+descartable `ludex_test_mon40_audit_20260831` restaurado del backup
+canónico y dropeado al cierre — ver "Corrección R2" arriba). La base `ludex`
+nunca se escribió en ningún momento de R2.
 
 ## Datos inspeccionados
 
@@ -177,34 +309,38 @@ los 8 archivos originales del brief (auditado línea por línea contra D70
 antes de continuar — ninguno contradecía el ruling; el trabajo de la sesión
 anterior ya cumplía "nunca inventar", solo faltaba cerrar
 DECISIONS/evidencia/mutaciones/commit/push), `.git` (worktree list, stash
-list, `git diff --check`).
+list, `git diff --check`). En R2: `_SAVE_BATTLE_SQL` (único caller sin
+`replay_url` era el par de tests de C-01, confirmado por `grep`), el
+esquema real del backup canónico (`\d trajectory_steps`, `schema_migrations`)
+y el diff de la migración `20260822000001_phase3_hitl.sql` antes de
+aplicarla al clon.
 
 ## Decisiones agregadas a DECISIONS.md
 
 `docs/DECISIONS.md` D70 (autorizado explícitamente como noveno path por el
 tech lead) — ruling completo transcripto, motivo, verificación por mutación
-con SHA-256, suites ejecutadas y límite conocido de la capa DB offline.
+con SHA-256 y suites ejecutadas. R2 no agrega una decisión nueva: es
+evidencia adicional sobre el mismo D70 (cierre del hallazgo C-01 y
+verificación de integración que faltaba).
 
 ## Limitaciones conocidas
 
-- `tests/db/test_repository.py` (incl. los 3 tests nuevos de esta tarea)
-  requiere `TEST_DATABASE_URL` y quedó en `skipped` por la restricción
-  offline; falta correrlo contra Postgres real antes de cerrar la rebanada
-  completa (capa de integración de `.claude/verification/SKILL.md`).
-- Las 4 fallas de `test/cli.test.ts` son preexistentes (confirmadas también
-  contra la base) y fuera de alcance; no se tocó ese archivo.
+Ninguna. La limitación documentada en la versión anterior de este packet
+("`test_repository.py` no verificado contra Postgres real") quedó resuelta
+en R2: 41/41 GREEN contra Postgres real, y `pnpm --filter
+@ludex/dataset-audit test` da 214/214 con los scopes DB incluidos.
 
 ## Riesgos o dudas pendientes
 
-Ninguno nuevo. El único punto abierto es la verificación de integración con
-DB real, ya documentado arriba como límite conocido y acotado a
-`test_repository.py`.
+Ninguno.
 
 ## Commits
 
-Ver `git log` del branch `migueljh/phase3-s9-provenance-ws` — commit único
-en inglés con rutas explícitas cubriendo los 8 archivos del brief más
-`docs/DECISIONS.md` y este packet.
+Ver `git log` del branch `migueljh/phase3-s9-provenance-ws`:
+- Commit Task 9: rutas explícitas cubriendo los 8 archivos del brief más
+  `docs/DECISIONS.md` y este packet.
+- Commit R2: `apps/agent/tests/db/test_repository.py` (fix C-01) y este
+  packet actualizado.
 
-**Modelo efectivo:** Sonnet 5 (Neoblex), continuación de MON-40 Task 9.
-Sin recomendación propia de estado: Tasos/tech lead adjudica.
+**Modelo efectivo:** Sonnet 5 (Neoblex), Task 9 + corrección pre-review R2
+de MON-40. Sin recomendación propia de estado: Tasos/tech lead adjudica.

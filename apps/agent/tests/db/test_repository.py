@@ -392,9 +392,11 @@ async def _dos_conexiones_forzando_conflicto(database_url: str, datos1: dict, da
 async def test_dos_conexiones_reales_se_serializan_por_metadata_incompatible(repo, test_database_url):
     key = _identity(TAG)
     datos1 = {"tag": TAG, "key": key, "fmt": "gen6randombattle",
-             "p1": "A", "p2": "B", "w": None, "pb": "bot", "src": SOURCE}
+             "p1": "A", "p2": "B", "w": None, "pb": "bot", "src": SOURCE,
+             "replay_url": None}
     datos2 = {"tag": TAG, "key": key, "fmt": "gen6randombattle",
-             "p1": "OTRO", "p2": "B", "w": None, "pb": "bot", "src": SOURCE}
+             "p1": "OTRO", "p2": "B", "w": None, "pb": "bot", "src": SOURCE,
+             "replay_url": None}
 
     bloqueada, filas2 = await _dos_conexiones_forzando_conflicto(test_database_url, datos1, datos2)
 
@@ -417,9 +419,11 @@ async def test_dos_conexiones_reales_se_serializan_por_metadata_incompatible(rep
 async def test_dos_conexiones_reales_se_serializan_por_winner_incompatible(repo, test_database_url):
     key = _identity(TAG)
     datos1 = {"tag": TAG, "key": key, "fmt": "f",
-             "p1": "A", "p2": "B", "w": "A", "pb": "bot", "src": SOURCE}
+             "p1": "A", "p2": "B", "w": "A", "pb": "bot", "src": SOURCE,
+             "replay_url": None}
     datos2 = {"tag": TAG, "key": key, "fmt": "f",
-             "p1": "A", "p2": "B", "w": "B", "pb": "bot", "src": SOURCE}
+             "p1": "A", "p2": "B", "w": "B", "pb": "bot", "src": SOURCE,
+             "replay_url": None}
 
     bloqueada, filas2 = await _dos_conexiones_forzando_conflicto(test_database_url, datos1, datos2)
 
