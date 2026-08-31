@@ -87,11 +87,12 @@ Durante el diagnóstico hubo dos resultados no aceptados como evidencia final:
 
 - Al apuntar `DATABASE_URL` al clon, dos guardias que exigen reconocer la DB
   canónica no levantaron; el entorno del test era incorrecto, no el código.
-- Un test de batalla random excedió una vez 45 s y otro observó una vez un
-  turno desalineado. El primero está documentado como variabilidad previa en
-  D46. El segundo pasó tres reproducciones consecutivas (11.46 s, 11.20 s y
-  11.57 s) y luego la suite completa final. Se conservan como riesgo conocido,
-  no como prueba descartada silenciosamente.
+- `test_respuesta_ilegal_dos_veces_juega_y_persiste_fallback` excedió una vez
+  el límite de 45 s; D46 documenta la variabilidad de esta ruta, pero el
+  nombre exacto se conserva aquí para no atribuirlo a otro test. Otro test
+  observó una vez un turno desalineado. Pasó tres reproducciones consecutivas
+  (11.46 s, 11.20 s y 11.57 s) y luego la suite completa final. Se conservan
+  como riesgo conocido, no como pruebas descartadas silenciosamente.
 
 ### Monorepo TypeScript
 
@@ -155,6 +156,12 @@ d38_human_override_metadata_nonnull       0
 d38_agent_outcome_metadata_incomplete     0
 d38_action_source_outcome_incoherent      0
 ```
+
+El resultado es vacuamente cero: la distribución independiente del clon es
+`approval_outcome=NULL, action_source=agent` en 44.949 pasos y no hay filas en
+`pending_decisions`. Las filas humanas reales se ejercitan en fixtures
+descartables de los tests de autoría; MON-41/42 aportarán la primera evidencia
+live de esos outcomes.
 
 Resultado D44:
 
@@ -221,9 +228,31 @@ cerrada en `e945512`. No queda registro de mutación sin RED en Tasks 1–9.
   completa hasta MON-41 (challenge oficial controlado) y MON-42 (una batalla
   ranked con cuenta de testing, DB descartable y presupuesto autorizado).
 
-## Riesgos o dudas pendientes
+## Adjudicación de Tasos y follow-ups aceptados
 
-No hay finding técnico offline abierto al emitir este packet. Tasos debe
-revisar read-only el rango exacto Base..Head y Latwan debe adjudicar. Las
-ejecuciones live posteriores siguen sujetas a credenciales, cuenta de testing,
-DB de aceptación no canónica y las restricciones de modelos/costo de AGENTS.md.
+Tasos revisó read-only el rango exacto `5868c087..bca3b48` y recomendó
+`PASS_WITH_MINOR`. No hay findings críticos ni importantes. Latwan acepta como
+menores no bloqueantes: (1) el AST todavía no resuelve un `getattr` asignado a
+un alias ni `asyncio.shield`; no hay uso actual en `gate.py`, (2) D38 es
+vacuamente cero en el clon sin filas HITL, (3) los transcripts RED originales
+de Task 2 y del teardown de Task 3 no están versionados aunque constan en los
+registros de Orca y los canarios siguen presentes, y (4) la variabilidad del
+test de 45 s queda rotulada con su nombre exacto. Estos puntos no exigen
+reabrir código aceptado ni impiden el gate offline.
+
+**Riesgos o dudas pendientes:** las ejecuciones live posteriores siguen
+sujetas a credenciales, cuenta de testing, DB de aceptación no canónica y las
+restricciones de modelos/costo de AGENTS.md. Tasos sugirió opcionalmente un
+follow-up para ampliar el AST; no forma parte de MON-39.
+
+```yaml
+LINEAR_VERDICT:
+  issue: MON-39
+  status: Completed
+  reviewed_commit: bca3b48d1f2c2fa4af3fb14e8e558ec3bdce738e
+  summary: "Gate offline verificado read-only; suites, auditoría training, scans, D38/D44 y T-02 AST GREEN. Cuatro minors documentados, sin cambios requeridos."
+  required_changes: []
+  follow_up_issues:
+    - "Opcional: extender el canario AST a getattr asignado y asyncio.shield."
+    - "MON-41 challenge oficial y MON-42 ladder; no son parte de MON-39."
+```
