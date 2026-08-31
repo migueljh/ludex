@@ -14,7 +14,11 @@
 
 import { describe, expect, it } from "vitest";
 import { loadDataset } from "../src/db.js";
-import { computeAuthorshipMix, renderAuthorshipReport } from "../src/render.js";
+import {
+  computeAuthorshipMix,
+  opponentUsername,
+  renderAuthorshipReport,
+} from "../src/render.js";
 import type { Dataset, TrajectoryStepRecord } from "../src/types.js";
 import { createDisposableDatabase, type DisposableDatabase } from "./_disposable.js";
 import { baseDataset } from "./fixtures.js";
@@ -69,7 +73,46 @@ describe("computeAuthorshipMix", () => {
   });
 });
 
+// --- MON-40/Fase 3 S9: identidad del rival normalizada por rol p1/p2 ------
+//
+// `battles.p1`/`p2` no dicen por sí solos quién es el rival: hay que
+// resolverlos contra `trajectories.player_side` (D-pendiente, mismo criterio
+// que ya usa `cli._persist_one` para escribir `p1`/`p2` según el rol real).
+
+describe("opponentUsername", () => {
+  it("player_side='p1' => el rival es p2", () => {
+    const battle = baseDataset().battles[0];
+    expect(opponentUsername(battle, "p1")).toBe("Rival");
+  });
+
+  it("player_side='p2' => el rival es p1", () => {
+    const battle = baseDataset().battles[0];
+    expect(opponentUsername(battle, "p2")).toBe("LudexBot");
+  });
+
+  it("un player_side que no es 'p1' ni 'p2' falla cerrado, nunca asume un lado", () => {
+    const battle = baseDataset().battles[0];
+    expect(() => opponentUsername(battle, "p3")).toThrow(/p3/);
+  });
+});
+
 describe("renderAuthorshipReport", () => {
+  it("lista la identidad del rival por trayectoria, normalizada por player_side", () => {
+    const output = renderAuthorshipReport(baseDataset());
+    expect(output).toContain(`Rival de la trayectoria ${20} (p1): Rival`);
+  });
+
+  it("una trayectoria de p2 muestra a p1 como rival, no repite el propio nombre", () => {
+    const dataset: Dataset = {
+      ...baseDataset(),
+      trajectories: [{ ...baseDataset().trajectories[0], playerSide: "p2" }],
+    };
+    const output = renderAuthorshipReport(dataset);
+    expect(output).toContain("Rival de la trayectoria 20 (p2): LudexBot");
+    expect(output).not.toContain("Rival de la trayectoria 20 (p2): Rival");
+  });
+
+
   it("lista el total, la mezcla por source y por outcome en orden alfabético", () => {
     const dataset: Dataset = {
       ...baseDataset(),

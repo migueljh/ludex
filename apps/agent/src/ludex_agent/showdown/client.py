@@ -49,6 +49,7 @@ from .protocol import (
     ProjectionAmbiguityError,
     ProtocolRecorder,
     RawFrameInbox,
+    extract_replay_url,
     normalize_id,
     project_observable_state,
 )
@@ -1534,6 +1535,19 @@ class LudexPlayer(RandomPlayer):
             if step.get("action_taken") is None:
                 return (index, "action_missing")
         return None
+
+    def replay_url(self, tag: str) -> str | None:
+        """MON-40/Fase 3 S9: gancho estrecho y pasivo para `battles.replay_url`.
+
+        Delega en `extract_replay_url` sobre TODO el protocolo crudo grabado
+        para `tag` (`ProtocolRecorder.all_lines`, D17): nunca se construye la
+        URL a partir del `battle_tag`, solo se reporta lo que Showdown ya
+        mando. `None` si la sala nunca emitio ese link.
+        """
+        recorder = self.recorders.get(tag)
+        if recorder is None:
+            return None
+        return extract_replay_url(recorder.all_lines)
 
     def _reserve_step(
         self,

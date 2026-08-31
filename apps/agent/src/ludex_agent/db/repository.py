@@ -37,11 +37,18 @@ class BattleIdentityConflictError(RuntimeError):
 # "no paso nada" (esta INSERT siempre intenta insertar o actualizar UNA fila).
 _SAVE_BATTLE_SQL = text("""
     INSERT INTO battles (battle_tag, identity_key, format, p1, p2, winner,
-                         played_by, source)
+                         played_by, source, replay_url)
     VALUES (:tag, :key, :fmt, :p1, :p2, :w, CAST(:pb AS played_by_kind),
-            CAST(:src AS battle_source))
+            CAST(:src AS battle_source), :replay_url)
     ON CONFLICT (source, identity_key) DO UPDATE
-      SET winner = COALESCE(EXCLUDED.winner, battles.winner)
+      SET winner = COALESCE(EXCLUDED.winner, battles.winner),
+          -- MON-40/Fase 3 S9: gancho estrecho, no columna de identidad. La
+          -- primera persistencia puede correr ANTES de que Showdown emita
+          -- el link (el `|raw|` de replay llega recien al cierre real de la
+          -- sala); COALESCE deja que una re-persistencia posterior de la
+          -- MISMA batalla complete el dato sin pisar uno ya conocido con
+          -- NULL.
+          replay_url = COALESCE(EXCLUDED.replay_url, battles.replay_url)
       WHERE battles.p1 = EXCLUDED.p1
         AND battles.p2 = EXCLUDED.p2
         AND battles.format = EXCLUDED.format
@@ -58,7 +65,7 @@ class BattleRepository:
 
     async def save_battle(self, *, battle_tag: str, identity_key: str, fmt: str,
                           p1: str, p2: str, winner: str | None, source: str,
-                          played_by: str) -> int:
+                          played_by: str, replay_url: str | None = None) -> int:
         """Idempotente por `(source, identity_key)`: reejecutar el runner no
         duplica, y dos batallas distintas que comparten `battle_tag` (tag
         reusado tras un restart de Showdown) ya no se fusionan.
@@ -69,11 +76,16 @@ class BattleRepository:
         mismo; dos ganadores conocidos DISTINTOS, o cualquier diferencia de
         p1/p2/format/played_by, hacen que el WHERE del conflicto de falso y
         `RETURNING` no entregue fila para esta sentencia.
+
+        `replay_url` (MON-40/Fase 3 S9) NO participa en la compatibilidad de
+        identidad: es un gancho estrecho, opcional por naturaleza (`None`
+        cuando Showdown todavia no emitio el link), y default `None` para no
+        romper a ningun caller existente.
         """
         async with self.factory() as s:
             row = await s.execute(_SAVE_BATTLE_SQL, {
                 "tag": battle_tag, "key": identity_key, "fmt": fmt, "p1": p1, "p2": p2,
-                "w": winner, "pb": played_by, "src": source,
+                "w": winner, "pb": played_by, "src": source, "replay_url": replay_url,
             })
             result = row.first()
             if result is not None:
@@ -120,19 +132,34 @@ class BattleRepository:
             await s.commit()
 
     async def save_trajectory(self, battle_id: int, *, gen_number: int, fmt: str,
-                              player_side: str) -> int:
+                              player_side: str, elo_bucket: str | None = None) -> int:
+        """MON-40/Fase 3 S9: `elo_bucket` es el rating PUBLICO del rival
+        (`battle.opponent_rating`), nunca el propio -- el gancho es para
+        identidad del rival (Fase 6), no para el desempeno del agente.
+        Solo llega poblado cuando Showdown mando el `|raw|` de rating (tipico
+        de ladder; ausente en challenge, que por eso persiste NULL sin
+        ninguna rama especial aca: la ausencia del dato ES la senal). Nunca
+        se agrupa en rangos ("bucket" es el nombre de la columna heredado del
+        diseno, no una categoria inventada por esta implementacion) -- D17:
+        omitir es valido, inventar no.
+        """
         async with self.factory() as s:
             row = await s.execute(text("""
-                INSERT INTO trajectories (battle_id, gen_id, format, player_side)
-                SELECT :b, g.id, :fmt, :ps FROM generations g WHERE g.gen_number = :gen
+                INSERT INTO trajectories (battle_id, gen_id, format, player_side, elo_bucket)
+                SELECT :b, g.id, :fmt, :ps, :elo FROM generations g WHERE g.gen_number = :gen
                 ON CONFLICT (battle_id, player_side) DO UPDATE
                   SET format = EXCLUDED.format,
                       -- minor de la review final: antes solo se refrescaba
                       -- `format`; re-persistir con otra generacion dejaba
                       -- `gen_id` viejo con el `format` nuevo.
-                      gen_id = EXCLUDED.gen_id
+                      gen_id = EXCLUDED.gen_id,
+                      -- mismo criterio que replay_url: gancho opcional, no
+                      -- pisar un valor ya conocido con NULL de una
+                      -- re-persistencia que no lo trae.
+                      elo_bucket = COALESCE(EXCLUDED.elo_bucket, trajectories.elo_bucket)
                 RETURNING id
-            """), {"b": battle_id, "gen": gen_number, "fmt": fmt, "ps": player_side})
+            """), {"b": battle_id, "gen": gen_number, "fmt": fmt, "ps": player_side,
+                   "elo": elo_bucket})
             await s.commit()
             return row.scalar_one()
 

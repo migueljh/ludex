@@ -1,4 +1,8 @@
-from ludex_agent.showdown.protocol import ProtocolRecorder
+from ludex_agent.showdown.protocol import (
+    ProtocolRecorder,
+    elo_bucket_from_rating,
+    extract_replay_url,
+)
 
 
 def _split(raw: str) -> list[str]:
@@ -4111,3 +4115,73 @@ def test_switch_in_descarta_un_override_temporal_colgado_de_la_misma_identidad()
         "para que un switch_out posterior lo restaure con datos viejos"
     )
     assert memoria["meloetta"]["canonical_types"] == ["NORMAL", "PSYCHIC"]
+
+
+# --- MON-40/Fase 3 S9 (D-pendiente): replay_url, hook estrecho y pasivo ----
+#
+# poke-env no expone ningun hook activo (no hay `/savereplay`/`uploadreplay`
+# en el paquete vendorizado): la UNICA fuente offline legitima es una linea
+# `|raw|` que el propio Showdown manda cuando la sala ya tiene un replay
+# subido, con un link a `replay.pokemonshowdown.com`. Nunca se construye la
+# URL desde `battle_tag`: eso afirmaria un replay que puede no existir
+# (D17 -- omitir, no inventar).
+
+def test_extract_replay_url_encuentra_el_link_en_una_linea_raw():
+    lines = [
+        f">{BATTLE_TAG}", "|win|LudexBot3682",
+        '|raw|<a href="https://replay.pokemonshowdown.com/gen6randombattle-386">'
+        "View replay</a>",
+    ]
+    assert (
+        extract_replay_url(lines)
+        == "https://replay.pokemonshowdown.com/gen6randombattle-386"
+    )
+
+
+def test_extract_replay_url_devuelve_none_sin_linea_raw_de_replay():
+    lines = [f">{BATTLE_TAG}", "|win|LudexBot3682", "|raw|GG"]
+    assert extract_replay_url(lines) is None
+
+
+def test_extract_replay_url_no_se_deja_enganar_por_un_host_distinto():
+    """Saneado: un host que se PARECE a replay.pokemonshowdown.com pero no lo
+    es (typosquat/subdominio ajeno) no cuenta como evidencia real."""
+    lines = [
+        '|raw|<a href="https://replay.pokemonshowdown.com.evil.example/x">link</a>',
+    ]
+    assert extract_replay_url(lines) is None
+
+
+def test_extract_replay_url_ignora_esquema_no_https():
+    lines = ['|raw|<a href="http://replay.pokemonshowdown.com/gen6-1">x</a>']
+    assert extract_replay_url(lines) is None
+
+
+def test_extract_replay_url_toma_el_primero_cuando_hay_varias_lineas_raw():
+    lines = [
+        '|raw|<a href="https://replay.pokemonshowdown.com/gen6randombattle-1">a</a>',
+        '|raw|<a href="https://replay.pokemonshowdown.com/gen6randombattle-2">b</a>',
+    ]
+    assert (
+        extract_replay_url(lines)
+        == "https://replay.pokemonshowdown.com/gen6randombattle-1"
+    )
+
+
+# --- MON-40/Fase 3 S9: elo_bucket, sin bucketing por rangos ---------------
+
+def test_elo_bucket_from_rating_none_da_none():
+    assert elo_bucket_from_rating(None) is None
+
+
+def test_elo_bucket_from_rating_rating_publico_da_el_string_exacto():
+    assert elo_bucket_from_rating(1503) == "1503"
+
+
+def test_elo_bucket_from_rating_no_agrupa_por_rangos():
+    """Canario nombrado: dos ratings vecinos NO deben colapsar al mismo
+    bucket. Un bucketing por rangos (p.ej. redondeo a centena) es
+    exactamente el "bucket inventado" que el hook prohibe."""
+    assert elo_bucket_from_rating(1499) != elo_bucket_from_rating(1501)
+    assert elo_bucket_from_rating(1499) == "1499"
+    assert elo_bucket_from_rating(1501) == "1501"

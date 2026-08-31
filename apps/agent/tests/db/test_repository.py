@@ -115,6 +115,79 @@ async def test_guarda_batalla_turno_trayectoria_y_paso(repo):
         assert row[5] == "llm_retry"
 
 
+async def test_replay_url_y_elo_bucket_se_persisten_cuando_estan_presentes(repo):
+    """MON-40/Fase 3 S9: ganchos estrechos y opcionales. Redondo: lo que se
+    escribe es lo que se lee, sin transformacion adicional."""
+    tag = "battle-test-replay-elo"
+    bid = await repo.save_battle(
+        battle_tag=tag, identity_key=_identity(tag), fmt="gen6randombattle",
+        p1="A", p2="B", winner=None, source="ladder", played_by="bot",
+        replay_url="https://replay.pokemonshowdown.com/gen6randombattle-386",
+    )
+    tid = await repo.save_trajectory(
+        bid, gen_number=6, fmt="gen6randombattle", player_side="p1",
+        elo_bucket="1503",
+    )
+
+    async with repo.factory() as s:
+        replay_url = (await s.execute(text(
+            "SELECT replay_url FROM battles WHERE id=:b"
+        ), {"b": bid})).scalar_one()
+        elo_bucket = (await s.execute(text(
+            "SELECT elo_bucket FROM trajectories WHERE id=:t"
+        ), {"t": tid})).scalar_one()
+        assert replay_url == "https://replay.pokemonshowdown.com/gen6randombattle-386"
+        assert elo_bucket == "1503"
+
+
+async def test_replay_url_y_elo_bucket_quedan_null_sin_dato_publico(repo):
+    """Challenge sin rating publico: NULL, nunca un bucket inventado ni una
+    URL construida desde el battle_tag."""
+    tag = "battle-test-sin-provenance"
+    bid = await repo.save_battle(
+        battle_tag=tag, identity_key=_identity(tag), fmt="gen6randombattle",
+        p1="A", p2="B", winner=None, source="challenge", played_by="bot",
+    )
+    tid = await repo.save_trajectory(
+        bid, gen_number=6, fmt="gen6randombattle", player_side="p1",
+    )
+
+    async with repo.factory() as s:
+        replay_url = (await s.execute(text(
+            "SELECT replay_url FROM battles WHERE id=:b"
+        ), {"b": bid})).scalar_one()
+        elo_bucket = (await s.execute(text(
+            "SELECT elo_bucket FROM trajectories WHERE id=:t"
+        ), {"t": tid})).scalar_one()
+        assert replay_url is None
+        assert elo_bucket is None
+
+
+async def test_replay_url_de_una_repersistencia_posterior_no_pisa_el_ya_conocido_con_null(repo):
+    """El link de replay suele llegar DESPUES de la primera persistencia
+    (Showdown lo emite al cerrar la sala); una re-persistencia sin el dato
+    todavia no puede borrar uno ya guardado."""
+    tag = "battle-test-replay-tardio"
+    key = _identity(tag)
+    bid = await repo.save_battle(
+        battle_tag=tag, identity_key=key, fmt="gen6randombattle",
+        p1="A", p2="B", winner=None, source=SOURCE, played_by="bot",
+        replay_url="https://replay.pokemonshowdown.com/gen6randombattle-1",
+    )
+    otra_vez = await repo.save_battle(
+        battle_tag=tag, identity_key=key, fmt="gen6randombattle",
+        p1="A", p2="B", winner=None, source=SOURCE, played_by="bot",
+        replay_url=None,
+    )
+    assert otra_vez == bid
+
+    async with repo.factory() as s:
+        replay_url = (await s.execute(text(
+            "SELECT replay_url FROM battles WHERE id=:b"
+        ), {"b": bid})).scalar_one()
+        assert replay_url == "https://replay.pokemonshowdown.com/gen6randombattle-1"
+
+
 async def test_action_path_nullable_y_restringido(repo):
     tag = "battle-test-action-path"
     bid = await repo.save_battle(

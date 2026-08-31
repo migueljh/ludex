@@ -5519,3 +5519,80 @@ comportamiento de producción en ningún archivo.
 
 **Modelo efectivo:** Sonnet 5, corrección de revisión independiente (R2).
 Sin recomendación propia: Tasos/tech lead adjudica.
+
+## D70 — MON-40 (Fase 3 Task 9, F3-09): `replay_url` y `elo_bucket` nunca se
+inventan (2026-08-31)
+
+**Ruling vinculante del tech lead**, registrado tal como se recibió para la
+implementación de los ganchos estrechos de `battles.replay_url` y
+`trajectories.elo_bucket`:
+
+- **`replay_url` NUNCA se deriva de `battle_tag`.** Queda `NULL` salvo que el
+  protocolo crudo de Showdown haya emitido una URL `https` explícita, con
+  allowlist de host EXACTO `replay.pokemonshowdown.com` (nunca un
+  subdominio/typosquat como `replay.pokemonshowdown.com.evil.example`, nunca
+  `http`) y slug estricto. No hay llamada a `/savereplay`, `uploadreplay` ni
+  a la red: la única fuente legítima es la línea `|raw|` que Showdown ya
+  mandó y quedó grabada en `ProtocolRecorder.all_lines` (D17).
+- **`elo_bucket` usa solo `battle.opponent_rating`, público y del RIVAL.**
+  Nunca el rating propio del agente. Se persiste como `str` decimal
+  canónico (`str(opponent_rating)`), nunca un rango, un label ni un
+  redondeo — "bucket" es el nombre heredado de la columna, no una categoría
+  a inventar. Ausente (`None`, típico de `challenge` sin `|raw|` de rating
+  de ladder) implica `NULL`, sin rama especial.
+
+**Motivo.** poke-env no expone ningún hook activo de replay en el paquete
+vendorizado (`Battle.save_replay()` solo escribe HTML local, no produce URL
+de servidor); inventar la URL desde `battle_tag` afirmaría que un replay
+existe cuando puede no haberse guardado nunca. Igual para el rating: cualquier
+bucketing por rangos, o sustituir la ausencia del dato por un valor default,
+tapa exactamente la señal que la ausencia representa (rating privado o
+`challenge` sin ladder).
+
+**Implementación (Task 9 / F3-09).**
+`extract_replay_url`/`elo_bucket_from_rating`
+(`apps/agent/src/ludex_agent/showdown/protocol.py`), gancho pasivo
+`LudexPlayer.replay_url` (`showdown/client.py`), persistencia con
+`COALESCE(EXCLUDED.x, tabla.x)` para que una re-persistencia sin el dato no
+pise uno ya conocido con `NULL` (`db/repository.py`), y `opponentUsername`
+en `packages/dataset-audit/src/render.ts` para resolver la identidad del
+rival por `player_side` en el reporte de autoría.
+
+**Verificación de las dos reglas centrales (mutación, restaurada por
+`sha256`).** (1) Selección de rol: en `render.ts`, invertir
+`opponentUsername` (`p1`→`battle.p1` en vez de `battle.p2`) tira en rojo 4
+tests nombrados de `test/authorship.test.ts`
+(`opponentUsername`/`renderAuthorshipReport`); restaurado, `sha256sum`
+idéntico
+(`d5c7f6e1f6aa497d6f199a20a1f2bbf84daeaa33a82fc20696930f1a8d86bb3e`) y los 9
+tests aplicables vuelven a verde (4 se saltan sin `DATABASE_URL`, esperado
+offline). (2) NULL-rating: en `protocol.py`, cambiar
+`elo_bucket_from_rating(None)` para devolver `"unrated"` en vez de `None`
+tira en rojo `test_elo_bucket_from_rating_none_da_none`; restaurado,
+`sha256sum` idéntico
+(`8ef0cb67ae935ecb97fba60dc9bf0812d15a7dfa59d4981ad087a3bc58449590`) y los 8
+tests de `replay_url`/`elo_bucket` en `test_protocol.py` vuelven a verde.
+
+**Suites completas ejecutadas (offline, sin DB/Docker).** Python:
+`pytest --ignore=tests/integration/test_langgraph_battle.py --ignore=tests/api`
+(la exclusión de `tests/api` es preexistente al venv compartido de
+`/Users/miguelhernandez/Documents/ludex`, que no tiene `fastapi` instalado —
+no relacionado con este cambio) → 796 passed, 174 skipped. TS:
+`vitest run test/authorship.test.ts` → 9 passed, 4 skipped (los 4
+`skipped` necesitan `DATABASE_URL`/Postgres). `pnpm --filter
+@ludex/dataset-audit test` (suite completa) deja 4 fallas preexistentes en
+`test/cli.test.ts`, confirmadas también contra la base sin este diff
+(idénticas con y sin los cambios de S9): necesitan `DATABASE_URL` y el dex
+local de poke-env, fuera del alcance de esta tarea y de la restricción
+offline.
+
+**Límite conocido.** `apps/agent/tests/db/test_repository.py` (incluidos los
+tres tests nuevos de `replay_url`/`elo_bucket`) requiere `TEST_DATABASE_URL`
+(MON-11/R2) y quedó en `skipped` por la restricción offline de esta sesión;
+no se ejecutó contra Postgres real. Es la capa de integración de
+`.claude/verification/SKILL.md`; falta correrla antes de cerrar la
+rebanada con DB disponible.
+
+**Modelo efectivo:** Sonnet 5 (Neoblex), continuación de MON-40 Task 9 tras
+agotamiento de contexto de la sesión anterior, sobre la base aceptada
+`7abda93a2b7b9db4d7cd85a8877674479efbbf20`.

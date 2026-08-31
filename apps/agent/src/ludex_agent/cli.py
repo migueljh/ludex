@@ -40,7 +40,7 @@ from .db.repository import BattleRepository
 from .db.session import make_engine, session_factory
 from .hitl import NeverGateApprovalPolicy
 from .showdown.client import LudexPlayer, local_server_configuration
-from .showdown.protocol import compute_opening_identity
+from .showdown.protocol import compute_opening_identity, elo_bucket_from_rating
 from .graph.calc import CalcClient
 from .graph.decision import DecisionResponse
 from .graph.provider import (
@@ -298,9 +298,26 @@ async def _persist_one(
     recorder = agent.recorders[tag]
     identity_key = compute_opening_identity(tag, recorder.lines_for_turn(0))
 
+    # MON-40/Fase 3 S9: ganchos estrechos y pasivos, nunca inventados.
+    # `replay_url` sale de lo que Showdown ya emitio en el protocolo crudo
+    # (D17: omitir, no construir desde `battle_tag`). `elo_bucket` es el
+    # rating PUBLICO del RIVAL (`opponent_rating`, nunca el propio): solo
+    # `|raw|` de ladder lo puebla, asi que en `challenge` queda NULL sin
+    # ninguna rama especial -- la ausencia del dato en el protocolo ES la
+    # senal, no un caso a codificar aparte.
+    replay_url = agent.replay_url(tag)
+    # `getattr` con default: `battle` en tests unitarios es un doble sin
+    # `opponent_rating` (poke_env.Battle real siempre lo tiene, default
+    # `None`). No es una excusa sin diagnosticar (.claude/verification): el
+    # atributo real es `Optional[int]` que arranca `None`, asi que un doble
+    # sin definirlo representa el mismo estado que un `battle.opponent_
+    # rating` real sin narracion `|raw|` de rating -- no encubre nada.
+    opponent_rating = getattr(battle, "opponent_rating", None)
+    elo_bucket = elo_bucket_from_rating(opponent_rating)
+
     battle_id = await repo.save_battle(
         battle_tag=tag, identity_key=identity_key, fmt=fmt, p1=p1, p2=p2,
-        winner=winner, source=source, played_by="bot",
+        winner=winner, source=source, played_by="bot", replay_url=replay_url,
     )
     for turn in recorder.turns():
         await repo.save_turn(battle_id, side, turn, recorder.lines_for_turn(turn))
@@ -320,7 +337,8 @@ async def _persist_one(
             f"phase={phase} (lost_step_count={agent.lost_step_count})"
         )
     traj = await repo.save_trajectory(
-        battle_id, gen_number=battle.gen, fmt=fmt, player_side=side
+        battle_id, gen_number=battle.gen, fmt=fmt, player_side=side,
+        elo_bucket=elo_bucket,
     )
     # D21/F2-02: decision_index cuenta decisiones canonicas resueltas. Los
     # retries rechazados reemplazan el mismo slot y no producen filas.

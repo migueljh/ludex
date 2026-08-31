@@ -328,6 +328,63 @@ def compute_opening_identity(battle_tag: str, opening_lines: Sequence[str]) -> s
 
 
 # ---------------------------------------------------------------------------
+# replay_url (MON-40/Fase 3 S9, gancho estrecho para Fase 6)
+#
+# poke-env NO expone ningun hook activo: el paquete vendorizado no tiene
+# `/savereplay`/`uploadreplay`, y `Battle.save_replay()` solo escribe un HTML
+# local, no produce una URL del servidor. La UNICA fuente offline legitima es
+# pasiva: una linea `|raw|` que Showdown ya manda cuando la sala tiene un
+# replay subido, con un link a `replay.pokemonshowdown.com`. Nunca se
+# construye la URL a partir de `battle_tag`: eso afirmaria que un replay
+# existe cuando puede no haberse guardado nunca -- exactamente lo que D17
+# prohibe (omitir es valido, inventar no).
+# ---------------------------------------------------------------------------
+
+_REPLAY_URL_RE = re.compile(
+    r'href="(https://replay\.pokemonshowdown\.com/[a-zA-Z0-9][a-zA-Z0-9-]*)"'
+)
+
+
+def extract_replay_url(lines: Sequence[str]) -> str | None:
+    """Primer link de replay saneado que aparece en `lines`, o `None`.
+
+    Saneado significa: el host tiene que ser EXACTAMENTE
+    `replay.pokemonshowdown.com` bajo `https`, nunca un prefijo/typosquat
+    (`replay.pokemonshowdown.com.evil.example`) ni `http`. El regex ancla el
+    host entre `://` y la primera `/` implicita del atributo `href="..."`, y
+    el propio patron ya excluye cualquier caracter de dominio despues del
+    host esperado porque el primer `"` cierra el atributo.
+    """
+    for line in lines:
+        match = _REPLAY_URL_RE.search(line)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# elo_bucket (MON-40/Fase 3 S9, gancho estrecho para Fase 6)
+#
+# `battle.opponent_rating` (poke-env) solo se puebla si Showdown mando el
+# `|raw|` "X's rating: NNNN" -- tipico de ladder, ausente en challenge. El
+# hook es del RIVAL (para identidad del rival, Fase 6), nunca del propio
+# rating del agente. Ningun bucketing por rangos: "elo_bucket" es el nombre
+# heredado de la columna, no una categoria a inventar (D17: omitir es
+# valido, inventar no).
+# ---------------------------------------------------------------------------
+
+
+def elo_bucket_from_rating(opponent_rating: int | None) -> str | None:
+    """`str(opponent_rating)` cuando el rating del rival es publico, si no
+    `None`. Nunca agrupa en rangos ni sustituye la ausencia por un valor
+    default: la ausencia del dato ES la senal (rating privado o challenge
+    sin ladder), no un caso a rellenar."""
+    if opponent_rating is None:
+        return None
+    return str(opponent_rating)
+
+
+# ---------------------------------------------------------------------------
 # Camino pre-lock (D31, MON-6)
 #
 # Medido con una sonda causal contra Showdown local (ver

@@ -1,4 +1,9 @@
-import type { AuthorshipMix, Dataset, TrajectoryStepRecord } from "./types.js";
+import type {
+  AuthorshipMix,
+  BattleRecord,
+  Dataset,
+  TrajectoryStepRecord,
+} from "./types.js";
 
 function actionLabel(action: TrajectoryStepRecord["actionTaken"]): string {
   if (!action) return "(sin acción)";
@@ -107,6 +112,22 @@ export function renderBattle(dataset: Dataset, selector: string | number): strin
   return lines.join("\n");
 }
 
+/** MON-40/Fase 3 S9: identidad del rival normalizada por rol p1/p2.
+ *
+ * `battles.p1`/`p2` no dicen por sí solos quién es el rival de una
+ * trayectoria: hay que resolverlos contra `player_side`, con el mismo
+ * criterio que `cli._persist_one` ya usa para escribir `p1`/`p2` según el
+ * ROL real (nunca asumiendo que el agente es siempre p1). Falla cerrado ante
+ * un `playerSide` que no sea `p1`/`p2` en vez de adivinar un lado.
+ */
+export function opponentUsername(battle: BattleRecord, playerSide: string): string {
+  if (playerSide === "p1") return battle.p2;
+  if (playerSide === "p2") return battle.p1;
+  throw new Error(
+    `player_side desconocido (no es 'p1' ni 'p2'): ${JSON.stringify(playerSide)}`,
+  );
+}
+
 const NO_APPROVAL_OUTCOME_LABEL = "(sin outcome)";
 
 /** D65 (MON-31/Fase 3 S2): mezcla de autoría sobre `dataset.steps` completo.
@@ -138,6 +159,7 @@ function formatCounts(counts: Record<string, number>): string[] {
  * auditor reporta mezcla agent/human y los tres outcomes"). */
 export function renderAuthorshipReport(dataset: Dataset): string {
   const mix = computeAuthorshipMix(dataset);
+  const battlesById = new Map(dataset.battles.map((battle) => [battle.id, battle]));
   const lines = [
     `Autoría de ${mix.total} decisiones`,
     "",
@@ -146,6 +168,21 @@ export function renderAuthorshipReport(dataset: Dataset): string {
     "",
     "Por approval_outcome:",
     ...formatCounts(mix.byApprovalOutcome),
+    "",
+    "Identidad del rival (por trayectoria, normalizada por player_side):",
+    ...dataset.trajectories
+      .slice()
+      .sort((a, b) => a.id - b.id)
+      .map((trajectory) => {
+        const battle = battlesById.get(trajectory.battleId);
+        if (battle === undefined) {
+          // No se inventa un rival para una trayectoria huérfana: se marca
+          // como tal en vez de omitirla en silencio (D17).
+          return `  Rival de la trayectoria ${trajectory.id} (${trajectory.playerSide}): (batalla ${trajectory.battleId} no encontrada)`;
+        }
+        return `  Rival de la trayectoria ${trajectory.id} (${trajectory.playerSide}): `
+          + opponentUsername(battle, trajectory.playerSide);
+      }),
   ];
   return lines.join("\n");
 }
