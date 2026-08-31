@@ -10,6 +10,7 @@ del CAS.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import threading
 
@@ -353,12 +354,131 @@ async def test_pending_await_resolution_sees_autonomous_toggle_immediately():
 # ---------------------------------------------------------------------------
 # Canario de fuente: prohibidos los primitivos de timeout de asyncio
 # ---------------------------------------------------------------------------
+#
+# Un canario de substring (MON-32 T-02) no distingue una llamada real de una
+# mencion en un docstring o comentario, y no ve dos rutas de evasion triviales:
+# un alias de import (`from asyncio import wait_for as wf`) o un acceso via
+# `getattr(asyncio, "wait_for")`. Este canario parsea el AST del modulo y
+# resuelve ambas rutas, ademas de la llamada calificada directa
+# (`asyncio.wait_for(...)`). El `.cancel()` prohibido se acota al Future de
+# aprobacion (`self._future` o un alias local asignado directamente desde el)
+# para no marcar un `.cancel()` legitimo sobre otro objeto que el modulo
+# pueda ganar despues.
+
+_FORBIDDEN_ASYNCIO_ATTRS = {"wait_for", "timeout", "wrap_future"}
+
+
+class _ForbiddenTimeoutPrimitiveVisitor(ast.NodeVisitor):
+    """Detecta, en el AST de `gate.py`, usos prohibidos de primitivos de
+    timeout de asyncio y `.cancel()` sobre el Future de aprobacion (D42/D65
+    S4.1)."""
+
+    def __init__(self) -> None:
+        self.violations: list[str] = []
+        self.future_attr_refs = 0
+        self._asyncio_aliases: set[str] = set()
+        self._forbidden_name_aliases: dict[str, str] = {}
+        self._future_local_aliases: set[str] = set()
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "asyncio":
+                self._asyncio_aliases.add(alias.asname or alias.name)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module == "asyncio":
+            for alias in node.names:
+                if alias.name in _FORBIDDEN_ASYNCIO_ATTRS:
+                    local = alias.asname or alias.name
+                    self._forbidden_name_aliases[local] = alias.name
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr == "_future":
+            self.future_attr_refs += 1
+        self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if self._is_approval_future_ref(node.value):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    self._future_local_aliases.add(target.id)
+        self.generic_visit(node)
+
+    def _is_asyncio_ref(self, node: ast.AST) -> bool:
+        return isinstance(node, ast.Name) and node.id in self._asyncio_aliases
+
+    def _is_approval_future_ref(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.Attribute) and node.attr == "_future":
+            return isinstance(node.value, ast.Name) and node.value.id == "self"
+        if isinstance(node, ast.Name):
+            return node.id in self._future_local_aliases
+        return False
+
+    def _forbidden_attr_target(self, node: ast.AST) -> str | None:
+        """Nombre prohibido si `node` referencia `asyncio.<forbidden>`,
+        directo o via `getattr` literal."""
+        if isinstance(node, ast.Attribute) and self._is_asyncio_ref(node.value):
+            if node.attr in _FORBIDDEN_ASYNCIO_ATTRS:
+                return node.attr
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and self._is_asyncio_ref(node.args[0])
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+            and node.args[1].value in _FORBIDDEN_ASYNCIO_ATTRS
+        ):
+            return node.args[1].value
+        return None
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        forbidden = self._forbidden_attr_target(func)
+        if forbidden is not None:
+            self.violations.append(
+                f"linea {node.lineno}: llamada a asyncio.{forbidden} "
+                "(directa o via getattr)"
+            )
+        elif isinstance(func, ast.Name) and func.id in self._forbidden_name_aliases:
+            target = self._forbidden_name_aliases[func.id]
+            self.violations.append(
+                f"linea {node.lineno}: llamada via alias de import {func.id!r} "
+                f"-> asyncio.{target}"
+            )
+        elif (
+            isinstance(func, ast.Attribute)
+            and func.attr == "cancel"
+            and self._is_approval_future_ref(func.value)
+        ):
+            self.violations.append(
+                f"linea {node.lineno}: cancel() sobre el Future de aprobacion"
+            )
+        self.generic_visit(node)
 
 
 def test_gate_source_never_uses_forbidden_timeout_primitives():
-    """D42/D65 S4.1: prohibido sobre el Future del CAS esperar con un
-    timeout de asyncio, envolverlo bajo timeout equivalente, o cancelarlo."""
+    """D42/D65 S4.1: prohibido sobre el Future del CAS de aprobacion usar
+    asyncio.wait_for/timeout/wrap_future -- llamada directa, alias de import,
+    o `getattr` literal -- y prohibido cancelar el Future de aprobacion (o un
+    alias local asignado directamente desde `self._future`)."""
     source = inspect.getsource(gate_module)
-    forbidden = ("wait_for", "asyncio.timeout", "wrap_future", ".cancel(")
-    for token in forbidden:
-        assert token not in source, f"token prohibido encontrado: {token!r}"
+    tree = ast.parse(source)
+    visitor = _ForbiddenTimeoutPrimitiveVisitor()
+    visitor.visit(tree)
+
+    # Canario no vacuo: si `_future` deja de existir como nombre de atributo
+    # en el modulo (p.ej. un rename), la deteccion de `.cancel()` sobre el
+    # Future de aprobacion queda ciega en silencio. Esto lo hace fallar en
+    # vez de pasar sin haber verificado nada.
+    assert visitor.future_attr_refs > 0, (
+        "no se encontro ninguna referencia a `_future` en gate.py: si el "
+        "atributo se renombro, este canario quedo vacuo y hay que actualizarlo"
+    )
+
+    assert visitor.violations == [], "primitivos prohibidos encontrados:\n" + "\n".join(
+        visitor.violations
+    )
